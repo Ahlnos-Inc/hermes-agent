@@ -3386,6 +3386,7 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
     print_info("  Configure all settings:    hermes setup")
     if gateway_choice != 0:
         print_info("  Connect Telegram/Discord:  hermes setup gateway")
+    print_info("  Browse curated MCPs:       hermes mcp")
     print()
 
     _print_setup_summary(config, hermes_home)

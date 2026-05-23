@@ -340,7 +340,7 @@ class TestPicker:
 
         show_catalog()
         out = capsys.readouterr().out
-        assert "No MCPs in the catalog" in out
+        assert "No MCPs in the catalog or configured" in out
 
     def test_show_catalog_lists_entry(self, catalog_dir, capsys):
         _write_manifest(catalog_dir, "demo", _basic_manifest())
@@ -376,7 +376,7 @@ class TestPicker:
 
         run_picker()
         out = capsys.readouterr().out
-        assert "Nous-approved MCP catalog" in out
+        assert "MCP Catalog + configured servers" in out
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +514,257 @@ class TestToolSelection:
 
         # Invalid manifests are silently skipped at list_catalog level
         assert list_catalog() == []
+
+
+
+
+# ---------------------------------------------------------------------------
+# Forward-compat / diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogDiagnostics:
+    def test_future_manifest_version_skipped_with_diagnostic(self, catalog_dir):
+        """A manifest with a newer manifest_version is skipped, but the skip
+        is reported via catalog_diagnostics so the UI can tell the user."""
+        body = _basic_manifest()
+        body["manifest_version"] = 999  # Future version
+        _write_manifest(catalog_dir, "futuristic", body)
+        # Plus one valid entry
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+
+        from hermes_cli.mcp_catalog import list_catalog, catalog_diagnostics
+
+        entries = list_catalog()
+        assert [e.name for e in entries] == ["demo"]
+
+        diags = catalog_diagnostics()
+        # At least one future_manifest diagnostic for the futuristic entry
+        future = [d for d in diags if d[1] == "future_manifest"]
+        assert len(future) == 1
+        assert future[0][0] == "futuristic"
+
+    def test_invalid_manifest_diagnostic(self, catalog_dir):
+        body = _basic_manifest()
+        body["transport"] = {"type": "unsupported"}
+        _write_manifest(catalog_dir, "broken", body)
+
+        from hermes_cli.mcp_catalog import list_catalog, catalog_diagnostics
+
+        entries = list_catalog()
+        assert entries == []
+        diags = catalog_diagnostics()
+        invalid = [d for d in diags if d[1] == "invalid"]
+        assert len(invalid) == 1
+
+    def test_picker_surfaces_future_manifest_warning(self, catalog_dir, capsys, monkeypatch):
+        """The text-dump path should print a warning line for future-manifest
+        entries so users running headless or after `hermes setup` know to update."""
+        body = _basic_manifest()
+        body["manifest_version"] = 999
+        _write_manifest(catalog_dir, "futuristic", body)
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False)
+        from hermes_cli.mcp_picker import show_catalog
+
+        show_catalog()
+        out = capsys.readouterr().out
+        assert "futuristic" in out
+        assert "requires a newer Hermes" in out
+
+
+# ---------------------------------------------------------------------------
+# Picker — custom (non-catalog) MCP rows
+# ---------------------------------------------------------------------------
+
+
+class TestCustomMcpRows:
+    def test_custom_mcp_shown_alongside_catalog(self, catalog_dir, capsys):
+        """Servers in mcp_servers that aren't in the catalog show up in the
+        picker text dump with a 'custom' status."""
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config()
+        cfg.setdefault("mcp_servers", {})["my-custom"] = {
+            "command": "npx",
+            "args": ["-y", "my-custom-mcp"],
+            "enabled": True,
+        }
+        save_config(cfg)
+
+        from hermes_cli.mcp_picker import show_catalog
+        show_catalog()
+        out = capsys.readouterr().out
+        assert "demo" in out
+        assert "my-custom" in out
+        assert "custom" in out  # The status badge
+
+    def test_custom_mcp_only_no_catalog(self, catalog_dir, capsys):
+        """If the catalog is empty but the user has custom MCPs, they\'re
+        still visible — the picker is the unified surface."""
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config()
+        cfg.setdefault("mcp_servers", {})["my-custom"] = {
+            "url": "https://mcp.example.com",
+            "enabled": False,
+        }
+        save_config(cfg)
+
+        from hermes_cli.mcp_picker import show_catalog
+        show_catalog()
+        out = capsys.readouterr().out
+        assert "my-custom" in out
+
+
+# ---------------------------------------------------------------------------
+# Git install — SHA ref detection
+# ---------------------------------------------------------------------------
+
+
+class TestGitInstallShaRef:
+    def test_sha_ref_skips_branch_attempt(self, catalog_dir, monkeypatch, tmp_path):
+        """When install.ref is a SHA-shaped hex string, _do_git_install
+        skips the `git clone --branch <ref>` attempt (which would always fail
+        noisily for SHAs) and goes straight to clone + checkout."""
+        body = _basic_manifest(
+            install={
+                "type": "git",
+                "url": "https://example.com/x.git",
+                "ref": "abc1234567890abcdef1234567890abcdef12345",  # 40-char SHA
+                "bootstrap": [],
+            },
+            transport={
+                "type": "stdio",
+                "command": "${INSTALL_DIR}/run.sh",
+                "args": [],
+            },
+        )
+        _write_manifest(catalog_dir, "demo", body)
+
+        from hermes_cli import mcp_catalog
+        from hermes_cli.mcp_catalog import _do_git_install
+
+        calls = []
+
+        class _FakeProc:
+            def __init__(self, returncode):
+                self.returncode = returncode
+
+        def fake_run(argv, *args, **kwargs):
+            calls.append(list(argv))
+            # Make every command succeed
+            return _FakeProc(returncode=0)
+
+        monkeypatch.setattr(mcp_catalog.subprocess, "run", fake_run)
+        monkeypatch.setattr(mcp_catalog.shutil, "which", lambda x: "/usr/bin/git")
+
+        from hermes_cli.mcp_catalog import get_entry
+        entry = get_entry("demo")
+        assert entry is not None
+        _do_git_install(entry)
+
+        # Should have called clone (no --branch) then checkout — NOT clone --branch
+        branch_attempts = [c for c in calls if "--branch" in c]
+        assert branch_attempts == [], (
+            "SHA refs must NOT trigger a --branch clone attempt — that would "
+            "always fail noisily before falling back. Calls were: " + repr(calls)
+        )
+        # Confirm we DID do plain clone + checkout
+        clone_calls = [c for c in calls if "clone" in c and "--branch" not in c]
+        checkout_calls = [c for c in calls if "checkout" in c]
+        assert len(clone_calls) == 1, calls
+        assert len(checkout_calls) == 1, calls
+
+    def test_branch_ref_uses_branch_clone(self, catalog_dir, monkeypatch):
+        """When install.ref is a branch/tag (not SHA-shaped), the fast
+        `git clone --depth 1 --branch <ref>` path is used."""
+        body = _basic_manifest(
+            install={
+                "type": "git",
+                "url": "https://example.com/x.git",
+                "ref": "v1.0.0",  # Tag-shaped
+                "bootstrap": [],
+            },
+            transport={
+                "type": "stdio",
+                "command": "${INSTALL_DIR}/run.sh",
+                "args": [],
+            },
+        )
+        _write_manifest(catalog_dir, "demo", body)
+
+        from hermes_cli import mcp_catalog
+        from hermes_cli.mcp_catalog import _do_git_install, get_entry
+
+        calls = []
+
+        class _FakeProc:
+            def __init__(self, returncode):
+                self.returncode = returncode
+
+        def fake_run(argv, *args, **kwargs):
+            calls.append(list(argv))
+            return _FakeProc(returncode=0)
+
+        monkeypatch.setattr(mcp_catalog.subprocess, "run", fake_run)
+        monkeypatch.setattr(mcp_catalog.shutil, "which", lambda x: "/usr/bin/git")
+
+        _do_git_install(get_entry("demo"))
+        branch_attempts = [c for c in calls if "--branch" in c]
+        assert len(branch_attempts) == 1, calls
+
+
+# ---------------------------------------------------------------------------
+# Existing tools_config converged to tools.include
+# ---------------------------------------------------------------------------
+
+
+class TestToolsConfigIncludeMode:
+    def test_configure_mcp_writes_include_not_exclude(self, monkeypatch, tmp_path):
+        """`_configure_mcp_tools_interactive` in tools_config.py must write
+        `tools.include` (whitelist), matching the rest of the codebase. The
+        old behavior wrote `tools.exclude`, which produced inconsistent
+        on-disk shapes depending on which UI the user used last."""
+        # Build a minimal mcp_servers config + mock probe + checklist
+        cfg = {
+            "_config_version": 23,
+            "mcp_servers": {
+                "demo": {
+                    "command": "npx",
+                    "args": ["-y", "demo-mcp"],
+                    "enabled": True,
+                }
+            },
+        }
+
+        import hermes_cli.tools_config as tc
+        # Mock the probe to return three tools
+        monkeypatch.setattr(
+            "tools.mcp_tool.probe_mcp_server_tools",
+            lambda: {"demo": [("a", "desc"), ("b", "desc"), ("c", "desc")]},
+        )
+        # Mock the checklist to return just the first tool
+        monkeypatch.setattr(
+            "hermes_cli.curses_ui.curses_checklist",
+            lambda title, labels, pre_selected, **kw: {0},
+        )
+        # Mock save_config so we can inspect the write
+        saved = {}
+
+        def fake_save(config):
+            saved.update(config)
+
+        monkeypatch.setattr(tc, "save_config", fake_save)
+
+        tc._configure_mcp_tools_interactive(cfg)
+
+        # Must have written include, not exclude
+        srv = saved["mcp_servers"]["demo"]["tools"]
+        assert srv.get("include") == ["a"], srv
+        assert "exclude" not in srv, srv
 
 
 class TestShippedCatalog:

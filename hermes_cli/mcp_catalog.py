@@ -266,22 +266,50 @@ def _parse_manifest(path: Path) -> CatalogEntry:
 def list_catalog() -> List[CatalogEntry]:
     """Return all valid catalog entries, sorted by name.
 
-    Invalid manifests are skipped silently (they should be caught in CI tests).
+    Invalid manifests are skipped silently (CI tests catch them at PR time).
+    Manifests with a future ``manifest_version`` are also skipped, but the
+    skip is surfaced via :func:`catalog_diagnostics` so the picker / catalog
+    UIs can tell the user their Hermes is out of date.
     """
     root = _catalog_root()
     if not root.exists():
         return []
     entries: List[CatalogEntry] = []
+    _CATALOG_DIAGNOSTICS.clear()
     for child in sorted(root.iterdir()):
         manifest = child / "manifest.yaml"
         if not manifest.is_file():
             continue
         try:
             entries.append(_parse_manifest(manifest))
-        except CatalogError:
-            # Skip broken manifests; tests guard against this.
+        except CatalogError as exc:
+            msg = str(exc)
+            # Recognize the future-manifest error specifically so the UI can
+            # surface a more actionable nudge than "broken manifest".
+            if "manifest_version" in msg and "unsupported" in msg:
+                _CATALOG_DIAGNOSTICS.append((child.name, "future_manifest", msg))
+            else:
+                _CATALOG_DIAGNOSTICS.append((child.name, "invalid", msg))
             continue
     return entries
+
+
+# Populated by list_catalog(). Inspected by the picker / catalog UIs so the
+# user gets actionable feedback instead of a silently-shorter list.
+_CATALOG_DIAGNOSTICS: List[tuple] = []
+
+
+def catalog_diagnostics() -> List[tuple]:
+    """Diagnostics from the most recent :func:`list_catalog` call.
+
+    Returns a list of ``(entry_name, kind, message)`` tuples where ``kind``
+    is one of:
+      - ``future_manifest`` — manifest_version is newer than this Hermes
+        understands. Update Hermes to install this entry.
+      - ``invalid`` — manifest is malformed in some other way (caught by
+        CI for shipped manifests; user-modified manifests can hit this).
+    """
+    return list(_CATALOG_DIAGNOSTICS)
 
 
 def get_entry(name: str) -> Optional[CatalogEntry]:
@@ -362,12 +390,27 @@ def _do_git_install(entry: CatalogEntry) -> Path:
         shutil.rmtree(dest)
 
     print(color(f"  Cloning {install.url} ({install.ref}) → {dest}", Colors.CYAN))
-    proc = subprocess.run(
-        [git, "clone", "--depth", "1", "--branch", install.ref, install.url, str(dest)],
-    )
-    if proc.returncode != 0:
-        # Fall back to fetching the ref by SHA (clone --branch only accepts
-        # branches and tags, not arbitrary commits).
+
+    # `git clone --branch` only accepts branches and tags, NOT commit SHAs.
+    # Detecting SHA-shaped refs upfront avoids a guaranteed stderr leak on
+    # the fast path (the --branch attempt would always fail noisily for a
+    # SHA ref before we fall back to full-clone-then-checkout).
+    is_sha_ref = bool(re.fullmatch(r"[0-9a-f]{7,40}", install.ref))
+
+    if not is_sha_ref:
+        proc = subprocess.run(
+            [git, "clone", "--depth", "1", "--branch", install.ref, install.url, str(dest)],
+        )
+        if proc.returncode == 0:
+            pass
+        else:
+            # Branch/tag form failed (unlikely for valid manifests; possible if
+            # the ref was deleted upstream). Fall through to the full-clone path.
+            if dest.exists():
+                shutil.rmtree(dest)
+            is_sha_ref = True  # treat the same as a SHA ref from here
+
+    if is_sha_ref:
         proc = subprocess.run([git, "clone", install.url, str(dest)])
         if proc.returncode != 0:
             raise CatalogError(f"git clone failed for {install.url}")
@@ -603,10 +646,15 @@ def _apply_tool_selection(
         return
 
     if len(chosen_indices) == len(probed):
-        # Everything selected — clear filter for the cleanest config shape
+        # Everything selected — clear filter for the cleanest config shape.
+        # NOTE: this means any tools the server adds later (e.g. a future MCP
+        # version) will also be auto-enabled. To pin to the current set,
+        # the user can re-run `hermes mcp configure <name>` and unselect a
+        # tool to switch back to include-mode.
         _write_tools_include(entry.name, None)
         print(color(
-            f"  ✓ All {len(probed)} tools enabled.",
+            f"  ✓ All {len(probed)} tools enabled (no filter — new tools "
+            "the server adds later will be auto-enabled).",
             Colors.GREEN,
         ))
         return

@@ -119,6 +119,41 @@ backing service not running), the install still succeeds: the manifest's
 written (if not). Re-run `hermes mcp configure <name>` once the server is
 reachable to refine.
 
+### Trust model
+
+Installing a catalog entry runs whatever the manifest specifies — `git clone`,
+the entry's `bootstrap` commands (`pip install`, `npm install`, etc.), and
+ultimately the MCP server's own code. Manifests are gated by PR review into
+the hermes-agent repo, so Nous has reviewed each entry before it shipped —
+**but you should still read the manifest before installing**, especially the
+`source:` field's repository, the `install.bootstrap:` commands, and any
+`transport.command:` invocation.
+
+Manifests live at
+[`optional-mcps/<name>/manifest.yaml`](https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps)
+on GitHub. The picker also prints the manifest's `source:` URL at install
+time so you can quickly verify the upstream repo.
+
+### Manifest version compatibility
+
+Manifests pin a `manifest_version`. The catalog is forward-compatible: if a
+PR adds an entry with a newer `manifest_version` than your installed Hermes
+understands, the picker will surface a warning (`⚠ '<name>' requires a newer
+Hermes`) for that entry instead of silently hiding it. Run `hermes update`
+to install the latest Hermes when you see that.
+
+### Runtime `${ENV_VAR}` substitution
+
+Inside an entry's `transport.command`, `transport.args`, `transport.url`,
+and `headers`, `${VAR}` placeholders are resolved at server-connect time
+from environment variables (which include everything in `~/.hermes/.env`).
+This is useful when a catalog entry wants to reference a value the user
+configured elsewhere — e.g. `${HOME}/foo` or `${MY_PROVIDER_TOKEN}`.
+
+Note this is distinct from `${INSTALL_DIR}` in catalog manifests, which is
+substituted at install-time with the path the catalog cloned the entry's
+repo into.
+
 ### Updating tool selection later
 
 ```bash
