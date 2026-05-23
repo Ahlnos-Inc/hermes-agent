@@ -44,7 +44,7 @@ describe('virtual height estimates', () => {
     const msg: Msg = { role: 'assistant', text: 'ok' }
 
     expect(estimatedMsgHeight(msg, 80, { compact: false, details: true })).toBe(
-      estimatedMsgHeight(msg, 80, { compact: false, details: false }) + 1
+      estimatedMsgHeight(msg, 80, { compact: false, details: false })
     )
   })
 

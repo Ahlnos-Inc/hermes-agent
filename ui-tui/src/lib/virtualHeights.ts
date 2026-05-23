@@ -111,12 +111,14 @@ export const estimatedMsgHeight = (
   }
 
   if (details) {
-    h += (msg.tools?.length ?? 0) + wrappedLines(msg.thinking ?? '', bodyWidth)
-
     const hasVisibleDetails = Boolean(msg.tools?.length || /\S/.test(msg.thinking ?? ''))
 
-    if (msg.role === 'assistant' && hasVisibleDetails && /\S/.test(msg.text)) {
-      h += 2
+    if (hasVisibleDetails) {
+      h += (msg.tools?.length ?? 0) + wrappedLines(msg.thinking ?? '', bodyWidth)
+
+      if (msg.role === 'assistant' && /\S/.test(msg.text)) {
+        h += 2
+      }
     }
   }
 
