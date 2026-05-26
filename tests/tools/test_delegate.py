@@ -9,12 +9,15 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import datetime as dt
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -32,6 +35,9 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _append_delegate_route_telemetry,
+    _assess_delegate_route_quota,
+    _delegate_failure_diagnostic,
 )
 
 
@@ -56,6 +62,184 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+def _write_native_quota_snapshot(directory, provider="openai-codex", pct=86.0):
+    now = dt.datetime.now(dt.timezone.utc)
+    reset = now + dt.timedelta(hours=2)
+    path = os.path.join(directory, f"provider-native-quota-{provider}.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": 1,
+                "provider": provider,
+                "fetched_at": now.isoformat().replace("+00:00", "Z"),
+                "windows": {
+                    "five_hour": {
+                        "used_percentage": pct,
+                        "resets_at": reset.isoformat().replace("+00:00", "Z"),
+                    }
+                },
+            },
+            fh,
+        )
+    return path
+
+
+class TestDelegationQuotaAndDiagnostics(unittest.TestCase):
+    def test_quota_assessment_blocks_native_codex_snapshot_at_threshold(self):
+        parent = _make_mock_parent(depth=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_native_quota_snapshot(tmp, provider="openai-codex", pct=86.0)
+            with patch.dict(os.environ, {"HERMES_NATIVE_QUOTA_STATE_DIR": tmp}):
+                assessment = _assess_delegate_route_quota(
+                    provider="openai-codex",
+                    model="gpt-5.1-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_mode="codex_responses",
+                    parent_agent=parent,
+                    cfg={},
+                )
+
+        self.assertEqual(assessment["decision"], "avoid")
+        self.assertEqual(assessment["native_provider"], "openai-codex")
+        self.assertEqual(assessment["usage"]["window"], "five_hour")
+        self.assertGreaterEqual(assessment["usage"]["usage_pct"], 85.0)
+
+    def test_delegate_task_blocks_high_usage_before_spawn_and_logs_route(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openai-codex"
+        parent.base_url = "https://chatgpt.com/backend-api/codex"
+        parent.api_mode = "codex_responses"
+        parent.model = "gpt-5.1-codex"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home, exist_ok=True)
+            _write_native_quota_snapshot(tmp, provider="openai-codex", pct=91.0)
+            env = {
+                "HERMES_NATIVE_QUOTA_STATE_DIR": tmp,
+                "HERMES_HOME": home,
+                "HERMES_ORCHESTRATION_TELEMETRY": "1",
+            }
+            creds = {
+                "provider": None,
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "model": None,
+                "reasoning_effort": None,
+                "command": None,
+                "args": None,
+            }
+            with patch.dict(os.environ, env), patch(
+                "tools.delegate_tool._load_config", return_value={"max_iterations": 2}
+            ), patch(
+                "tools.delegate_tool._resolve_delegation_credentials", return_value=creds
+            ), patch(
+                "tools.delegate_tool._build_child_agent"
+            ) as mock_build:
+                payload = json.loads(delegate_task(goal="Use a specialist", parent_agent=parent))
+                mock_build.assert_not_called()
+                from orchestration_telemetry import read_events, telemetry_path
+
+                events = read_events(path=telemetry_path())
+
+        self.assertIn("error", payload)
+        self.assertIn("Delegation avoided", payload["error"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "route.blocked")
+        self.assertEqual(events[0]["status"], "blocked_quota")
+        self.assertEqual(events[0]["route"]["provider"], "openai-codex")
+        self.assertEqual(events[0]["quota"]["decision"], "avoid")
+        self.assertIn("diagnostic_route", events[0])
+        self.assertIn("retry", events[0])
+
+    def test_failure_diagnostic_contains_provider_model_retry_route_and_redacts(self):
+        child = SimpleNamespace(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+            _delegate_route_reason="delegate_task default route",
+            _delegate_quota_assessment={"decision": "allow", "source": "none"},
+        )
+        diagnostic = _delegate_failure_diagnostic(
+            child,
+            "429 rate limit api_key=sk-secret1234567890",
+            status="error",
+            duration_seconds=1.5,
+            api_calls=1,
+        )
+
+        self.assertEqual(diagnostic["provider"], "openrouter")
+        self.assertEqual(diagnostic["model"], "anthropic/claude-sonnet-4")
+        self.assertEqual(diagnostic["error"]["category"], "rate_limit")
+        self.assertTrue(diagnostic["retry"]["retryable"])
+        self.assertEqual(diagnostic["diagnostic_route"]["provider"], "openrouter")
+        self.assertNotIn("sk-secret", json.dumps(diagnostic))
+        self.assertIn("[REDACTED]", json.dumps(diagnostic))
+
+    def test_anthropic_extra_usage_error_is_quota_diagnostic_evidence(self):
+        child = SimpleNamespace(
+            provider="anthropic",
+            model="claude-sonnet-4",
+            _delegate_route_reason="delegate_task override",
+            _delegate_quota_assessment={"decision": "allow", "source": "none"},
+        )
+        diagnostic = _delegate_failure_diagnostic(
+            child,
+            'Anthropic 400 invalid_request_error: "Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."',
+            status="error",
+            duration_seconds=0.8,
+            api_calls=1,
+        )
+
+        self.assertEqual(diagnostic["error"]["category"], "quota")
+        self.assertTrue(diagnostic["retry"]["retryable"])
+        self.assertEqual(diagnostic["diagnostic_route"]["provider"], "anthropic")
+        self.assertIn("route delegation.provider/model", diagnostic["retry"]["strategy"])
+
+    def test_delegate_route_telemetry_records_failure_fields_without_summary(self):
+        child = SimpleNamespace(
+            _orchestration_route_telemetry={
+                "action_type": "spawn_subagent",
+                "route": {
+                    "chosen_route": "delegate_task",
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                },
+            }
+        )
+        diagnostic = {
+            "error": {"class": "RuntimeError", "category": "rate_limit", "message": "429"},
+            "retry": {"retryable": True, "strategy": "wait for reset"},
+            "diagnostic_route": {"selected_route": "delegate_task", "provider": "openrouter"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home, exist_ok=True)
+            with patch.dict(os.environ, {"HERMES_HOME": home, "HERMES_ORCHESTRATION_TELEMETRY": "1"}):
+                _append_delegate_route_telemetry(
+                    "route.completed",
+                    child=child,
+                    status="error",
+                    extra={
+                        "summary": "do not persist this child summary",
+                        "error": diagnostic["error"],
+                        "retry": diagnostic["retry"],
+                        "diagnostic_route": diagnostic["diagnostic_route"],
+                    },
+                )
+                from orchestration_telemetry import read_events, telemetry_path
+
+                events = read_events(path=telemetry_path())
+
+        self.assertEqual(len(events), 1)
+        event_text = json.dumps(events[0], sort_keys=True)
+        self.assertEqual(events[0]["surface"], "delegate_task")
+        self.assertEqual(events[0]["error"]["category"], "rate_limit")
+        self.assertTrue(events[0]["retry"]["retryable"])
+        self.assertIn("diagnostic_route", events[0])
+        self.assertNotIn("do not persist", event_text)
+        self.assertIn("summary", events[0]["privacy"]["content_fields_excluded"])
 
 
 class TestDelegateRequirements(unittest.TestCase):

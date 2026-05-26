@@ -22,6 +22,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -924,25 +925,31 @@ def _build_child_progress_callback(
     return _callback
 
 
+_PREMIUM_DELEGATION_USAGE_THRESHOLD = 85.0
+_NATIVE_QUOTA_STALE_AFTER_SECONDS = 10 * 60
+
+
 def _append_delegate_route_telemetry(
     event_type: str,
     *,
-    child: Any,
+    child: Any = None,
     status: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
+    **fields: Any,
 ) -> None:
     """Best-effort metadata-only route telemetry for delegate_task.
 
     The shared writer sanitizes defensively; this helper still avoids passing
-    goal/context/summary/error strings so route observability never depends on
-    content redaction to stay private.
+    goal/context/summary/error strings unless they have already been reduced to
+    diagnostic metadata. Telemetry is optional and must never affect delegation.
     """
     try:
         from orchestration_telemetry import append_event
 
-        payload: Dict[str, Any] = dict(
-            getattr(child, "_orchestration_route_telemetry", {}) or {}
-        )
+        payload: Dict[str, Any] = {}
+        if child is not None:
+            payload.update(getattr(child, "_orchestration_route_telemetry", {}) or {})
+        payload.update(fields)
         if extra:
             payload.update(extra)
         append_event(event_type, surface="delegate_task", status=status, **payload)
@@ -958,6 +965,397 @@ def _tool_count_for_agent(agent: Any) -> Optional[int]:
     except Exception:
         pass
     return None
+
+
+def _coerce_pct(value: Any) -> Optional[float]:
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, pct))
+
+
+def _parse_iso_timestamp(value: Any) -> Optional[float]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        import datetime as _dt
+
+        return _dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _quota_state_dirs() -> List[Any]:
+    from pathlib import Path
+
+    dirs: List[Any] = []
+    env_dir = os.getenv("HERMES_NATIVE_QUOTA_STATE_DIR", "")
+    if env_dir:
+        dirs.extend(Path(p).expanduser() for p in env_dir.split(os.pathsep) if p.strip())
+    try:
+        from hermes_constants import get_hermes_home
+
+        dirs.append(get_hermes_home() / "state")
+    except Exception:
+        dirs.append(Path.home() / ".hermes" / "state")
+    seen: set[str] = set()
+    out: List[Any] = []
+    for path in dirs:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _native_quota_provider_for_route(
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+) -> Optional[str]:
+    """Map a route to a native 5h/7d quota provider, when one is safe to know.
+
+    We only claim native quota knowledge for providers whose runtime surfaces are
+    known to expose 5-hour/7-day plan windows. A model name containing "claude"
+    on OpenRouter/Anthropic API is not, by itself, a Claude Code quota signal.
+    """
+    provider_l = (provider or "").lower()
+    base_l = (base_url or "").lower()
+    mode_l = (api_mode or "").lower()
+    if "openai-codex" in provider_l or provider_l == "codex" or "/backend-api/codex" in base_l or mode_l == "codex_responses":
+        return "openai-codex"
+    if provider_l in {"claude-cli", "claude-code", "anthropic-oauth"}:
+        return "claude-cli"
+    return None
+
+
+def _read_native_quota_usage(provider: str, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Read freshest Hermes-owned native quota snapshot for Codex/Claude.
+
+    This is intentionally disk-only: it does not read credential files or make
+    network calls. Snapshot writers may refresh from provider-specific status
+    endpoints elsewhere, but delegation's safety gate only consumes the sanitized
+    percentages if already available.
+    """
+    from pathlib import Path
+    import json as _json
+
+    now_ts = time.time() if now is None else float(now)
+    prefix = f"provider-native-quota-{provider}"
+    newest: Optional[Any] = None
+    newest_mtime = -1.0
+    for state_dir in _quota_state_dirs():
+        try:
+            entries = list(Path(state_dir).iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            name = path.name
+            if not name.startswith(prefix) or not name.endswith(".json"):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest = path
+                newest_mtime = mtime
+    if newest is None:
+        return None
+
+    try:
+        raw = _json.loads(newest.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("provider") != provider:
+        return None
+
+    fetched_at = raw.get("fetched_at")
+    fetched_ts = _parse_iso_timestamp(fetched_at)
+    stale = False
+    if fetched_ts is not None:
+        stale = (now_ts - fetched_ts) > _NATIVE_QUOTA_STALE_AFTER_SECONDS
+
+    best: Optional[Dict[str, Any]] = None
+
+    def visit(container: Any, limit_id: Optional[str] = None) -> None:
+        nonlocal best
+        if not isinstance(container, dict):
+            return
+        windows = container.get("windows")
+        if not isinstance(windows, dict):
+            return
+        for key in ("five_hour", "seven_day"):
+            raw_window = windows.get(key)
+            if not isinstance(raw_window, dict):
+                continue
+            pct = _coerce_pct(raw_window.get("used_percentage"))
+            if pct is None:
+                continue
+            resets_at = raw_window.get("resets_at") if isinstance(raw_window.get("resets_at"), str) else None
+            reset_ts = _parse_iso_timestamp(resets_at)
+            if reset_ts is not None and reset_ts <= now_ts:
+                continue
+            candidate = {
+                "source": "native_quota_snapshot",
+                "native_provider": provider,
+                "usage_pct": pct,
+                "window": key,
+                "resets_at": resets_at,
+                "stale": stale,
+                "source_path": str(newest),
+            }
+            if limit_id:
+                candidate["limit_id"] = limit_id
+            if best is None or pct > float(best.get("usage_pct", 0.0)):
+                best = candidate
+
+    visit(raw)
+    for item in raw.get("additional_limits") or []:
+        if isinstance(item, dict):
+            visit(item, limit_id=str(item.get("limit_id") or item.get("limit_name") or "unknown"))
+    return best
+
+
+def _rate_limit_usage_from_agent(parent_agent: Any, target_provider: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Summarize the parent's live RateLimitState, when it is trustworthy."""
+    getter = getattr(parent_agent, "get_rate_limit_state", None)
+    if not callable(getter):
+        return None
+    try:
+        state = getter()
+    except Exception:
+        return None
+    if getattr(state, "has_data", False) is not True:
+        return None
+    state_provider = getattr(state, "provider", "")
+    if isinstance(state_provider, str) and target_provider and state_provider and state_provider != target_provider:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    for attr, label in (
+        ("requests_min", "requests_min"),
+        ("requests_hour", "requests_hour"),
+        ("tokens_min", "tokens_min"),
+        ("tokens_hour", "tokens_hour"),
+    ):
+        bucket = getattr(state, attr, None)
+        limit = getattr(bucket, "limit", 0)
+        if not isinstance(limit, (int, float)) or limit <= 0:
+            continue
+        pct = _coerce_pct(getattr(bucket, "usage_pct", None))
+        if pct is None:
+            continue
+        reset_seconds = getattr(bucket, "remaining_seconds_now", None)
+        if not isinstance(reset_seconds, (int, float)):
+            reset_seconds = None
+        candidate = {
+            "source": "rate_limit_state",
+            "provider": state_provider if isinstance(state_provider, str) else target_provider,
+            "usage_pct": pct,
+            "window": label,
+            "reset_seconds": reset_seconds,
+            "age_seconds": getattr(state, "age_seconds", None) if isinstance(getattr(state, "age_seconds", None), (int, float)) else None,
+        }
+        if best is None or pct > float(best.get("usage_pct", 0.0)):
+            best = candidate
+    return best
+
+
+def _delegation_quota_cfg(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not isinstance(cfg, dict):
+        return {}
+    merged: Dict[str, Any] = {}
+    nested = cfg.get("delegation")
+    if isinstance(nested, dict):
+        merged.update(nested)
+    merged.update(cfg)
+    return merged
+
+
+def _delegation_usage_threshold(cfg: Optional[Dict[str, Any]] = None) -> float:
+    cfg_values = _delegation_quota_cfg(cfg)
+    for key in ("premium_usage_threshold", "quota_usage_threshold"):
+        if key in cfg_values:
+            pct = _coerce_pct(cfg_values.get(key))
+            if pct is not None:
+                return pct
+    return _PREMIUM_DELEGATION_USAGE_THRESHOLD
+
+
+def _assess_delegate_route_quota(
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    parent_agent: Any,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Decide whether a delegation route should be avoided for quota safety."""
+    cfg = cfg or {}
+    threshold = _delegation_usage_threshold(cfg)
+    native_provider = _native_quota_provider_for_route(provider, model, base_url, api_mode)
+    usage = _read_native_quota_usage(native_provider) if native_provider else None
+    source = "native_quota_snapshot" if usage else "none"
+
+    if usage is None:
+        usage = _rate_limit_usage_from_agent(parent_agent, provider)
+        if usage is not None:
+            source = "rate_limit_state"
+
+    decision = "allow"
+    reason = "no quota surface available; delegation allowed without assuming cooldown"
+    if usage is not None:
+        pct = float(usage.get("usage_pct", 0.0))
+        # Do not interpret future resets_at by itself as a cooldown. The gate is
+        # driven by observed high-watermark usage percentage only.
+        if pct >= threshold:
+            decision = "avoid"
+            reason = f"{source} reports {pct:.0f}% usage in {usage.get('window')} (threshold {threshold:.0f}%)"
+        else:
+            reason = f"{source} reports {pct:.0f}% usage below {threshold:.0f}% threshold"
+
+    quota_cfg = _delegation_quota_cfg(cfg)
+    if decision == "avoid" and is_truthy_value(quota_cfg.get("allow_high_usage_delegation"), default=False):
+        decision = "allow_override"
+        reason += "; delegation.allow_high_usage_delegation=true override applied"
+
+    return {
+        "decision": decision,
+        "reason": reason,
+        "threshold_pct": threshold,
+        "source": source,
+        "native_provider": native_provider,
+        "provider": provider,
+        "model": model,
+        "api_mode": api_mode,
+        "usage": usage,
+    }
+
+
+def _sanitize_delegate_error(value: Any, limit: int = 360) -> str:
+    text = str(value or "")
+    patterns = (
+        re.compile(r"sk-[A-Za-z0-9_-]{12,}"),
+        re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._~+/=-]+"),
+        re.compile(r"(?i)(api[_-]?key[=:])[^\s&]+"),
+        re.compile(r"(?i)(token[=:])[^\s&]+"),
+        re.compile(r"(?i)(password[=:])[^\s&]+"),
+    )
+    for pattern in patterns:
+        text = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[:limit] + "…[truncated]"
+    return text
+
+
+def _classify_delegate_error(error: Any, *, status: Optional[str] = None) -> Dict[str, Any]:
+    text = _sanitize_delegate_error(error)
+    lower = text.lower()
+    category = "unknown"
+    retryable = False
+    if status == "timeout" or "timeout" in lower or "timed out" in lower:
+        category = "timeout"
+        retryable = True
+    elif "429" in lower or "rate limit" in lower or "too many requests" in lower:
+        category = "rate_limit"
+        retryable = True
+    elif (
+        "quota" in lower
+        or "usage limit" in lower
+        or "usage limits" in lower
+        or "plan limit" in lower
+        or "plan limits" in lower
+        or "extra usage" in lower
+        or "draw from your extra usage" in lower
+        or "claude.ai/settings/usage" in lower
+        or "limit reached" in lower
+    ):
+        category = "quota"
+        retryable = True
+    elif "connection" in lower or "network" in lower or "temporar" in lower:
+        category = "network"
+        retryable = True
+    elif "401" in lower or "403" in lower or "auth" in lower or "api key" in lower:
+        category = "auth"
+        retryable = False
+    elif "invalid_request" in lower or "400" in lower or "404" in lower:
+        category = "request"
+        retryable = False
+    return {
+        "class": type(error).__name__ if not isinstance(error, str) else "str",
+        "category": category,
+        "message": text,
+        "retryable": retryable,
+    }
+
+
+def _safe_delegate_metadata_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return None
+
+
+def _delegate_failure_diagnostic(
+    child: Any,
+    error: Any,
+    *,
+    status: str,
+    duration_seconds: float,
+    api_calls: int,
+    diagnostic_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    provider = getattr(child, "provider", None)
+    model = getattr(child, "model", None)
+    provider_s = provider if isinstance(provider, str) else None
+    model_s = model if isinstance(model, str) else None
+    error_info = _classify_delegate_error(error, status=status)
+    retryable = bool(error_info.get("retryable"))
+    quota = getattr(child, "_delegate_quota_assessment", None)
+    if error_info.get("category") in {"rate_limit", "quota"}:
+        suggested = "wait for reset, lower concurrency, or route delegation.provider/model to a non-front-door lane"
+    elif error_info.get("category") == "timeout":
+        suggested = "retry with a smaller task, longer delegation.child_timeout_seconds, or a cheaper/faster delegate route"
+    elif error_info.get("category") == "auth":
+        suggested = "fix provider credentials before retrying"
+    else:
+        suggested = "inspect child diagnostic fields and retry only if the route still has capacity"
+    diagnostic_route = {
+        "selected_route": "delegate_task",
+        "provider": provider_s,
+        "model": model_s,
+        "route_reason": getattr(child, "_delegate_route_reason", None),
+        "execution_mode": "delegate_task",
+        "quota_decision": quota,
+        "suggested_next_step": suggested,
+    }
+    diagnostic = {
+        "provider": provider_s,
+        "model": model_s,
+        "status": status,
+        "duration_seconds": duration_seconds,
+        "api_calls": api_calls,
+        "error": error_info,
+        "retry": {"retryable": retryable, "strategy": suggested},
+        "diagnostic_route": diagnostic_route,
+    }
+    if diagnostic_path:
+        diagnostic["diagnostic_path"] = diagnostic_path
+        diagnostic_route["diagnostic_path"] = diagnostic_path
+    logger.warning(
+        "delegate_task child failure provider=%s model=%s category=%s retryable=%s route_reason=%s",
+        provider_s,
+        model_s,
+        error_info.get("category"),
+        retryable,
+        getattr(child, "_delegate_route_reason", None),
+    )
+    return diagnostic
 
 
 def _build_child_agent(
@@ -981,6 +1379,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    quota_assessment: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1256,6 +1655,56 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    setattr(child, "_delegate_quota_assessment", quota_assessment)
+
+    explicit_route_override = bool(
+        override_provider
+        or model
+        or override_acp_command
+        or delegation_reasoning_applied
+    )
+    setattr(child, "_orchestration_route_telemetry", {
+        "action_type": "spawn_subagent",
+        "route": {
+            "chosen_route": "delegate_task",
+            "provider": effective_provider,
+            "model": effective_model_for_cb,
+            "reasoning_effort": child_reasoning_effort,
+            "role": effective_role,
+            "execution_mode": "delegate_task",
+            "route_reason": route_reason,
+            "explicit_override": explicit_route_override,
+        },
+        "tree": {
+            "subagent_id": subagent_id,
+            "parent_id": parent_subagent_id,
+            "depth": tui_depth,
+            "task_index": task_index,
+            "task_count": task_count,
+        },
+        "tooling": {
+            "toolsets": list(child_toolsets),
+            "tool_count": _tool_count_for_agent(child),
+        },
+        "quota": quota_assessment,
+        "input_shape": {
+            "goal_chars": len(goal or ""),
+            "context_chars": len(context or ""),
+            "context_supplied": bool(context and str(context).strip()),
+        },
+        "gates": {
+            "privacy": "goal/context/prompts/messages/tool args/tool outputs excluded",
+            "quota": "premium native delegation avoided when live 5h/7d or RateLimitState usage is at/above threshold",
+            "tool_access": "parent-intersected toolsets with blocked child tools stripped",
+            "side_effects": "child receives only its restricted toolset; parent must verify side effects",
+        },
+        "parent_session_id": getattr(parent_agent, "session_id", None),
+    })
+    _append_delegate_route_telemetry(
+        "route.selected",
+        child=child,
+        status="selected",
+    )
 
     explicit_route_override = bool(
         override_provider
@@ -1524,11 +1973,15 @@ def _run_single_child(
     _stale_count = [0]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+        while not _heartbeat_stop.is_set():
             if parent_agent is None:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
@@ -1591,8 +2044,20 @@ def _run_single_child(
                 touch(desc)
             except Exception:
                 pass
+            if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                break
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+
+    # Touch once synchronously so a freshly-spawned child cannot look idle
+    # while imports, executor startup, or the first provider call are still
+    # warming up. The background loop continues the periodic heartbeat.
+    try:
+        touch = getattr(parent_agent, "_touch_activity", None) if parent_agent else None
+        if touch:
+            touch(f"delegate_task: subagent {task_index} starting")
+    except Exception:
+        pass
 
     # Register the live agent in the module-level registry so the TUI can
     # target it by subagent_id (kill, pause, status queries).  Unregistered
@@ -1633,6 +2098,12 @@ def _run_single_child(
 
     try:
         _heartbeat_thread.start()
+        try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} heartbeat active")
+        except Exception:
+            pass
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.start", preview=goal)
@@ -1758,20 +2229,31 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            _status = "timeout" if is_timeout else "error"
+            diagnostic = _delegate_failure_diagnostic(
+                child,
+                _err,
+                status=_status,
+                duration_seconds=duration,
+                api_calls=child_api_calls,
+                diagnostic_path=diagnostic_path,
+            )
             _append_delegate_route_telemetry(
                 "route.completed",
                 child=child,
-                status="timeout" if is_timeout else "error",
+                status=_status,
                 extra={
                     "outcome": {
                         "success": False,
-                        "exit_reason": "timeout" if is_timeout else "error",
-                        "error_class": type(_timeout_exc).__name__,
+                        "exit_reason": _status,
                     },
                     "metrics": {
                         "duration_seconds": duration,
                         "api_calls": child_api_calls,
                     },
+                    "error": diagnostic["error"],
+                    "retry": diagnostic["retry"],
+                    "diagnostic_route": diagnostic["diagnostic_route"],
                     "verification": {
                         "status": "not_applicable",
                         "reason": "child did not return a completed summary",
@@ -1781,19 +2263,22 @@ def _run_single_child(
 
             return {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": _status,
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": _status,
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
-                "model": getattr(child, "model", None),
-                "provider": getattr(child, "provider", None),
+                "model": _safe_delegate_metadata_value(getattr(child, "model", None)),
+                "provider": _safe_delegate_metadata_value(getattr(child, "provider", None)),
                 "reasoning_effort": _reasoning_effort_label(getattr(child, "reasoning_config", None)),
-                "role": getattr(child, "_delegate_role", None),
+                "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
                 "execution_mode": "delegate_task",
-                "route_reason": getattr(child, "_delegate_route_reason", None),
-                "_child_role": getattr(child, "_delegate_role", None),
+                "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),
+                "diagnostic": diagnostic,
+                "retry": diagnostic["retry"],
+                "diagnostic_route": diagnostic["diagnostic_route"],
+                "_child_role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
                 "diagnostic_path": diagnostic_path,
             }
         finally:
@@ -1885,9 +2370,9 @@ def _run_single_child(
             "model": _model if isinstance(_model, str) else None,
             "provider": _provider if isinstance(_provider, str) else None,
             "reasoning_effort": _reasoning_effort,
-            "role": getattr(child, "_delegate_role", None),
+            "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
             "execution_mode": "delegate_task",
-            "route_reason": getattr(child, "_delegate_route_reason", None),
+            "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -1901,7 +2386,7 @@ def _run_single_child(
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
-            "_child_role": getattr(child, "_delegate_role", None),
+            "_child_role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
             # Captured before child.close() so the parent aggregator can fold
             # the child's total spend into the parent's session cost.  Port of
             # Kilo-Org/kilocode#9448 — previously the footer only reflected the
@@ -2007,9 +2492,10 @@ def _run_single_child(
             except (TypeError, ValueError):
                 pass
 
+        api_calls_int = int(api_calls) if isinstance(api_calls, (int, float)) else 0
         telemetry_metrics: Dict[str, Any] = {
             "duration_seconds": duration,
-            "api_calls": int(api_calls) if isinstance(api_calls, (int, float)) else 0,
+            "api_calls": api_calls_int,
             "tokens": {
                 "input": int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0,
                 "output": int(_output_tokens) if isinstance(_output_tokens, (int, float)) else 0,
@@ -2024,21 +2510,45 @@ def _run_single_child(
                 telemetry_metrics["cost_usd"] = float(_cost_usd)
             except (TypeError, ValueError):
                 pass
+
+        telemetry_extra: Dict[str, Any] = {
+            "outcome": {
+                "success": status == "completed",
+                "exit_reason": exit_reason,
+            },
+            "metrics": telemetry_metrics,
+            "verification": {
+                "status": "parent_required" if status == "completed" else "not_applicable",
+                "reason": (
+                    "subagent summaries are self-reports until the parent verifies side effects"
+                    if status == "completed"
+                    else "child did not return a completed summary"
+                ),
+            },
+        }
+        if status != "completed":
+            diagnostic = _delegate_failure_diagnostic(
+                child,
+                entry.get("error", exit_reason),
+                status=status,
+                duration_seconds=duration,
+                api_calls=api_calls_int,
+            )
+            entry["diagnostic"] = diagnostic
+            entry["retry"] = diagnostic["retry"]
+            entry["diagnostic_route"] = diagnostic["diagnostic_route"]
+            telemetry_extra.update(
+                {
+                    "error": diagnostic["error"],
+                    "retry": diagnostic["retry"],
+                    "diagnostic_route": diagnostic["diagnostic_route"],
+                }
+            )
         _append_delegate_route_telemetry(
             "route.completed",
             child=child,
             status=status,
-            extra={
-                "outcome": {
-                    "success": status == "completed",
-                    "exit_reason": exit_reason,
-                },
-                "metrics": telemetry_metrics,
-                "verification": {
-                    "status": "parent_required",
-                    "reason": "subagent summaries are self-reports until the parent verifies side effects",
-                },
-            },
+            extra=telemetry_extra,
         )
 
         if child_progress_cb:
@@ -2063,6 +2573,13 @@ def _run_single_child(
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
+        diagnostic = _delegate_failure_diagnostic(
+            child,
+            exc,
+            status="error",
+            duration_seconds=duration,
+            api_calls=0,
+        )
         _append_delegate_route_telemetry(
             "route.completed",
             child=child,
@@ -2071,12 +2588,14 @@ def _run_single_child(
                 "outcome": {
                     "success": False,
                     "exit_reason": "error",
-                    "error_class": type(exc).__name__,
                 },
                 "metrics": {
                     "duration_seconds": duration,
                     "api_calls": 0,
                 },
+                "error": diagnostic["error"],
+                "retry": diagnostic["retry"],
+                "diagnostic_route": diagnostic["diagnostic_route"],
                 "verification": {
                     "status": "not_applicable",
                     "reason": "child failed before returning a completed summary",
@@ -2090,13 +2609,16 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
-            "model": getattr(child, "model", None),
-            "provider": getattr(child, "provider", None),
+            "model": _safe_delegate_metadata_value(getattr(child, "model", None)),
+            "provider": _safe_delegate_metadata_value(getattr(child, "provider", None)),
             "reasoning_effort": _reasoning_effort_label(getattr(child, "reasoning_config", None)),
-            "role": getattr(child, "_delegate_role", None),
+            "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
             "execution_mode": "delegate_task",
-            "route_reason": getattr(child, "_delegate_route_reason", None),
-            "_child_role": getattr(child, "_delegate_role", None),
+            "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),
+            "diagnostic": diagnostic,
+            "retry": diagnostic["retry"],
+            "diagnostic_route": diagnostic["diagnostic_route"],
+            "_child_role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
         }
 
     finally:
@@ -2113,6 +2635,13 @@ def _run_single_child(
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
             _unregister_subagent(_subagent_id)
+
+        try:
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent else None
+            if touch:
+                touch(f"delegate_task: subagent {task_index} finished")
+        except Exception:
+            pass
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -2247,16 +2776,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2293,6 +2812,60 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve delegation credentials (provider:model pair) only after cheap
+    # argument validation. Invalid tool calls should return validation errors
+    # without depending on the caller's provider auth state.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    effective_provider_for_quota = creds.get("provider") or getattr(parent_agent, "provider", None)
+    effective_model_for_quota = creds.get("model") or getattr(parent_agent, "model", None)
+    effective_base_url_for_quota = creds.get("base_url") or getattr(parent_agent, "base_url", None)
+    effective_api_mode_for_quota = creds.get("api_mode") or getattr(parent_agent, "api_mode", None)
+    quota_assessment = _assess_delegate_route_quota(
+        provider=effective_provider_for_quota if isinstance(effective_provider_for_quota, str) else None,
+        model=effective_model_for_quota if isinstance(effective_model_for_quota, str) else None,
+        base_url=effective_base_url_for_quota if isinstance(effective_base_url_for_quota, str) else None,
+        api_mode=effective_api_mode_for_quota if isinstance(effective_api_mode_for_quota, str) else None,
+        parent_agent=parent_agent,
+        cfg=cfg,
+    )
+    if quota_assessment.get("decision") == "avoid":
+        diagnostic_route = {
+            "selected_route": "delegate_task",
+            "provider": quota_assessment.get("provider"),
+            "model": quota_assessment.get("model"),
+            "execution_mode": "delegate_task",
+            "quota_decision": quota_assessment,
+            "suggested_next_step": (
+                "Use direct tools, reduce fan-out, wait for reset, or configure "
+                "delegation.provider/model to a non-front-door lane. Set "
+                "delegation.allow_high_usage_delegation=true only for deliberate overrides."
+            ),
+        }
+        _append_delegate_route_telemetry(
+            "route.blocked",
+            status="blocked_quota",
+            action_type="spawn_subagent",
+            route={
+                "chosen_route": "delegate_task",
+                "provider": quota_assessment.get("provider"),
+                "model": quota_assessment.get("model"),
+                "execution_mode": "delegate_task",
+            },
+            quota=quota_assessment,
+            retry={"retryable": True, "strategy": diagnostic_route["suggested_next_step"]},
+            diagnostic_route=diagnostic_route,
+        )
+        return tool_error(
+            "Delegation avoided to preserve premium/front-door capacity: "
+            f"{quota_assessment.get('reason')}. "
+            "Use direct tools, route delegation.provider/model to a non-front-door lane, "
+            "or explicitly enable delegation.allow_high_usage_delegation only if this delegation is necessary."
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2340,6 +2913,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                quota_assessment=quota_assessment,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names

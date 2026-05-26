@@ -395,6 +395,7 @@ def append_event(
             with lock_path.open("a+", encoding="utf-8") as lock_fd:
                 try:
                     _lock(lock_fd)
+                    _rotate_if_needed(target)
                     with target.open("a", encoding="utf-8") as out:
                         out.write(line)
                 finally:
