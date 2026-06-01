@@ -22,6 +22,7 @@ import os
 import random
 import re
 import ssl
+import subprocess
 import threading
 import time
 import uuid
@@ -362,6 +363,63 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
             "length limit. Continue exactly where you left off. Do not "
             "restart or repeat prior text. Finish the answer directly.]"
         )
+
+
+# ── Safe workspace diagnostics for Kanban recovery handoff ──────────
+# Captured only for non-cooperative exits (iteration exhaustion, crashes,
+# timeouts, protocol violations) — never for normal completes/blocks.
+_WORKSPACE_DIAG_MAX_BYTES = 4096
+_WORKSPACE_DIAG_MAX_LINES = 50
+# Simple secret-like patterns to redact: lines that look like API keys,
+# tokens, or private values with high entropy.
+_WORKSPACE_DIAG_REDACT_PATTERNS = [
+    re.compile(r"(?:api_?key|token|secret|password|auth)\s*[:=]\s*\S+", re.I),
+    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),   # base64-like long runs
+    re.compile(r"sk-[A-Za-z0-9]{32,}"),           # OpenAI/Anthropic keys
+    re.compile(r"ghp_[A-Za-z0-9]{36,}"),          # GitHub PATs
+]
+
+
+def _capture_safe_workspace_status(workspace_path: str) -> Optional[dict]:
+    """Capture capped, redacted git status for a workspace directory.
+
+    Returns ``None`` if the workspace is not a git repo or the command
+    fails.  Never returns full diffs — only status/diffstat lines.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", workspace_path, "status", "--short", "--branch"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        raw = out.stdout.strip()
+        if not raw:
+            return {"git_repo": True, "dirty": False}
+        # Cap output
+        lines = raw.split("\n")
+        capped_lines = lines[:_WORKSPACE_DIAG_MAX_LINES]
+        capped = "\n".join(capped_lines)
+        if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
+            capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
+        # Redact obvious secret-like patterns
+        for pat in _WORKSPACE_DIAG_REDACT_PATTERNS:
+            capped = pat.sub("[REDACTED]", capped)
+        # Extract branch name from the first line (## main...origin/main)
+        branch = ""
+        first_line = capped_lines[0] if capped_lines else ""
+        if first_line.startswith("## "):
+            branch = first_line[3:].split("...")[0].strip()
+        return {
+            "git_repo": True,
+            "branch": branch or None,
+            "dirty": True,
+            "git_status_raw": capped,
+        }
+    except Exception:
+        return None
 
 
 def run_conversation(
@@ -715,6 +773,7 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _kanban_near_budget_nudged = False  # One-shot nudge for Kanban workers
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
     # each failed ``write_file`` / ``patch`` call records the error
@@ -837,6 +896,62 @@ def run_conversation(
         if (agent._skill_nudge_interval > 0
                 and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
+
+        # ── Kanban near-budget nudge ───────────────────────────────────
+        # When a Kanban worker is within a small reserve of iterations,
+        # inject a one-time nudge telling the model to stop expanding
+        # scope and finalize with a structured handoff (kanban_complete
+        # or kanban_comment + kanban_block).  This gives the worker a
+        # chance to hand off useful context before tools are stripped.
+        # Does NOT apply to non-Kanban sessions.
+        _NEAR_BUDGET_RESERVE = 3
+        if (not _kanban_near_budget_nudged
+                and os.environ.get("HERMES_KANBAN_TASK")
+                and api_call_count >= agent.max_iterations - _NEAR_BUDGET_RESERVE):
+            _kanban_near_budget_nudged = True
+            _nudge = (
+                f"\n\n[System: You have approximately "
+                f"{agent.max_iterations - api_call_count} tool-calling "
+                f"iterations remaining before the iteration budget is "
+                f"exhausted. Stop expanding scope now. If the task is "
+                f"complete, call kanban_complete with summary + "
+                f"metadata. If you have partial results, call "
+                f"kanban_comment to document them, then call "
+                f"kanban_block(reason=\"review-required: ...\", "
+                f"summary=..., metadata=...). Do NOT start new "
+                f"investigations or tool chains — finalize what you "
+                f"have.]"
+            )
+            _tool_messages = [
+                m for m in messages
+                if isinstance(m, dict) and m.get("role") == "tool"
+            ]
+            if _tool_messages:
+                # Piggyback on the last tool result so the nudge is
+                # visible without breaking role alternation.
+                _last_tool = _tool_messages[-1]
+                existing = _last_tool.get("content", "")
+                if isinstance(existing, str):
+                    _last_tool["content"] = existing + _nudge
+                elif isinstance(existing, list):
+                    # Multimodal content blocks — append text block.
+                    try:
+                        blocks = list(existing)
+                        blocks.append({"type": "text", "text": _nudge})
+                        _last_tool["content"] = blocks
+                    except Exception:
+                        pass
+            else:
+                # Very first iteration with near-budget (unusual but
+                # possible with a tiny budget). Append as user message
+                # — the loop can handle a single role mismatch.
+                messages.append({"role": "user", "content": _nudge})
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⏳  Near iteration budget ({api_call_count}/"
+                    f"{agent.max_iterations}) — nudging worker to "
+                    f"finalize..."
+                )
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
@@ -4411,9 +4526,46 @@ def run_conversation(
         # protocol violation).  The agent loop strips tools before calling
         # _handle_max_iterations, so the model cannot call kanban_block
         # itself — we must do it on its behalf.
+        #
+        # Build rich recovery handoff: summary = capped model final response,
+        # metadata = structured diagnostics (iteration counts, session info,
+        # safe workspace git status).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
+                # Build metadata for downstream retry context.
+                _block_metadata: dict = {
+                    "failure_code": "iteration_budget_exhausted",
+                    "iterations": {
+                        "used": api_call_count,
+                        "max": agent.max_iterations,
+                    },
+                    "turn_exit_reason": _turn_exit_reason,
+                }
+                # Stitch in model/provider info from env.
+                _model_provider = os.environ.get("HERMES_PROVIDER") or os.environ.get("HERMES_MODEL_PROVIDER")
+                _model_name = os.environ.get("HERMES_MODEL")
+                _session_id = os.environ.get("HERMES_SESSION_ID")
+                if _model_provider:
+                    _block_metadata["provider"] = _model_provider.strip()
+                if _model_name:
+                    _block_metadata["model"] = _model_name.strip()
+                if _session_id:
+                    _block_metadata["session_id"] = _session_id.strip()
+                # Safe workspace diagnostics.
+                _workspace_path = os.environ.get("HERMES_KANBAN_WORKSPACE")
+                if _workspace_path:
+                    _ws_status = _capture_safe_workspace_status(_workspace_path)
+                    if _ws_status:
+                        _block_metadata["workspace_status"] = _ws_status
+                # Cap the summary at ~500 chars for DB hygiene.
+                _summary = (final_response or "").strip()
+                if len(_summary) > 500:
+                    _summary = _summary[:500] + "… [truncated]"
+                _block_metadata["handoff_text"] = _summary or None
+                _block_metadata["recovery_recommendation"] = (
+                    "retry with narrower scope / split task"
+                )
                 _ra().handle_function_call(
                     "kanban_block",
                     {
@@ -4424,12 +4576,18 @@ def run_conversation(
                             "task could not complete within the allowed "
                             "iterations"
                         ),
+                        "summary": (
+                            f"Iteration budget exhausted after "
+                            f"{api_call_count}/{agent.max_iterations} iterations. "
+                            f"Last response: {_summary}"
+                        ),
+                        "metadata": _block_metadata,
                     },
                     task_id=effective_task_id,
                 )
                 logger.info(
-                    "kanban_block called for task %s after iteration "
-                    "exhaustion (%d/%d)",
+                    "kanban_block with recovery handoff called for task %s "
+                    "after iteration exhaustion (%d/%d)",
                     _kanban_task, api_call_count, agent.max_iterations,
                 )
             except Exception:

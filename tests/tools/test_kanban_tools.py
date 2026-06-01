@@ -2081,6 +2081,73 @@ def test_board_param_rejects_invalid_slug(multi_board_env):
     assert "invalid board slug" in err, f"got {err!r}"
 
 
+def test_block_with_summary_metadata_persists_to_db(worker_env):
+    """block_task with summary and metadata must persist both on the run
+    row so a retrying worker sees them in retry context."""
+    from hermes_cli import kanban_db as kb
+
+    tid = worker_env
+    conn = kb.connect()
+    try:
+        meta = {
+            "failure_code": "iteration_budget_exhausted",
+            "iterations": {"used": 42, "max": 90},
+            "changed_files": ["a.py", "b.py"],
+            "tests_run": 3,
+        }
+        summary = "Did half the work before exhausting budget."
+        ok = kb.block_task(
+            conn, tid,
+            reason="iteration exhaustion",
+            summary=summary,
+            metadata=meta,
+        )
+        assert ok is True
+
+        # Verify the run row has the handoff data.
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.outcome == "blocked"
+        assert run.summary is not None
+        assert "Did half the work" in run.summary
+        assert run.metadata is not None
+        # metadata is stored as JSON
+        import json
+        stored_meta = json.loads(run.metadata) if isinstance(run.metadata, str) else run.metadata
+        assert stored_meta["failure_code"] == "iteration_budget_exhausted"
+        assert stored_meta["iterations"]["used"] == 42
+        assert stored_meta["changed_files"] == ["a.py", "b.py"]
+        assert stored_meta["tests_run"] == 3
+    finally:
+        conn.close()
+
+
+def test_block_schema_includes_summary_and_metadata():
+    """KANBAN_BLOCK_SCHEMA must include optional summary and metadata
+    properties so the LLM knows it can pass recovery handoff."""
+    from tools import kanban_tools as kt
+
+    schema = kt.KANBAN_BLOCK_SCHEMA
+    props = schema["parameters"]["properties"]
+
+    assert "summary" in props, (
+        "KANBAN_BLOCK_SCHEMA must include 'summary' property"
+    )
+    assert props["summary"]["type"] == "string"
+
+    assert "metadata" in props, (
+        "KANBAN_BLOCK_SCHEMA must include 'metadata' property"
+    )
+    assert props["metadata"]["type"] == "object"
+
+    # summary and metadata must always remain optional — never required.
+    required = schema["parameters"].get("required", [])
+    assert "summary" not in required
+    assert "metadata" not in required
+    # reason is still required.
+    assert "reason" in required
+
+
 def test_board_param_in_all_schemas():
     """All nine kanban_* tool schemas must expose an optional ``board``
     parameter. This pins the contract surfaced to the LLM — adding a

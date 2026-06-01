@@ -388,7 +388,21 @@ class ChatCompletionsTransport(ProviderTransport):
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+                # ── Non-GitHub, non-LM-Studio: honour the supplied reasoning_config
+                # instead of hardcoding "medium".  Use the legacy default only when
+                # reasoning_config is None/empty; otherwise emit exactly what was
+                # requested.  When reasoning is explicitly disabled (enabled=False),
+                # omit the reasoning key entirely, matching provider-profile behaviour.
+                _rc = reasoning_config
+                if isinstance(_rc, dict) and _rc:
+                    _enabled = _rc.get("enabled") is not False
+                    if not _enabled:
+                        pass  # omit reasoning key when disabled
+                    else:
+                        _effort = (_rc.get("effort") or "").strip() or "medium"
+                        extra_body["reasoning"] = {"enabled": True, "effort": _effort}
+                else:
+                    extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
 
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)

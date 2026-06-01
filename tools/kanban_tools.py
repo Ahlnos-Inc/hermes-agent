@@ -1167,7 +1167,12 @@ def _handle_complete(args: dict, **kw) -> str:
 
 
 def _handle_block(args: dict, **kw) -> str:
-    """Transition the task to blocked with a reason a human will read."""
+    """Transition the task to blocked with a reason a human will read.
+
+    Also accepts optional ``summary`` and ``metadata`` for structured
+    recovery handoff (e.g. iteration-budget exhaustion, review-required
+    blocks after partial work).
+    """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1179,6 +1184,18 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    summary = args.get("summary")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    # Stamp model/session metadata, mirroring kanban_complete.
+    model_used = _current_model_used()
+    if model_used:
+        metadata = dict(metadata or {})
+        metadata.setdefault("model_used", model_used)
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1186,6 +1203,8 @@ def _handle_block(args: dict, **kw) -> str:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                summary=summary,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1682,7 +1701,11 @@ KANBAN_BLOCK_SCHEMA = {
         "to proceed. ``reason`` will be shown to the human on the "
         "board and included in context when someone unblocks you. "
         "Use for genuine blockers only — don't block on things you can "
-        "resolve yourself."
+        "resolve yourself. When blocking after partial work, pass "
+        "``summary`` (1-3 sentence handoff of what was done) and "
+        "``metadata`` (structured facts: changed_files, tests_run, "
+        "decisions, failure_code, etc.) so downstream workers and "
+        "reviewers can see what happened."
     ),
     "parameters": {
         "type": "object",
@@ -1697,6 +1720,25 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered, in one or two sentences. "
                     "Don't paste the whole conversation; the human has "
                     "the board and can ask follow-ups via comments."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Optional human-readable handoff, 1-3 sentences. "
+                    "Persisted on the run row so downstream workers see "
+                    "what happened before the block. Useful for "
+                    "iteration-exhaustion and review-required blocks."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional free-form dict of structured facts — "
+                    "{\"changed_files\": [...], \"tests_run\": 12, "
+                    "\"failure_code\": \"iteration_budget_exhausted\", "
+                    "…}. Persisted on the run row and shown in retry "
+                    "context."
                 ),
             },
             "board": _board_schema_prop(),

@@ -3937,9 +3937,19 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready``/``review`` -> blocked."""
+    """Transition ``running``/``ready``/``review`` -> blocked.
+
+    ``reason`` is the concise board-visible blocker (shown in the
+    dashboard, persisted in the blocked event payload).  ``summary``
+    and ``metadata`` provide richer recovery handoff — they are
+    persisted on the run row just like ``kanban_complete``, so a
+    retrying worker or downstream reviewer can see what was done before
+    the block.
+    """
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -3970,10 +3980,14 @@ def block_task(
             )
         if cur.rowcount != 1:
             return False
+        # Prefer ``summary`` when available; fall back to ``reason`` for
+        # backward compatibility with callers that only pass reason.
+        effective_summary = summary or reason
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
-            summary=reason,
+            summary=effective_summary,
+            metadata=metadata,
         )
         # Synthesize a run when blocking a never-claimed task so the
         # reason is preserved in attempt history.
@@ -3981,7 +3995,8 @@ def block_task(
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="blocked",
-                summary=reason,
+                summary=effective_summary,
+                metadata=metadata,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
         return True
@@ -5227,6 +5242,56 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# ── Safe workspace diagnostics for crash/timeout forensics ─────────
+_WORKSPACE_DIAG_MAX_BYTES = 4096
+_WORKSPACE_DIAG_MAX_LINES = 50
+_WORKSPACE_DIAG_REDACT_PATTERNS = [
+    re.compile(r"(?:api_?key|token|secret|password|auth)\s*[:=]\s*\S+", re.I),
+    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),
+    re.compile(r"sk-[A-Za-z0-9]{32,}"),
+    re.compile(r"ghp_[A-Za-z0-9]{36,}"),
+]
+
+
+def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
+    """Capture capped, redacted git status for a crashed worker's workspace.
+
+    Returns ``None`` if the path does not exist or is not a git repo.
+    Never returns full diffs — only status/diffstat lines.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", workspace_path, "status", "--short", "--branch"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        raw = out.stdout.strip()
+        if not raw:
+            return {"git_repo": True, "dirty": False}
+        lines = raw.split("\n")
+        capped_lines = lines[:_WORKSPACE_DIAG_MAX_LINES]
+        capped = "\n".join(capped_lines)
+        if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
+            capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
+        for pat in _WORKSPACE_DIAG_REDACT_PATTERNS:
+            capped = pat.sub("[REDACTED]", capped)
+        branch = ""
+        first_line = capped_lines[0] if capped_lines else ""
+        if first_line.startswith("## "):
+            branch = first_line[3:].split("...")[0].strip()
+        return {
+            "git_repo": True,
+            "branch": branch or None,
+            "dirty": True,
+            "git_status_raw": capped,
+        }
+    except Exception:
+        return None
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -5256,7 +5321,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, workspace_path "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5307,6 +5373,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+            # Capture safe workspace diagnostics for crash/timeout
+            # forensics.  Only runs when the task has a workspace_path
+            # and the directory exists on this host.
+            _ws_path = row["workspace_path"]
+            if _ws_path:
+                _ws_diag = _capture_workspace_diag(_ws_path)
+                if _ws_diag:
+                    event_payload["workspace_diag"] = _ws_diag
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "

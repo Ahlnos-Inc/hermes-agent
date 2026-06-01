@@ -3609,11 +3609,20 @@ class TestRunConversation:
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must call kanban_block when iteration
         budget is exhausted, otherwise the dispatcher sees a protocol
-        violation and gives up after 1 failure (issue #23216)."""
+        violation and gives up after 1 failure (issue #23216).
+
+        Also verifies that the block includes rich recovery handoff:
+        summary, metadata with failure_code, iteration counts, and
+        recovery recommendation.
+        """
         self._setup_agent(agent)
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        # Set env vars that drive model_used / session_id stamping.
+        monkeypatch.setenv("HERMES_PROVIDER", "test-provider")
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        monkeypatch.setenv("HERMES_SESSION_ID", "sess-123")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -3653,6 +3662,95 @@ class TestRunConversation:
         call = kanban_block_calls[0]
         assert call[0][1]["task_id"] == "t_test_task_123"
         assert "Iteration budget exhausted" in call[0][1]["reason"]
+
+        # Verify rich recovery handoff fields.
+        assert "summary" in call[0][1], (
+            "kanban_block must include 'summary' in recovery handoff"
+        )
+        assert isinstance(call[0][1]["summary"], str)
+        assert len(call[0][1]["summary"]) > 0
+
+        assert "metadata" in call[0][1], (
+            "kanban_block must include 'metadata' in recovery handoff"
+        )
+        meta = call[0][1]["metadata"]
+        assert isinstance(meta, dict)
+        assert meta.get("failure_code") == "iteration_budget_exhausted"
+        assert isinstance(meta.get("iterations"), dict)
+        assert meta["iterations"]["used"] == 2
+        assert meta["iterations"]["max"] == 2
+        assert "turn_exit_reason" in meta
+        assert "recovery_recommendation" in meta
+        assert "retry" in meta["recovery_recommendation"].lower()
+
+    def test_kanban_near_budget_nudge(self, agent, monkeypatch):
+        """When a Kanban worker reaches the near-budget reserve (3
+        iterations remaining), a one-time nudge is injected telling the
+        model to finalize. Non-Kanban sessions must NOT receive the
+        nudge.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 6  # Reserve fires at iteration 3.
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_nudge")
+        monkeypatch.setenv("HERMES_PROVIDER", "test-provider")
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+
+        # Return tool calls until near-budget, then a final response.
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Done.", finish_reason="stop",
+        )
+        # 6 iterations: 3 tool calls to trigger the nudge, then 3 more,
+        # then final response on exhaustion.
+        agent.client.chat.completions.create.side_effect = (
+            [tool_resp, tool_resp, tool_resp,   # iteration 1-3 (nudge at 3)
+             tool_resp, tool_resp, tool_resp,   # iteration 4-6
+             summary_resp]                      # exhaustion summary
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do work")
+
+        assert result["completed"] is False
+
+    def test_no_near_budget_nudge_for_non_kanban(self, agent, monkeypatch):
+        """Non-Kanban sessions must NOT receive the near-budget nudge."""
+        self._setup_agent(agent)
+        agent.max_iterations = 6
+
+        # Explicitly unset the Kanban env var.
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Done.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = (
+            [tool_resp] * 6 + [summary_resp]
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do work")
+
+        # Should still report not completed (exhausted budget)
+        assert result["completed"] is False
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """kanban_block must NOT be called when HERMES_KANBAN_TASK is unset."""

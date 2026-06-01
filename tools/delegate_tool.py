@@ -165,6 +165,37 @@ def _reasoning_effort_label(config: Any) -> str:
     return effort
 
 
+def _child_reasoning_metadata(child: Any, /) -> Dict[str, Any]:
+    """Build reasoning metadata for a delegate_task result dict.
+
+    Returns a dict with keys:
+      reasoning_effort — live runtime value (backward-compat, what was used)
+      requested_reasoning_effort — what the caller asked for (None = inherit)
+      effective_reasoning_effort — what was configured at build time
+      reasoning_override_source — "per-call" | "delegation-config" | "inherited"
+
+    All values are JSON-safe — non-string/None attributes degrade to None.
+    """
+    live = _safe_delegate_metadata_value(
+        _reasoning_effort_label(getattr(child, "reasoning_config", None))
+    )
+    requested = _safe_delegate_metadata_value(
+        getattr(child, "_delegate_requested_reasoning_effort", None)
+    )
+    effective = _safe_delegate_metadata_value(
+        getattr(child, "_delegate_effective_reasoning_effort", "") or live
+    )
+    source = _safe_delegate_metadata_value(
+        getattr(child, "_delegate_reasoning_override_source", "") or ""
+    )
+    return {
+        "reasoning_effort": live,
+        "requested_reasoning_effort": requested,
+        "effective_reasoning_effort": effective,
+        "reasoning_override_source": source,
+    }
+
+
 def _delegated_route_notice(
     *,
     provider: Optional[str] = None,
@@ -1615,8 +1646,13 @@ def _build_child_agent(
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
 
+    # ── Reasoning metadata stash (immutable – survives runtime fallback) ─
+    # Stored at build time so _run_single_child result dicts always report
+    # what was *requested* and *configured*, not the live runtime state which
+    # can drift due to provider fallback, transport reconfiguration, etc.
     effective_model_for_cb = effective_model
     child_reasoning_effort = _reasoning_effort_label(child_reasoning)
+
     route_reason_bits = []
     if override_provider:
         route_reason_bits.append("delegation provider override")
@@ -1705,6 +1741,22 @@ def _build_child_agent(
     child._subagent_goal = goal
     setattr(child, "_delegate_quota_assessment", quota_assessment)
 
+    # Per-call override (top-level reasoning_effort or per-task reasoning_effort)
+    # is the caller's explicit wish; None means "inherit".
+    reason_source: str
+    if reasoning_override_applied:
+        reason_source = "per-call"
+    elif delegation_reasoning_applied:
+        reason_source = "delegation-config"
+    else:
+        reason_source = "inherited"
+    child._delegate_requested_reasoning_effort = override_reasoning_effort or None
+    child._delegate_effective_reasoning_effort = child_reasoning_effort
+    child._delegate_reasoning_override_source = reason_source
+    # Keep a snapshot of the initial reasoning_config dict for telemetry
+    # consumers that need the full structured form (not just the label).
+    child._delegate_initial_reasoning_config = child_reasoning
+
     explicit_route_override = bool(
         override_provider
         or model
@@ -1743,53 +1795,6 @@ def _build_child_agent(
         "gates": {
             "privacy": "goal/context/prompts/messages/tool args/tool outputs excluded",
             "quota": "premium native delegation avoided when live 5h/7d or RateLimitState usage is at/above threshold",
-            "tool_access": "parent-intersected toolsets with blocked child tools stripped",
-            "side_effects": "child receives only its restricted toolset; parent must verify side effects",
-        },
-        "parent_session_id": getattr(parent_agent, "session_id", None),
-    })
-    _append_delegate_route_telemetry(
-        "route.selected",
-        child=child,
-        status="selected",
-    )
-
-    explicit_route_override = bool(
-        override_provider
-        or model
-        or override_acp_command
-        or reasoning_override_applied
-    )
-    setattr(child, "_orchestration_route_telemetry", {
-        "action_type": "spawn_subagent",
-        "route": {
-            "chosen_route": "delegate_task",
-            "provider": effective_provider,
-            "model": effective_model_for_cb,
-            "reasoning_effort": child_reasoning_effort,
-            "role": effective_role,
-            "execution_mode": "delegate_task",
-            "route_reason": route_reason,
-            "explicit_override": explicit_route_override,
-        },
-        "tree": {
-            "subagent_id": subagent_id,
-            "parent_id": parent_subagent_id,
-            "depth": tui_depth,
-            "task_index": task_index,
-            "task_count": task_count,
-        },
-        "tooling": {
-            "toolsets": list(child_toolsets),
-            "tool_count": _tool_count_for_agent(child),
-        },
-        "input_shape": {
-            "goal_chars": len(goal or ""),
-            "context_chars": len(context or ""),
-            "context_supplied": bool(context and str(context).strip()),
-        },
-        "gates": {
-            "privacy": "goal/context/prompts/messages/tool args/tool outputs excluded",
             "tool_access": "parent-intersected toolsets with blocked child tools stripped",
             "side_effects": "child receives only its restricted toolset; parent must verify side effects",
         },
@@ -2133,7 +2138,7 @@ def _run_single_child(
                     if isinstance(getattr(child, "provider", None), str)
                     else None
                 ),
-                "reasoning_effort": _reasoning_effort_label(getattr(child, "reasoning_config", None)),
+                "reasoning_effort": getattr(child, "_delegate_effective_reasoning_effort", "") or _reasoning_effort_label(getattr(child, "reasoning_config", None)),
                 "role": getattr(child, "_delegate_role", None),
                 "execution_mode": "delegate_task",
                 "route_reason": getattr(child, "_delegate_route_reason", None),
@@ -2319,7 +2324,7 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "model": _safe_delegate_metadata_value(getattr(child, "model", None)),
                 "provider": _safe_delegate_metadata_value(getattr(child, "provider", None)),
-                "reasoning_effort": _reasoning_effort_label(getattr(child, "reasoning_config", None)),
+                **_child_reasoning_metadata(child),
                 "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
                 "execution_mode": "delegate_task",
                 "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),
@@ -2407,7 +2412,6 @@ def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
         _provider = getattr(child, "provider", None)
-        _reasoning_effort = _reasoning_effort_label(getattr(child, "reasoning_config", None))
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -2417,7 +2421,7 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "provider": _provider if isinstance(_provider, str) else None,
-            "reasoning_effort": _reasoning_effort,
+            **_child_reasoning_metadata(child),
             "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
             "execution_mode": "delegate_task",
             "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),
@@ -2659,7 +2663,7 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _safe_delegate_metadata_value(getattr(child, "model", None)),
             "provider": _safe_delegate_metadata_value(getattr(child, "provider", None)),
-            "reasoning_effort": _reasoning_effort_label(getattr(child, "reasoning_config", None)),
+            **_child_reasoning_metadata(child),
             "role": _safe_delegate_metadata_value(getattr(child, "_delegate_role", None)),
             "execution_mode": "delegate_task",
             "route_reason": _safe_delegate_metadata_value(getattr(child, "_delegate_route_reason", None)),

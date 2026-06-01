@@ -214,6 +214,28 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
 
+    def test_reasoning_legacy_honors_supplied_config(self, transport):
+        """Legacy non-profile path must use the supplied reasoning_config, not
+        hardcode 'medium'.  Regression test for the override drift bug."""
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "low"}
+
+    def test_reasoning_legacy_honors_disabled_config(self, transport):
+        """Legacy non-profile path must omit reasoning when disabled, matching
+        the provider-profile behaviour (e.g. Nous omits enabled=false)."""
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": False},
+        )
+        assert "reasoning" not in kw.get("extra_body", {})
+
     def test_nous_omits_disabled_reasoning(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("nous")
