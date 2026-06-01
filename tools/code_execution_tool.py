@@ -1204,6 +1204,15 @@ def execute_code(
         if _profile_home:
             child_env["HOME"] = _profile_home
 
+        # Keep the execute_code child profile-isolated, but ensure any nested
+        # subprocess it launches for allowlisted host-auth CLIs (currently
+        # Claude Code) reaches the OS-account auth store through a PATH shim.
+        try:
+            from tools.host_home_cli import prepare_host_home_cli_shims
+            prepare_host_home_cli_shims(child_env)
+        except Exception:
+            pass
+
         # Resolve interpreter + CWD based on execute_code mode.
         #   - strict : today's behavior (sys.executable + tmpdir CWD).
         #   - project: user's venv python + session's working directory, so

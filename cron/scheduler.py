@@ -936,7 +936,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             run_env["HOME"] = profile_home
     except Exception:
         pass
-
+    try:
+        from tools.host_home_cli import prepare_host_home_cli_shims
+        prepare_host_home_cli_shims(run_env)
+    except Exception:
+        pass
     try:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(

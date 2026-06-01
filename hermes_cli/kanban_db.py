@@ -6456,6 +6456,21 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    # Do not leak the dispatcher's HOME into a worker for another profile.
+    # The worker process itself should use the assignee profile's isolated
+    # home; host-auth CLIs get the OS-account home only through explicit,
+    # narrow shims downstream.
+    try:
+        from hermes_constants import get_host_user_home, get_subprocess_home_for_hermes_home
+
+        profile_home = get_subprocess_home_for_hermes_home(env.get("HERMES_HOME"))
+        if profile_home:
+            env["HOME"] = profile_home
+        host_home = get_host_user_home()
+        if host_home:
+            env["HERMES_HOST_HOME"] = host_home
+    except Exception:
+        pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

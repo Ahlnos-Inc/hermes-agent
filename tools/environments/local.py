@@ -209,6 +209,15 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if _profile_home:
         sanitized["HOME"] = _profile_home
 
+    # Keep normal subprocess HOME profile-local, but route narrow host-auth
+    # CLIs (currently Claude Code) through PATH shims that restore OS HOME only
+    # for that CLI process.
+    try:
+        from tools.host_home_cli import prepare_host_home_cli_shims
+        prepare_host_home_cli_shims(sanitized)
+    except Exception:
+        pass
+
     return sanitized
 
 
@@ -321,6 +330,15 @@ def _make_run_env(env: dict) -> dict:
             value = var.get()
             if value is not _UNSET and value:
                 run_env[var_name] = value
+    except Exception:
+        pass
+
+    # Keep normal subprocess HOME profile-local, but route narrow host-auth
+    # CLIs (currently Claude Code) through PATH shims that restore OS HOME only
+    # for that CLI process.
+    try:
+        from tools.host_home_cli import prepare_host_home_cli_shims
+        prepare_host_home_cli_shims(run_env)
     except Exception:
         pass
 

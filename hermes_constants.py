@@ -274,6 +274,53 @@ def secure_parent_dir(path: Path) -> None:
         pass
 
 
+def get_host_user_home() -> str | None:
+    """Return the OS account HOME, ignoring any Hermes subprocess HOME override.
+
+    Hermes intentionally sets subprocess ``HOME`` to ``{HERMES_HOME}/home`` for
+    profile isolation.  Some host-authenticated CLIs, however, keep OAuth state
+    in the real OS account home.  ``Path.home()`` and ``expanduser('~')`` follow
+    ``HOME`` and are therefore wrong once a profile override is active; this
+    helper asks the account database on POSIX and uses stable Windows account
+    variables on Windows.
+    """
+    explicit = os.getenv("HERMES_HOST_HOME", "").strip()
+    if explicit and os.path.isdir(explicit):
+        return explicit
+
+    if os.name == "posix":
+        try:
+            import pwd
+
+            candidate = pwd.getpwuid(os.getuid()).pw_dir
+            if candidate and os.path.isdir(candidate):
+                return candidate
+        except Exception:
+            pass
+
+    for key in ("USERPROFILE",):
+        candidate = os.getenv(key, "").strip()
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    drive = os.getenv("HOMEDRIVE", "")
+    path = os.getenv("HOMEPATH", "")
+    if drive and path:
+        candidate = drive + path
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def get_subprocess_home_for_hermes_home(hermes_home: str | os.PathLike[str] | None) -> str | None:
+    """Return ``<hermes_home>/home`` when that profile-home directory exists."""
+    if not hermes_home:
+        return None
+    profile_home = os.path.join(str(hermes_home), "home")
+    if os.path.isdir(profile_home):
+        return profile_home
+    return None
+
+
 def get_subprocess_home() -> str | None:
     """Return a per-profile HOME directory for subprocesses, or None.
 
@@ -292,12 +339,7 @@ def get_subprocess_home() -> str | None:
     exist, returns ``None`` and behavior is unchanged.
     """
     hermes_home = get_hermes_home_override() or os.getenv("HERMES_HOME")
-    if not hermes_home:
-        return None
-    profile_home = os.path.join(hermes_home, "home")
-    if os.path.isdir(profile_home):
-        return profile_home
-    return None
+    return get_subprocess_home_for_hermes_home(hermes_home)
 
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")

@@ -8,6 +8,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/4426
 """
 
 import os
+import subprocess
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -53,6 +54,24 @@ class TestGetSubprocessHome:
         monkeypatch.setenv("HERMES_HOME", str(profile_dir))
         from hermes_constants import get_subprocess_home
         assert get_subprocess_home() == str(profile_home)
+
+    def test_host_user_home_prefers_account_home_over_overridden_home(self, tmp_path, monkeypatch):
+        """Host home discovery must not follow the profile HOME override."""
+        profile_home = tmp_path / "profile-home"
+        host_home = tmp_path / "host-home"
+        profile_home.mkdir()
+        host_home.mkdir()
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.delenv("HERMES_HOST_HOME", raising=False)
+
+        import pwd
+
+        class _Pw:
+            pw_dir = str(host_home)
+
+        monkeypatch.setattr(pwd, "getpwuid", lambda _uid: _Pw)
+        from hermes_constants import get_host_user_home
+        assert get_host_user_home() == str(host_home)
 
     def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
         base = tmp_path / ".hermes" / "profiles"
@@ -179,6 +198,42 @@ class TestMakeRunEnvHomeInjection:
         assert result["HERMES_HOME"] == str(profile)
         assert result["HOME"] == str(profile / "home")
 
+    def test_host_home_claude_shim_keeps_parent_home_profile_local(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        host_home = tmp_path / "host-home"
+        real_bin = tmp_path / "bin"
+        profile_home.mkdir(parents=True)
+        host_home.mkdir()
+        real_bin.mkdir()
+        fake_claude = real_bin / "claude"
+        fake_claude.write_text("#!/bin/sh\nprintf '%s\\n' \"$HOME\"\n", encoding="utf-8")
+        fake_claude.chmod(0o755)
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_HOST_HOME", str(host_home))
+        monkeypatch.setenv("HOME", "/dispatcher/home")
+        monkeypatch.setenv("PATH", str(real_bin))
+
+        from tools.environments.local import _make_run_env
+
+        result = _make_run_env({})
+
+        assert result["HOME"] == str(profile_home)
+        assert result["HERMES_HOST_HOME"] == str(host_home)
+        shim_dir = Path(result["HERMES_HOST_CLI_SHIM_DIR"])
+        assert result["PATH"].split(os.pathsep)[0] == str(shim_dir)
+        assert (shim_dir / "claude").is_file()
+
+        completed = subprocess.run(
+            ["claude"],
+            capture_output=True,
+            text=True,
+            env=result,
+            check=True,
+        )
+        assert completed.stdout.strip() == str(host_home)
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
@@ -280,3 +335,76 @@ class TestPythonProcessUnchanged:
         assert sub_home is not None
         assert os.environ.get("HOME") == original_home
         assert str(Path.home()) == original_path_home
+
+
+# ---------------------------------------------------------------------------
+# Kanban worker spawn env
+# ---------------------------------------------------------------------------
+
+class TestKanbanWorkerSpawnHome:
+    """Workers should not inherit dispatcher HOME from another profile."""
+
+    def test_default_spawn_sets_assignee_profile_home_and_host_home(self, tmp_path, monkeypatch):
+        from hermes_cli import kanban_db as kb
+
+        worker_profile = tmp_path / "profiles" / "worker"
+        worker_home = worker_profile / "home"
+        host_home = tmp_path / "host-home"
+        workspace = tmp_path / "workspace"
+        log_dir = tmp_path / "logs"
+        worker_home.mkdir(parents=True)
+        host_home.mkdir()
+        workspace.mkdir()
+        log_dir.mkdir()
+
+        captured: dict[str, object] = {}
+
+        class _FakePopen:
+            pid = 4242
+
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env")
+                captured["cwd"] = kwargs.get("cwd")
+
+        monkeypatch.setenv("HOME", "/dispatcher/profile/home")
+        monkeypatch.setenv("HERMES_HOST_HOME", str(host_home))
+        monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: str(worker_profile))
+        monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+        monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: False)
+        monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: log_dir)
+        monkeypatch.setattr(kb, "worker_log_rotation_config", lambda: (0, 0))
+        monkeypatch.setattr(kb, "_rotate_worker_log", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: tmp_path / "kanban.db")
+        monkeypatch.setattr(kb, "workspaces_root", lambda board=None: tmp_path / "workspaces")
+        monkeypatch.setattr(kb, "get_current_board", lambda: "default")
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_home",
+            title="home test",
+            body=None,
+            assignee="worker",
+            status="running",
+            priority=0,
+            created_by="test",
+            created_at=1,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        pid = kb._default_spawn(task, str(workspace), board="default")
+
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert pid == 4242
+        assert captured["cwd"] == str(workspace)
+        assert env["HERMES_HOME"] == str(worker_profile)
+        assert env["HOME"] == str(worker_home)
+        assert env["HERMES_HOST_HOME"] == str(host_home)
+        assert env["HERMES_PROFILE"] == "worker"

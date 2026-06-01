@@ -439,6 +439,16 @@ class BaseEnvironment(ABC):
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
 
+        # Login shells and the saved snapshot can overwrite PATH after Python
+        # prepared the environment.  Re-prepend Hermes host-CLI shims here so
+        # allowlisted tools like `claude` keep working without giving every
+        # command the OS account HOME.
+        try:
+            from tools.host_home_cli import shell_reprepend_host_cli_shim_path
+            parts.append(shell_reprepend_host_cli_shim_path())
+        except Exception:
+            pass
+
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
