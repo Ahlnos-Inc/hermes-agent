@@ -3663,6 +3663,23 @@ class TestRunConversation:
         assert call[0][1]["task_id"] == "t_test_task_123"
         assert "Iteration budget exhausted" in call[0][1]["reason"]
 
+        kanban_comment_calls = [
+            c for c in mock_hfc.call_args_list
+            if c[0][0] == "kanban_comment"
+        ]
+        assert len(kanban_comment_calls) == 1, (
+            "iteration exhaustion must append a durable kanban_comment "
+            "before blocking so retry workers do not lose the handoff"
+        )
+        assert (
+            mock_hfc.call_args_list.index(kanban_comment_calls[0])
+            < mock_hfc.call_args_list.index(kanban_block_calls[0])
+        )
+        comment_args = kanban_comment_calls[0][0][1]
+        assert comment_args["task_id"] == "t_test_task_123"
+        assert "iteration-budget recovery handoff" in comment_args["body"]
+        assert "Could not finish — budget exhausted." in comment_args["body"]
+
         # Verify rich recovery handoff fields.
         assert "summary" in call[0][1], (
             "kanban_block must include 'summary' in recovery handoff"
@@ -3680,6 +3697,7 @@ class TestRunConversation:
         assert meta["iterations"]["used"] == 2
         assert meta["iterations"]["max"] == 2
         assert "turn_exit_reason" in meta
+        assert meta.get("handoff_text") == "Could not finish — budget exhausted."
         assert "recovery_recommendation" in meta
         assert "retry" in meta["recovery_recommendation"].lower()
 

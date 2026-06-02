@@ -904,7 +904,15 @@ def run_conversation(
         # or kanban_comment + kanban_block).  This gives the worker a
         # chance to hand off useful context before tools are stripped.
         # Does NOT apply to non-Kanban sessions.
-        _NEAR_BUDGET_RESERVE = 3
+        # Fixed reserve=3 was too late for real Kanban repo work: a
+        # 90-iteration worker received the nudge at 87/90, after it had
+        # already made broad edits and had too little runway to comment,
+        # block, and hand off.  Keep tiny test/debug budgets unchanged,
+        # but give normal Kanban workers a larger finalization window.
+        _NEAR_BUDGET_RESERVE = (
+            3 if agent.max_iterations < 30
+            else max(8, min(20, agent.max_iterations // 5))
+        )
         if (not _kanban_near_budget_nudged
                 and os.environ.get("HERMES_KANBAN_TASK")
                 and api_call_count >= agent.max_iterations - _NEAR_BUDGET_RESERVE):
@@ -4558,14 +4566,50 @@ def run_conversation(
                     _ws_status = _capture_safe_workspace_status(_workspace_path)
                     if _ws_status:
                         _block_metadata["workspace_status"] = _ws_status
-                # Cap the summary at ~500 chars for DB hygiene.
-                _summary = (final_response or "").strip()
-                if len(_summary) > 500:
-                    _summary = _summary[:500] + "… [truncated]"
-                _block_metadata["handoff_text"] = _summary or None
+                # Preserve enough of the model's toolless recovery summary
+                # to make a retry useful.  A previous 500-char cap erased the
+                # concrete file/test handoff for a real Vitatide worker that
+                # exhausted 90/90 iterations; store a compact run summary but
+                # also append a fuller Kanban comment before blocking.
+                _handoff_full = (final_response or "").strip()
+                _SUMMARY_CAP = 2_000
+                _COMMENT_CAP = 12_000
+                _summary = _handoff_full
+                if len(_summary) > _SUMMARY_CAP:
+                    _summary = _summary[:_SUMMARY_CAP] + "… [truncated]"
+                _comment_handoff = _handoff_full
+                if len(_comment_handoff) > _COMMENT_CAP:
+                    _comment_handoff = _comment_handoff[:_COMMENT_CAP] + "… [truncated]"
+                _block_metadata["handoff_text"] = _comment_handoff or None
                 _block_metadata["recovery_recommendation"] = (
                     "retry with narrower scope / split task"
                 )
+                if _comment_handoff:
+                    _comment_body = (
+                        "iteration-budget recovery handoff\n\n"
+                        f"Task `{_kanban_task}` exhausted "
+                        f"{api_call_count}/{agent.max_iterations} iterations "
+                        "before it could make its own final Kanban comment. "
+                        "Hermes captured the worker's final recovery summary "
+                        "before blocking the task.\n\n"
+                        f"{_comment_handoff}"
+                    )
+                    try:
+                        _ra().handle_function_call(
+                            "kanban_comment",
+                            {
+                                "task_id": _kanban_task,
+                                "body": _comment_body,
+                            },
+                            task_id=effective_task_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to append kanban_comment recovery handoff "
+                            "for task %s before iteration-exhaustion block",
+                            _kanban_task,
+                            exc_info=True,
+                        )
                 _ra().handle_function_call(
                     "kanban_block",
                     {
