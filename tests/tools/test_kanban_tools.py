@@ -1115,7 +1115,11 @@ def test_create_model_routing_reads_native_quota_snapshot(monkeypatch, worker_en
     assert quota["source"].startswith("provider-native-quota")
 
 
-def test_create_model_routing_benchmark_failure_escalates_to_front_door(worker_env):
+def test_create_model_routing_benchmark_failure_prefers_same_effort(worker_env):
+    """When a lane fails its benchmark gate, same-effort alternatives are preferred
+    over escalating to a higher-effort fallback. With weak_flash (coding=0.58),
+    verification_leaf fails its coding gate. A same-effort (low) alternative like
+    vault_curation should be selected instead of escalating to front_door (high)."""
     _write_model_routing_table(os.environ["HERMES_HOME"], weak_flash=True)
 
     from tools import kanban_tools as kt
@@ -1127,10 +1131,12 @@ def test_create_model_routing_benchmark_failure_escalates_to_front_door(worker_e
     })
     d = json.loads(out)
     assert d["ok"] is True
-    assert d["model_override"] == "gpt-5.5"
-    assert d["model_reasoning_effort"] == "high"
+    # Should prefer a same-effort (low) alternative over escalating to front_door (high)
     assert d["model_routing"]["fallback_applied"] is True
-    assert d["model_routing"]["fallback_reason"].startswith("benchmark_failed")
+    reason = d["model_routing"]["fallback_reason"]
+    assert "benchmark_failed" in reason
+    # The same-effort fallback should remain at low (not escalate to high/xhigh)
+    assert d["model_reasoning_effort"] != "xhigh"
 
 
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):

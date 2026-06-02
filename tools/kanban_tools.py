@@ -735,6 +735,54 @@ def _benchmark_gate_failure(table: dict[str, Any], route: dict[str, Any], lane: 
     return None
 
 
+def _find_same_effort_route(
+    table: dict[str, Any], lane: dict[str, Any], current_preset: str, args: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Try to find a same-effort alternative lane that passes the benchmark gate.
+
+    When a lane fails its benchmark gate, prefer a same-effort alternative
+    over escalating to a higher-effort fallback. This prevents unnecessary
+    xhigh escalations when a same-effort lane exists that clears the gate.
+
+    Candidates must use the same provider/model as the current lane
+    to avoid accidentally switching to a semantically different lane
+    (e.g., architecture_design → security_review).
+    """
+    current_effort = str(lane.get("reasoning_effort") or "").strip()
+    if not current_effort:
+        return None
+    current_provider = str(lane.get("provider") or "").strip()
+    current_model = str(lane.get("model") or "").strip()
+    lanes = table.get("task_lanes") if isinstance(table.get("task_lanes"), dict) else {}
+    data_sensitive = _is_sensitive_data(args.get("data_sensitivity"))
+
+    for name, candidate in lanes.items():
+        if name == current_preset:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        candidate_effort = str(candidate.get("reasoning_effort") or "").strip()
+        if candidate_effort != current_effort:
+            continue
+        # Only consider lanes that use the same provider and model
+        # to avoid accidentally switching semantic domains
+        if str(candidate.get("provider") or "").strip() != current_provider:
+            continue
+        if str(candidate.get("model") or "").strip() != current_model:
+            continue
+        # Don't switch to a lane that would itself fail the benchmark gate
+        if _benchmark_gate_failure(table, dict(candidate), candidate):
+            continue
+        # Privacy check: don't route sensitive data to public/free lanes
+        if data_sensitive:
+            model_meta = _model_for_route(table, dict(candidate))
+            if _is_public_or_free_route(dict(candidate), model_meta):
+                continue
+        return dict(candidate)
+
+    return None
+
+
 def _fallback_route(table: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
     fallbacks = lane.get("fallback")
     if isinstance(fallbacks, str):
@@ -781,9 +829,15 @@ def _resolve_model_routing(args: dict[str, Any], explicit_model_override: Any) -
         else:
             gate_failure = _benchmark_gate_failure(table, route, lane)
             if gate_failure:
-                route = _fallback_route(table, lane)
+                # Try same-effort alternatives before escalating
+                same_effort = _find_same_effort_route(table, lane, preset, args)
+                if same_effort:
+                    route = same_effort
+                    fallback_reason = f"{gate_failure}→same_effort"
+                else:
+                    route = _fallback_route(table, lane)
+                    fallback_reason = gate_failure
                 fallback_applied = True
-                fallback_reason = gate_failure
 
             quota = _estimate_quota_usage()
             if quota:
@@ -1369,6 +1423,9 @@ def _handle_create(args: dict, **kw) -> str:
     workflow_key = args.get("workflow_key")
     if workflow_key is not None:
         workflow_key = str(workflow_key).strip() or None
+    current_step_key = args.get("current_step_key")
+    if current_step_key is not None:
+        current_step_key = str(current_step_key).strip() or None
     model_override, model_routing_decision = _resolve_model_routing(
         args,
         args.get("model_override"),
@@ -1412,12 +1469,36 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 workflow_key=workflow_key,
+                current_step_key=current_step_key,
                 model_override=model_override,
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None
+            # --- vault doc impact gate (auto-insert curator before finalizer) ---
+            vault_doc_impact = None
+            if (
+                new_task
+                and parents
+                and workflow_key
+                and not triage
+                and initial_status != "blocked"
+            ):
+                try:
+                    from hermes_cli.kanban_vault_doc_impact import (
+                        ensure_vault_doc_impact_for_task,
+                    )
+                    vault_doc_impact = ensure_vault_doc_impact_for_task(
+                        conn,
+                        new_task,
+                        source="kanban_create_tool",
+                    )
+                except Exception:
+                    logger.debug(
+                        "vault_doc_impact gate skipped during kanban_create",
+                        exc_info=True,
+                    )
             # Auto-subscribe the originating gateway chat so the user
             # receives terminal-event notifications without polling.
             # Mirrors the gateway's auto-subscribe on /kanban create.
@@ -1466,6 +1547,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=task_status,
+                vault_doc_impact=vault_doc_impact,
                 model_override=model_override,
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
@@ -1946,6 +2028,16 @@ KANBAN_CREATE_SCHEMA = {
                     "Use this to tag child tasks created in a fan-out so "
                     "the originating chat receives a unified status report "
                     "when the finalizer task completes."
+                ),
+            },
+            "current_step_key": {
+                "type": "string",
+                "description": (
+                    "Optional step key identifying the current phase of "
+                    "a workflow (e.g. 'finalizer', 'synthesizer', "
+                    "'implementation'). The vault-doc-impact gate uses "
+                    "this to detect finalizer tasks that may need "
+                    "documentation curation before completion."
                 ),
             },
             "skills": {
