@@ -925,33 +925,53 @@ def _write_model_routing_table(home: str | os.PathLike[str], *, weak_flash: bool
     return path
 
 
-def _write_quota_usage(home: str | os.PathLike[str], *, pct: float) -> Path:
+def _write_quota_usage(
+    home: str | os.PathLike[str],
+    *,
+    pct: float,
+    resets_at: datetime | str | None = None,
+) -> Path:
     state = Path(home) / "state"
     state.mkdir(parents=True, exist_ok=True)
     path = state / "quota-usage.json"
-    path.write_text(json.dumps({
+    payload = {
         "usage_pct": pct,
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": "test-estimate",
-    }), encoding="utf-8")
+    }
+    if resets_at is not None:
+        payload["resets_at"] = resets_at if isinstance(resets_at, str) else resets_at.isoformat().replace("+00:00", "Z")
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
 
-def _write_native_quota_snapshot(state_dir: str | os.PathLike[str], *, pct: float) -> Path:
-    path = Path(state_dir) / "provider-native-quota-openai-codex-test.json"
+def _write_native_quota_snapshot(
+    state_dir: str | os.PathLike[str],
+    *,
+    pct: float | None = None,
+    provider: str = "openai-codex",
+    suffix: str = "test",
+    fetched_at: datetime | str | None = None,
+    windows: dict | None = None,
+    additional_limits: list[dict] | None = None,
+) -> Path:
+    path = Path(state_dir) / f"provider-native-quota-{provider}-{suffix}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     reset = datetime.now(timezone.utc) + timedelta(hours=1)
-    fetched = datetime.now(timezone.utc)
-    path.write_text(json.dumps({
-        "provider": "openai-codex",
-        "fetched_at": fetched.isoformat().replace("+00:00", "Z"),
-        "windows": {
+    fetched = fetched_at or datetime.now(timezone.utc)
+    payload = {
+        "provider": provider,
+        "fetched_at": fetched if isinstance(fetched, str) else fetched.isoformat().replace("+00:00", "Z"),
+        "windows": windows if windows is not None else {
             "five_hour": {
                 "used_percentage": pct,
                 "resets_at": reset.isoformat().replace("+00:00", "Z"),
             }
         },
-    }), encoding="utf-8")
+    }
+    if additional_limits is not None:
+        payload["additional_limits"] = additional_limits
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
 
@@ -1113,6 +1133,94 @@ def test_create_model_routing_reads_native_quota_snapshot(monkeypatch, worker_en
     assert quota is not None
     assert quota["usage_pct"] == 88.0
     assert quota["source"].startswith("provider-native-quota")
+
+
+def test_quota_prefers_profile_native_over_expired_legacy_with_env_unset(monkeypatch, worker_env):
+    home = os.environ["HERMES_HOME"]
+    state = Path(home) / "state"
+    _write_model_routing_table(home)
+    _write_native_quota_snapshot(state, pct=17.0)
+    _write_quota_usage(home, pct=99.0, resets_at=datetime.now(timezone.utc) - timedelta(minutes=5))
+    monkeypatch.delenv("HERMES_NATIVE_QUOTA_STATE_DIR", raising=False)
+
+    from tools import kanban_tools as kt
+
+    quota = kt._estimate_quota_usage()
+    assert quota is not None
+    assert quota["usage_pct"] == 17.0
+    assert quota["source"].startswith("provider-native-quota-openai-codex")
+
+    model, decision = kt._resolve_model_routing({
+        "model_routing": "code_implementation",
+        "task_category": "implementation/routine",
+        "data_sensitivity": "public",
+        "verifiability": "tests",
+        "quota_policy": "auto",
+    }, None)
+    assert model == "deepseek-v4-pro"
+    assert decision is not None
+    assert decision["quota_gate_triggered"] is False
+    assert decision["quota_usage_pct"] == 17.0
+    assert decision["provider"] == "deepseek"
+
+
+def test_native_quota_state_dir_splits_pathsep_and_ignores_other_providers(monkeypatch, tmp_path, worker_env):
+    first = tmp_path / "native-one"
+    second = tmp_path / "native-two"
+    _write_native_quota_snapshot(first, pct=93.0, provider="anthropic", suffix="claude")
+    _write_native_quota_snapshot(second, pct=23.0, provider="openai-codex", suffix="codex")
+    monkeypatch.setenv("HERMES_NATIVE_QUOTA_STATE_DIR", os.pathsep.join([str(first), str(second)]))
+
+    from tools.kanban_tools import _estimate_quota_usage
+
+    quota = _estimate_quota_usage()
+    assert quota is not None
+    assert quota["usage_pct"] == 23.0
+    assert quota["source"].startswith("provider-native-quota-openai-codex")
+
+
+def test_expired_legacy_quota_is_ignored(monkeypatch, worker_env):
+    home = os.environ["HERMES_HOME"]
+    _write_quota_usage(home, pct=98.0, resets_at=datetime.now(timezone.utc) - timedelta(minutes=1))
+    monkeypatch.delenv("HERMES_NATIVE_QUOTA_STATE_DIR", raising=False)
+
+    from tools.kanban_tools import _estimate_quota_usage
+
+    assert _estimate_quota_usage() is None
+
+
+def test_native_additional_limits_high_usage_beats_low_top_level_window(monkeypatch, worker_env):
+    home = os.environ["HERMES_HOME"]
+    state = Path(home) / "state"
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _write_native_quota_snapshot(
+        state,
+        windows={"five_hour": {"used_percentage": 10.0, "resets_at": future}},
+        additional_limits=[
+            {"name": "weekly", "windows": {"week": {"usage_pct": 86.5, "resets_at": future}}},
+        ],
+    )
+    monkeypatch.setenv("HERMES_NATIVE_QUOTA_STATE_DIR", str(state))
+
+    from tools.kanban_tools import _estimate_quota_usage
+
+    quota = _estimate_quota_usage()
+    assert quota is not None
+    assert quota["usage_pct"] == 86.5
+    assert quota["window"] == "week"
+
+
+def test_fresh_legacy_quota_still_used_when_native_absent(monkeypatch, worker_env):
+    home = os.environ["HERMES_HOME"]
+    _write_quota_usage(home, pct=72.0, resets_at=datetime.now(timezone.utc) + timedelta(minutes=30))
+    monkeypatch.delenv("HERMES_NATIVE_QUOTA_STATE_DIR", raising=False)
+
+    from tools.kanban_tools import _estimate_quota_usage
+
+    quota = _estimate_quota_usage()
+    assert quota is not None
+    assert quota["usage_pct"] == 72.0
+    assert quota["source"] == "quota-usage.json"
 
 
 def test_create_model_routing_benchmark_failure_prefers_same_effort(worker_env):

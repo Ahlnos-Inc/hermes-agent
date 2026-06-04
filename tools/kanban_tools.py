@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -729,63 +730,200 @@ def _extract_percentage(value: Any) -> Optional[float]:
     return max(0.0, min(100.0, round(pct, 2)))
 
 
-def _estimate_quota_usage() -> Optional[dict[str, Any]]:
-    """Return a best-effort premium quota usage estimate.
+def _parse_quota_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
-    Future reset timestamps are metadata only; active routing pressure comes
-    from explicit usage percentages.
-    """
+
+def _quota_timestamp_is_expired(value: Any, now: datetime) -> bool:
+    parsed = _parse_quota_timestamp(value)
+    return parsed is not None and parsed <= now
+
+
+def _native_quota_state_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    raw = os.environ.get("HERMES_NATIVE_QUOTA_STATE_DIR")
+    if raw:
+        dirs.extend(Path(part).expanduser() for part in raw.split(os.pathsep) if part.strip())
+    dirs.append(_hermes_home_path() / "state")
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in dirs:
+        try:
+            key = str(root.resolve())
+        except Exception:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return deduped
+
+
+def _native_quota_provider_slug(provider: Any = None, model: Any = None) -> str:
+    provider_text = str(provider or "").strip().casefold()
+    model_text = str(model or "").strip().casefold()
+    if provider_text:
+        return provider_text.replace("/", "-")
+    if model_text.startswith("openai-codex/") or model_text.startswith("gpt-"):
+        return "openai-codex"
+    return "openai-codex"
+
+
+def _matching_native_quota_files(provider_slug: str) -> list[Path]:
     candidates: list[Path] = []
-    native_dir = os.environ.get("HERMES_NATIVE_QUOTA_STATE_DIR")
-    if native_dir:
-        root = Path(native_dir).expanduser()
-        if root.exists():
-            candidates.extend(sorted(root.glob("provider-native-quota*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
-    fallback = _hermes_home_path() / "state" / "quota-usage.json"
-    if fallback.exists():
-        candidates.append(fallback)
+    seen: set[str] = set()
+    for root in _native_quota_state_dirs():
+        try:
+            if not root.is_dir():
+                continue
+            files = root.glob(f"provider-native-quota-{provider_slug}*.json")
+        except Exception:
+            logger.debug("failed to inspect native quota state dir %s", root, exc_info=True)
+            continue
+        for path in files:
+            try:
+                key = str(path.resolve())
+            except Exception:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path)
+    return candidates
 
-    def walk(obj: Any, source: str, window: Optional[str] = None) -> Optional[dict[str, Any]]:
-        if isinstance(obj, dict):
-            for key in ("usage_pct", "used_pct", "used_percentage", "usage_percentage", "percent_used"):
-                if key in obj:
-                    pct = _extract_percentage(obj.get(key))
-                    if pct is not None:
-                        return {
-                            "usage_pct": pct,
-                            "source": source,
-                            **({"window": window} if window else {}),
-                            **({"resets_at": obj.get("resets_at")} if obj.get("resets_at") else {}),
-                            **({"fetched_at": obj.get("fetched_at")} if obj.get("fetched_at") else {}),
-                        }
-            windows = obj.get("windows")
-            if isinstance(windows, dict):
-                best: Optional[dict[str, Any]] = None
-                for name, child in windows.items():
-                    found = walk(child, source, str(name))
-                    if found and (best is None or found["usage_pct"] > best["usage_pct"]):
-                        best = found
-                if best:
-                    return best
-            for child in obj.values():
-                found = walk(child, source, window)
-                if found:
-                    return found
-        elif isinstance(obj, list):
-            for child in obj:
-                found = walk(child, source, window)
-                if found:
-                    return found
+
+def _native_provider_matches(parsed: dict[str, Any], provider_slug: str) -> bool:
+    for key in ("provider", "native_provider"):
+        value = parsed.get(key)
+        if value:
+            return str(value).strip().casefold().replace("/", "-") == provider_slug
+    return True
+
+
+def _quota_pct_from_window(window: Any) -> Optional[float]:
+    if not isinstance(window, dict):
+        return None
+    for key in ("usage_pct", "used_pct", "used_percentage", "usage_percentage", "percent_used"):
+        if key in window:
+            pct = _extract_percentage(window.get(key))
+            if pct is not None:
+                return pct
+    return None
+
+
+def _parse_native_quota_snapshot(path: Path, provider_slug: str, now: datetime) -> Optional[dict[str, Any]]:
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        return None
+    if not _native_provider_matches(parsed, provider_slug):
         return None
 
-    for path in candidates:
+    best: Optional[dict[str, Any]] = None
+
+    def consider_windows(windows: Any) -> None:
+        nonlocal best
+        if not isinstance(windows, dict):
+            return
+        for name, window in windows.items():
+            if not isinstance(window, dict):
+                continue
+            resets_at = window.get("resets_at")
+            if _quota_timestamp_is_expired(resets_at, now):
+                continue
+            pct = _quota_pct_from_window(window)
+            if pct is None:
+                continue
+            found = {
+                "usage_pct": pct,
+                "source": path.name,
+                "provider": parsed.get("provider") or provider_slug,
+                **({"native_provider": parsed.get("native_provider")} if parsed.get("native_provider") else {}),
+                "window": str(name),
+                **({"resets_at": resets_at} if resets_at else {}),
+                **({"fetched_at": parsed.get("fetched_at")} if parsed.get("fetched_at") else {}),
+            }
+            if best is None or found["usage_pct"] > best["usage_pct"]:
+                best = found
+
+    consider_windows(parsed.get("windows"))
+    additional = parsed.get("additional_limits")
+    if isinstance(additional, list):
+        for limit in additional:
+            if isinstance(limit, dict):
+                consider_windows(limit.get("windows"))
+    return best
+
+
+def _native_quota_sort_key(path: Path) -> float:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            fetched = _parse_quota_timestamp(parsed.get("fetched_at"))
+            if fetched is not None:
+                return fetched.timestamp()
+    except Exception:
+        logger.debug("failed to parse native quota fetched_at %s", path, exc_info=True)
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _parse_legacy_quota_usage(path: Path, now: datetime) -> Optional[dict[str, Any]]:
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        return None
+    resets_at = parsed.get("resets_at")
+    if _quota_timestamp_is_expired(resets_at, now):
+        return None
+    pct = _quota_pct_from_window(parsed)
+    if pct is None:
+        return None
+    return {
+        "usage_pct": pct,
+        "source": path.name,
+        **({"resets_at": resets_at} if resets_at else {}),
+        **({"fetched_at": parsed.get("fetched_at")} if parsed.get("fetched_at") else {}),
+    }
+
+
+def _estimate_quota_usage(provider: Any = None, model: Any = None) -> Optional[dict[str, Any]]:
+    """Return a best-effort premium quota usage estimate.
+
+    Provider-native snapshots are authoritative when usable. Legacy
+    ``quota-usage.json`` is kept only as a compatibility fallback so stale
+    legacy state cannot override a refreshed provider-native quota snapshot.
+    """
+    now = datetime.now(timezone.utc)
+    provider_slug = _native_quota_provider_slug(provider, model)
+
+    native_candidates = sorted(_matching_native_quota_files(provider_slug), key=_native_quota_sort_key, reverse=True)
+    for path in native_candidates:
         try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-            found = walk(parsed, path.name)
+            found = _parse_native_quota_snapshot(path, provider_slug, now)
             if found:
                 return found
         except Exception:
-            logger.debug("failed to read quota estimate %s", path, exc_info=True)
+            logger.debug("failed to read native quota estimate %s", path, exc_info=True)
+
+    fallback = _hermes_home_path() / "state" / "quota-usage.json"
+    try:
+        if fallback.exists():
+            return _parse_legacy_quota_usage(fallback, now)
+    except Exception:
+        logger.debug("failed to read quota estimate %s", fallback, exc_info=True)
     return None
 
 
