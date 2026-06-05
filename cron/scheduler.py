@@ -1595,7 +1595,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        # Per-job fallback_providers overrides profile config.  An explicit
+        # empty list means "no fallback" — the job must succeed on its
+        # primary provider or fail outright, never cascading to paid models.
+        if "fallback_providers" in job:
+            fallback_model = job["fallback_providers"]
+        else:
+            fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
