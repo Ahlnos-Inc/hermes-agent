@@ -1287,3 +1287,84 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+# ── Skill output cap tests ───────────────────────────────────────────
+
+class TestSkillViewOutputCap:
+    """Tests for skill_view content cap (skills.max_output_chars config)."""
+
+    def _make_skill_view_patch(self, monkeypatch, max_output_chars):
+        """Patch _get_skill_max_output_chars and set up a temp skills dir."""
+        monkeypatch.setattr(
+            skills_tool_module, "_get_skill_max_output_chars",
+            lambda: max_output_chars,
+        )
+
+    @patch("tools.skills_tool.SKILLS_DIR", new_callable=lambda: Path("/tmp/test-skills-cap"))
+    def test_short_skill_not_truncated(self, mock_dir):
+        """Skills under the cap are returned in full, no truncation metadata."""
+        mock_dir.mkdir(parents=True, exist_ok=True)
+        _make_skill(mock_dir, "short-skill", body="Short body content here.")
+        # Patch SKILLS_DIR in the module for the test
+        with patch.object(skills_tool_module, "SKILLS_DIR", mock_dir):
+            with patch.object(skills_tool_module, "_get_skill_max_output_chars", return_value=25000):
+                raw = skill_view("short-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "Short body content here." in result["content"]
+        assert "content_truncated" not in result
+        assert "total_content_chars" not in result
+        # Cleanup
+        import shutil
+        shutil.rmtree(mock_dir, ignore_errors=True)
+
+    @patch("tools.skills_tool.SKILLS_DIR", new_callable=lambda: Path("/tmp/test-skills-cap2"))
+    def test_long_skill_truncated(self, mock_dir):
+        """Skills exceeding the cap are truncated with metadata."""
+        mock_dir.mkdir(parents=True, exist_ok=True)
+        long_body = "x" * 5000  # 5000 chars
+        _make_skill(mock_dir, "long-skill", body=long_body)
+        with patch.object(skills_tool_module, "SKILLS_DIR", mock_dir):
+            with patch.object(skills_tool_module, "_get_skill_max_output_chars", return_value=1000):
+                raw = skill_view("long-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["content_truncated"] is True
+        assert result["total_content_chars"] > 1000
+        assert len(result["content"]) <= 1000
+        assert "content_truncation_hint" in result
+        # Cleanup
+        import shutil
+        shutil.rmtree(mock_dir, ignore_errors=True)
+
+    @patch("tools.skills_tool.SKILLS_DIR", new_callable=lambda: Path("/tmp/test-skills-cap3"))
+    def test_zero_cap_disabled(self, mock_dir):
+        """max_output_chars=0 means unlimited — no truncation."""
+        mock_dir.mkdir(parents=True, exist_ok=True)
+        long_body = "x" * 5000
+        _make_skill(mock_dir, "big-skill", body=long_body)
+        with patch.object(skills_tool_module, "SKILLS_DIR", mock_dir):
+            with patch.object(skills_tool_module, "_get_skill_max_output_chars", return_value=0):
+                raw = skill_view("big-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "content_truncated" not in result
+        assert "x" * 1000 in result["content"]  # body is present
+        import shutil
+        shutil.rmtree(mock_dir, ignore_errors=True)
+
+    @patch("tools.skills_tool.SKILLS_DIR", new_callable=lambda: Path("/tmp/test-skills-cap4"))
+    def test_negative_cap_disabled(self, mock_dir):
+        """max_output_chars < 0 means unlimited — no truncation."""
+        mock_dir.mkdir(parents=True, exist_ok=True)
+        long_body = "y" * 3000
+        _make_skill(mock_dir, "neg-cap-skill", body=long_body)
+        with patch.object(skills_tool_module, "SKILLS_DIR", mock_dir):
+            with patch.object(skills_tool_module, "_get_skill_max_output_chars", return_value=-1):
+                raw = skill_view("neg-cap-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "content_truncated" not in result
+        import shutil
+        shutil.rmtree(mock_dir, ignore_errors=True)

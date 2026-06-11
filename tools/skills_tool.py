@@ -91,6 +91,34 @@ HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 
 # Anthropic-recommended limits for progressive disclosure efficiency
+_DEFAULT_SKILL_MAX_OUTPUT_CHARS = 100000
+
+
+def _get_skill_max_output_chars() -> int:
+    """Read ``skills.max_output_chars`` from config.
+
+    Falls back to :data:`_DEFAULT_SKILL_MAX_OUTPUT_CHARS`.
+    Zero or negative values mean *no cap* (return ``0``).
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        skills_cfg = config.get("skills", {}) if isinstance(config, dict) else {}
+        if isinstance(skills_cfg, dict):
+            val = skills_cfg.get("max_output_chars")
+            if val is not None:
+                parsed = int(val)
+                if parsed < 0:
+                    return 0  # negative means unlimited
+                if parsed == 0:
+                    return 0  # zero means unlimited
+                if parsed > 0:
+                    return parsed
+    except Exception:
+        pass
+    return _DEFAULT_SKILL_MAX_OUTPUT_CHARS
+
+
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 
@@ -1424,6 +1452,19 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # ── Output cap for large skill content ──────────────────────
+        _max_chars = _get_skill_max_output_chars()
+        _total_chars = len(rendered_content)
+        _content_truncated = False
+        if _max_chars > 0 and _total_chars > _max_chars:
+            rendered_content = rendered_content[:_max_chars]
+            _content_truncated = True
+            logger.info(
+                "skill_view(%s): content capped at %d chars (total %d); "
+                "full content available via file_path or direct disk read",
+                skill_name, _max_chars, _total_chars,
+            )
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1448,6 +1489,18 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        # ── Surface truncation metadata when content was capped ────
+        if _content_truncated:
+            result["content_truncated"] = True
+            result["total_content_chars"] = _total_chars
+            result["content_truncation_hint"] = (
+                f"Skill content was capped at {_max_chars} chars "
+                f"(full size: {_total_chars} chars). "
+                "To retrieve the full content, call skill_view(name, file_path=None) "
+                "with a higher skills.max_output_chars config value, "
+                "or read the file directly from disk."
+            )
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:

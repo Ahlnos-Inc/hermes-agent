@@ -236,3 +236,208 @@ class TestMaybeAutoTitle:
 
     def test_skips_if_no_session_db(self):
         maybe_auto_title(None, "sess-1", "hello", "response", [])  # no db
+
+
+# ── Multimodal-safe normalization tests ──────────────────────────────
+
+class TestNormalizeTextContent:
+    """Tests for _normalize_text_content() — multimodal input safety."""
+
+    def test_string_passthrough(self):
+        from agent.title_generator import _normalize_text_content
+        result = _normalize_text_content("hello world")
+        assert result == "hello world"
+
+    def test_none_returns_empty(self):
+        from agent.title_generator import _normalize_text_content
+        assert _normalize_text_content(None) == ""
+
+    def test_list_of_text_blocks_concatenated(self):
+        from agent.title_generator import _normalize_text_content
+        content = [
+            {"type": "text", "text": "What is this image?"},
+            {"type": "text", "text": "I need help."},
+        ]
+        result = _normalize_text_content(content)
+        assert "What is this image?" in result
+        assert "I need help." in result
+
+    def test_image_block_replaced_with_marker(self):
+        from agent.title_generator import _normalize_text_content
+        content = [
+            {"type": "text", "text": "Look at this:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}},
+        ]
+        result = _normalize_text_content(content)
+        assert "Look at this:" in result
+        assert "[image attached]" in result
+        # The data URI must not appear
+        assert "base64" not in result
+        assert "iVBOR" not in result
+
+    def test_data_uri_redacted_in_string_input(self):
+        from agent.title_generator import _normalize_text_content
+        # Base64 payload must be >=200 chars to match _DATA_URI_RE
+        long_payload = "A" * 250
+        nasty = f"Check this: data:image/png;base64,{long_payload}=="
+        result = _normalize_text_content(nasty)
+        assert "[data URI redacted]" in result
+        assert long_payload not in result
+
+    def test_long_base64_redacted(self):
+        from agent.title_generator import _normalize_text_content
+        # 300+ chars of base64-looking text
+        fake_b64 = "AAAA" * 80  # 320 chars
+        result = _normalize_text_content(f"prefix {fake_b64} suffix")
+        assert "prefix" in result
+        assert "suffix" in result
+        assert "[base64 redacted]" in result
+
+    def test_mixed_multimodal_list(self):
+        from agent.title_generator import _normalize_text_content
+        content = [
+            {"type": "text", "text": "Hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+            {"type": "text", "text": "World"},
+            {"type": "video", "source": "..."},
+        ]
+        result = _normalize_text_content(content)
+        assert "Hello" in result
+        assert "World" in result
+        assert "[image attached]" in result
+        assert "[video attached]" in result
+
+    def test_unknown_block_type_ignored(self):
+        from agent.title_generator import _normalize_text_content
+        content = [
+            {"type": "text", "text": "Hi"},
+            {"type": "weird_custom_block", "payload": "sensitive stuff"},
+        ]
+        result = _normalize_text_content(content)
+        assert "Hi" in result
+        assert "sensitive stuff" not in result  # Never stringify raw dicts
+
+    def test_single_dict_block(self):
+        from agent.title_generator import _normalize_text_content
+        result = _normalize_text_content({"type": "text", "text": "single block"})
+        assert result == "single block"
+
+    def test_empty_list_returns_empty(self):
+        from agent.title_generator import _normalize_text_content
+        assert _normalize_text_content([]) == ""
+
+    def test_non_string_non_list_non_dict_returns_empty(self):
+        from agent.title_generator import _normalize_text_content
+        # Should never crash on unexpected types
+        assert _normalize_text_content(42) == ""
+
+
+class TestBoundedTitleInput:
+    """Tests for configurable caps and input bounding."""
+
+    def test_normal_text_title_still_works(self):
+        """Smoke test: normal string input still produces a title."""
+        from agent.title_generator import generate_title
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "A Normal Title"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("help me", "sure thing")
+            assert title == "A Normal Title"
+
+    def test_multimodal_input_normalized_before_llm_call(self):
+        """Image content must not reach the provider."""
+        from agent.title_generator import generate_title
+
+        captured_messages = []
+
+        def capture_call(**kwargs):
+            captured_messages.append(kwargs["messages"])
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Image Discussion"
+            return resp
+
+        multimodal_user = [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}},
+        ]
+        with patch("agent.title_generator.call_llm", side_effect=capture_call):
+            generate_title(multimodal_user, "It's a red pixel.")
+
+        assert len(captured_messages) == 1
+        llm_input = captured_messages[0][1]["content"]
+        # Image content must be a marker, not the raw multimodal dict or base64
+        assert "[image attached]" in llm_input
+        assert "base64" not in llm_input
+        assert "iVBOR" not in llm_input
+        # Text content preserved
+        assert "What is in this image?" in llm_input
+        assert "red pixel" in llm_input
+
+    def test_input_bounded_by_config_cap(self):
+        """Input should be truncated when it exceeds max_input_chars."""
+        from agent.title_generator import generate_title
+
+        captured_messages = []
+
+        def capture_call(**kwargs):
+            captured_messages.append(kwargs["messages"])
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short"
+            return resp
+
+        # Set a low cap in config
+        mock_config = {"auxiliary": {"title_generation": {"max_input_chars": 100}}}
+        with patch("agent.title_generator._get_max_input_chars", return_value=100):
+            with patch("agent.title_generator.call_llm", side_effect=capture_call):
+                generate_title("x" * 3000, "y" * 3000)
+
+        assert len(captured_messages) == 1
+        llm_input = captured_messages[0][1]["content"]
+        # Input must be within the cap (plus some formatting overhead)
+        assert len(llm_input) <= 200  # generous upper bound
+
+    def test_image_only_input_still_calls_with_markers(self):
+        """Pure image input should generate a title from markers (not skip)."""
+        from agent.title_generator import generate_title
+        multimodal_only = [
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+        ]
+        with patch("agent.title_generator.call_llm") as mock_call:
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "Image Discussion"
+            mock_call.return_value = mock_response
+            result = generate_title(multimodal_only, multimodal_only)
+            # Call should proceed with markers, not raw data
+            mock_call.assert_called_once()
+            messages = mock_call.call_args[1]["messages"]
+            llm_input = messages[1]["content"]
+            assert "[image attached]" in llm_input
+            assert "https://example.com" not in llm_input  # URL not leaked
+            assert result == "Image Discussion"
+
+    def test_debug_logging_includes_input_sizes(self, caplog):
+        """Debug logging should show char counts but never raw prompt text."""
+        from agent.title_generator import generate_title
+        import logging
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Logged Title"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            with caplog.at_level(logging.DEBUG, logger="agent.title_generator"):
+                generate_title("hello", "world")
+
+        # Find the debug log entry
+        debug_logs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        size_log = [m for m in debug_logs if "user_chars=" in m]
+        assert len(size_log) == 1
+        # Must contain size info
+        assert "user_chars=5" in size_log[0] or "user_chars=5" in size_log[0]
+        # Must NOT contain the raw prompt text
+        assert "hello" not in size_log[0]

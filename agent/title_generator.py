@@ -5,8 +5,9 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from agent.auxiliary_client import call_llm
 
@@ -25,10 +26,128 @@ _TITLE_PROMPT = (
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
+# ── Default caps for title-generation input ──────────────────────────
+_DEFAULT_MAX_INPUT_CHARS = 2000
+
+# Pattern to detect data URIs and long base64 strings so they never leak
+# into an auxiliary provider prompt.
+_DATA_URI_RE = re.compile(r"data:[^;]*;base64,[A-Za-z0-9+/=]{200,}")
+_LONG_BASE64_RE = re.compile(r"[A-Za-z0-9+/=]{300,}")
+
+
+def _normalize_text_content(raw: Any) -> str:
+    """Extract plain text from user/assistant content for title generation.
+
+    Handles str, list (multimodal content array), and dict (single block).
+    - Concatenates text parts only.
+    - Replaces image/file/audio/non-text blocks with compact markers.
+    - Strips data URIs and long base64 strings so they never leak into
+      an auxiliary provider prompt.
+
+    Returns a plain string safe for title-generation input.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return _redact_sensitive_patterns(raw)
+    return _flatten_content_blocks(raw)
+
+
+def _flatten_content_blocks(raw: Any) -> str:
+    """Walk a multimodal content structure and return text-only concatenation."""
+    if isinstance(raw, str):
+        return _redact_sensitive_patterns(raw)
+    if isinstance(raw, dict):
+        return _flatten_single_block(raw)
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(_redact_sensitive_patterns(item))
+            elif isinstance(item, dict):
+                parts.append(_flatten_single_block(item))
+        return " ".join(part for part in parts if part)
+    # Fallback for unexpected types — don't stringify arbitrary objects
+    return ""
+
+
+# Map of block types → compact placeholder when the block carries no
+# extractable text.  Non-text blocks get a short marker; text blocks
+# contribute their text.
+_BLOCK_TYPE_MARKERS: dict[str, str] = {
+    "image_url": "[image attached]",
+    "image": "[image attached]",
+    "video_url": "[video attached]",
+    "video": "[video attached]",
+    "audio": "[audio attached]",
+    "file": "[file attached]",
+}
+
+
+def _flatten_single_block(block: dict) -> str:
+    """Extract usable text from a single multimodal content block."""
+    block_type = block.get("type", "")
+    if block_type == "text":
+        text = block.get("text", "")
+        if isinstance(text, str):
+            return _redact_sensitive_patterns(text)
+        return ""
+    if block_type in _BLOCK_TYPE_MARKERS:
+        return _BLOCK_TYPE_MARKERS[block_type]
+    # Unknown block — return empty, don't risk stringifying raw dicts
+    return ""
+
+
+def _redact_sensitive_patterns(text: str) -> str:
+    """Strip data URIs and long base64 runs from *text*.
+
+    These patterns should never appear in the source text (they're a
+    defence-in-depth layer in case a caller accidentally passes raw
+    multimodal JSON through a string path).
+    """
+    text = _DATA_URI_RE.sub("[data URI redacted]", text)
+    text = _LONG_BASE64_RE.sub("[base64 redacted]", text)
+    return text
+
+
+def _get_max_input_chars() -> int:
+    """Read ``auxiliary.title_generation.max_input_chars`` from config.
+
+    Falls back to :data:`_DEFAULT_MAX_INPUT_CHARS` when the config key is
+    absent, unparseable, or zero/negative.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        task_cfg = aux.get("title_generation", {}) if isinstance(aux, dict) else {}
+        if isinstance(task_cfg, dict):
+            val = task_cfg.get("max_input_chars")
+            if val is not None:
+                parsed = int(val)
+                if parsed > 0:
+                    return parsed
+    except Exception:
+        pass
+    return _DEFAULT_MAX_INPUT_CHARS
+
+
+def _bound_input_text(text: str) -> str:
+    """Apply the configurable character cap to title-generation input."""
+    max_chars = _get_max_input_chars()
+    if len(text) <= max_chars:
+        return text
+    # Truncate at a word boundary when possible
+    snippet = text[:max_chars]
+    last_space = snippet.rfind(" ")
+    if last_space > max_chars // 2:
+        snippet = snippet[:last_space]
+    return snippet
+
 
 def generate_title(
-    user_message: str,
-    assistant_response: str,
+    user_message: Any,
+    assistant_response: Any,
     timeout: float = 30.0,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
@@ -44,13 +163,36 @@ def generate_title(
     ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
     of silently accumulating untitled sessions.
     """
-    # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
-    assistant_snippet = assistant_response[:500] if assistant_response else ""
+    # ── Normalize & bound input ─────────────────────────────────────
+    user_text = _normalize_text_content(user_message) if user_message else ""
+    assistant_text = _normalize_text_content(assistant_response) if assistant_response else ""
+
+    max_chars = _get_max_input_chars()
+    # Per-field soft truncation so one giant field doesn't starve the other
+    per_field_limit = max(200, max_chars // 2)
+    if len(user_text) > per_field_limit:
+        user_text = user_text[:per_field_limit]
+    if len(assistant_text) > per_field_limit:
+        assistant_text = assistant_text[:per_field_limit]
+
+    input_text = f"User: {user_text}\n\nAssistant: {assistant_text}"
+    if len(input_text) > max_chars:
+        input_text = _bound_input_text(input_text)
+
+    # PII-safe debug log: size and any skip reason, never raw prompt text
+    logger.debug(
+        "Title generation input: user_chars=%d assistant_chars=%d total_chars=%d cap=%d",
+        len(user_text), len(assistant_text), len(input_text), max_chars,
+    )
+
+    # ── Guard: skip when no usable text ─────────────────────────────
+    if not user_text.strip() and not assistant_text.strip():
+        logger.info("Title generation skipped: no usable text after normalization")
+        return None
 
     messages = [
         {"role": "system", "content": _TITLE_PROMPT},
-        {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
+        {"role": "user", "content": input_text},
     ]
 
     try:
@@ -87,8 +229,8 @@ def generate_title(
 def auto_title_session(
     session_db,
     session_id: str,
-    user_message: str,
-    assistant_response: str,
+    user_message: Any,
+    assistant_response: Any,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
@@ -133,8 +275,8 @@ def auto_title_session(
 def maybe_auto_title(
     session_db,
     session_id: str,
-    user_message: str,
-    assistant_response: str,
+    user_message: Any,
+    assistant_response: Any,
     conversation_history: list,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
