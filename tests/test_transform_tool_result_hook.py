@@ -109,6 +109,100 @@ def test_hook_receives_expected_kwargs(monkeypatch):
     assert captured["tool_call_id"] == "tc1"
 
 
+def test_handle_function_call_accepts_and_forwards_gateway_source(monkeypatch):
+    """Gateway-origin metadata is dispatcher context, not schema input.
+
+    The agent loop passes ``gateway_source`` into ``handle_function_call`` so
+    kanban_create can auto-subscribe the originating chat without mutating
+    process-global env vars. The dispatcher must accept it and forward it to
+    the registry instead of raising ``unexpected keyword argument`` before the
+    real tool handler runs.
+    """
+    from tools.registry import registry
+
+    captured = {}
+
+    def _dispatch(name, args, **kw):
+        captured.update({"name": name, "args": args, "kwargs": kw})
+        return '{"ok": true}'
+
+    monkeypatch.setattr(registry, "dispatch", _dispatch)
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+
+    gateway_source = {
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": None,
+        "user_id": "u1",
+    }
+
+    out = model_tools.handle_function_call(
+        "skill_view",
+        {"name": "hermes-agent"},
+        task_id="t1",
+        session_id="s1",
+        tool_call_id="tc1",
+        skip_pre_tool_call_hook=True,
+        gateway_source=gateway_source,
+    )
+
+    assert out == '{"ok": true}'
+    assert captured["name"] == "skill_view"
+    assert captured["args"] == {"name": "hermes-agent"}
+    assert captured["kwargs"]["task_id"] == "t1"
+    assert captured["kwargs"]["gateway_source"] == gateway_source
+
+
+def test_tool_call_bridge_preserves_gateway_source(monkeypatch):
+    """Nested tool_call recursion must not drop gateway context."""
+    from tools.registry import registry
+    from tools import tool_search as tool_search_mod
+
+    captured = {}
+
+    def _dispatch(name, args, **kw):
+        captured.update({"name": name, "args": args, "kwargs": kw})
+        return '{"ok": true}'
+
+    monkeypatch.setattr(registry, "dispatch", _dispatch)
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kw: [
+            {"type": "function", "function": {"name": "skill_view"}},
+        ],
+    )
+    monkeypatch.setattr(
+        tool_search_mod,
+        "is_deferrable_tool_name",
+        lambda name: name == "skill_view",
+    )
+    monkeypatch.setattr(
+        tool_search_mod,
+        "scoped_deferrable_names",
+        lambda _defs: {"skill_view"},
+    )
+
+    gateway_source = {"platform": "telegram", "chat_id": "123"}
+    out = model_tools.handle_function_call(
+        tool_search_mod.TOOL_CALL_NAME,
+        {
+            "name": "skill_view",
+            "arguments": {"name": "hermes-agent"},
+        },
+        task_id="t1",
+        session_id="s1",
+        tool_call_id="tc1",
+        skip_pre_tool_call_hook=True,
+        gateway_source=gateway_source,
+    )
+
+    assert out == '{"ok": true}'
+    assert captured["name"] == "skill_view"
+    assert captured["kwargs"]["gateway_source"] == gateway_source
+
+
 def test_hook_exception_falls_back_to_original(monkeypatch):
     def _raise(*_a, **_kw):
         raise RuntimeError("boom")

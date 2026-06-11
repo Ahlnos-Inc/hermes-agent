@@ -869,6 +869,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    gateway_source: Optional[dict] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
 ) -> str:
@@ -884,6 +885,9 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
+        gateway_source: Originating gateway chat context.  Passed through to
+                       gateway-aware tool handlers (currently kanban_create)
+                       without using process-global environment mutation.
         enabled_toolsets: The session's enabled toolsets.  Used to scope the
                        Tool Search bridge catalog so ``tool_search`` /
                        ``tool_describe`` / ``tool_call`` only see and invoke
@@ -970,6 +974,7 @@ def handle_function_call(
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                gateway_source=gateway_source,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
             )
@@ -1074,6 +1079,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         enabled_tools=sandbox_enabled,
+                        gateway_source=gateway_source,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1081,6 +1087,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         user_task=user_task,
+                        gateway_source=gateway_source,
                     )
             result = _dispatch(function_args)
         finally:
