@@ -23,8 +23,68 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+from typing import Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+
+# ── Safe workspace diagnostics for Kanban recovery handoff ──────────
+# Captured only for non-cooperative exits (iteration exhaustion, crashes,
+# timeouts, protocol violations) — never for normal completes/blocks.
+_WORKSPACE_DIAG_MAX_BYTES = 4096
+_WORKSPACE_DIAG_MAX_LINES = 50
+# Simple secret-like patterns to redact: lines that look like API keys,
+# tokens, or private values with high entropy.
+_WORKSPACE_DIAG_REDACT_PATTERNS = [
+    re.compile(r"(?:api_?key|token|secret|password|auth)\s*[:=]\s*\S+", re.I),
+    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),   # base64-like long runs
+    re.compile(r"sk-[A-Za-z0-9]{32,}"),           # OpenAI/Anthropic keys
+    re.compile(r"ghp_[A-Za-z0-9]{36,}"),          # GitHub PATs
+]
+
+
+def _capture_safe_workspace_status(workspace_path: str) -> Optional[dict]:
+    """Capture capped, redacted git status for a workspace directory.
+
+    Returns ``None`` if the workspace is not a git repo or the command
+    fails.  Never returns full diffs — only status/diffstat lines.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", workspace_path, "status", "--short", "--branch"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        raw = out.stdout.strip()
+        if not raw:
+            return {"git_repo": True, "dirty": False}
+        # Cap output
+        lines = raw.split("\n")
+        capped_lines = lines[:_WORKSPACE_DIAG_MAX_LINES]
+        capped = "\n".join(capped_lines)
+        if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
+            capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
+        # Redact obvious secret-like patterns
+        for pat in _WORKSPACE_DIAG_REDACT_PATTERNS:
+            capped = pat.sub("[REDACTED]", capped)
+        # Extract branch name from the first line (## main...origin/main)
+        branch = ""
+        first_line = capped_lines[0] if capped_lines else ""
+        if first_line.startswith("## "):
+            branch = first_line[3:].split("...")[0].strip()
+        return {
+            "git_repo": True,
+            "branch": branch or None,
+            "dirty": True,
+            "git_status_raw": capped,
+        }
+    except Exception:
+        return None
 
 
 def finalize_turn(
@@ -48,7 +108,7 @@ def finalize_turn(
     Lifted verbatim from ``run_conversation`` (the region after the main agent
     loop). See module docstring.
     """
-    from agent.conversation_loop import logger
+    from agent.conversation_loop import _ra, logger
 
     if final_response is None and (
         api_call_count >= agent.max_iterations
@@ -75,17 +135,85 @@ def finalize_turn(
         # _handle_max_iterations, so the model cannot call kanban_block
         # itself — we must do it on its behalf.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the
-        # ``consecutive_failures`` counter and the dispatcher's
-        # ``failure_limit`` circuit breaker (#29747 gap 2).  Without this,
-        # a task whose worker keeps exhausting its budget would block
-        # silently each run, get auto-promoted by the operator (or never
-        # surface), and re-block in an endless loop with no signal.
+        # Build a rich recovery handoff, append it as a durable
+        # kanban_comment when possible, then route the actual failure
+        # through ``_record_task_failure(outcome="timed_out")`` so
+        # consecutive_failures increments and the dispatcher's
+        # failure_limit circuit breaker works.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
+                _block_metadata: dict = {
+                    "failure_code": "iteration_budget_exhausted",
+                    "iterations": {
+                        "used": api_call_count,
+                        "max": agent.max_iterations,
+                    },
+                    "turn_exit_reason": _turn_exit_reason,
+                }
+                _model_provider = (
+                    os.environ.get("HERMES_PROVIDER")
+                    or os.environ.get("HERMES_MODEL_PROVIDER")
+                )
+                _model_name = os.environ.get("HERMES_MODEL")
+                _session_id = os.environ.get("HERMES_SESSION_ID")
+                if _model_provider:
+                    _block_metadata["provider"] = _model_provider.strip()
+                if _model_name:
+                    _block_metadata["model"] = _model_name.strip()
+                if _session_id:
+                    _block_metadata["session_id"] = _session_id.strip()
+
+                _workspace_path = os.environ.get("HERMES_KANBAN_WORKSPACE")
+                if _workspace_path:
+                    _ws_status = _capture_safe_workspace_status(_workspace_path)
+                    if _ws_status:
+                        _block_metadata["workspace_status"] = _ws_status
+
+                _handoff_full = (final_response or "").strip()
+                _SUMMARY_CAP = 2_000
+                _COMMENT_CAP = 12_000
+                _summary = _handoff_full
+                if len(_summary) > _SUMMARY_CAP:
+                    _summary = _summary[:_SUMMARY_CAP] + "… [truncated]"
+                _comment_handoff = _handoff_full
+                if len(_comment_handoff) > _COMMENT_CAP:
+                    _comment_handoff = _comment_handoff[:_COMMENT_CAP] + "… [truncated]"
+
+                _block_metadata["handoff_text"] = _comment_handoff or None
+                _block_metadata["recovery_recommendation"] = (
+                    "retry with narrower scope / split task"
+                )
+
+                if _comment_handoff:
+                    _comment_body = (
+                        "iteration-budget recovery handoff\n\n"
+                        f"Task `{_kanban_task}` exhausted "
+                        f"{api_call_count}/{agent.max_iterations} iterations "
+                        "before it could make its own final Kanban comment. "
+                        "Hermes captured the worker's final recovery summary "
+                        "before recording the timed-out failure.\n\n"
+                        f"{_comment_handoff}"
+                    )
+                    try:
+                        _ra().handle_function_call(
+                            "kanban_comment",
+                            {
+                                "task_id": _kanban_task,
+                                "body": _comment_body,
+                            },
+                            task_id=effective_task_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to append kanban_comment recovery handoff "
+                            "for task %s before iteration-exhaustion failure",
+                            _kanban_task,
+                            exc_info=True,
+                        )
+
                 from hermes_cli import kanban_db as _kb
+
                 _conn = _kb.connect()
                 try:
                     _kb._record_task_failure(
@@ -103,10 +231,13 @@ def finalize_turn(
                         event_payload_extra={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
+                            "recovery_summary": _summary,
+                            "recovery_handoff": _block_metadata,
                         },
                     )
                     logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
+                        "recorded budget-exhausted failure with recovery "
+                        "handoff for task %s (%d/%d)",
                         _kanban_task, api_call_count, agent.max_iterations,
                     )
                 finally:
