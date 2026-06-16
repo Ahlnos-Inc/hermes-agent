@@ -89,6 +89,7 @@ import shutil
 import sys
 import threading
 import time
+from typing import Callable
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
@@ -1202,6 +1203,26 @@ class MCPServerTask:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
 
+    def _advertises_tools(self) -> bool:
+        """Whether the server advertises the ``tools`` capability.
+
+        Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
+        iff the server implements the ``tools/*`` request family. Prompt-only
+        or resource-only servers omit it, and calling ``tools/list`` against
+        them raises ``McpError(-32601 Method not found)`` — which previously
+        killed the connection during discovery and made every keepalive fail.
+        (Ported from anomalyco/opencode#31271.)
+
+        Returns True when no capability info was captured (legacy fallback:
+        preserve the old always-call-list_tools behavior rather than regress
+        any server that was working before this gate).
+        """
+        init_result = self.initialize_result
+        caps = getattr(init_result, "capabilities", None) if init_result is not None else None
+        if caps is None:
+            return True
+        return getattr(caps, "tools", None) is not None
+
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
     async def _refresh_tools_task(self):
@@ -1272,6 +1293,12 @@ class MCPServerTask:
         — atomic from the event loop's perspective.
         """
         from tools.registry import registry
+
+        if not self._advertises_tools():
+            # A server that doesn't implement tools/* should never send
+            # tools/list_changed, but guard anyway — calling tools/list
+            # would raise McpError(-32601).
+            return
 
         async with self._refresh_lock:
             # Capture old tool names for change diff
@@ -1360,12 +1387,22 @@ class MCPServerTask:
 
                 # Timeout — no lifecycle event fired.  Send a keepalive
                 # to exercise the connection and detect stale sockets.
+                # Prompt-only / resource-only servers don't implement
+                # ``tools/list`` (McpError -32601), so use the universal
+                # ``ping`` request for them instead — otherwise every
+                # keepalive cycle would trigger a spurious reconnect.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        if self._advertises_tools():
+                            await asyncio.wait_for(
+                                self.session.list_tools(),
+                                timeout=30.0,
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                self.session.send_ping(),
+                                timeout=30.0,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "
@@ -1778,8 +1815,24 @@ class MCPServerTask:
                         )
 
     async def _discover_tools(self):
-        """Discover tools from the connected session."""
+        """Discover tools from the connected session.
+
+        Capability-gated: prompt-only / resource-only MCP servers don't
+        implement ``tools/list``, and calling it raises ``McpError(-32601)``,
+        which previously aborted the connection — those servers could never
+        stay connected for their prompts/resources. Skip the call when the
+        server doesn't advertise the ``tools`` capability.
+        (Ported from anomalyco/opencode#31271.)
+        """
         if self.session is None:
+            return
+        if not self._advertises_tools():
+            logger.info(
+                "MCP server '%s': does not advertise 'tools' capability — "
+                "skipping tools/list (prompts/resources remain available)",
+                self.name,
+            )
+            self._tools = []
             return
         async with self._rpc_lock:
             tools_result = await self.session.list_tools()
@@ -2621,6 +2674,33 @@ def _interpolate_env_vars(value):
     return value
 
 
+def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
+    try:
+        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
+    except Exception:
+        _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
+
+    if _validate_mcp_server_entry is None:
+        return servers
+
+    safe_servers = {}
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            safe_servers[name] = cfg
+            continue
+        issues = _validate_mcp_server_entry(name, cfg)
+        if issues:
+            logger.warning(
+                "Skipping suspicious MCP server '%s': %s",
+                name,
+                "; ".join(issues),
+            )
+            continue
+        safe_servers[name] = cfg
+    return safe_servers
+
+
 def _load_mcp_config() -> Dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
@@ -2634,6 +2714,11 @@ def _load_mcp_config() -> Dict[str, dict]:
     """
     try:
         from hermes_cli.config import load_config
+        # Safe mode (--safe-mode / HERMES_SAFE_MODE=1): troubleshooting run
+        # with all customizations disabled — no MCP servers connect.
+        from utils import env_var_enabled as _env_enabled
+        if _env_enabled("HERMES_SAFE_MODE"):
+            return {}
         config = load_config()
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
@@ -2644,7 +2729,12 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        safe_servers: Dict[str, dict] = {}
+        for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+            interpolated = _interpolate_env_vars(cfg)
+            if isinstance(interpolated, dict):
+                safe_servers[name] = interpolated
+        return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -3591,6 +3681,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
+    servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
@@ -3889,7 +3980,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     except Exception as exc:
         logger.debug("MCP probe failed: %s", exc)
     finally:
-        _stop_mcp_loop()
+        _stop_mcp_loop_if_idle()
 
     return result
 
@@ -4027,10 +4118,25 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
         )
 
 
-def _stop_mcp_loop():
+def _stop_mcp_loop_if_idle() -> bool:
+    """Stop the MCP loop only when no registered server still owns it.
+
+    Probe paths create temporary MCPServerTask instances that are not placed in
+    ``_servers``.  They should clean up an otherwise-idle loop, but must not
+    tear down the process-global loop when live agent tools are registered on
+    it.  Otherwise a dashboard/CLI probe can make later MCP tool calls fail
+    with ``MCP event loop is not running``.
+    """
+    return _stop_mcp_loop(only_if_idle=True)
+
+
+def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
+        if only_if_idle and (_servers or _server_connecting):
+            logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
+            return False
         loop = _mcp_loop
         thread = _mcp_thread
         _mcp_loop = None
@@ -4047,3 +4153,4 @@ def _stop_mcp_loop():
         # graceful shutdown are now orphaned — include active PIDs too
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
+    return True

@@ -1120,6 +1120,7 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        session_id=session_id,
                         enabled_tools=sandbox_enabled,
                         gateway_source=gateway_source,
                     )
@@ -1128,6 +1129,7 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        session_id=session_id,
                         user_task=user_task,
                         gateway_source=gateway_source,
                     )

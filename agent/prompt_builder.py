@@ -489,15 +489,41 @@ PLATFORM_HINTS = {
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
     ),
+    "whatsapp_cloud": (
+        "You are on a text messaging communication platform, WhatsApp "
+        "(via Meta's official Business Cloud API). Standard markdown "
+        "(**bold**, ~~strike~~, # headers, [links](url)) is auto-converted "
+        "to WhatsApp's native syntax (*bold*, ~strike~, etc.) — feel free "
+        "to write in markdown. Tables are NOT supported — prefer bullet "
+        "lists or labeled key:value pairs. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png) become photo attachments, "
+        "videos (.mp4) play inline, audio (.mp3, .ogg) sends as voice/audio "
+        "messages, other files arrive as documents. Image URLs in markdown "
+        "format ![alt](url) also work. "
+        "IMPORTANT: this platform has a 24-hour conversation window — if the "
+        "user hasn't messaged in 24h, free-form replies are refused by Meta "
+        "(error 131047). This rarely matters for live chat, but is worth "
+        "knowing if you're scheduling a delayed message."
+    ),
     "telegram": (
         "You are on a text messaging communication platform, Telegram. "
-        "Standard markdown is automatically converted to Telegram format. "
+        "Standard Markdown is automatically converted to Telegram formatting. "
         "Supported: **bold**, *italic*, ~~strikethrough~~, ||spoiler||, "
         "`inline code`, ```code blocks```, [links](url), and ## headers. "
-        "Telegram has NO table syntax — prefer bullet lists or labeled "
-        "key: value pairs over pipe tables (any tables you do emit are "
-        "auto-rewritten into row-group bullets, which you can produce "
-        "directly for cleaner output). "
+        "Telegram now supports rich Markdown, so lean into it: whenever it "
+        "makes the answer clearer or easier to scan, actively reach for real "
+        "Markdown tables (pipe `| col | col |` syntax), bullet and numbered "
+        "lists, task lists (`- [ ]` / `- [x]`), headings, nested blockquotes, "
+        "collapsible details, footnotes/references, math/formulas (`$...$`, "
+        "`$$...$$`), underline, subscript/superscript, marked (highlighted) "
+        "text, and anchors. Default to structured formatting over dense "
+        "paragraphs for any comparison, set of steps, key/value summary, or "
+        "tabular data. Prefer real Markdown tables and task lists over "
+        "hand-built bullet substitutes when presenting structured data; these "
+        "degrade gracefully (tables become readable bullet groups) when rich "
+        "rendering is unavailable, but advanced constructs like math and "
+        "collapsible details may render as plain source text in that case. "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
@@ -1138,7 +1164,7 @@ def build_skills_system_prompt(
         or get_session_env("HERMES_SESSION_PLATFORM")
         or ""
     )
-    disabled = get_disabled_skill_names()
+    disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1418,13 +1444,13 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
     lines = [
         "# Nous Subscription",
-        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browser Use) by default. Modal execution is optional.",
+        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, OpenAI Whisper STT, and browser automation (Browser Use) by default. Modal execution is optional.",
         "Current capability status:",
     ]
     lines.extend(_status_line(feature) for feature in features.items())
     lines.extend(
         [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys.",
+            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
             "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
             "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
             "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
