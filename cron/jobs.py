@@ -680,7 +680,9 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    fallback_providers: Optional[List[Dict[str, Any]]] = None,
     script: Optional[str] = None,
+    profile: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -763,6 +765,8 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_profile = _normalize_profile(profile)
+    normalized_fallback = _normalize_fallback_providers(fallback_providers)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -816,6 +820,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "fallback_providers": normalized_fallback,
+        "profile": normalized_profile,
     }
 
     with _jobs_lock():
@@ -907,24 +913,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
-        # Validate / normalize profile if present in updates.  Empty string or
-        # None both mean "clear the field" (restore old behaviour).
-        if "profile" in updates:
-            _profile = updates["profile"]
-            if _profile is None or _profile == "" or _profile is False:
-                updates["profile"] = None
-            else:
-                updates["profile"] = _normalize_profile(_profile)
+            # Validate / normalize profile if present in updates.  Empty string or
+            # None both mean "clear the field" (restore old behaviour).
+            if "profile" in updates:
+                _profile = updates["profile"]
+                if _profile is None or _profile == "" or _profile is False:
+                    updates["profile"] = None
+                else:
+                    updates["profile"] = _normalize_profile(_profile)
 
-        # Validate / normalize fallback_providers if present in updates.
-        # None clears the per-job override (the job inherits the profile
-        # chain again); explicit [] pins "no fallback"; malformed values
-        # raise ValueError — same contract as create_job(). Guards writers
-        # that bypass the cronjob tool (e.g. the web API passes raw updates).
-        if "fallback_providers" in updates:
-            updates["fallback_providers"] = _normalize_fallback_providers(
-                updates["fallback_providers"]
-            )
+            # Validate / normalize fallback_providers if present in updates.
+            # None clears the per-job override (the job inherits the profile
+            # chain again); explicit [] pins "no fallback"; malformed values
+            # raise ValueError — same contract as create_job(). Guards writers
+            # that bypass the cronjob tool (e.g. the web API passes raw updates).
+            if "fallback_providers" in updates:
+                updates["fallback_providers"] = _normalize_fallback_providers(
+                    updates["fallback_providers"]
+                )
 
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
