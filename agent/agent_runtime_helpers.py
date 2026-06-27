@@ -35,7 +35,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
-from agent.credential_pool import STATUS_EXHAUSTED
+from agent.credential_pool import STATUS_EXHAUSTED, STATUS_DEAD
 from agent.error_classifier import FailoverReason
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -773,9 +773,58 @@ def recover_with_credential_pool(
                 agent.provider or "provider",
             )
             return False, has_retried_429
+        # Per-turn refresh guard: if a credential-pool auth refresh
+        # "succeeds" at the OAuth-mint layer but the API still rejects
+        # the new token, the pool loop can spin indefinitely
+        # (try_refresh_current → swap → retry request → 401 →
+        #  try_refresh_current again).  After MAX_POOL_AUTH_REFRESHES
+        # per entry per turn, skip the refresh and rotate instead so
+        # the stuck-worker class (Kanban live-but-no-progress auth
+        # loop) cannot form.  See hermes-runtime-routing-debugging
+        # reference: `openai-codex-profile-auth-recovery.md`.
+        MAX_POOL_AUTH_REFRESHES = 3
+        if not hasattr(agent, "_pool_auth_refresh_counts"):
+            agent._pool_auth_refresh_counts = {}
+        current_entry = pool.current()
+        entry_id = (current_entry and current_entry.id) or "?"
+        agent._pool_auth_refresh_counts.setdefault(entry_id, 0)
+        if agent._pool_auth_refresh_counts[entry_id] >= MAX_POOL_AUTH_REFRESHES:
+            _ra().logger.warning(
+                "Credential pool auth refresh guard: entry %s already "
+                "refreshed %d× this turn — marking DEAD and rotating",
+                entry_id, agent._pool_auth_refresh_counts[entry_id],
+            )
+            # Mark the loop-bait entry DEAD via _mark_exhausted with a
+            # "refresh-loop-guard" reason, which _is_terminal_auth_failure
+            # recognises (see credential_pool._TERMINAL_AUTH_REASONS).
+            pool._mark_exhausted(
+                current_entry,
+                401,
+                error_context={"reason": "refresh-loop-guard"},
+            )
+            rotate_status = status_code if status_code is not None else 401
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status, error_context=error_context)
+            if next_entry is not None:
+                _ra().logger.info(
+                    "Credential %s (refresh-loop guard fired) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, False
+            return False, has_retried_429
+
         refreshed = pool.try_refresh_current()
         if refreshed is not None:
-            _ra().logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+            agent._pool_auth_refresh_counts[entry_id] += 1
+            _ra().logger.info(
+                "Credential auth failure — refreshed pool entry %s "
+                "(attempt %d/%d this turn)",
+                getattr(refreshed, "id", "?"),
+                agent._pool_auth_refresh_counts[entry_id],
+                MAX_POOL_AUTH_REFRESHES,
+            )
             agent._swap_credential(refreshed)
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
