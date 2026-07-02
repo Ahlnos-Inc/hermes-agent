@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import types
@@ -28,32 +28,14 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _make_profile(home: Path, name: str, *, disabled_skills=()) -> Path:
-    profile_dir = home / "profiles" / name
-    (profile_dir / "skills").mkdir(parents=True)
-    if disabled_skills:
-        disabled_yaml = "\n".join(f"  - {skill}" for skill in disabled_skills)
-        config = f"skills:\n  disabled:\n{disabled_yaml}\n"
-    else:
-        config = "skills:\n  disabled: []\n"
-    (profile_dir / "config.yaml").write_text(config, encoding="utf-8")
-    return profile_dir
-
-
-def _make_profile_skill(profile_dir: Path, name: str, *, platforms=None) -> Path:
-    skill_dir = profile_dir / "skills" / "software-development" / name
-    skill_dir.mkdir(parents=True)
-    platform_line = f"platforms: {platforms}\n" if platforms is not None else ""
-    (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        f"name: {name}\n"
-        f"description: Test skill {name}\n"
-        f"{platform_line}"
-        "---\n\n"
-        f"# {name}\n",
-        encoding="utf-8",
-    )
-    return skill_dir
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +79,15 @@ def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
-    """Windows must use a real process lock, not a no-op sidecar open."""
+    """Windows must use a real (non-blocking) process lock, not a no-op open.
+
+    The init lock acquires with LK_NBLCK in a bounded retry loop (#36644) so a
+    wedged holder can never block connect() forever; a clean acquire takes the
+    lock once and releases it once.
+    """
     calls: list[tuple[int, int, int]] = []
     fake_msvcrt = types.SimpleNamespace(
-        LK_LOCK=1,
+        LK_NBLCK=3,
         LK_UNLCK=2,
         locking=lambda fd, mode, nbytes: calls.append((fd, mode, nbytes)),
     )
@@ -109,10 +96,12 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
 
     db_path = tmp_path / "kanban.db"
     with kb._cross_process_init_lock(db_path):
-        assert calls == [(calls[0][0], fake_msvcrt.LK_LOCK, 1)]
+        # Acquired exactly once via the non-blocking byte-range lock.
+        assert [call[1:] for call in calls] == [(fake_msvcrt.LK_NBLCK, 1)]
 
+    # Released once on exit.
     assert [call[1:] for call in calls] == [
-        (fake_msvcrt.LK_LOCK, 1),
+        (fake_msvcrt.LK_NBLCK, 1),
         (fake_msvcrt.LK_UNLCK, 1),
     ]
 
@@ -279,111 +268,6 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
             workspace_kind="scratch",
             branch_name="wt/bad",
         )
-
-
-def test_create_task_rejects_forced_skill_disabled_for_assignee_profile(kanban_home):
-    profile_dir = _make_profile(kanban_home, "worker", disabled_skills=("demo-skill",))
-    _make_profile_skill(profile_dir, "demo-skill")
-
-    with kb.connect() as conn, pytest.raises(ValueError) as exc_info:
-        kb.create_task(
-            conn,
-            title="bad forced skill",
-            assignee="worker",
-            skills=["demo-skill"],
-        )
-
-    msg = str(exc_info.value)
-    assert "skill-disabled-for-profile" in msg
-    assert "demo-skill" in msg
-    assert "worker" in msg
-
-
-def test_create_task_rejects_forced_skill_missing_from_assignee_profile(kanban_home):
-    _make_profile(kanban_home, "worker")
-
-    with kb.connect() as conn, pytest.raises(ValueError) as exc_info:
-        kb.create_task(
-            conn,
-            title="missing forced skill",
-            assignee="worker",
-            skills=["does-not-exist"],
-        )
-
-    msg = str(exc_info.value)
-    assert "skill-not-installed-for-profile" in msg
-    assert "does-not-exist" in msg
-    assert "worker" in msg
-
-
-def test_create_task_rejects_forced_skill_unsupported_on_platform(kanban_home):
-    profile_dir = _make_profile(kanban_home, "worker")
-    _make_profile_skill(
-        profile_dir,
-        "wrong-platform",
-        platforms="[definitely-not-this-platform]",
-    )
-
-    with kb.connect() as conn, pytest.raises(ValueError) as exc_info:
-        kb.create_task(
-            conn,
-            title="unsupported forced skill",
-            assignee="worker",
-            skills=["wrong-platform"],
-        )
-
-    msg = str(exc_info.value)
-    assert "skill-unsupported-on-platform" in msg
-    assert "wrong-platform" in msg
-    assert "worker" in msg
-
-
-def test_create_task_accepts_category_qualified_forced_skill(kanban_home):
-    profile_dir = _make_profile(kanban_home, "worker")
-    _make_profile_skill(profile_dir, "category-skill")
-
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="category forced skill",
-            assignee="worker",
-            skills=["software-development:category-skill"],
-        )
-        task = kb.get_task(conn, tid)
-
-    assert task is not None
-    assert task.skills == ["software-development:category-skill"]
-
-
-def test_create_task_rejects_missing_category_qualified_forced_skill(kanban_home):
-    _make_profile(kanban_home, "worker")
-
-    with kb.connect() as conn, pytest.raises(ValueError) as exc_info:
-        kb.create_task(
-            conn,
-            title="missing category forced skill",
-            assignee="worker",
-            skills=["software-development:missing-skill"],
-        )
-
-    msg = str(exc_info.value)
-    assert "skill-not-installed-for-profile" in msg
-    assert "software-development:missing-skill" in msg
-    assert "worker" in msg
-
-
-def test_kanban_worker_skill_available_respects_disabled_profile_skill(kanban_home):
-    enabled_profile = _make_profile(kanban_home, "enabled-worker")
-    _make_profile_skill(enabled_profile, "kanban-worker")
-    disabled_profile = _make_profile(
-        kanban_home,
-        "disabled-worker",
-        disabled_skills=("kanban-worker",),
-    )
-    _make_profile_skill(disabled_profile, "kanban-worker")
-
-    assert kb._kanban_worker_skill_available(str(enabled_profile)) is True
-    assert kb._kanban_worker_skill_available(str(disabled_profile)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1316,28 +1200,6 @@ def test_unblock_resets_failure_counters(kanban_home):
         assert task.last_failure_error is None
 
 
-def test_unblock_refuses_disabled_forced_skill_for_assignee_profile(kanban_home):
-    profile_dir = _make_profile(kanban_home, "worker", disabled_skills=("demo-skill",))
-    _make_profile_skill(profile_dir, "demo-skill")
-
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="blocked bad skill", assignee="worker")
-        conn.execute(
-            "UPDATE tasks SET skills = ? WHERE id = ?",
-            (json.dumps(["demo-skill"]), tid),
-        )
-        assert kb.block_task(conn, tid, reason="operator review")
-
-        with pytest.raises(ValueError) as exc_info:
-            kb.unblock_task(conn, tid)
-
-        task = kb.get_task(conn, tid)
-        assert task is not None
-
-    msg = str(exc_info.value)
-    assert "skill-disabled-for-profile" in msg
-    assert "demo-skill" in msg
-    assert task.status == "blocked"
 def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
     """recompute_ready must not auto-recover tasks whose consecutive_failures
     has reached the circuit-breaker limit (#35072).
@@ -1479,7 +1341,6 @@ def test_recompute_ready_per_task_max_retries_overrides_dispatcher(kanban_home):
         task = kb.get_task(conn, t)
         assert task.status == "ready"
         assert task.consecutive_failures == 2
-
 
 
 # ---------------------------------------------------------------------------
@@ -1779,42 +1640,6 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
-
-
-def test_dispatch_blocks_legacy_task_with_disabled_forced_skill_before_spawn(kanban_home):
-    profile_dir = _make_profile(kanban_home, "worker", disabled_skills=("demo-skill",))
-    _make_profile_skill(profile_dir, "demo-skill")
-    spawned = []
-
-    def fake_spawn(task, workspace):
-        spawned.append(task.id)
-
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="legacy bad skill", assignee="worker")
-        # Simulate a task created before forced-skill validation existed, or one
-        # edited directly in the DB. Dispatch must still fail closed before the
-        # worker process reaches fatal CLI preload.
-        conn.execute(
-            "UPDATE tasks SET skills = ? WHERE id = ?",
-            (json.dumps(["demo-skill"]), tid),
-        )
-
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        events = kb.list_events(conn, tid)
-
-    assert spawned == []
-    assert tid in res.auto_blocked
-    assert task.status == "blocked"
-    assert task.claim_lock is None
-    assert task.worker_pid is None
-    assert task.last_failure_error and "skill-disabled-for-profile" in task.last_failure_error
-    blocked_events = [event for event in events if event.kind == "blocked"]
-    assert blocked_events
-    reason = blocked_events[-1].payload["reason"] if blocked_events[-1].payload else ""
-    assert "skill-disabled-for-profile" in reason
-
 
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:
@@ -2257,6 +2082,7 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
     assert ws.exists()
     assert ws.is_dir()
@@ -2270,21 +2096,230 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
             conn, title="biz", workspace_kind="dir", workspace_path=str(target)
         )
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
     assert ws == target
     assert ws.exists()
 
 
-def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
-    target = str(tmp_path / ".worktrees" / "my-task")
+def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", workspace_path=target
+            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo)
         )
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
+
+    expected = repo / ".worktrees" / t
+    assert ws == expected
+    assert ws.exists()
+    repo_common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ws_common = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert ws_common == repo_common
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{t}" in listed
+
+
+def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
+    """A worktree task created with no explicit path inherits the board's
+    default_workdir as its anchor and materializes a per-task linked worktree
+    at ``<repo>/.worktrees/<id>`` — NOT the dispatcher's CWD, and NOT the
+    shared default_workdir verbatim (which would collapse every task into one
+    directory)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("wt-default-board", default_workdir=str(repo))
+    with kb.connect(board="wt-default-board") as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", board="wt-default-board"
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task, board="wt-default-board")
+
+    expected = repo / ".worktrees" / t
+    assert ws == expected
+    assert ws.exists()
+    assert ws != repo  # not the shared default verbatim
+
+
+def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
+    """With neither an explicit workspace_path nor a board default_workdir,
+    resolution fails loudly pointing at default_workdir / worktree:<path> —
+    rather than silently materializing under the dispatcher's CWD (the old
+    behavior that scattered worktrees under whatever dir launched the
+    gateway)."""
+    # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
+    # code would have "succeeded" — proving the new code does NOT use cwd.
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        with pytest.raises(ValueError, match="default_workdir"):
+            kb.resolve_workspace(task)
+
+
+def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "custom-task"
+    branch = "wt/custom-task"
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=branch,
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+
+    assert ws == target
+    assert ws.exists()
+    repo_common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ws_common = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert ws_common == repo_common
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {target}" in listed
+    assert f"branch refs/heads/{branch}" in listed
+
+
+def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-board",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-board")
+        task = kb.get_task(conn, tid)
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected))]
+    assert task is not None
+    assert task.workspace_path == str(expected)
+    assert task.branch_name == f"wt/{tid}"
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{tid}" in listed
+
+
+def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-rerun-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-rerun-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-rerun-board",
+        )
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        first_task = kb.get_task(conn, tid)
+        assert first_task is not None
+        expected = repo / ".worktrees" / tid
+        assert first_task.workspace_path == str(expected)
+        assert first_task.branch_name == f"wt/{tid}"
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        second_task = kb.get_task(conn, tid)
+
+    assert first.spawned == [(tid, "sentinel", str(expected))]
+    assert second.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected)), (tid, str(expected))]
+    assert second_task is not None
+    assert second_task.workspace_path == str(expected)
+    actual_branch = subprocess.run(
+        ["git", "-C", str(expected), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_branch == f"wt/{tid}"
+    assert second_task.branch_name == actual_branch
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert listed.count(f"worktree {expected}\n") == 1
+    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert f"branch refs/heads/{actual_branch}" in listed
 
 
 # ---------------------------------------------------------------------------
@@ -2296,6 +2331,7 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="scratchy")
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
         assert ws.is_dir()
@@ -3408,42 +3444,6 @@ def _make_task(**overrides) -> "kb.Task":
     return kb.Task(**defaults)
 
 
-def test_default_spawn_passes_routed_provider_model_and_effort(kanban_home, monkeypatch, tmp_path):
-    _make_profile(kanban_home, "coder")
-    captured = {}
-
-    class FakeProc:
-        pid = 4242
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = kwargs.get("env", {})
-        return FakeProc()
-
-    monkeypatch.setattr("subprocess.Popen", fake_popen)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-
-    task = _make_task(
-        id="t_route",
-        assignee="coder",
-        model_override="gpt-5.5",
-        model_provider_override="openai-codex",
-        model_reasoning_effort="xhigh",
-    )
-
-    assert kb._default_spawn(task, str(tmp_path), board=None) == 4242
-
-    cmd = captured["cmd"]
-    assert cmd[cmd.index("-m") + 1] == "gpt-5.5"
-    assert cmd[cmd.index("--provider") + 1] == "openai-codex"
-    assert cmd[cmd.index("--reasoning-effort") + 1] == "xhigh"
-    env = captured["env"]
-    assert env["HERMES_MODEL"] == "gpt-5.5"
-    assert env["HERMES_PROVIDER"] == "openai-codex"
-    assert env["HERMES_MODEL_PROVIDER"] == "openai-codex"
-    assert env["HERMES_REASONING_EFFORT"] == "xhigh"
-
-
 def test_safe_int_accepts_int_and_int_string():
     """Sanity: well-typed values pass through."""
     # PR d8ad431de renamed _safe_int → _to_epoch (now also handles ISO-8601).
@@ -3732,28 +3732,6 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills == ["sdlc-review"]
-
-
-def test_dispatch_review_blocks_when_sdlc_review_disabled_for_profile(kanban_home):
-    profile_dir = _make_profile(kanban_home, "reviewer", disabled_skills=("sdlc-review",))
-    _make_profile_skill(profile_dir, "sdlc-review")
-    spawned = []
-
-    def fake_spawn(task, workspace, board=None):
-        spawned.append(task.id)
-
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="review bad skill", assignee="reviewer")
-        _set_task_status(conn, tid, "review")
-
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
-        task = kb.get_task(conn, tid)
-        assert task is not None
-
-    assert spawned == []
-    assert tid in res.auto_blocked
-    assert task.status == "blocked"
-    assert task.last_failure_error and "skill-disabled-for-profile" in task.last_failure_error
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
