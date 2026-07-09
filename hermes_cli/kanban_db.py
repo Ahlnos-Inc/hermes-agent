@@ -6220,7 +6220,7 @@ def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> 
     :class:`DispatchResult` objects into a compact, human-readable breakdown
     (BUILD-263), e.g.::
 
-        "respawn_guarded(active_pr)=3, quota=1"
+        "respawn_guarded(recent_success)=3, quota=1"
 
     Used by the gateway's/CLI's "dispatcher stuck" warning and Telegram
     escalation so an operator sees *why* zero workers spawned instead of
@@ -6231,7 +6231,7 @@ def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> 
     Buckets, ordered by descending count (ties broken alphabetically):
 
     * ``respawn_guarded(<reason>)`` — non-quota respawn-guard reasons
-      (``active_pr``, ``recent_success``, ``forced_skill_validation``).
+      (``recent_success``, ``forced_skill_validation``).
     * ``quota`` — respawn-guard reasons ``blocker_auth`` /
       ``rate_limit_cooldown``, plus post-crash ``rate_limited`` requeues.
       Retrying immediately won't help; the provider needs to cool down.
