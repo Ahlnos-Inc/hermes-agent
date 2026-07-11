@@ -2440,32 +2440,58 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # each task quietly but the operator has no signal that the dispatcher
     # itself is dysfunctional.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {
+        "bad_ticks": 0,
+        "log_cooldowns": kb.DispatchHealthLogCooldowns(),
+        "results": [],
+    }
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1
+            health_state["results"].append(res)
+            if len(health_state["results"]) > 500:
+                del health_state["results"][:-500]
         else:
             health_state["bad_ticks"] = 0
+            health_state["results"].clear()
         # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
         # so log volume stays bounded while the problem persists.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
-            # Rate-limit repeats: at most one warning per 5 minutes.
-            if now - health_state["last_warn_at"] >= 300:
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
-                    f"consecutive ticks but 0 workers spawned successfully. "
-                    f"Check profile health (venv, PATH, credentials) and "
-                    f"`hermes kanban list --status ready` / "
-                    f"`hermes kanban list --status blocked` for recent "
-                    f"spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+            # Rate-limit repeats per classification: at most one capacity
+            # INFO and one actionable WARN per 5 minutes.
+            counts = kb.dispatch_cause_counts(health_state["results"])
+            capacity_only = kb.dispatch_causes_capacity_only(counts)
+            if health_state["log_cooldowns"].should_emit(
+                capacity_only=capacity_only, now=now,
+            ):
+                if capacity_only:
+                    # Counts accumulate across the streak, so no per-task
+                    # figure here — the causes breakdown carries the
+                    # cumulative counts, same convention as the WARN path.
+                    causes = kb.summarize_dispatch_causes(health_state["results"])
+                    print(
+                        f"[{_fmt_ts(now)}] INFO dispatcher at capacity: "
+                        f"ready tasks deferred by concurrency caps for "
+                        f"{health_state['bad_ticks']} consecutive ticks "
+                        f"(causes: {causes}) — healthy; drains when a running worker "
+                        f"finishes.",
+                        file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
+                        f"ready queue non-empty for {health_state['bad_ticks']} "
+                        f"consecutive ticks but 0 workers spawned successfully. "
+                        f"Check profile health (venv, PATH, credentials) and "
+                        f"`hermes kanban list --status ready` / "
+                        f"`hermes kanban list --status blocked` for recent "
+                        f"spawn_failed tasks.",
+                        file=sys.stderr, flush=True,
+                    )
         if not verbose:
             return
         did_work = (

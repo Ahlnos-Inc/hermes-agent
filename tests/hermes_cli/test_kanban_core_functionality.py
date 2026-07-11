@@ -3703,6 +3703,41 @@ def test_cli_daemon_help_marks_deprecated():
     )
 
 
+def test_cli_daemon_capacity_info_does_not_suppress_actionable_warn(
+    kanban_home, monkeypatch, capsys,
+):
+    """A capacity INFO and subsequent failure use independent cooldowns."""
+    from contextlib import nullcontext
+    from hermes_cli import kanban as kb_cli
+
+    capacity = kb.DispatchResult(max_in_progress_deferred=1)
+    actionable = kb.DispatchResult(
+        max_in_progress_deferred=1,
+        spawn_errors=[("t-failed", "boom")],
+    )
+
+    def _run_daemon(*, on_tick, **_kwargs):
+        for _ in range(6):
+            on_tick(capacity)
+        on_tick(actionable)
+        on_tick(actionable)
+
+    monkeypatch.setattr(kb, "run_daemon", _run_daemon)
+    monkeypatch.setattr(kb, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kb, "has_spawnable_ready", lambda _conn: True)
+    monkeypatch.setattr(kb_cli.time, "time", lambda: 1000)
+
+    ns = argparse.Namespace(
+        force=True, interval=5.0, max=None, failure_limit=3,
+        pidfile=None, verbose=False,
+    )
+    assert kb_cli._cmd_daemon(ns) == 0
+
+    err = capsys.readouterr().err
+    assert err.count("INFO dispatcher at capacity") == 1
+    assert err.count("WARN dispatcher stuck") == 1
+
+
 # ---------------------------------------------------------------------------
 # Gateway embedded dispatcher watcher
 # ---------------------------------------------------------------------------

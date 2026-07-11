@@ -7160,12 +7160,73 @@ class DispatchResult:
 # operators reach for the same remediation (wait, or fix credentials)
 # regardless of which of the two paths stamped it.
 _QUOTA_RESPAWN_GUARD_REASONS = frozenset({"blocker_auth", "rate_limit_cooldown"})
+CAPACITY_ONLY_CAUSES = frozenset({"concurrency_cap", "concurrency_cap(per_profile)"})
+
+
+@dataclass
+class DispatchHealthLogCooldowns:
+    """Rate-limit capacity and actionable dispatcher health logs separately."""
+
+    cooldown_seconds: float = 300.0
+    last_capacity_at: Optional[float] = None
+    last_actionable_at: Optional[float] = None
+
+    def should_emit(self, *, capacity_only: bool, now: float) -> bool:
+        attr = "last_capacity_at" if capacity_only else "last_actionable_at"
+        last_emitted = getattr(self, attr)
+        if (
+            last_emitted is not None
+            and now - last_emitted < self.cooldown_seconds
+        ):
+            return False
+        setattr(self, attr, now)
+        return True
+
+
+def dispatch_cause_counts(
+    results: "Iterable[Optional[DispatchResult]]",
+) -> "dict[str, int]":
+    """Aggregate per-cause spawn-refusal counts across ``results``.
+
+    ``None`` entries are skipped defensively when a board raises before
+    producing a :class:`DispatchResult`.
+    """
+    counts: "dict[str, int]" = {}
+
+    def _bump(key: str, n: int = 1) -> None:
+        if n:
+            counts[key] = counts.get(key, 0) + n
+
+    for result in results:
+        if result is None:
+            continue
+        for _tid, reason in result.respawn_guarded:
+            if reason in _QUOTA_RESPAWN_GUARD_REASONS:
+                _bump("quota")
+            else:
+                _bump(f"respawn_guarded({reason})")
+        _bump("quota", len(result.rate_limited))
+        _bump("unassigned", len(result.skipped_unassigned))
+        _bump("nonspawnable", len(result.skipped_nonspawnable))
+        _bump("concurrency_cap", getattr(result, "max_in_progress_deferred", 0) or 0)
+        if result.skipped_per_profile_capped:
+            _bump("concurrency_cap(per_profile)", len(result.skipped_per_profile_capped))
+        _bump("claim_race", len(getattr(result, "claim_race", []) or []))
+        _bump("workspace_collision", len(result.workspace_collisions))
+        _bump("spawn_exception", len(getattr(result, "spawn_errors", []) or []))
+        if result.skipped_locked:
+            _bump("dispatch_lock_contended")
+
+    return counts
+
+
+def dispatch_causes_capacity_only(counts: "dict[str, int]") -> bool:
+    """Whether ``counts`` contains only intentional concurrency deferrals."""
+    return bool(counts) and CAPACITY_ONLY_CAUSES.issuperset(counts)
 
 
 def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> str:
-    """Aggregate per-cause spawn-refusal counts across one or more
-    :class:`DispatchResult` objects into a compact, human-readable breakdown
-    (BUILD-263), e.g.::
+    """Format per-cause spawn-refusal counts, e.g.::
 
         "respawn_guarded(recent_success)=3, quota=1"
 
@@ -7198,32 +7259,7 @@ def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> 
 
     Returns ``""`` when every bucket is empty (nothing to report).
     """
-    counts: "dict[str, int]" = {}
-
-    def _bump(key: str, n: int = 1) -> None:
-        if n:
-            counts[key] = counts.get(key, 0) + n
-
-    for result in results:
-        if result is None:
-            continue
-        for _tid, reason in result.respawn_guarded:
-            if reason in _QUOTA_RESPAWN_GUARD_REASONS:
-                _bump("quota")
-            else:
-                _bump(f"respawn_guarded({reason})")
-        _bump("quota", len(result.rate_limited))
-        _bump("unassigned", len(result.skipped_unassigned))
-        _bump("nonspawnable", len(result.skipped_nonspawnable))
-        _bump("concurrency_cap", getattr(result, "max_in_progress_deferred", 0) or 0)
-        if result.skipped_per_profile_capped:
-            _bump("concurrency_cap(per_profile)", len(result.skipped_per_profile_capped))
-        _bump("claim_race", len(getattr(result, "claim_race", []) or []))
-        _bump("workspace_collision", len(result.workspace_collisions))
-        _bump("spawn_exception", len(getattr(result, "spawn_errors", []) or []))
-        if result.skipped_locked:
-            _bump("dispatch_lock_contended")
-
+    counts = dispatch_cause_counts(results)
     if not counts:
         return ""
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
