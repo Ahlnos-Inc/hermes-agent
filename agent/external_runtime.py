@@ -228,7 +228,14 @@ def run_claude_agent_sdk_attempt(
 
     if key not in sessions:
         from model_tools import handle_function_call
-        file_broker = WorkspaceFileBroker(workspace)
+        from hermes_cli.profiles import get_active_profile_name
+
+        worker_profile = get_active_profile_name()
+        file_broker = WorkspaceFileBroker(
+            workspace,
+            deny_credential_reads=worker_profile.strip().lower()
+            in {"reviewer", "verifier"},
+        )
 
         def _options(resume: str | None) -> Any:
             return build_claude_agent_options(
@@ -251,6 +258,7 @@ def run_claude_agent_sdk_attempt(
                 capability_mode=str(
                     getattr(agent, "_claude_capability_mode", "worker") or "worker"
                 ),
+                worker_profile=worker_profile,
                 auxiliary_tool_names=tuple(
                     getattr(agent, "_claude_auxiliary_tool_names", ()) or ()
                 ),

@@ -13,11 +13,22 @@ from agent.claude_sdk_mcp import build_hermes_sdk_mcp_server
 from agent.claude_process_scope import WorkerProcessBroker
 from agent.claude_subscription_env import build_claude_subscription_env
 from agent.claude_tool_guard import create_workspace_pre_tool_hook
-from agent.claude_workspace_terminal import build_workspace_terminal_args
+from agent.claude_workspace_terminal import (
+    build_workspace_terminal_args,
+    dispatch_read_only_workspace_terminal,
+)
 from agent.claude_workspace_files import WorkspaceFileBroker
 
 
 _BUILTIN_TOOLS: tuple[str, ...] = ()
+_READ_ONLY_WORKER_PROFILES = frozenset({"reviewer", "verifier"})
+
+
+def _is_read_only_worker(capability_mode: str, worker_profile: str | None) -> bool:
+    return (
+        capability_mode == "worker"
+        and str(worker_profile or "").strip().lower() in _READ_ONLY_WORKER_PROFILES
+    )
 
 
 def load_claude_agent_sdk() -> Any:
@@ -36,6 +47,7 @@ def _mcp_tool_names(
     *,
     capability_mode: str,
     auxiliary_tool_names: Iterable[str],
+    worker_profile: str | None,
 ) -> list[str]:
     available: set[str] = set()
     names: list[str] = []
@@ -46,13 +58,12 @@ def _mcp_tool_names(
         name = str(function.get("name") or "")
         if name:
             available.add(name)
-        if capability_mode == "worker" and (name.startswith("kanban_") or name in {
-            "terminal",
-            "process",
-            "read_file",
-            "write_file",
-        }):
-            names.append(name)
+        if capability_mode == "worker":
+            worker_tools = {"terminal", "process", "read_file", "write_file"}
+            if _is_read_only_worker(capability_mode, worker_profile):
+                worker_tools = {"terminal", "read_file"}
+            if name.startswith("kanban_") or name in worker_tools:
+                names.append(name)
     if capability_mode == "auxiliary":
         required = {str(name) for name in auxiliary_tool_names if str(name)}
         if not required:
@@ -89,6 +100,7 @@ def build_claude_agent_options(
     file_broker: WorkspaceFileBroker | None = None,
     capability_mode: str = "worker",
     auxiliary_tool_names: Iterable[str] = (),
+    worker_profile: str | None = None,
 ) -> Any:
     """Create the sole supported Claude runtime policy: an isolated worker.
 
@@ -112,12 +124,21 @@ def build_claude_agent_options(
         tool_definitions,
         capability_mode=capability_mode,
         auxiliary_tool_names=auxiliary_tool_names,
+        worker_profile=worker_profile,
     )
-    file_broker = file_broker or WorkspaceFileBroker(workspace_path)
+    read_only_worker = _is_read_only_worker(capability_mode, worker_profile)
+    file_broker = file_broker or WorkspaceFileBroker(
+        workspace_path,
+        deny_credential_reads=read_only_worker,
+    )
+    if read_only_worker:
+        file_broker.deny_credentials_for_read_only_worker()
     process_broker = WorkerProcessBroker(effective_task_id) if "process" in tool_names else None
 
     def _transform(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "terminal":
+            return arguments
+        if read_only_worker:
             return arguments
         return build_workspace_terminal_args(
             arguments,
@@ -135,6 +156,20 @@ def build_claude_agent_options(
         argument_transform=_transform,
         handler_overrides={
             **({"process": process_broker.handle} if process_broker is not None else {}),
+            **(
+                {
+                    "terminal": lambda args: dispatch_read_only_workspace_terminal(
+                        args,
+                        workspace=workspace_path,
+                        host_home=host_home_path,
+                        exact_env=env,
+                        dispatch=dispatch,
+                        task_id=effective_task_id,
+                    )
+                }
+                if read_only_worker and "terminal" in tool_names
+                else {}
+            ),
             **(
                 {"read_file": lambda args: file_broker.handle("read_file", args)}
                 if "read_file" in tool_names
