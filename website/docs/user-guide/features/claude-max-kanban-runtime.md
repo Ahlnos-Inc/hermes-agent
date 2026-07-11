@@ -113,8 +113,9 @@ The SDK worker receives a small in-process Hermes MCP surface:
   workspace with symlink and linked-file rejection;
 - `terminal`, run with an exact environment, workspace-only writes, network
   disabled, and a stable default-deny Seatbelt profile that reads only the
-  workspace, read-only Git common directory, and explicit system/toolchain
-  roots;
+  workspace, explicit system/toolchain roots, and the Git metadata required to
+  stage and commit on the active worktree branch. Shared configuration, other
+  refs, and existing Git objects remain read-only;
 - `process`, limited to processes owned by the current worker task.
 
 When the same Claude runtime performs a background memory/skill review, it gets

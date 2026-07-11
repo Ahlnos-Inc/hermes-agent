@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,7 @@ def build_workspace_seatbelt_profile(
     restrict_reads: bool = True,
     control_write_paths: list[str | Path] | None = None,
     control_write_roots: list[str | Path] | None = None,
+    git_object_roots: list[str | Path] | None = None,
 ) -> str:
     """Build a deny-by-default write boundary with workspace-only effects."""
 
@@ -182,24 +184,169 @@ def build_workspace_seatbelt_profile(
     for writable_root in control_write_roots or []:
         path = Path(writable_root).expanduser().resolve(strict=False)
         lines.append(f"(allow file-write* (subpath {_seatbelt_string(path)}))")
+    for object_root in git_object_roots or []:
+        path = Path(object_root).expanduser().resolve(strict=False)
+        # Git creates immutable loose objects through a temporary file. Permit
+        # new paths in the object database, but never mutation or deletion of
+        # an existing object. Only Git's tmp_obj_* files may be changed or
+        # removed after creation.
+        lines.append(
+            f"(allow file-write-create (subpath {_seatbelt_string(path)}))"
+        )
+        lines.append(
+            "(allow file-write-create file-write-data file-write-mode "
+            "file-write-unlink "
+            f"(require-all (subpath {_seatbelt_string(path)}) "
+            '(regex #"tmp_obj_")))'
+        )
     return "\n".join(lines)
 
 
-def _git_common_dir(root: Path) -> Path | None:
-    git = shutil.which("git")
-    if not git:
+@dataclass(frozen=True)
+class _GitSandboxMetadata:
+    common_dir: Path
+    worktree_git_dir: Path | None
+    object_dir: Path | None
+    control_write_paths: tuple[Path, ...]
+
+
+def _selected_git(exact_path: str) -> Path | None:
+    """Resolve Git outside Seatbelt, avoiding Apple's xcrun launcher."""
+
+    actual_darwin = platform.system() == "Darwin"
+    if actual_darwin:
+        # Only probe fixed toolchain locations outside the sandbox. Executing
+        # an arbitrary PATH candidate here would let a workspace-controlled
+        # `git` run before Seatbelt starts.
+        for candidate in (Path("/opt/homebrew/bin/git"), Path("/usr/local/bin/git")):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.absolute()
+        try:
+            result = subprocess.run(
+                ["/usr/bin/xcrun", "--find", "git"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            candidate = Path(result.stdout.strip())
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.absolute()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+    ambient = shutil.which("git", path=exact_path) or shutil.which("git")
+    return Path(ambient).absolute() if ambient else None
+
+
+def _git_output(git: Path, root: Path, *arguments: str) -> str:
+    clean_env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    clean_env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "HOME": str(root),
+        }
+    )
+    result = subprocess.run(
+        [str(git), "-C", str(root), *arguments],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata | None:
+    """Discover the minimum external metadata needed by a linked worktree."""
+
+    if git is None:
         return None
     try:
-        result = subprocess.run(
-            [git, "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
+        common_dir = Path(
+            _git_output(
+                git,
+                root,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        ).expanduser().resolve()
+        git_dir = Path(
+            _git_output(
+                git,
+                root,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+            )
+        ).expanduser().resolve()
+        if not common_dir.is_dir() or not git_dir.is_dir():
+            return None
+        if git_dir.is_relative_to(root):
+            return _GitSandboxMetadata(common_dir, None, None, ())
+        linked_root = common_dir / "worktrees"
+        if not git_dir.is_relative_to(linked_root):
+            raise RuntimeError(
+                "Claude terminal rejected Git metadata outside the workspace: "
+                f"{git_dir}"
+            )
+        object_dir = (common_dir / "objects").resolve()
+        if not object_dir.is_dir() or not object_dir.is_relative_to(common_dir):
+            raise RuntimeError(
+                "Claude terminal rejected Git object storage outside the common "
+                f"directory: {object_dir}"
+            )
+        packed_refs_lock = common_dir / "packed-refs.lock"
+        if packed_refs_lock.resolve(strict=False) != packed_refs_lock:
+            raise RuntimeError("Claude terminal rejected linked Git packed-refs lock")
+        control_paths: list[Path] = [packed_refs_lock]
+        try:
+            branch = _git_output(git, root, "symbolic-ref", "--quiet", "HEAD")
+        except subprocess.CalledProcessError:
+            branch = ""
+        if branch:
+            if not branch.startswith("refs/heads/"):
+                raise RuntimeError(f"Claude terminal rejected unexpected Git ref: {branch}")
+            branch_path = common_dir / branch
+            ref = branch_path.resolve(strict=False)
+            heads = (common_dir / "refs" / "heads").resolve(strict=False)
+            if ref != branch_path or not ref.is_relative_to(heads):
+                raise RuntimeError(f"Claude terminal rejected Git ref outside heads: {branch}")
+            ref_lock = Path(f"{ref}.lock")
+            reflog_path = common_dir / "logs" / branch
+            reflog = reflog_path.resolve(strict=False)
+            logs_heads = (common_dir / "logs" / "refs" / "heads").resolve(
+                strict=False
+            )
+            reflog_lock = Path(f"{reflog}.lock")
+            if (
+                ref_lock.resolve(strict=False) != ref_lock
+                or reflog != reflog_path
+                or not reflog.is_relative_to(logs_heads)
+                or reflog_lock.resolve(strict=False) != reflog_lock
+            ):
+                raise RuntimeError(
+                    f"Claude terminal rejected Git reflog outside heads: {branch}"
+                )
+            control_paths.extend(
+                [
+                    ref,
+                    ref_lock,
+                    reflog,
+                    reflog_lock,
+                ]
+            )
+        return _GitSandboxMetadata(
+            common_dir=common_dir,
+            worktree_git_dir=git_dir,
+            object_dir=object_dir,
+            control_write_paths=tuple(control_paths),
         )
-        path = Path(result.stdout.strip()).expanduser().resolve()
-        return path if path.exists() else None
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -278,13 +425,14 @@ def build_workspace_terminal_args(
     if not command:
         raise RuntimeError("Workspace terminal requires a command")
     _reject_linked_workspace_files(root)
+    git = _selected_git(str(exact_env.get("PATH", "")))
     executable_paths = [
         Path(path)
         for path in (
             sys.executable,
             shutil.which("uv"),
             shutil.which("rg"),
-            shutil.which("git"),
+            str(git) if git else None,
             str(root / ".venv" / "bin" / "python"),
             str(root / ".venv" / "bin" / "python3"),
         )
@@ -298,7 +446,7 @@ def build_workspace_terminal_args(
             executable_paths.append(target.absolute())
     executable_paths.extend(_mach_o_dependencies(executable_paths))
 
-    git_common_dir = _git_common_dir(root)
+    git_metadata = _git_sandbox_metadata(root, git)
     toolchain_roots = [
         Path(path)
         for path in (
@@ -307,14 +455,29 @@ def build_workspace_terminal_args(
         if Path(path).exists()
     ]
     toolchain_roots.extend(_homebrew_formula_roots(executable_paths))
-    if git_common_dir is not None and not git_common_dir.is_relative_to(root):
-        toolchain_roots.append(git_common_dir)
+    if git_metadata is not None and not git_metadata.common_dir.is_relative_to(root):
+        toolchain_roots.append(git_metadata.common_dir)
+    if git is not None and git.is_relative_to(Path("/Library/Developer")):
+        toolchain_roots.append(Path("/Library/Developer"))
     profile = build_workspace_seatbelt_profile(
         workspace=root,
         host_home=host,
         allow_network=False,
         readable_roots=toolchain_roots,
         readable_paths=executable_paths,
+        control_write_paths=(
+            list(git_metadata.control_write_paths) if git_metadata else None
+        ),
+        control_write_roots=(
+            [git_metadata.worktree_git_dir]
+            if git_metadata and git_metadata.worktree_git_dir
+            else None
+        ),
+        git_object_roots=(
+            [git_metadata.object_dir]
+            if git_metadata and git_metadata.object_dir
+            else None
+        ),
     )
     profile_path = _write_terminal_profile(profile)
     allowed_env_keys = {
@@ -334,6 +497,11 @@ def build_workspace_terminal_args(
         for key, value in exact_env.items()
         if key in allowed_env_keys
     }
+    if git is not None:
+        existing_path = terminal_env.get("PATH", "")
+        terminal_env["PATH"] = os.pathsep.join(
+            part for part in (str(git.parent), existing_path) if part
+        )
     terminal_env["HOME"] = str(root)
     terminal_tmp = root / ".hermes-claude-runtime" / "tmp"
     terminal_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)

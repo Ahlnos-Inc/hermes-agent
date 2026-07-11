@@ -10,6 +10,148 @@ import pytest
 from agent.claude_workspace_terminal import build_workspace_terminal_args
 
 
+def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "worktree"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes@example.invalid",
+            "commit",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "build/sandbox-test", str(workspace)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return repo, workspace
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_workspace_terminal_can_commit_in_linked_worktree_with_apple_git_path(tmp_path):
+    _, workspace = _linked_worktree(tmp_path)
+    transformed = build_workspace_terminal_args(
+        {
+            "command": (
+                "printf 'sandbox commit\\n' > committed.txt && "
+                "git add committed.txt && "
+                "git -c user.name='Hermes Test' "
+                "-c user.email=hermes@example.invalid commit -m sandbox"
+            )
+        },
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert subprocess.run(
+        ["git", "log", "-1", "--format=%s"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "sandbox"
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_workspace_terminal_keeps_shared_git_metadata_and_objects_immutable(tmp_path):
+    repo, workspace = _linked_worktree(tmp_path)
+    common_dir = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    main_ref = common_dir / "refs" / "heads" / "main"
+    config = common_dir / "config"
+    tree_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    existing_object = common_dir / "objects" / tree_oid[:2] / tree_oid[2:]
+    originals = {
+        config: config.read_bytes(),
+        main_ref: main_ref.read_bytes(),
+        existing_object: existing_object.read_bytes(),
+    }
+    transformed = build_workspace_terminal_args(
+        {
+            "command": "; ".join(
+                [
+                    f"printf hacked > {shlex.quote(str(config))}",
+                    f"printf hacked > {shlex.quote(str(main_ref))}",
+                    f"rm -f {shlex.quote(str(existing_object))}",
+                ]
+            )
+        },
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode != 0
+    assert "Operation not permitted" in result.stderr
+    assert {path: path.read_bytes() for path in originals} == originals
+    assert subprocess.run(
+        ["git", "status", "--short"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
 def test_workspace_terminal_denies_host_and_ambient_but_can_run_tests(tmp_path):
     host_home = tmp_path / "host"
