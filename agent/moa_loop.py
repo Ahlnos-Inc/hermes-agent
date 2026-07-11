@@ -604,8 +604,13 @@ def build_moa_reference_guidance(
             continue
         if isinstance(accounting.usage, CanonicalUsage):
             usage = usage + accounting.usage
-        if accounting.cost_usd is not None:
-            estimated_cost_usd = (estimated_cost_usd or 0) + accounting.cost_usd
+        cost_value = (
+            float(accounting.cost_usd)
+            if accounting.cost_usd is not None
+            else None
+        )
+        if cost_value is not None:
+            estimated_cost_usd = (estimated_cost_usd or 0.0) + cost_value
         billing_rows.append(
             {
                 "label": label,
@@ -615,7 +620,7 @@ def build_moa_reference_guidance(
                 "output_tokens": accounting.usage.output_tokens,
                 "cache_read_tokens": accounting.usage.cache_read_tokens,
                 "cache_write_tokens": accounting.usage.cache_write_tokens,
-                "estimated_cost_usd": accounting.cost_usd,
+                "estimated_cost_usd": cost_value,
                 "cost_status": accounting.cost_status,
                 "cost_source": accounting.cost_source,
             }

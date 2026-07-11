@@ -466,8 +466,8 @@ def record_moa_reference_usage(agent: Any, guidance: Any) -> dict[str, Any]:
                 ),
                 cost_status=cost_status,
                 cost_source=cost_source,
-                billing_provider="moa-reference",
-                model="reference-fanout",
+                billing_provider=str(getattr(agent, "provider", "") or "") or None,
+                model=str(getattr(agent, "model", "") or "") or None,
                 api_call_count=usage.request_count,
             )
         except Exception:
