@@ -78,7 +78,7 @@ def _write_terminal_profile(profile: str) -> Path:
     info = path.lstat()
     if (
         not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
+        or info.st_uid != os.geteuid()  # windows-footgun: ok — after Darwin-only Seatbelt guard
         or stat.S_IMODE(info.st_mode) != 0o600
         or info.st_nlink != 1
         or path.read_text(encoding="utf-8") != profile
