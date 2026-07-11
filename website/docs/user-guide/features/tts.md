@@ -44,6 +44,12 @@ Convert text to speech with ten providers:
 # In ~/.hermes/config.yaml
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper"
+  # Optional one-shot backup when the selected provider raises a runtime
+  # synthesis error. The fallback provider must differ from the primary.
+  fallback:
+    provider: "edge"
+    edge:
+      voice: "en-US-BrianNeural"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -98,6 +104,30 @@ tts:
 ```
 
 **Speed control**: The global `tts.speed` value applies to all providers by default. Each provider can override it with its own `speed` setting (e.g., `tts.openai.speed: 1.5`). Provider-specific speed takes precedence over the global value. Default is `1.0` (normal speed).
+
+### Provider fallback
+
+Set `tts.fallback` to keep voice replies working when the selected provider
+raises a runtime synthesis error, such as a Gemini quota error. Hermes retries
+the same text once with the named fallback provider. If that attempt also
+fails, Hermes returns the fallback provider's error and does not recurse.
+
+The fallback block uses the same provider-specific settings as the main `tts`
+block. It can select any built-in, command, or plugin provider. The fallback
+provider must be explicitly named and must differ from `tts.provider`.
+Configuration errors and missing local dependencies remain direct errors, and
+multi-provider fallback chains are not supported.
+
+```yaml
+tts:
+  provider: gemini
+  gemini:
+    voice: Kore
+  fallback:
+    provider: edge
+    edge:
+      voice: en-US-BrianNeural
+```
 
 ### Gemini Persona Prompts
 

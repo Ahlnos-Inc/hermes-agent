@@ -350,6 +350,43 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def _resolve_tts_fallback_config(
+    tts_config: Dict[str, Any],
+    failed_provider: str,
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    """Build the one-shot fallback config for a failed TTS provider.
+
+    ``tts.fallback`` mirrors the regular ``tts`` shape but must name a
+    different provider. The returned config deliberately omits ``fallback``
+    so a recursive synthesis call cannot start a fallback chain.
+    """
+    fallback = tts_config.get("fallback") if isinstance(tts_config, dict) else None
+    if not isinstance(fallback, dict):
+        return None
+
+    raw_provider = fallback.get("provider")
+    if not isinstance(raw_provider, str) or not raw_provider.strip():
+        logger.warning("Ignoring TTS fallback without a provider")
+        return None
+
+    fallback_provider = raw_provider.strip().lower()
+    if fallback_provider == failed_provider:
+        logger.warning(
+            "Ignoring TTS fallback because it matches the failed provider '%s'",
+            failed_provider,
+        )
+        return None
+
+    fallback_config = {
+        key: value for key, value in tts_config.items() if key != "fallback"
+    }
+    fallback_config["provider"] = fallback_provider
+    fallback_config.update(
+        {key: value for key, value in fallback.items() if key != "provider"}
+    )
+    return fallback_provider, fallback_config
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -2442,28 +2479,23 @@ def text_to_speech_tool(
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
-        # Provider-level fallback: on any synthesis failure (e.g. Gemini 429
+        # Provider-level fallback: on a runtime synthesis failure (e.g. Gemini
         # quota), retry once with tts.fallback if configured. Structure:
         #   tts:
         #     provider: gemini
         #     fallback: {provider: edge, edge: {voice: en-US-BrianNeural}}
-        _fb = tts_config.get("fallback") if isinstance(tts_config, dict) else None
-        if _fb and isinstance(_fb, dict) and not _is_fallback:
-            _fb_provider = str(_fb.get("provider") or DEFAULT_PROVIDER)
+        fallback = _resolve_tts_fallback_config(tts_config, provider)
+        if fallback is not None and not _is_fallback:
+            fallback_provider, fallback_config = fallback
             logger.warning(
                 "TTS provider '%s' failed (%s); falling back to '%s'",
-                provider, e, _fb_provider,
+                provider, e, fallback_provider,
             )
-            _fb_config = {k: v for k, v in tts_config.items() if k != "fallback"}
-            _fb_config["provider"] = _fb_provider
-            for _k, _v in _fb.items():
-                if _k != "provider":
-                    _fb_config[_k] = _v
             return text_to_speech_tool(
                 text,
                 output_path=output_path,
                 platform=platform,
-                _tts_config_override=_fb_config,
+                _tts_config_override=fallback_config,
                 _is_fallback=True,
             )
         # Unexpected errors
