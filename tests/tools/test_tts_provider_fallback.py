@@ -50,6 +50,57 @@ def test_runtime_failure_retries_once_with_fallback_provider(tmp_path, monkeypat
     assert calls == {"gemini": 1, "edge": 1}
 
 
+def test_primary_no_output_retries_with_fallback_provider(tmp_path, monkeypatch):
+    calls = {"gemini": 0, "edge": 0}
+
+    def silent_gemini(*_args):
+        calls["gemini"] += 1
+
+    async def write_edge(*args):
+        calls["edge"] += 1
+        return await _write_edge_output(*args)
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", _gemini_with_edge_fallback)
+    monkeypatch.setattr(tts_tool, "_generate_gemini_tts", silent_gemini)
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", write_edge)
+
+    output = tmp_path / "reply.mp3"
+    result = json.loads(tts_tool.text_to_speech_tool("hello", str(output)))
+
+    assert result["success"] is True
+    assert result["provider"] == "edge"
+    assert result["file_path"] == str(output)
+    assert calls == {"gemini": 1, "edge": 1}
+
+
+def test_primary_and_fallback_no_output_retry_only_once(tmp_path, monkeypatch, caplog):
+    calls = {"gemini": 0, "edge": 0}
+
+    def silent_gemini(*_args):
+        calls["gemini"] += 1
+
+    async def silent_edge(*_args):
+        calls["edge"] += 1
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", _gemini_with_edge_fallback)
+    monkeypatch.setattr(tts_tool, "_generate_gemini_tts", silent_gemini)
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
+    monkeypatch.setattr(tts_tool, "_generate_edge_tts", silent_edge)
+
+    result = json.loads(
+        tts_tool.text_to_speech_tool("hello", str(tmp_path / "reply.mp3"))
+    )
+
+    assert result["success"] is False
+    assert (
+        "TTS generation failed (edge): "
+        "TTS generation produced no output (provider: edge)"
+    ) in result["error"]
+    assert calls == {"gemini": 1, "edge": 1}
+    assert sum("falling back to 'edge'" in record.message for record in caplog.records) == 1
+
+
 def test_fallback_failure_does_not_recurse(tmp_path, monkeypatch, caplog):
     calls = {"gemini": 0, "edge": 0}
 

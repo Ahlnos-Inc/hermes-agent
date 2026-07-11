@@ -2408,10 +2408,12 @@ def text_to_speech_tool(
 
         # Check the file was actually created
         if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
-            return json.dumps({
-                "success": False,
-                "error": f"TTS generation produced no output (provider: {provider})"
-            }, ensure_ascii=False)
+            # Treat a silent provider result as a synthesis failure so the
+            # configured one-shot fallback gets the same opportunity as an
+            # exception raised by the provider SDK.
+            raise RuntimeError(
+                f"TTS generation produced no output (provider: {provider})"
+            )
 
         # Try Opus conversion for Telegram compatibility.
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV. Keep those native
