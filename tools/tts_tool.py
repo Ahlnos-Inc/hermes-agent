@@ -2134,6 +2134,8 @@ def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
     platform: Optional[str] = None,
+    _tts_config_override: Optional[Dict[str, Any]] = None,
+    _is_fallback: bool = False,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2155,7 +2157,7 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    tts_config = _load_tts_config()
+    tts_config = _tts_config_override if _tts_config_override is not None else _load_tts_config()
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
@@ -2440,6 +2442,30 @@ def text_to_speech_tool(
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
+        # Provider-level fallback: on any synthesis failure (e.g. Gemini 429
+        # quota), retry once with tts.fallback if configured. Structure:
+        #   tts:
+        #     provider: gemini
+        #     fallback: {provider: edge, edge: {voice: en-US-BrianNeural}}
+        _fb = tts_config.get("fallback") if isinstance(tts_config, dict) else None
+        if _fb and isinstance(_fb, dict) and not _is_fallback:
+            _fb_provider = str(_fb.get("provider") or DEFAULT_PROVIDER)
+            logger.warning(
+                "TTS provider '%s' failed (%s); falling back to '%s'",
+                provider, e, _fb_provider,
+            )
+            _fb_config = {k: v for k, v in tts_config.items() if k != "fallback"}
+            _fb_config["provider"] = _fb_provider
+            for _k, _v in _fb.items():
+                if _k != "provider":
+                    _fb_config[_k] = _v
+            return text_to_speech_tool(
+                text,
+                output_path=output_path,
+                platform=platform,
+                _tts_config_override=_fb_config,
+                _is_fallback=True,
+            )
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
