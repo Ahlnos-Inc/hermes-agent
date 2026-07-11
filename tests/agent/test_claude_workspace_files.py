@@ -19,6 +19,29 @@ def test_workspace_file_broker_reads_and_writes_relative_files(tmp_path):
     assert (workspace / "result.txt").read_text(encoding="utf-8") == "safe"
 
 
+def test_workspace_file_broker_credential_policy_is_read_only_opt_in(tmp_path):
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    credential_names = [
+        ".env",
+        ".env.development.local",
+        ".ENV.PRODUCTION.LOCAL",
+        ".EnVrC",
+    ]
+    for name in credential_names:
+        (workspace / name).write_text("SECRET=value\n", encoding="utf-8")
+
+    coder_broker = WorkspaceFileBroker(workspace)
+    assert "SECRET=value" in coder_broker.handle("read_file", {"path": ".env"})
+
+    read_only_broker = WorkspaceFileBroker(
+        workspace, deny_credential_reads=True
+    )
+    for name in credential_names:
+        with pytest.raises(RuntimeError, match="credential"):
+            read_only_broker.handle("read_file", {"path": name})
+
+
 def test_workspace_file_broker_rejects_symlink_and_hardlink_writes(tmp_path):
     workspace = tmp_path / "worktree"
     outside = tmp_path / "outside"

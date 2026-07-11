@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.claude_workspace_terminal import build_workspace_terminal_args
+from agent.claude_workspace_terminal import dispatch_read_only_workspace_terminal
 
 
 def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
@@ -282,6 +283,46 @@ def test_workspace_terminal_rejects_linked_gitdir_for_another_workspace(tmp_path
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_read_only_linked_worktree_has_no_git_write_grants(tmp_path):
+    _, workspace = _linked_worktree(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    transformed = build_workspace_terminal_args(
+        {"command": "git status --short"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+        read_only=True,
+        runtime_root=runtime_root,
+    )
+    argv = shlex.split(transformed["command"])
+    profile = Path(argv[argv.index("-f") + 1]).read_text(encoding="utf-8")
+    git_dir = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    git_write_rules = [
+        line for line in profile.splitlines() if line.startswith("(allow file-write")
+    ]
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all(str(git_dir) not in line for line in git_write_rules)
+    assert all(str(workspace) not in line for line in git_write_rules)
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
 def test_workspace_terminal_denies_host_and_ambient_but_can_run_tests(tmp_path):
     host_home = tmp_path / "host"
     workspace = host_home / "worktree"
@@ -372,6 +413,289 @@ def test_workspace_terminal_preserves_process_controls(tmp_path):
     assert transformed["workdir"] == str(workspace.resolve())
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg -n TODO agent",
+        "git diff --check",
+    ],
+)
+def test_read_only_workspace_terminal_builds_read_only_inspection_profile(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    credentials = [
+        workspace / ".env",
+        workspace / ".env.development.local",
+        workspace / ".ENV.PRODUCTION.LOCAL",
+        workspace / ".EnVrC",
+    ]
+    for credential in credentials:
+        credential.write_text("SECRET=hidden\n", encoding="utf-8")
+    runtime_root = tmp_path / "runtime"
+
+    transformed = build_workspace_terminal_args(
+        {"command": command},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"HOME": str(tmp_path / "host"), "PATH": os.environ["PATH"]},
+        platform_name="Darwin",
+        read_only=True,
+        runtime_root=runtime_root,
+    )
+
+    assert "sandbox-exec" in transformed["command"]
+    argv = shlex.split(transformed["command"])
+    profile = Path(argv[argv.index("-f") + 1]).read_text(encoding="utf-8")
+    workspace_rule = f'(allow file-write* (subpath "{workspace.resolve()}"))'
+    runtime_rule = f'(allow file-write* (subpath "{runtime_root.resolve()}"))'
+    assert workspace_rule not in profile
+    assert runtime_rule in profile
+    assert all(
+        f'(deny file-read* (literal "{credential.resolve()}"))' in profile
+        for credential in credentials
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m pytest --junit-xml=report.xml --cache-clear",
+        "pytest --snapshot-update",
+        "ruff check --add-noqa --output-file report.txt .",
+    ],
+)
+def test_read_only_test_and_report_options_use_clean_disposable_mirror(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    source = workspace / "source.py"
+    source.write_text("original\n", encoding="utf-8")
+    credential_names = [
+        ".env",
+        ".env.development.local",
+        ".ENV.PRODUCTION.LOCAL",
+        ".EnVrC",
+    ]
+    for name in credential_names:
+        (workspace / name).write_text("SECRET=must-not-copy\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    execution_roots = []
+
+    def dispatch(name, arguments, *, task_id):
+        assert name == "terminal"
+        assert task_id == "worker-task"
+        execution_root = Path(arguments["workdir"])
+        execution_roots.append(execution_root)
+        assert execution_root != workspace
+        assert all(not (execution_root / name).exists() for name in credential_names)
+        (execution_root / "source.py").write_text("mutated\n", encoding="utf-8")
+        (execution_root / "report.xml").write_text("report\n", encoding="utf-8")
+        return "ok"
+
+    result = dispatch_read_only_workspace_terminal(
+        {"command": command},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": os.environ["PATH"]},
+        dispatch=dispatch,
+        task_id="worker-task",
+        platform_name="Darwin",
+        scratch_parent=scratch,
+    )
+
+    assert result == "ok"
+    assert source.read_text(encoding="utf-8") == "original\n"
+    assert all(
+        (workspace / name).read_text(encoding="utf-8") == "SECRET=must-not-copy\n"
+        for name in credential_names
+    )
+    assert not (workspace / "report.xml").exists()
+    assert execution_roots and all(not root.exists() for root in execution_roots)
+    assert list(scratch.iterdir()) == []
+
+
+def test_read_only_disposable_mirror_is_cleaned_when_dispatch_fails(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    source = workspace / "source.py"
+    source.write_text("original\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+
+    def dispatch(_name, arguments, *, task_id):
+        assert task_id == "worker-task"
+        execution_root = Path(arguments["workdir"])
+        (execution_root / "source.py").write_text("mutated\n", encoding="utf-8")
+        raise RuntimeError("executor failed")
+
+    with pytest.raises(RuntimeError, match="executor failed"):
+        dispatch_read_only_workspace_terminal(
+            {"command": "python -m pytest --cache-clear"},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"PATH": os.environ["PATH"]},
+            dispatch=dispatch,
+            task_id="worker-task",
+            platform_name="Darwin",
+            scratch_parent=scratch,
+        )
+
+    assert source.read_text(encoding="utf-8") == "original\n"
+    assert list(scratch.iterdir()) == []
+
+
+def _tree_bytes(root):
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_read_only_inspection_cannot_compile_into_original_workspace(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / "magic").write_text("0 string hello greeting\n", encoding="utf-8")
+    before = _tree_bytes(workspace)
+    scratch = tmp_path / "scratch"
+
+    def dispatch(_name, arguments, *, task_id):
+        assert task_id == "worker-task"
+        return subprocess.run(
+            ["/bin/bash", "-lc", arguments["command"]],
+            cwd=arguments["workdir"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    result = dispatch_read_only_workspace_terminal(
+        {"command": "file -C -m magic"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": os.environ["PATH"]},
+        dispatch=dispatch,
+        task_id="worker-task",
+        scratch_parent=scratch,
+    )
+
+    assert result.returncode != 0
+    assert _tree_bytes(workspace) == before
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_read_only_pytest_writes_only_disposable_mirror(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    host_secret = tmp_path / "host" / "credential"
+    host_secret.parent.mkdir()
+    host_secret.write_text("host-secret\n", encoding="utf-8")
+    dependency = workspace / "node_modules"
+    dependency.mkdir()
+    (dependency / "original.txt").write_text("dependency\n", encoding="utf-8")
+    (workspace / "test_sample.py").write_text(
+        (
+            "from pathlib import Path\n"
+            "import socket\n"
+            "import pytest\n\n"
+            "def test_boundaries():\n"
+            f"    with pytest.raises(PermissionError): Path({str(host_secret)!r}).read_text()\n"
+            "    with pytest.raises(PermissionError): "
+            "Path('node_modules/original.txt').write_text('changed')\n"
+            "    sock = socket.socket()\n"
+            "    try:\n"
+            "        with pytest.raises(PermissionError): sock.connect(('127.0.0.1', 9))\n"
+            "    finally:\n"
+            "        sock.close()\n"
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text("SECRET=outside-test\n", encoding="utf-8")
+    before = _tree_bytes(workspace)
+    scratch = tmp_path / "scratch"
+    execution_roots = []
+
+    def dispatch(_name, arguments, *, task_id):
+        assert task_id == "worker-task"
+        execution_roots.append(Path(arguments["workdir"]))
+        return subprocess.run(
+            ["/bin/bash", "-lc", arguments["command"]],
+            cwd=arguments["workdir"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    result = dispatch_read_only_workspace_terminal(
+        {
+            "command": (
+                "python -m pytest test_sample.py --junit-xml=report.xml "
+                "--cache-clear -q"
+            )
+        },
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": os.environ["PATH"]},
+        dispatch=dispatch,
+        task_id="worker-task",
+        scratch_parent=scratch,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _tree_bytes(workspace) == before
+    assert execution_roots and all(not root.exists() for root in execution_roots)
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "touch changed.txt",
+        "rm -rf .",
+        "git add .",
+        "git commit -m nope",
+        "sed -i '' 's/a/b/' source.py",
+        "rg TODO . > report.txt",
+        "rg TODO .; touch changed.txt",
+        "rg TODO . && touch changed.txt",
+        "find . -delete",
+        "ln ../outside linked",
+        "python -c 'open(\"changed.txt\", \"w\").write(\"x\")'",
+        "./rg TODO .",
+        "/tmp/git status",
+        "git grep --open-files-in-pager=touch TODO",
+        "git grep -Otouch TODO",
+        "git cat-file --filters HEAD:source.py",
+        "git diff --ext-dif",
+        "rg --pre touch TODO .",
+        "go test -exec touch ./...",
+        "npm test --script-shell=/tmp/helper",
+        "cargo test --config build.rustc-wrapper=/tmp/helper",
+        "make test -f/tmp/Makefile",
+    ],
+)
+def test_read_only_workspace_terminal_rejects_mutation_and_shell_escapes(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="Read-only worker terminal"):
+        build_workspace_terminal_args(
+            {"command": command},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"HOME": str(tmp_path / "host"), "PATH": "/usr/bin:/bin"},
+            platform_name="Darwin",
+            read_only=True,
+            runtime_root=tmp_path / "runtime",
+        )
+
+
 def test_workspace_terminal_rejects_outside_workdir(tmp_path):
     workspace = tmp_path / "work"
     workspace.mkdir()
@@ -396,7 +720,27 @@ def test_workspace_terminal_fails_closed_off_macos(tmp_path):
         )
 
 
-def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(tmp_path):
+def test_read_only_mutation_rejects_before_platform_preflight(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="Read-only worker terminal"):
+        build_workspace_terminal_args(
+            {"command": "touch changed.txt"},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            platform_name="Linux",
+            read_only=True,
+        )
+
+    assert not (workspace / "changed.txt").exists()
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(
+    tmp_path, read_only
+):
     workspace = tmp_path / "work"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
@@ -410,6 +754,8 @@ def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(tmp_path):
             host_home=tmp_path / "host",
             exact_env={"PATH": "/usr/bin:/bin"},
             platform_name="Darwin",
+            read_only=read_only,
+            runtime_root=tmp_path / "runtime" if read_only else None,
         )
 
 
@@ -440,6 +786,41 @@ def test_workspace_terminal_denies_symlink_to_outside_created_after_profile(tmp_
     assert result.returncode != 0
     assert "secret" not in result.stdout
     assert not (outside / "escaped.txt").exists()
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+@pytest.mark.parametrize(
+    "command",
+    ["cat ../outside/secret.txt", "cat escape/secret.txt"],
+)
+def test_read_only_workspace_terminal_denies_path_and_symlink_escape(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("host-secret", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    transformed = build_workspace_terminal_args(
+        {"command": command},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": os.environ["PATH"]},
+        read_only=True,
+        runtime_root=tmp_path / "runtime",
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "host-secret" not in result.stdout
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")

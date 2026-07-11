@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
+from agent.claude_workspace_policy import is_workspace_credential_path
+
 
 class WorkspaceFileBroker:
     """Read/write files relative to an immutable root directory descriptor."""
@@ -17,8 +19,11 @@ class WorkspaceFileBroker:
     MAX_FILE_BYTES = 2 * 1024 * 1024
     MAX_TURN_WRITE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, workspace: str | Path) -> None:
+    def __init__(
+        self, workspace: str | Path, *, deny_credential_reads: bool = False
+    ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        self.deny_credential_reads = deny_credential_reads
         self._root_fd = os.open(
             self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
         )
@@ -29,6 +34,10 @@ class WorkspaceFileBroker:
         """Reset the bounded write budget for one SDK query/response turn."""
         with self._write_lock:
             self._turn_written_bytes = 0
+
+    def deny_credentials_for_read_only_worker(self) -> None:
+        """Narrow an existing broker when its SDK session is read-only."""
+        self.deny_credential_reads = True
 
     def close(self) -> None:
         if self._root_fd >= 0:
@@ -61,6 +70,8 @@ class WorkspaceFileBroker:
 
     def _read(self, arguments: dict[str, Any]) -> str:
         parts = self._parts(arguments.get("path"))
+        if self.deny_credential_reads and is_workspace_credential_path(parts[-1]):
+            raise RuntimeError("Read-only workspace rejects credential file reads")
         with self._parent(parts) as (parent_fd, name):
             fd = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
