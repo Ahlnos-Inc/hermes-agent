@@ -675,6 +675,8 @@ def run_conversation(
     # conversation after each tool result.
     fallback_moa_guidance = (_prepared_context or {}).get("moa_guidance")
     current_moa_guidance = None
+    external_moa_reference_result = None
+    external_moa_reference_accounted = False
     external_user_message = user_message
     moa_aggregator = (moa_config or {}).get("aggregator") or {}
     configured_moa_runtime = str(moa_aggregator.get("runtime") or "").strip().lower()
@@ -728,13 +730,14 @@ def run_conversation(
                 )
             if fallback_moa_guidance is None:
                 if external_moa_actor_active:
-                    fallback_moa_guidance = build_moa_reference_guidance(
+                    external_moa_reference_result = build_moa_reference_guidance(
                         api_messages=moa_messages,
                         reference_models=moa_config.get("reference_models") or [],
                         temperature=float(
                             moa_config.get("reference_temperature", 0.6) or 0.6
                         ),
                     )
+                    fallback_moa_guidance = external_moa_reference_result.text
                 elif not external_moa_configured:
                     fallback_moa_guidance = aggregate_moa_context(
                         user_prompt=(
@@ -843,6 +846,7 @@ def run_conversation(
         from agent.external_runtime import (
             prepare_claude_agent_sdk_runtime,
             record_claude_subscription_usage,
+            record_moa_reference_usage,
             run_claude_agent_sdk_attempt,
         )
         from agent.runtime_circuit import (
@@ -884,6 +888,40 @@ def run_conversation(
             if failure is None or projection.usage is not None
             else {}
         )
+        if (
+            external_moa_reference_result is not None
+            and not external_moa_reference_accounted
+        ):
+            reference_usage_result = record_moa_reference_usage(
+                agent, external_moa_reference_result
+            )
+            external_moa_reference_accounted = True
+            combined_usage = dict(usage_result)
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            ):
+                combined_usage[key] = int(usage_result.get(key) or 0) + int(
+                    reference_usage_result.get(key) or 0
+                )
+            actor_cost = usage_result.get("estimated_cost_usd")
+            reference_cost = reference_usage_result.get("estimated_cost_usd")
+            if actor_cost is not None or reference_cost is not None:
+                combined_usage["estimated_cost_usd"] = float(actor_cost or 0) + float(
+                    reference_cost or 0
+                )
+            combined_usage["cost_status"] = reference_usage_result.get(
+                "cost_status"
+            ) or usage_result.get("cost_status")
+            combined_usage["cost_source"] = reference_usage_result.get(
+                "cost_source"
+            ) or usage_result.get("cost_source")
+            usage_result = combined_usage
         if failure is not None:
             _emit_runtime_event(
                 agent,

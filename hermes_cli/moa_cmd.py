@@ -60,6 +60,31 @@ def _pick_slot(current: dict[str, str] | None = None) -> dict[str, str]:
     return {"provider": str(provider.get("slug") or ""), "model": str(model)}
 
 
+def _pick_aggregator_slot(
+    current: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Pick an acting model and explicitly preserve/manage its runtime."""
+
+    selected = _pick_slot(current)
+    if selected["provider"].strip().lower() != "anthropic":
+        return selected
+    current_runtime = str((current or {}).get("runtime") or "").strip().lower()
+    choices = [
+        "Hermes native API billing",
+        "Claude Agent SDK (Claude Max, Kanban workers only)",
+    ]
+    default = 1 if current_runtime == "claude_agent_sdk" else 0
+    if current_runtime not in {"", "hermes", "claude_agent_sdk"}:
+        choices.append(f"Keep configured runtime (fail closed): {current_runtime}")
+        default = len(choices) - 1
+    runtime_choice = _prompt_choice("Select aggregator runtime", choices, default)
+    if runtime_choice == 1:
+        selected["runtime"] = "claude_agent_sdk"
+    elif runtime_choice == len(choices) - 1 and len(choices) > 2:
+        selected["runtime"] = current_runtime
+    return selected
+
+
 def _print_config(config: dict[str, Any]) -> None:
     cfg = normalize_moa_config(config.get("moa") if isinstance(config, dict) else {})
     print("Mixture of Agents presets")
@@ -73,7 +98,8 @@ def _print_config(config: dict[str, Any]) -> None:
         for idx, slot in enumerate(preset["reference_models"], start=1):
             print(f"    {idx}. {slot['provider']}:{slot['model']}")
         agg = preset["aggregator"]
-        print(f"  Aggregator: {agg['provider']}:{agg['model']}")
+        runtime = str(agg.get("runtime") or "hermes")
+        print(f"  Aggregator: {agg['provider']}:{agg['model']} ({runtime})")
 
 
 def cmd_moa(args) -> None:
@@ -104,7 +130,7 @@ def cmd_moa(args) -> None:
         print("Configure aggregator model.")
         current = dict(current)
         current["reference_models"] = refs
-        current["aggregator"] = _pick_slot(current.get("aggregator"))
+        current["aggregator"] = _pick_aggregator_slot(current.get("aggregator"))
         moa["presets"][preset_name] = current
         moa.setdefault("default_preset", preset_name)
         cfg["moa"] = normalize_moa_config(moa)

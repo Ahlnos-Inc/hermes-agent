@@ -61,11 +61,14 @@ For each main model call when provider `moa` is selected, Hermes normally:
 
 Because MoA is selected through the normal model system, it composes automatically with `/goal`, gateway sessions, TUI sessions, and Desktop chat.
 
-An aggregator can instead be configured as an external whole-agent runtime. In
-that mode Hermes runs the reference models once, supplies their successful
-output as private guidance, and lets that runtime reason, call tools, and finish
-the task. Hermes does not make a separate direct aggregator API call. If every
-reference fails, the acting runtime proceeds on its own.
+For dispatcher-spawned Kanban workers, an aggregator can instead be configured
+as an external whole-agent runtime. In that worker context Hermes runs the
+reference models once, supplies their successful output as private guidance,
+and lets that runtime reason, call tools, and finish the task. Hermes does not
+make a separate direct aggregator API call. If every reference fails, the
+acting runtime proceeds on its own. Ordinary CLI, gateway, TUI, Desktop, cron,
+and orchestrator sessions remain on native MoA even when the preset includes an
+external runtime; the Claude Agent SDK worker boundary is not opened there.
 
 ## Configure presets
 
@@ -115,8 +118,12 @@ moa:
 ```
 
 This route uses the Claude Agent SDK/Claude CLI subscription session rather
-than an Anthropic API key. The reference provider still follows its own normal
-credential and billing route.
+than an Anthropic API key when the process is an authorized Kanban worker. The
+reference provider still follows its own normal credential and billing route;
+Hermes records advisor token usage and per-provider estimated cost separately
+from the included Claude Max actor. Select the acting runtime explicitly in the
+CLI, dashboard, or Desktop preset editor—choosing Hermes API billing removes
+the subscription runtime deliberately.
 
 Default preset:
 

@@ -928,7 +928,15 @@ def test_external_moa_keeps_claude_billing_and_fallback_events_accurate(caplog):
                     finish_reason="stop",
                 )
             ],
-            usage=None,
+            usage=SimpleNamespace(
+                input_tokens=120,
+                output_tokens=30,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=0,
+                    cache_creation_tokens=0,
+                ),
+                output_tokens_details=None,
+            ),
         )
 
     def fake_codex_turn(self, user_input, **kwargs):
@@ -951,6 +959,14 @@ def test_external_moa_keeps_claude_billing_and_fallback_events_accurate(caplog):
         ),
         patch("agent.moa_loop.call_llm", side_effect=fake_advisor),
         patch(
+            "agent.usage_pricing.estimate_usage_cost",
+            return_value=SimpleNamespace(
+                amount_usd=0.0042,
+                status="estimated",
+                source="official_docs_snapshot",
+            ),
+        ),
+        patch(
             "agent.external_runtime.run_claude_agent_sdk_attempt",
             return_value=rejected,
         ),
@@ -962,6 +978,9 @@ def test_external_moa_keeps_claude_billing_and_fallback_events_accurate(caplog):
     assert result["completed"] is True
     assert result["final_response"] == "Codex fallback"
     assert len(advisor_calls) == 1
+    assert agent.session_input_tokens == 127
+    assert agent.session_output_tokens == 33
+    assert agent.session_estimated_cost_usd == pytest.approx(0.0042)
     assert sum(message.get("role") == "user" for message in result["messages"]) == 1
     events = [
         json.loads(record.message)
@@ -969,12 +988,19 @@ def test_external_moa_keeps_claude_billing_and_fallback_events_accurate(caplog):
         if record.name == "hermes.runtime_events"
     ]
     billing = next(event for event in events if event["event"] == "runtime_billing_mode")
+    advisor_billing = next(
+        event for event in events if event["event"] == "moa_reference_billing"
+    )
     fallback = next(
         event for event in events if event["event"] == "runtime_fallback_activated"
     )
     assert billing["provider"] == "anthropic"
     assert billing["runtime"] == "claude_agent_sdk"
     assert billing["billing_mode"] == "subscription_included"
+    assert advisor_billing["input_tokens"] == 120
+    assert advisor_billing["output_tokens"] == 30
+    assert advisor_billing["estimated_cost_usd"] == pytest.approx(0.0042)
+    assert advisor_billing["references"][0]["provider"] == "openai-codex"
     assert fallback["from_provider"] == "anthropic"
     assert fallback["from_runtime"] == "claude_agent_sdk"
     assert fallback["to_provider"] == "openai-codex"

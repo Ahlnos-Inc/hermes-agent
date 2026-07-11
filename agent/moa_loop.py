@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -79,6 +80,16 @@ class _RefAccounting:
         self.model = model
         self.provider = provider
         self.temperature = temperature
+
+
+@dataclass(frozen=True)
+class MoaReferenceGuidance:
+    """Private advisor context plus its independently priced accounting."""
+
+    text: str
+    usage: Any
+    estimated_cost_usd: Any = None
+    references: tuple[dict[str, Any], ...] = ()
 
 # Per-tool-result character budget for the advisory reference view. Tool
 # results can be huge (a full diff, a 5000-line file dump); replaying them
@@ -567,7 +578,7 @@ def build_moa_reference_guidance(
     reference_models: list[dict[str, str]],
     temperature: float = 0.6,
     max_tokens: int | None = None,
-) -> str:
+) -> MoaReferenceGuidance:
     """Return successful advisor output for an external acting runtime.
 
     Unlike :func:`aggregate_moa_context`, this path intentionally makes no
@@ -583,6 +594,32 @@ def build_moa_reference_guidance(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    from agent.usage_pricing import CanonicalUsage
+
+    usage = CanonicalUsage(request_count=0)
+    estimated_cost_usd: Any = None
+    billing_rows: list[dict[str, Any]] = []
+    for label, _text, accounting in reference_outputs:
+        if not isinstance(accounting, _RefAccounting):
+            continue
+        if isinstance(accounting.usage, CanonicalUsage):
+            usage = usage + accounting.usage
+        if accounting.cost_usd is not None:
+            estimated_cost_usd = (estimated_cost_usd or 0) + accounting.cost_usd
+        billing_rows.append(
+            {
+                "label": label,
+                "provider": str(accounting.provider or ""),
+                "model": str(accounting.model or ""),
+                "input_tokens": accounting.usage.input_tokens,
+                "output_tokens": accounting.usage.output_tokens,
+                "cache_read_tokens": accounting.usage.cache_read_tokens,
+                "cache_write_tokens": accounting.usage.cache_write_tokens,
+                "estimated_cost_usd": accounting.cost_usd,
+                "cost_status": accounting.cost_status,
+                "cost_source": accounting.cost_source,
+            }
+        )
     successful = [
         (label, text)
         for label, text, _usage in reference_outputs
@@ -591,17 +628,27 @@ def build_moa_reference_guidance(
         and not text.startswith("[skipped:")
     ]
     if not successful:
-        return ""
+        return MoaReferenceGuidance(
+            text="",
+            usage=usage,
+            estimated_cost_usd=estimated_cost_usd,
+            references=tuple(billing_rows),
+        )
     joined = "\n\n".join(
         f"Reference {idx} — {label}:\n{text}"
         for idx, (label, text) in enumerate(successful, start=1)
     )
-    return (
-        "[Mixture of Agents advisor context — private guidance for the acting "
-        "whole-agent runtime. Use it as input, then independently reason, call "
-        "tools, and complete the task.]\n"
-        f"References: {', '.join(label for label, _text in successful)}\n\n"
-        f"{joined}"
+    return MoaReferenceGuidance(
+        text=(
+            "[Mixture of Agents advisor context — private guidance for the acting "
+            "whole-agent runtime. Use it as input, then independently reason, call "
+            "tools, and complete the task.]\n"
+            f"References: {', '.join(label for label, _text in successful)}\n\n"
+            f"{joined}"
+        ),
+        usage=usage,
+        estimated_cost_usd=estimated_cost_usd,
+        references=tuple(billing_rows),
     )
 
 

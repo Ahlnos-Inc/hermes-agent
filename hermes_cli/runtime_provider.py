@@ -2063,7 +2063,14 @@ def resolve_runtime_provider(
             preset = None
         aggregator = dict((preset or {}).get("aggregator") or {})
         aggregator_runtime = str(aggregator.get("runtime") or "").strip().lower()
-        if aggregator_runtime and aggregator_runtime != HERMES_RUNTIME:
+        kanban_worker_authorized = bool(
+            os.getenv("HERMES_KANBAN_TASK", "").strip()
+        )
+        if (
+            aggregator_runtime
+            and aggregator_runtime != HERMES_RUNTIME
+            and kanban_worker_authorized
+        ):
             # The configured aggregator is the acting whole-agent runtime, not
             # an auxiliary `call_llm` synthesis. Route the primary agent to the
             # aggregator target and carry the full preset alongside it so the

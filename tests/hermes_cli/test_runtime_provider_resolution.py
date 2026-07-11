@@ -42,6 +42,7 @@ def test_moa_external_aggregator_routes_to_subscription_acting_runtime(monkeypat
     }
     monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
     monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
 
     resolved = rp.resolve_runtime_provider(
         requested="moa",
@@ -54,6 +55,40 @@ def test_moa_external_aggregator_routes_to_subscription_acting_runtime(monkeypat
     assert resolved["api_key"] == ""
     assert resolved["base_url"] == ""
     assert resolved["moa_config"]["aggregator"]["runtime"] == "claude_agent_sdk"
+
+
+def test_moa_external_aggregator_stays_native_outside_kanban(monkeypatch):
+    config = {
+        "model": {"provider": "moa", "default": "architect"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            },
+        },
+    }
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="moa",
+        target_model="architect",
+    )
+
+    assert resolved["provider"] == "moa"
+    assert resolved["runtime"] == "hermes"
+    assert resolved["base_url"] == "moa://local"
+    assert "moa_config" not in resolved
 
 
 def test_moa_external_aggregator_unknown_runtime_fails_closed(monkeypatch):
@@ -77,6 +112,7 @@ def test_moa_external_aggregator_unknown_runtime_fails_closed(monkeypatch):
     }
     monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
     monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
 
     with pytest.raises(ValueError, match="Unknown agent runtime: claude_max_typo"):
         rp.resolve_runtime_provider(requested="moa", target_model="architect")
