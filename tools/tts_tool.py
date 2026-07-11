@@ -350,6 +350,43 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def _resolve_tts_fallback_config(
+    tts_config: Dict[str, Any],
+    failed_provider: str,
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    """Build the one-shot fallback config for a failed TTS provider.
+
+    ``tts.fallback`` mirrors the regular ``tts`` shape but must name a
+    different provider. The returned config deliberately omits ``fallback``
+    so a recursive synthesis call cannot start a fallback chain.
+    """
+    fallback = tts_config.get("fallback") if isinstance(tts_config, dict) else None
+    if not isinstance(fallback, dict):
+        return None
+
+    raw_provider = fallback.get("provider")
+    if not isinstance(raw_provider, str) or not raw_provider.strip():
+        logger.warning("Ignoring TTS fallback without a provider")
+        return None
+
+    fallback_provider = raw_provider.strip().lower()
+    if fallback_provider == failed_provider:
+        logger.warning(
+            "Ignoring TTS fallback because it matches the failed provider '%s'",
+            failed_provider,
+        )
+        return None
+
+    fallback_config = {
+        key: value for key, value in tts_config.items() if key != "fallback"
+    }
+    fallback_config["provider"] = fallback_provider
+    fallback_config.update(
+        {key: value for key, value in fallback.items() if key != "provider"}
+    )
+    return fallback_provider, fallback_config
+
+
 # ===========================================================================
 # Custom command providers (type: command under tts.providers.<name>)
 # ===========================================================================
@@ -2134,6 +2171,8 @@ def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
     platform: Optional[str] = None,
+    _tts_config_override: Optional[Dict[str, Any]] = None,
+    _is_fallback: bool = False,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2155,7 +2194,7 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    tts_config = _load_tts_config()
+    tts_config = _tts_config_override if _tts_config_override is not None else _load_tts_config()
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
@@ -2369,10 +2408,12 @@ def text_to_speech_tool(
 
         # Check the file was actually created
         if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
-            return json.dumps({
-                "success": False,
-                "error": f"TTS generation produced no output (provider: {provider})"
-            }, ensure_ascii=False)
+            # Treat a silent provider result as a synthesis failure so the
+            # configured one-shot fallback gets the same opportunity as an
+            # exception raised by the provider SDK.
+            raise RuntimeError(
+                f"TTS generation produced no output (provider: {provider})"
+            )
 
         # Try Opus conversion for Telegram compatibility.
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV. Keep those native
@@ -2440,6 +2481,25 @@ def text_to_speech_tool(
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
     except Exception as e:
+        # Provider-level fallback: on a runtime synthesis failure (e.g. Gemini
+        # quota), retry once with tts.fallback if configured. Structure:
+        #   tts:
+        #     provider: gemini
+        #     fallback: {provider: edge, edge: {voice: en-US-BrianNeural}}
+        fallback = _resolve_tts_fallback_config(tts_config, provider)
+        if fallback is not None and not _is_fallback:
+            fallback_provider, fallback_config = fallback
+            logger.warning(
+                "TTS provider '%s' failed (%s); falling back to '%s'",
+                provider, e, fallback_provider,
+            )
+            return text_to_speech_tool(
+                text,
+                output_path=output_path,
+                platform=platform,
+                _tts_config_override=fallback_config,
+                _is_fallback=True,
+            )
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
