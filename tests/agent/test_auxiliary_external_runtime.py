@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -124,3 +125,138 @@ def test_auxiliary_fallback_does_not_reinterpret_external_agent_runtime_entry():
 
     assert (client, model) == (None, None)
     resolve.assert_not_called()
+
+
+@pytest.mark.parametrize("runtime", ["claude_agent_sdk", "codex_app_server"])
+def test_auto_vision_external_runtime_stops_before_resolver_or_request(runtime):
+    main_runtime = {
+        "runtime": runtime,
+        "provider": "anthropic" if runtime == "claude_agent_sdk" else "openai-codex",
+        "model": "acting-model",
+    }
+    vision_resolver = MagicMock()
+    cached_resolver = MagicMock()
+    with (
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ),
+        patch.object(aux, "resolve_vision_provider_client", vision_resolver),
+        patch.object(aux, "_get_cached_client", cached_resolver),
+    ):
+        with pytest.raises(RuntimeError, match="Automatic auxiliary task vision"):
+            aux.call_llm(
+                task="vision",
+                main_runtime=main_runtime,
+                messages=[{"role": "user", "content": "describe image"}],
+            )
+
+    vision_resolver.assert_not_called()
+    cached_resolver.assert_not_called()
+
+
+def test_explicit_vision_route_still_works_under_external_main_runtime():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="described"))]
+    )
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=MagicMock(return_value=response))
+        ),
+    )
+    vision_resolver = MagicMock(return_value=("openrouter", client, "vision-model"))
+    with (
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("openrouter", "vision-model", None, None, None),
+        ),
+        patch.object(aux, "resolve_vision_provider_client", vision_resolver),
+    ):
+        result = aux.call_llm(
+            task="vision",
+            main_runtime={
+                "runtime": "claude_agent_sdk",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+            },
+            messages=[{"role": "user", "content": "describe image"}],
+        )
+
+    assert result.choices[0].message.content == "described"
+    vision_resolver.assert_called_once()
+    assert vision_resolver.call_args.kwargs["provider"] == "openrouter"
+    client.chat.completions.create.assert_called_once()
+
+
+def test_explicit_vision_uses_only_task_local_hermes_fallback_when_unavailable():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="fallback vision"))]
+    )
+    fallback_client = SimpleNamespace(
+        base_url="https://local.invalid/v1",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=MagicMock(return_value=response))
+        ),
+    )
+    vision_resolver = MagicMock(return_value=("openrouter", None, None))
+    with (
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("openrouter", "vision-model", None, None, None),
+        ),
+        patch.object(aux, "resolve_vision_provider_client", vision_resolver),
+        patch.object(
+            aux,
+            "_try_configured_fallback_for_unavailable_client",
+            return_value=(fallback_client, "local-vision", "custom"),
+        ) as task_fallback,
+        patch.object(aux, "_try_payment_fallback") as ambient_fallback,
+    ):
+        result = aux.call_llm(
+            task="vision",
+            main_runtime={
+                "runtime": "claude_agent_sdk",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+            },
+            messages=[{"role": "user", "content": "describe image"}],
+        )
+
+    assert result.choices[0].message.content == "fallback vision"
+    vision_resolver.assert_called_once()
+    task_fallback.assert_called_once_with("vision", "openrouter")
+    ambient_fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("task", ["vision", "compression", "title_generation"])
+def test_async_auto_special_paths_stop_before_any_resolver(task):
+    vision_resolver = MagicMock()
+    cached_resolver = MagicMock()
+    with (
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ),
+        patch.object(aux, "resolve_vision_provider_client", vision_resolver),
+        patch.object(aux, "_get_cached_client", cached_resolver),
+    ):
+        with pytest.raises(RuntimeError, match=f"Automatic auxiliary task {task}"):
+            asyncio.run(
+                aux.async_call_llm(
+                    task=task,
+                    main_runtime={
+                        "runtime": "codex_app_server",
+                        "provider": "openai-codex",
+                        "model": "gpt-5.4",
+                    },
+                    messages=[{"role": "user", "content": "work"}],
+                )
+            )
+
+    vision_resolver.assert_not_called()
+    cached_resolver.assert_not_called()
