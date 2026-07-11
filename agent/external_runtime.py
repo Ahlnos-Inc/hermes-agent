@@ -230,8 +230,12 @@ def run_claude_agent_sdk_attempt(
         from model_tools import handle_function_call
         from hermes_cli.profiles import get_active_profile_name
 
-        file_broker = WorkspaceFileBroker(workspace)
         worker_profile = get_active_profile_name()
+        file_broker = WorkspaceFileBroker(
+            workspace,
+            deny_credential_reads=worker_profile.strip().lower()
+            in {"reviewer", "verifier"},
+        )
 
         def _options(resume: str | None) -> Any:
             return build_claude_agent_options(

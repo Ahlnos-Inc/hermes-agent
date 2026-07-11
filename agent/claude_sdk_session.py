@@ -13,7 +13,10 @@ from agent.claude_sdk_mcp import build_hermes_sdk_mcp_server
 from agent.claude_process_scope import WorkerProcessBroker
 from agent.claude_subscription_env import build_claude_subscription_env
 from agent.claude_tool_guard import create_workspace_pre_tool_hook
-from agent.claude_workspace_terminal import build_workspace_terminal_args
+from agent.claude_workspace_terminal import (
+    build_workspace_terminal_args,
+    dispatch_read_only_workspace_terminal,
+)
 from agent.claude_workspace_files import WorkspaceFileBroker
 
 
@@ -123,18 +126,25 @@ def build_claude_agent_options(
         auxiliary_tool_names=auxiliary_tool_names,
         worker_profile=worker_profile,
     )
-    file_broker = file_broker or WorkspaceFileBroker(workspace_path)
+    read_only_worker = _is_read_only_worker(capability_mode, worker_profile)
+    file_broker = file_broker or WorkspaceFileBroker(
+        workspace_path,
+        deny_credential_reads=read_only_worker,
+    )
+    if read_only_worker:
+        file_broker.deny_credentials_for_read_only_worker()
     process_broker = WorkerProcessBroker(effective_task_id) if "process" in tool_names else None
 
     def _transform(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "terminal":
+            return arguments
+        if read_only_worker:
             return arguments
         return build_workspace_terminal_args(
             arguments,
             workspace=workspace_path,
             host_home=host_home_path,
             exact_env=env,
-            read_only=_is_read_only_worker(capability_mode, worker_profile),
         )
 
     mcp_server = build_hermes_sdk_mcp_server(
@@ -146,6 +156,20 @@ def build_claude_agent_options(
         argument_transform=_transform,
         handler_overrides={
             **({"process": process_broker.handle} if process_broker is not None else {}),
+            **(
+                {
+                    "terminal": lambda args: dispatch_read_only_workspace_terminal(
+                        args,
+                        workspace=workspace_path,
+                        host_home=host_home_path,
+                        exact_env=env,
+                        dispatch=dispatch,
+                        task_id=effective_task_id,
+                    )
+                }
+                if read_only_worker and "terminal" in tool_names
+                else {}
+            ),
             **(
                 {"read_file": lambda args: file_broker.handle("read_file", args)}
                 if "read_file" in tool_names

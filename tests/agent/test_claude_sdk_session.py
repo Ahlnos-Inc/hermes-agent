@@ -198,6 +198,14 @@ def test_read_only_worker_file_capability_rejects_path_and_link_escapes(tmp_path
     secret.write_text("secret", encoding="utf-8")
     (workspace / "symlink.txt").symlink_to(secret)
     os.link(secret, workspace / "hardlink.txt")
+    credential_names = [
+        ".env",
+        ".env.development.local",
+        ".ENV.PRODUCTION.LOCAL",
+        ".EnVrC",
+    ]
+    for name in credential_names:
+        (workspace / name).write_text("SECRET=value\n", encoding="utf-8")
 
     options = build_claude_agent_options(
         sdk=FakeSdk,
@@ -222,6 +230,10 @@ def test_read_only_worker_file_capability_rejects_path_and_link_escapes(tmp_path
         asyncio.run(read_file({"path": "../outside/secret.txt"})),
         asyncio.run(read_file({"path": "symlink.txt"})),
         asyncio.run(read_file({"path": "hardlink.txt"})),
+        *[
+            asyncio.run(read_file({"path": name}))
+            for name in credential_names
+        ],
     ]
 
     assert all(result["is_error"] is True for result in results)

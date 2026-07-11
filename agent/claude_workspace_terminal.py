@@ -11,11 +11,13 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from agent.claude_workspace_policy import is_workspace_credential_path
 from hermes_constants import get_hermes_home
 
 
@@ -58,20 +60,12 @@ _READ_ONLY_GIT_SUBCOMMANDS = frozenset(
     }
 )
 _READ_ONLY_SHELL_ESCAPE_MARKERS = ("\n", "\r", ";", "&", "|", ">", "<", "`", "$(", "${")
-_READ_ONLY_DANGEROUS_OPTIONS = (
+_GIT_HELPER_OPTIONS = (
     "--exec",
     "--ext-diff",
-    "--fix",
-    "--fix-only",
     "--filters",
     "--open-files-in-pager",
-    "--output",
-    "--pre",
-    "--snapshot-update",
     "--textconv",
-    "--unsafe-fixes",
-    "--update-snapshots",
-    "--updateSnapshot",
 )
 
 
@@ -135,8 +129,32 @@ def _is_read_only_test_command(tokens: list[str]) -> bool:
     return False
 
 
-def _validate_read_only_terminal_command(command: str) -> None:
-    """Reject commands outside the reviewer/verifier inspection surface."""
+def _has_option(
+    tokens: list[str],
+    options: tuple[str, ...],
+    *,
+    allow_long_abbreviation: bool = False,
+) -> bool:
+    for token in tokens:
+        token_name = token.split("=", 1)[0]
+        for option in options:
+            if token_name == option:
+                return True
+            if option.startswith("-") and not option.startswith("--"):
+                if token.startswith(option):
+                    return True
+            if (
+                allow_long_abbreviation
+                and token_name.startswith("--")
+                and len(token_name) > 2
+                and option.startswith(token_name)
+            ):
+                return True
+    return False
+
+
+def _validate_read_only_terminal_command(command: str) -> bool:
+    """Validate a reviewer/verifier command and return whether it needs a mirror."""
 
     if any(marker in command for marker in _READ_ONLY_SHELL_ESCAPE_MARKERS):
         raise RuntimeError(
@@ -157,26 +175,77 @@ def _validate_read_only_terminal_command(command: str) -> None:
         raise RuntimeError(
             f"Read-only worker terminal rejected mutation-capable command: {executable or '<empty>'}"
         )
-    if any(
-        token == option or token.startswith(option + "=")
-        for token in tokens[1:]
-        for option in _READ_ONLY_DANGEROUS_OPTIONS
-    ):
-        raise RuntimeError(
-            "Read-only worker terminal rejected mutation-capable command option"
-        )
     if executable == "git" and _git_subcommand(tokens) not in _READ_ONLY_GIT_SUBCOMMANDS:
         raise RuntimeError("Read-only worker terminal rejected mutating git command")
-    if executable == "git" and any(
-        token == "-O" or token.startswith("-O") for token in tokens[2:]
+    if executable == "git" and (
+        _has_option(
+            tokens[2:], _GIT_HELPER_OPTIONS, allow_long_abbreviation=True
+        )
+        or any(token == "-O" or token.startswith("-O") for token in tokens[2:])
     ):
         raise RuntimeError(
-            "Read-only worker terminal rejected external git viewer command"
+            "Read-only worker terminal rejected external git helper command"
         )
-    if executable in {"npm", "pnpm", "yarn", "bun"} and "-u" in tokens[2:]:
+    if executable == "rg" and _has_option(tokens[1:], ("--pre",)):
+        raise RuntimeError("Read-only worker terminal rejected external rg helper")
+    if executable == "go" and _has_option(tokens[2:], ("-exec",)):
+        raise RuntimeError("Read-only worker terminal rejected external go helper")
+    if executable in {"npm", "pnpm", "yarn", "bun"} and _has_option(
+        tokens[2:], ("--script-shell",)
+    ):
+        raise RuntimeError("Read-only worker terminal rejected external script shell")
+    if executable == "cargo" and _has_option(tokens[2:], ("--config",)):
+        raise RuntimeError("Read-only worker terminal rejected cargo helper override")
+    if executable == "make" and _has_option(
+        tokens[1:], ("--eval", "--file", "--makefile", "-f")
+    ):
+        raise RuntimeError("Read-only worker terminal rejected makefile override")
+    return _is_read_only_test_command(tokens)
+
+
+def _normalize_read_only_terminal_command(
+    command: str,
+    *,
+    workspace: Path,
+    exact_env: Mapping[str, str],
+) -> tuple[str, bool]:
+    """Resolve the approved executable without consulting the model's shell path."""
+
+    use_mirror = _validate_read_only_terminal_command(command)
+    tokens = shlex.split(command, posix=True)
+    executable_path = Path(tokens[0])
+    executable = executable_path.name
+    if _is_project_test_runner(executable_path):
+        return shlex.join(tokens), use_mirror
+    if executable in {"pytest", "py.test", "ruff"}:
+        module = "pytest" if executable in {"pytest", "py.test"} else "ruff"
+        tokens = [sys.executable, "-m", module, *tokens[1:]]
+        return shlex.join(tokens), use_mirror
+    if executable.startswith("python"):
+        tokens[0] = sys.executable
+        return shlex.join(tokens), use_mirror
+    if executable == "git":
+        selected_git = _selected_git(str(exact_env.get("PATH") or os.defpath))
+        resolved = str(selected_git) if selected_git is not None else None
+    else:
+        resolved = shutil.which(
+            executable, path=str(exact_env.get("PATH") or os.defpath)
+        )
+    if not resolved:
         raise RuntimeError(
-            "Read-only worker terminal rejected snapshot update command"
+            f"Read-only worker terminal could not resolve approved executable: {executable}"
         )
+    resolved_path = Path(resolved).resolve()
+    try:
+        resolved_path.relative_to(workspace)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(
+            "Read-only worker terminal rejected workspace-selected executable"
+        )
+    tokens[0] = str(resolved_path)
+    return shlex.join(tokens), use_mirror
 
 
 def _seatbelt_string(path: Path) -> str:
@@ -212,10 +281,22 @@ def _metadata_ancestors(path: Path) -> list[Path]:
     return [path, *path.parents]
 
 
-def _write_terminal_profile(profile: str) -> Path:
+def _workspace_credential_paths(root: Path) -> list[Path]:
+    return [
+        path.resolve()
+        for path in root.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and is_workspace_credential_path(path)
+    ]
+
+
+def _write_terminal_profile(profile: str, *, directory: Path | None = None) -> Path:
     """Persist a stable, owner-only Seatbelt profile outside the workspace."""
 
-    directory = get_hermes_home() / "cache" / "claude-agent-sdk" / "terminal-profiles"
+    directory = directory or (
+        get_hermes_home() / "cache" / "claude-agent-sdk" / "terminal-profiles"
+    )
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.chmod(0o700)
     digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()
@@ -256,6 +337,8 @@ def build_workspace_seatbelt_profile(
     readable_roots: list[str | Path] | None = None,
     readable_paths: list[str | Path] | None = None,
     restrict_reads: bool = True,
+    workspace_writable: bool = True,
+    denied_read_paths: list[str | Path] | None = None,
     control_write_paths: list[str | Path] | None = None,
     control_write_roots: list[str | Path] | None = None,
     git_object_roots: list[str | Path] | None = None,
@@ -285,13 +368,9 @@ def build_workspace_seatbelt_profile(
         lines.append("(allow default)")
         if not allow_network:
             lines.append("(deny network*)")
-    lines.extend(
-        [
-            "(deny file-write*)",
-            f"(allow file-write* (subpath {_seatbelt_string(root)}))",
-            '(allow file-write* (literal "/dev/null"))',
-        ]
-    )
+    lines.extend(["(deny file-write*)", '(allow file-write* (literal "/dev/null"))'])
+    if workspace_writable:
+        lines.append(f"(allow file-write* (subpath {_seatbelt_string(root)}))")
     if restrict_reads:
         lines.append(f"(allow file-read* (subpath {_seatbelt_string(root)}))")
         for ancestor in _metadata_ancestors(root):
@@ -338,6 +417,9 @@ def build_workspace_seatbelt_profile(
                 lines.append(
                     f"(allow file-read-metadata (literal {_seatbelt_string(parent)}))"
                 )
+    for denied_path in denied_read_paths or []:
+        path = Path(denied_path).expanduser().resolve(strict=False)
+        lines.append(f"(deny file-read* (literal {_seatbelt_string(path)}))")
     for writable in control_write_paths or []:
         path = Path(writable).expanduser().resolve(strict=False)
         lines.append(f"(allow file-write* (literal {_seatbelt_string(path)}))")
@@ -671,6 +753,9 @@ def build_workspace_terminal_args(
     exact_env: Mapping[str, str],
     platform_name: str | None = None,
     read_only: bool = False,
+    runtime_root: str | Path | None = None,
+    additional_readable_roots: list[str | Path] | None = None,
+    git_metadata_enabled: bool = True,
 ) -> dict[str, Any]:
     """Wrap a Hermes terminal call in exact-env macOS Seatbelt isolation."""
 
@@ -679,7 +764,17 @@ def build_workspace_terminal_args(
     if not command:
         raise RuntimeError("Workspace terminal requires a command")
     if read_only:
-        _validate_read_only_terminal_command(command)
+        command, use_mirror = _normalize_read_only_terminal_command(
+            command,
+            workspace=root,
+            exact_env=exact_env,
+        )
+        if use_mirror:
+            raise RuntimeError(
+                "Read-only test/build commands require a disposable workspace mirror"
+            )
+        if runtime_root is None:
+            raise RuntimeError("Read-only terminal requires host-managed runtime scratch")
     if (platform_name or platform.system()) != "Darwin":
         raise RuntimeError("Workspace terminal sandbox is unsupported on this OS")
     host = Path(host_home).expanduser().resolve()
@@ -707,35 +802,51 @@ def build_workspace_terminal_args(
             executable_paths.append(target.absolute())
     executable_paths.extend(_mach_o_dependencies(executable_paths))
 
-    git_metadata = _git_sandbox_metadata(root, git)
-    toolchain_roots = [
-        Path(path)
-        for path in (
-            str(Path(sys.executable).resolve().parents[1]),
-        )
-        if Path(path).exists()
-    ]
+    git_metadata = _git_sandbox_metadata(root, git) if git_metadata_enabled else None
+    toolchain_paths = [str(Path(sys.executable).resolve().parents[1])]
+    if runtime_root is not None:
+        toolchain_paths.append(str(Path(sys.prefix).resolve()))
+    toolchain_roots = [Path(path) for path in toolchain_paths if Path(path).exists()]
     toolchain_roots.extend(_homebrew_formula_roots(executable_paths))
+    toolchain_roots.extend(
+        Path(path).expanduser().resolve()
+        for path in additional_readable_roots or []
+    )
     if git_metadata is not None and not git_metadata.common_dir.is_relative_to(root):
         toolchain_roots.append(git_metadata.common_dir)
     if git is not None and git.is_relative_to(Path("/Library/Developer")):
         toolchain_roots.append(Path("/Library/Developer"))
+    runtime_base = (
+        Path(runtime_root).expanduser().resolve()
+        if runtime_root is not None
+        else root / ".hermes-claude-runtime"
+    )
+    runtime_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_base.chmod(0o700)
     profile = build_workspace_seatbelt_profile(
         workspace=root,
         host_home=host,
         allow_network=False,
-        readable_roots=toolchain_roots,
+        readable_roots=[*toolchain_roots, runtime_base],
         readable_paths=executable_paths,
         control_write_paths=(
-            list(git_metadata.control_write_paths) if git_metadata else None
+            list(git_metadata.control_write_paths)
+            if git_metadata and not read_only
+            else None
         ),
         git_object_roots=(
             [git_metadata.object_dir]
-            if git_metadata and git_metadata.object_dir
+            if git_metadata and git_metadata.object_dir and not read_only
             else None
         ),
+        workspace_writable=not read_only,
+        denied_read_paths=_workspace_credential_paths(root) if read_only else [],
+        control_write_roots=[runtime_base],
     )
-    profile_path = _write_terminal_profile(profile)
+    profile_path = _write_terminal_profile(
+        profile,
+        directory=runtime_base / "profiles" if runtime_root is not None else None,
+    )
     allowed_env_keys = {
         "LANG",
         "LC_ALL",
@@ -758,8 +869,12 @@ def build_workspace_terminal_args(
         terminal_env["PATH"] = os.pathsep.join(
             part for part in (str(git.parent), existing_path) if part
         )
-    terminal_env["HOME"] = str(root)
-    terminal_tmp = root / ".hermes-claude-runtime" / "tmp"
+    terminal_home = root if runtime_root is None else runtime_base / "home"
+    if runtime_root is not None:
+        terminal_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        terminal_home.chmod(0o700)
+    terminal_env["HOME"] = str(terminal_home)
+    terminal_tmp = runtime_base / "tmp"
     terminal_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
     terminal_tmp.chmod(0o700)
     terminal_env["TMPDIR"] = str(terminal_tmp)
@@ -788,6 +903,7 @@ def build_workspace_terminal_args(
         command,
     ]
     transformed = dict(arguments)
+    transformed["command"] = command
     workdir = Path(str(arguments.get("workdir") or root)).expanduser()
     if not workdir.is_absolute():
         workdir = root / workdir
@@ -799,4 +915,125 @@ def build_workspace_terminal_args(
     return transformed
 
 
-__all__ = ["build_workspace_seatbelt_profile", "build_workspace_terminal_args"]
+_MIRROR_LINKED_DEPENDENCIES = (".venv", "venv", "node_modules")
+_MIRROR_EXCLUDED_NAMES = frozenset(
+    {
+        ".hermes-claude-runtime",
+        *_MIRROR_LINKED_DEPENDENCIES,
+    }
+)
+
+
+def _copy_workspace_to_mirror(source: Path, destination: Path) -> list[Path]:
+    """Copy source state without creating write aliases back to the assignment."""
+
+    def _ignore(_directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name in _MIRROR_EXCLUDED_NAMES or is_workspace_credential_path(name)
+        }
+
+    shutil.copytree(source, destination, symlinks=True, ignore=_ignore)
+    dependency_roots: list[Path] = []
+    for name in _MIRROR_LINKED_DEPENDENCIES:
+        dependency = source / name
+        if not dependency.exists() or not dependency.is_dir():
+            continue
+        (destination / name).symlink_to(dependency, target_is_directory=True)
+        dependency_roots.append(dependency.resolve())
+    return dependency_roots
+
+
+def _remove_disposable_root(root: Path) -> None:
+    def _retry(function: Callable[[str], Any], path: str, _error: Any) -> None:
+        os.chmod(path, stat.S_IRWXU)
+        function(path)
+
+    shutil.rmtree(root, onerror=_retry)
+
+
+def dispatch_read_only_workspace_terminal(
+    arguments: Mapping[str, Any],
+    *,
+    workspace: str | Path,
+    host_home: str | Path,
+    exact_env: Mapping[str, str],
+    dispatch: Callable[..., Any],
+    task_id: str,
+    platform_name: str | None = None,
+    scratch_parent: str | Path | None = None,
+) -> Any:
+    """Dispatch one reviewer/verifier command without writable access to source."""
+
+    source = Path(workspace).expanduser().resolve()
+    command = str(arguments.get("command") or "").strip()
+    normalized, use_mirror = _normalize_read_only_terminal_command(
+        command,
+        workspace=source,
+        exact_env=exact_env,
+    )
+    if bool(arguments.get("background")):
+        raise RuntimeError("Read-only worker terminal rejects background execution")
+    if not source.is_dir():
+        raise RuntimeError(f"Worker workspace does not exist: {source}")
+    _reject_linked_workspace_files(source)
+
+    scratch_base = Path(
+        scratch_parent
+        or get_hermes_home() / "cache" / "claude-agent-sdk" / "read-only-runs"
+    ).expanduser().resolve()
+    if scratch_base == source or scratch_base.is_relative_to(source):
+        raise RuntimeError("Read-only terminal scratch must be outside the workspace")
+    scratch_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scratch_base.chmod(0o700)
+    run_root = Path(tempfile.mkdtemp(prefix="run-", dir=scratch_base))
+    try:
+        dependency_roots: list[Path] = []
+        execution_root = source
+        if use_mirror:
+            execution_root = run_root / "workspace"
+            dependency_roots = _copy_workspace_to_mirror(source, execution_root)
+            source_git = _selected_git(str(exact_env.get("PATH", "")))
+            source_git_metadata = _git_sandbox_metadata(source, source_git)
+            if (
+                source_git_metadata is not None
+                and not source_git_metadata.common_dir.is_relative_to(source)
+            ):
+                dependency_roots.append(source_git_metadata.common_dir)
+
+        original_workdir = Path(str(arguments.get("workdir") or source)).expanduser()
+        if not original_workdir.is_absolute():
+            original_workdir = source / original_workdir
+        original_workdir = original_workdir.resolve(strict=False)
+        try:
+            relative_workdir = original_workdir.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Workspace terminal workdir is outside the worker workspace"
+            ) from exc
+
+        dispatch_arguments = dict(arguments)
+        dispatch_arguments["command"] = normalized if use_mirror else command
+        dispatch_arguments["workdir"] = str(execution_root / relative_workdir)
+        transformed = build_workspace_terminal_args(
+            dispatch_arguments,
+            workspace=execution_root,
+            host_home=host_home,
+            exact_env=exact_env,
+            platform_name=platform_name,
+            read_only=not use_mirror,
+            runtime_root=run_root / "runtime",
+            additional_readable_roots=dependency_roots,
+            git_metadata_enabled=not use_mirror,
+        )
+        return dispatch("terminal", transformed, task_id=task_id)
+    finally:
+        _remove_disposable_root(run_root)
+
+
+__all__ = [
+    "build_workspace_seatbelt_profile",
+    "build_workspace_terminal_args",
+    "dispatch_read_only_workspace_terminal",
+]
