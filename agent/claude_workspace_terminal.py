@@ -186,18 +186,28 @@ def build_workspace_seatbelt_profile(
         lines.append(f"(allow file-write* (subpath {_seatbelt_string(path)}))")
     for object_root in git_object_roots or []:
         path = Path(object_root).expanduser().resolve(strict=False)
-        # Git creates immutable loose objects through a temporary file. Permit
-        # new paths in the object database, but never mutation or deletion of
-        # an existing object. Only Git's tmp_obj_* files may be changed or
-        # removed after creation.
+        hex_pair = "[0-9a-f][0-9a-f]"
+        sha1_tail = "[0-9a-f]" * 38
+        temp_suffix = "[A-Za-z0-9]" * 6
+        fanout_pattern = json.dumps(f"/{hex_pair}$")
+        loose_pattern = json.dumps(f"/{hex_pair}/{sha1_tail}$")
+        temp_pattern = json.dumps(f"/tmp_obj_{temp_suffix}$")
+        # Git creates an immutable SHA-1 loose object through a six-character
+        # tmp_obj_* file. Permit only that exact lifecycle: create the two-hex
+        # fan-out directory, temporary file, and 38-hex tail; mutate/unlink only
+        # the temporary file. Existing objects and objects/{info,pack} remain
+        # immutable.
         lines.append(
-            f"(allow file-write-create (subpath {_seatbelt_string(path)}))"
+            "(allow file-write-create "
+            f"(require-all (subpath {_seatbelt_string(path)}) "
+            f"(require-any (regex #{fanout_pattern}) "
+            f"(regex #{loose_pattern}) (regex #{temp_pattern}))))"
         )
         lines.append(
             "(allow file-write-create file-write-data file-write-mode "
             "file-write-unlink "
             f"(require-all (subpath {_seatbelt_string(path)}) "
-            '(regex #"tmp_obj_")))'
+            f"(regex #{temp_pattern})))"
         )
     return "\n".join(lines)
 
@@ -205,7 +215,6 @@ def build_workspace_seatbelt_profile(
 @dataclass(frozen=True)
 class _GitSandboxMetadata:
     common_dir: Path
-    worktree_git_dir: Path | None
     object_dir: Path | None
     control_write_paths: tuple[Path, ...]
 
@@ -288,12 +297,52 @@ def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata |
         if not common_dir.is_dir() or not git_dir.is_dir():
             return None
         if git_dir.is_relative_to(root):
-            return _GitSandboxMetadata(common_dir, None, None, ())
+            return _GitSandboxMetadata(common_dir, None, ())
         linked_root = common_dir / "worktrees"
         if not git_dir.is_relative_to(linked_root):
             raise RuntimeError(
                 "Claude terminal rejected Git metadata outside the workspace: "
                 f"{git_dir}"
+            )
+        workspace_dotgit = root / ".git"
+        gitdir_backpointer = git_dir / "gitdir"
+        commondir_pointer = git_dir / "commondir"
+
+        def _regular_single_link(path: Path) -> bool:
+            try:
+                info = path.lstat()
+            except OSError:
+                return False
+            return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+        if not all(
+            _regular_single_link(path)
+            for path in (workspace_dotgit, gitdir_backpointer, commondir_pointer)
+        ):
+            raise RuntimeError("Claude terminal rejected mutable linked-worktree pointers")
+        dotgit_text = workspace_dotgit.read_text(encoding="utf-8").strip()
+        if not dotgit_text.startswith("gitdir:"):
+            raise RuntimeError("Claude terminal rejected malformed workspace .git file")
+        dotgit_target = Path(dotgit_text.split(":", 1)[1].strip()).expanduser()
+        if not dotgit_target.is_absolute():
+            dotgit_target = workspace_dotgit.parent / dotgit_target
+        backpointer_target = Path(
+            gitdir_backpointer.read_text(encoding="utf-8").strip()
+        ).expanduser()
+        if not backpointer_target.is_absolute():
+            backpointer_target = git_dir / backpointer_target
+        commondir_target = Path(
+            commondir_pointer.read_text(encoding="utf-8").strip()
+        ).expanduser()
+        if not commondir_target.is_absolute():
+            commondir_target = git_dir / commondir_target
+        if (
+            dotgit_target.resolve() != git_dir
+            or backpointer_target.resolve() != workspace_dotgit
+            or commondir_target.resolve() != common_dir
+        ):
+            raise RuntimeError(
+                "Claude terminal rejected linked-worktree metadata backpointers"
             )
         object_dir = (common_dir / "objects").resolve()
         if not object_dir.is_dir() or not object_dir.is_relative_to(common_dir):
@@ -301,10 +350,14 @@ def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata |
                 "Claude terminal rejected Git object storage outside the common "
                 f"directory: {object_dir}"
             )
-        packed_refs_lock = common_dir / "packed-refs.lock"
-        if packed_refs_lock.resolve(strict=False) != packed_refs_lock:
-            raise RuntimeError("Claude terminal rejected linked Git packed-refs lock")
-        control_paths: list[Path] = [packed_refs_lock]
+        control_paths: list[Path] = [
+            git_dir / "index",
+            git_dir / "index.lock",
+            git_dir / "COMMIT_EDITMSG",
+            git_dir / "HEAD.lock",
+            git_dir / "logs" / "HEAD",
+            git_dir / "logs" / "HEAD.lock",
+        ]
         try:
             branch = _git_output(git, root, "symbolic-ref", "--quiet", "HEAD")
         except subprocess.CalledProcessError:
@@ -341,9 +394,17 @@ def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata |
                     reflog_lock,
                 ]
             )
+        for path in control_paths:
+            if path.resolve(strict=False) != path:
+                raise RuntimeError(
+                    f"Claude terminal rejected linked Git write path: {path}"
+                )
+            if path.exists() and not _regular_single_link(path):
+                raise RuntimeError(
+                    f"Claude terminal rejected mutable linked Git write path: {path}"
+                )
         return _GitSandboxMetadata(
             common_dir=common_dir,
-            worktree_git_dir=git_dir,
             object_dir=object_dir,
             control_write_paths=tuple(control_paths),
         )
@@ -468,11 +529,6 @@ def build_workspace_terminal_args(
         control_write_paths=(
             list(git_metadata.control_write_paths) if git_metadata else None
         ),
-        control_write_roots=(
-            [git_metadata.worktree_git_dir]
-            if git_metadata and git_metadata.worktree_git_dir
-            else None
-        ),
         git_object_roots=(
             [git_metadata.object_dir]
             if git_metadata and git_metadata.object_dir
@@ -509,6 +565,11 @@ def build_workspace_terminal_args(
     terminal_env["TMPDIR"] = str(terminal_tmp)
     terminal_env["GIT_CONFIG_NOSYSTEM"] = "1"
     terminal_env["GIT_OPTIONAL_LOCKS"] = "0"
+    terminal_env["GIT_CONFIG_COUNT"] = "2"
+    terminal_env["GIT_CONFIG_KEY_0"] = "maintenance.auto"
+    terminal_env["GIT_CONFIG_VALUE_0"] = "false"
+    terminal_env["GIT_CONFIG_KEY_1"] = "gc.auto"
+    terminal_env["GIT_CONFIG_VALUE_1"] = "0"
     terminal_env["UV_LINK_MODE"] = "copy"
     env_argv = [f"{key}={value}" for key, value in sorted(terminal_env.items())]
     wrapped_argv = [

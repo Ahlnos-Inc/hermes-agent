@@ -153,6 +153,128 @@ def test_workspace_terminal_keeps_shared_git_metadata_and_objects_immutable(tmp_
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_workspace_terminal_cannot_retarget_head_between_invocations(tmp_path):
+    repo, workspace = _linked_worktree(tmp_path)
+    main_before = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    retarget = build_workspace_terminal_args(
+        {"command": "git symbolic-ref HEAD refs/heads/main"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+    )
+
+    retarget_result = subprocess.run(
+        ["/bin/bash", "-lc", retarget["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    second_invocation = build_workspace_terminal_args(
+        {
+            "command": (
+                "printf 'safe branch commit\\n' > safe.txt && "
+                "git add safe.txt && "
+                "git -c user.name='Hermes Test' "
+                "-c user.email=hermes@example.invalid commit -m safe"
+            )
+        },
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+    )
+    commit_result = subprocess.run(
+        ["/bin/bash", "-lc", second_invocation["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert retarget_result.returncode != 0
+    assert commit_result.returncode == 0, commit_result.stderr
+    assert subprocess.run(
+        ["git", "symbolic-ref", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "refs/heads/build/sandbox-test"
+    assert subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_before
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_workspace_terminal_denies_non_loose_git_object_paths(tmp_path):
+    repo, workspace = _linked_worktree(tmp_path)
+    object_dir = repo / ".git" / "objects"
+    denied_paths = [
+        object_dir / "info" / "worker-created",
+        object_dir / "pack" / "worker-created",
+        object_dir / "tmp_obj_worker_created",
+    ]
+    transformed = build_workspace_terminal_args(
+        {
+            "command": "; ".join(
+                f"printf poison > {shlex.quote(str(path))}" for path in denied_paths
+            )
+        },
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode != 0
+    assert "Operation not permitted" in result.stderr
+    assert all(not path.exists() for path in denied_paths)
+
+
+def test_workspace_terminal_rejects_linked_gitdir_for_another_workspace(tmp_path):
+    _, workspace = _linked_worktree(tmp_path)
+    git_dir = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    (git_dir / "gitdir").write_text(
+        str(tmp_path / "different-workspace" / ".git") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="backpointers"):
+        build_workspace_terminal_args(
+            {"command": "git status --short"},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"PATH": "/usr/bin:/bin"},
+            platform_name="Darwin",
+        )
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
 def test_workspace_terminal_denies_host_and_ambient_but_can_run_tests(tmp_path):
     host_home = tmp_path / "host"
     workspace = host_home / "worktree"
