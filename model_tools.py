@@ -1048,6 +1048,14 @@ def handle_function_call(
             logger.debug("tool_request middleware error: %s", _mw_err)
 
     try:
+        # Dynamic architecture gate boundary.  The policy is re-resolved here
+        # (rather than at agent init) so a gate opened by an earlier tool in
+        # this exact turn prevents every later model-callable operation.
+        from agent.kanban_delivery_policy import policy_for_current_kanban_task
+        _kanban_delivery_policy = policy_for_current_kanban_task()
+        if _kanban_delivery_policy is not None and _kanban_delivery_policy.withholding:
+            return _kanban_delivery_policy.receipt
+
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
@@ -1181,6 +1189,11 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        # Re-check after the handler.  A successful architect-create handler
+        # can itself open the gate; its raw tool envelope must not become the
+        # one-byte same-turn escape hatch into transcripts or transports.
+        if _kanban_delivery_policy is not None:
+            result = str(_kanban_delivery_policy.tool_result(result))
 
         _emit_post_tool_call_hook(
             function_name=function_name,
@@ -1234,7 +1247,14 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        error_result = json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        try:
+            _error_delivery_policy = locals().get("_kanban_delivery_policy")
+            if _error_delivery_policy is not None:
+                return str(_error_delivery_policy.tool_result(error_result))
+        except Exception:
+            pass
+        return error_result
 
 
 # =============================================================================

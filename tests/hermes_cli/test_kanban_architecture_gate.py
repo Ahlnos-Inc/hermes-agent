@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from agent.kanban_delivery_policy import policy_for_current_kanban_task
 
 
 @pytest.fixture
@@ -182,6 +183,7 @@ def test_valid_completed_architect_handoff_accepts_exact_snapshot_and_allows_cre
         )
 
         gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None
         accepted = kb.accept_architecture_handoff(conn, gate.gate_id)
         assert accepted.state == "policy_accepted"
         assert accepted.design_digest
@@ -311,7 +313,7 @@ def test_human_approved_gate_issues_one_atomic_five_card_graph(kanban_home):
     with kb.connect() as conn:
         gate = _awaiting_human_approval(conn)
         approved = kb.approve_architecture_gate(
-            conn, gate.gate_id, _human_context(), gate.design_digest,
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
         )
         issuer = kb.MutationContext(
             board_key="default",
@@ -361,7 +363,7 @@ def test_worker_kanban_create_cannot_append_to_an_issued_graph(kanban_home, monk
     with kb.connect() as conn:
         gate = _awaiting_human_approval(conn)
         approved = kb.approve_architecture_gate(
-            conn, gate.gate_id, _human_context(), gate.design_digest,
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
         )
         issued = kb.issue_architecture_graph(
             conn,
@@ -396,7 +398,7 @@ def test_auto_decompose_cannot_append_to_an_issued_graph(kanban_home):
     with kb.connect() as conn:
         gate = _awaiting_human_approval(conn)
         approved = kb.approve_architecture_gate(
-            conn, gate.gate_id, _human_context(), gate.design_digest,
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
         )
         issued = kb.issue_architecture_graph(
             conn,
@@ -499,14 +501,16 @@ def test_five_card_strava_incident_is_classified_without_any_external_action(kan
         architect = kb.create_task(
             conn, title="Architect remediation", assignee="architect", mutation_context=_architect_context(),
         )
-        kb.link_tasks(conn, architect, cards[0])
+        kb.link_tasks(conn, architect, cards[0], mutation_context=_architect_context())
         gate = kb.get_architecture_gate_for_task(conn, architect)
         assert gate is not None
 
         events_before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
         assert {item.task_id for item in kb.classify_policy_quarantine(conn, gate.gate_id)} == set(cards)
         assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events_before
-        assert kb.apply_policy_quarantine(conn, gate.gate_id) == set(cards)
+        assert kb.apply_policy_quarantine(
+            conn, gate.gate_id, context=_human_context(), signal_fn=lambda *_: None,
+        ) == set(cards)
         for card in cards:
             task = kb.get_task(conn, card)
             assert task is not None and task.policy_quarantined
@@ -521,20 +525,117 @@ def test_policy_quarantine_dominates_readiness_claim_dependencies_and_stale_comp
         architect = kb.create_task(
             conn, title="Design workflow", assignee="architect", mutation_context=_architect_context(),
         )
-        kb.link_tasks(conn, architect, premature)
+        kb.link_tasks(conn, architect, premature, mutation_context=_architect_context())
 
         gate = kb.get_architecture_gate_for_task(conn, architect)
         assert gate is not None
         classified = kb.classify_policy_quarantine(conn, gate.gate_id)
         assert {item.task_id for item in classified} == {premature, descendant}
-        assert kb.apply_policy_quarantine(conn, gate.gate_id) == {premature, descendant}
+        assert kb.apply_policy_quarantine(
+            conn, gate.gate_id, context=_human_context(), signal_fn=lambda *_: None,
+        ) == {premature, descendant}
 
         assert kb.claim_task(conn, descendant) is None
         assert not kb.complete_task(conn, premature, expected_run_id=claimed.current_run_id)
         assert kb.get_task(conn, premature).policy_quarantined
         assert kb.get_task(conn, descendant).policy_quarantined
 
-        dependent = kb.create_task(conn, title="Depends on invalid work", assignee="coder", parents=[premature])
-        assert kb.get_task(conn, dependent).status == "todo"
+        row_count_before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.create_task(
+                conn,
+                title="Depends on invalid work",
+                assignee="coder",
+                parents=[premature],
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == row_count_before
         assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, dependent).status == "todo"
+
+
+def test_same_turn_gate_open_withholds_tool_and_final_delivery(kanban_home, monkeypatch):
+    """The five-card incident cannot leak after its architect card is opened."""
+    with kb.connect() as conn:
+        dispatcher_task = kb.create_task(
+            conn,
+            title="Orchestrate five-card remediation",
+            assignee="orchestrator",
+            session_id="session-1",
+            workflow_key="incident-5",
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", dispatcher_task)
+        policy = policy_for_current_kanban_task()
+        assert policy is not None and not policy.withholding
+
+        architect = kb.create_task(
+            conn,
+            title="Architect the incident",
+            assignee="architect",
+            session_id="session-1",
+            workflow_key="incident-5",
+            mutation_context=kb.MutationContext(
+                board_key="default",
+                principal="orchestrator-session",
+                actor_type="orchestrator_agent",
+                session_id="session-1",
+                request_scope_id="incident-turn",
+                workflow_key="incident-5",
+                mode="orchestrator_only",
+                phase="architecture",
+            ),
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None and gate.enforcement_mode == "orchestrator_only"
+
+        assert policy.stream_delta("must not leak") is None
+        receipt = str(policy.tool_result('{"task_id":"must-not-leak"}'))
+        assert "must-not-leak" not in receipt
+        assert gate.gate_id in receipt
+        assert "architect " + architect in receipt
+        assert "state open" in receipt
+
+
+def test_authorized_graph_and_post_approval_descendants_are_not_quarantined(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        issued = kb.issue_architecture_graph(
+            conn,
+            approved.gate_id,
+            kb.MutationContext(
+                board_key="default", principal="orchestrator-session",
+                actor_type="orchestrator_agent", session_id="session-1",
+                request_scope_id="turn-1", gate_id=approved.gate_id,
+                profile="orchestrator", mode="orchestrator_only", phase="graph_issuance",
+            ),
+            [
+                {"title": "implementation", "assignee": "coder", "parents": []},
+                {"title": "Google configuration", "assignee": "coder", "parents": [0]},
+                {"title": "verification", "assignee": "verifier", "parents": [1]},
+                {"title": "finalizer", "assignee": "releaser", "parents": [2]},
+            ],
+            idempotency_key="incident-five-card-v1",
+        )
+        assert len(issued) == 4
+        assert kb.classify_policy_quarantine(conn, approved.gate_id) == []
+
+
+def test_accepted_architect_edit_invalidates_within_owning_mutation(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn, title="Design workflow", assignee="architect", mutation_context=_architect_context(),
+        )
+        claimed = kb.claim_task(conn, architect)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn, architect, metadata=_formal_handoff(), expected_run_id=claimed.current_run_id,
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None
+        accepted = kb.accept_architecture_handoff(conn, gate.gate_id)
+        assert accepted.state == "policy_accepted"
+
+        assert kb.edit_completed_task_result(conn, architect, result="corrected handoff")
+        invalidated = kb.get_architecture_gate(conn, gate.gate_id)
+        assert invalidated is not None and invalidated.state == "invalidated"

@@ -6,10 +6,11 @@ def test_unresolved_gate_withholds_all_delivery_shapes():
 
     assert policy.stream_delta("secret streamed prose") is None
     assert policy.interim("secret interim prose") is None
-    assert policy.final("secret final prose") == (
-        "Architecture approval pending; output withheld (gate gate-1)."
-    )
-    assert "secret" not in policy.receipt
+    receipt = str(policy.final("secret final prose"))
+    assert receipt.startswith("Architecture approval pending; output withheld (gate gate-1;")
+    assert "state validated_awaiting_approval" in receipt
+    assert "next action: await exact-digest human approval" in receipt
+    assert "secret" not in receipt
 
 
 def test_human_approved_gate_preserves_delivery():

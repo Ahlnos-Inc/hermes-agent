@@ -149,7 +149,12 @@ ARCHITECTURE_GATE_ACTIVE_STATES = {
 ARCHITECTURE_GATE_APPROVED_STATES = {"policy_accepted", "human_approved"}
 ARCHITECTURE_GATE_POLICY_VERSION = "v1"
 ARCHITECTURE_GATE_CANONICALIZATION_VERSION = "v1"
-ARCHITECTURE_GATE_MODES = {"off", "shadow", "enforce"}
+# Rollout is deliberately one-way in authority: disabled, observability-only,
+# then enforced only by the trusted orchestrator boundary.  ``enforce`` remains
+# as a legacy persisted value so old boards can be read, but new callers must
+# use the explicit orchestrator-only mode.
+ARCHITECTURE_GATE_MODES = {"off", "shadow", "orchestrator_only", "enforce"}
+ARCHITECTURE_GATE_ENFORCING_MODES = {"orchestrator_only", "enforce"}
 ARCHITECTURE_GATE_REASON_OPEN = "architecture_gate_open"
 AUTHENTICATED_APPROVAL_SURFACES = frozenset({"cli", "dashboard", "api", "acp", "gateway"})
 READ_ONLY_DISCOVERY_PROFILES = frozenset({"scout", "researcher"})
@@ -1178,6 +1183,7 @@ class ArchitectureGate:
     approval_surface: Optional[str]
     approved_digest: Optional[str]
     approved_at: Optional[int]
+    authorization_event_id: Optional[int]
     enforcement_mode: str
     row_version: int
     created_at: int
@@ -1199,6 +1205,11 @@ class ArchitectureGate:
             approval_surface=row["approval_surface"] if "approval_surface" in row.keys() else None,
             approved_digest=row["approved_digest"] if "approved_digest" in row.keys() else None,
             approved_at=(int(row["approved_at"]) if "approved_at" in row.keys() and row["approved_at"] is not None else None),
+            authorization_event_id=(
+                int(row["authorization_event_id"])
+                if "authorization_event_id" in row.keys() and row["authorization_event_id"] is not None
+                else None
+            ),
             enforcement_mode=row["enforcement_mode"], row_version=int(row["row_version"]),
             created_at=int(row["created_at"]), updated_at=int(row["updated_at"]),
         )
@@ -1440,7 +1451,8 @@ CREATE TABLE IF NOT EXISTS architecture_gates (
     approval_actor_type      TEXT,
     approval_surface         TEXT,
     approved_digest          TEXT,
-    approved_at              INTEGER,
+    approved_at               INTEGER,
+    authorization_event_id    INTEGER,
     enforcement_mode         TEXT NOT NULL DEFAULT 'off',
     row_version              INTEGER NOT NULL DEFAULT 0,
     created_at               INTEGER NOT NULL,
@@ -2246,6 +2258,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("approval_surface", "approval_surface TEXT"),
             ("approved_digest", "approved_digest TEXT"),
             ("approved_at", "approved_at INTEGER"),
+            ("authorization_event_id", "authorization_event_id INTEGER"),
         ):
             if name not in gate_cols:
                 _add_column_if_missing(conn, "architecture_gates", name, definition)
@@ -2954,6 +2967,42 @@ def get_architecture_gate_for_task(
     return None
 
 
+def get_delivery_architecture_gate(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[ArchitectureGate]:
+    """Resolve an enforcing gate that can affect this *current* worker turn.
+
+    Parent traversal covers graph-issued workers.  Before a graph exists, an
+    orchestrator can open an architect gate in the same turn; in that case the
+    active task and new architect card share the durable session/workflow
+    binding.  This lookup deliberately uses only persisted server-side fields,
+    never model supplied scope values.
+    """
+    direct = get_architecture_gate_for_task(conn, task_id)
+    if direct is not None and direct.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+        return direct
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    clauses: list[str] = []
+    params: list[Any] = []
+    if task.session_id:
+        clauses.append("session_id = ?")
+        params.append(task.session_id)
+    if task.workflow_key:
+        clauses.append("workflow_key = ?")
+        params.append(task.workflow_key)
+    if not clauses:
+        return None
+    row = conn.execute(
+        "SELECT * FROM architecture_gates WHERE enforcement_mode IN (?, ?) "
+        "AND state != 'human_approved' AND (" + " OR ".join(clauses) + ") "
+        "ORDER BY updated_at DESC LIMIT 1",
+        [*ARCHITECTURE_GATE_ENFORCING_MODES, *params],
+    ).fetchone()
+    return _architecture_gate_from_row(row)
+
+
 def _active_scope_gate(
     conn: sqlite3.Connection, context: MutationContext, *, include_terminal: bool = False,
 ) -> Optional[ArchitectureGate]:
@@ -2988,7 +3037,7 @@ def _active_scope_gate(
 def _gate_requires_enforcement(gate: Optional[ArchitectureGate]) -> bool:
     return bool(
         gate
-        and gate.enforcement_mode == "enforce"
+        and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES
         and gate.state not in ARCHITECTURE_GATE_APPROVED_STATES
     )
 
@@ -2999,7 +3048,7 @@ def _new_gate_id() -> str:
 
 def _append_gate_audit(
     conn: sqlite3.Connection, gate: ArchitectureGate, kind: str, reason: Optional[str] = None,
-) -> None:
+) -> int:
     payload: dict[str, Any] = {
         "gate_id": gate.gate_id,
         "state": gate.state,
@@ -3007,7 +3056,7 @@ def _append_gate_audit(
     }
     if reason:
         payload["reason"] = reason
-    _append_event(conn, gate.architect_task_id, kind, payload)
+    return _append_event(conn, gate.architect_task_id, kind, payload)
 
 
 def _open_architecture_gate(
@@ -3159,7 +3208,15 @@ def accept_architecture_handoff(conn: sqlite3.Connection, gate_id: str) -> Archi
             raise ArchitectureGateError("architecture_gate_cas_conflict")
         accepted = get_architecture_gate(conn, gate_id)
         assert accepted is not None
-        _append_gate_audit(conn, accepted, "handoff_validation_passed")
+        accepted_event_id = _append_gate_audit(conn, accepted, "handoff_validation_passed")
+        if accepted.state == "policy_accepted":
+            conn.execute(
+                "UPDATE architecture_gates SET authorization_event_id = ? "
+                "WHERE gate_id = ? AND authorization_event_id IS NULL",
+                (accepted_event_id, accepted.gate_id),
+            )
+            accepted = get_architecture_gate(conn, gate_id)
+            assert accepted is not None
         return accepted
 
 
@@ -3210,7 +3267,14 @@ def approve_architecture_gate(
             raise ArchitectureGateError("architecture_gate_cas_conflict")
         approved = get_architecture_gate(conn, gate_id)
         assert approved is not None
-        _append_gate_audit(conn, approved, "approval_approved")
+        approval_event_id = _append_gate_audit(conn, approved, "approval_approved")
+        conn.execute(
+            "UPDATE architecture_gates SET authorization_event_id = ? "
+            "WHERE gate_id = ? AND authorization_event_id IS NULL",
+            (approval_event_id, approved.gate_id),
+        )
+        approved = get_architecture_gate(conn, gate_id)
+        assert approved is not None
         return approved
 
 
@@ -3444,10 +3508,26 @@ def _consume_discovery_capability(
 def classify_policy_quarantine(
     conn: sqlite3.Connection, gate_id: str,
 ) -> list[PolicyQuarantineClassification]:
-    """Read-only deterministic containment report for premature descendants."""
+    """Read-only containment report for descendants created before authorization.
+
+    ``task_events.id`` supplies transaction ordering that wall-clock seconds
+    cannot.  Descendants created after the gate's accepted/approved audit
+    receipt remain valid, including a canonical graph issued in that window.
+    Unknown raw rows are left for the claim backstop instead of guessing that
+    post-approval work was premature.
+    """
     gate = get_architecture_gate(conn, gate_id)
     if gate is None:
         raise ValueError("unknown architecture gate")
+    issued_ids: set[str] = set()
+    issuance = conn.execute(
+        "SELECT task_ids FROM architecture_graph_issuances WHERE gate_id = ?", (gate_id,)
+    ).fetchone()
+    if issuance is not None:
+        try:
+            issued_ids = set(json.loads(issuance["task_ids"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ArchitectureGateError("architecture_graph_issuance_corrupt") from exc
     seen: set[str] = {gate.architect_task_id}
     stack = [gate.architect_task_id]
     classified: list[PolicyQuarantineClassification] = []
@@ -3458,28 +3538,48 @@ def classify_policy_quarantine(
                 continue
             seen.add(child)
             stack.append(child)
-            classified.append(PolicyQuarantineClassification(child))
+            if child in issued_ids:
+                continue
+            created = conn.execute(
+                "SELECT MIN(id) AS event_id FROM task_events "
+                "WHERE task_id = ? AND kind = 'created'", (child,),
+            ).fetchone()
+            created_event_id = int(created["event_id"]) if created and created["event_id"] is not None else None
+            if gate.authorization_event_id is None or (
+                created_event_id is not None and created_event_id < gate.authorization_event_id
+            ):
+                classified.append(PolicyQuarantineClassification(child))
     return classified
 
 
-def apply_policy_quarantine(conn: sqlite3.Connection, gate_id: str) -> set[str]:
-    """Idempotently quarantine classified cards and invalidate active leases."""
-    classified = classify_policy_quarantine(conn, gate_id)
-    if not classified:
-        return set()
-    task_ids = {item.task_id for item in classified}
-    now = int(time.time())
+def apply_policy_quarantine(
+    conn: sqlite3.Connection,
+    gate_id: str,
+    *,
+    context: MutationContext,
+    signal_fn=None,
+) -> set[str]:
+    """Human-authorized containment with worker termination outside the txn."""
+    if context.actor_type != "human" or context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
+        raise ArchitectureGateError("containment_requires_authenticated_human")
+    terminations: list[tuple[str, Optional[int], Optional[str]]] = []
     with write_txn(conn):
         gate = get_architecture_gate(conn, gate_id)
         if gate is None:
             raise ValueError("unknown architecture gate")
+        if gate.board_key != context.board_key:
+            raise ArchitectureGateError("architecture_gate_scope_mismatch")
+        task_ids = {item.task_id for item in classify_policy_quarantine(conn, gate_id)}
+        now = int(time.time())
         for task_id in task_ids:
             row = conn.execute(
-                "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+                "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             if row is None:
                 continue
             running_run_id = row["current_run_id"] if row["status"] == "running" else None
+            if running_run_id is not None:
+                terminations.append((task_id, row["worker_pid"], row["claim_lock"]))
             conn.execute(
                 """UPDATE tasks
                    SET policy_quarantined = 1, policy_invalidated = CASE WHEN status = 'done' THEN 1 ELSE policy_invalidated END,
@@ -3506,25 +3606,57 @@ def apply_policy_quarantine(conn: sqlite3.Connection, gate_id: str) -> set[str]:
             if row["status"] in {"running", "done"}:
                 _append_event(conn, task_id, "human_review_required", {"gate_id": gate_id})
         _append_gate_audit(conn, gate, "containment_quarantined")
+
+    # Never signal a worker while the database transaction holds the board
+    # lock.  Capture identity inside the transaction, then terminate after its
+    # durable lease has been removed, preserving the reclaimed-worker pattern.
+    termination_results: dict[str, dict[str, Any]] = {}
+    for task_id, pid, lock in terminations:
+        termination_results[task_id] = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+    if termination_results:
+        with write_txn(conn):
+            for task_id, result in termination_results.items():
+                _append_event(conn, task_id, "worker_termination", result)
     return task_ids
+
+
+def _invalidate_architecture_gate_in_txn(
+    conn: sqlite3.Connection, gate_id: str, *, reason: str,
+) -> ArchitectureGate:
+    """CAS invalidation for an owning mutation already holding ``write_txn``."""
+    gate = get_architecture_gate(conn, gate_id)
+    if gate is None:
+        raise ValueError("unknown architecture gate")
+    if gate.state == "invalidated":
+        return gate
+    cur = conn.execute(
+        """UPDATE architecture_gates SET state = 'invalidated', row_version = row_version + 1,
+           updated_at = ? WHERE gate_id = ? AND row_version = ?""",
+        (int(time.time()), gate_id, gate.row_version),
+    )
+    if cur.rowcount != 1:
+        raise ArchitectureGateError("architecture_gate_cas_conflict")
+    invalidated = get_architecture_gate(conn, gate_id)
+    assert invalidated is not None
+    _append_gate_audit(conn, invalidated, "approval_invalidated", reason)
+    return invalidated
+
+
+def _invalidate_architect_gate_for_mutation(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+) -> Optional[ArchitectureGate]:
+    """Invalidate a previously accepted architect gate in its owning write."""
+    gate = get_architecture_gate_for_task(conn, task_id)
+    if gate is None or gate.architect_task_id != task_id:
+        return None
+    if gate.state not in ARCHITECTURE_GATE_APPROVED_STATES | {"validated_awaiting_approval"}:
+        return None
+    return _invalidate_architecture_gate_in_txn(conn, gate.gate_id, reason=reason)
 
 
 def invalidate_architecture_gate(conn: sqlite3.Connection, gate_id: str, *, reason: str) -> ArchitectureGate:
     with write_txn(conn):
-        gate = get_architecture_gate(conn, gate_id)
-        if gate is None:
-            raise ValueError("unknown architecture gate")
-        cur = conn.execute(
-            """UPDATE architecture_gates SET state = 'invalidated', row_version = row_version + 1,
-               updated_at = ? WHERE gate_id = ? AND row_version = ?""",
-            (int(time.time()), gate_id, gate.row_version),
-        )
-        if cur.rowcount != 1:
-            raise ArchitectureGateError("architecture_gate_cas_conflict")
-        invalidated = get_architecture_gate(conn, gate_id)
-        assert invalidated is not None
-        _append_gate_audit(conn, invalidated, "approval_invalidated", reason)
-        return invalidated
+        return _invalidate_architecture_gate_in_txn(conn, gate_id, reason=reason)
 
 
 def _authorize_mutation(
@@ -3546,7 +3678,7 @@ def _authorize_mutation(
     if context.mode.strip().lower() == "shadow" and gate.state not in ARCHITECTURE_GATE_APPROVED_STATES:
         _append_gate_audit(conn, gate, "create_allowed", ARCHITECTURE_GATE_REASON_OPEN)
         return gate
-    if gate.enforcement_mode == "enforce" and gate.state == "human_approved":
+    if gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES and gate.state == "human_approved":
         issued = conn.execute(
             "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
         ).fetchone()
@@ -3792,6 +3924,21 @@ def create_task(
                             return existing_gate.architect_task_id
                     else:
                         _authorize_mutation(conn, mutation_context, assignee=assignee)
+                elif parents:
+                    # All supported front doors eventually create parent links
+                    # here.  A caller without a boundary-created context cannot
+                    # smuggle implementation work under an unresolved gate.
+                    for parent_id in parents:
+                        parent_gate = get_architecture_gate_for_task(conn, parent_id)
+                        if _gate_requires_enforcement(parent_gate):
+                            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+                        if parent_gate is not None and parent_gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+                            issued = conn.execute(
+                                "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?",
+                                (parent_gate.gate_id,),
+                            ).fetchone()
+                            if issued is not None:
+                                raise ArchitectureGateError("architecture_graph_issued")
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4058,6 +4205,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+        if row["assignee"] != profile:
+            _invalidate_architect_gate_for_mutation(
+                conn, task_id, reason="architect_scope_changed",
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
@@ -4076,12 +4227,19 @@ def link_tasks(
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
+        gate = get_architecture_gate_for_task(conn, child_id) or get_architecture_gate_for_task(conn, parent_id)
         if mutation_context is not None:
-            gate = get_architecture_gate_for_task(conn, child_id) or get_architecture_gate_for_task(conn, parent_id)
             if gate is not None and _gate_requires_enforcement(gate) and mutation_context.phase != "architecture":
                 raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
             if gate is not None and mutation_context.mode.strip().lower() == "shadow":
                 _append_gate_audit(conn, gate, "create_allowed", ARCHITECTURE_GATE_REASON_OPEN)
+        elif gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+            if _gate_requires_enforcement(gate):
+                raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+            if conn.execute(
+                "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
+            ).fetchone() is not None:
+                raise ArchitectureGateError("architecture_graph_issued")
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -4372,7 +4530,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4382,11 +4540,14 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    event_id = cur.lastrowid
+    assert event_id is not None
+    return int(event_id)
 
 
 def _end_run(
@@ -4692,6 +4853,24 @@ def claim_task(
             _append_event(conn, task_id, "claim_blocked", {"reason": "policy_quarantined"})
             return None
         gate = get_architecture_gate_for_task(conn, task_id)
+        if gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+            issued = conn.execute(
+                "SELECT task_ids FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
+            ).fetchone()
+            if issued is not None and task_id != gate.architect_task_id:
+                try:
+                    issued_ids = set(json.loads(issued["task_ids"]))
+                except (TypeError, json.JSONDecodeError):
+                    issued_ids = set()
+                if task_id not in issued_ids:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (task_id,)
+                    )
+                    _append_event(
+                        conn, task_id, "claim_blocked",
+                        {"reason": "architecture_graph_issued", "gate_id": gate.gate_id},
+                    )
+                    return None
         if _gate_requires_enforcement(gate):
             assert gate is not None
             if gate.architect_task_id != task_id:
@@ -5066,6 +5245,9 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
+            _invalidate_architect_gate_for_mutation(
+                conn, row["id"], reason="architect_stale_reclaimed",
+            )
             run_id = _end_run(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
@@ -5138,6 +5320,9 @@ def reclaim_task(
         )
         if cur.rowcount != 1:
             return False
+        _invalidate_architect_gate_for_mutation(
+            conn, task_id, reason="architect_manual_reclaim",
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
@@ -5897,6 +6082,9 @@ def edit_completed_task_result(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
+        _invalidate_architect_gate_for_mutation(
+            conn, task_id, reason="accepted_architect_handoff_edited",
+        )
         ev_summary = (
             handoff_summary.strip().splitlines()[0][:400]
             if handoff_summary else ""
@@ -6234,6 +6422,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _invalidate_architect_gate_for_mutation(
+            conn, task_id, reason="architect_reopened",
+        )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,

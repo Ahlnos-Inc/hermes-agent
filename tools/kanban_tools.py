@@ -1736,7 +1736,7 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
     if not task_id:
         return None
     gate = kb.get_architecture_gate_for_task(conn, task_id)
-    if gate is None or gate.enforcement_mode != "enforce":
+    if gate is None or gate.enforcement_mode not in kb.ARCHITECTURE_GATE_ENFORCING_MODES:
         return None
     return kb.MutationContext(
         board_key=gate.board_key,
@@ -1747,7 +1747,7 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
         workflow_key=gate.workflow_key,
         gate_id=gate.gate_id,
         profile=os.environ.get("HERMES_PROFILE") or None,
-        mode="enforce",
+        mode=gate.enforcement_mode,
         phase="protected",
     )
 
