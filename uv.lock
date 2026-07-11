@@ -1610,6 +1610,7 @@ daytona = [
     { name = "daytona" },
 ]
 dev = [
+    { name = "claude-agent-sdk" },
     { name = "debugpy" },
     { name = "mcp" },
     { name = "pytest" },
@@ -1770,6 +1771,7 @@ requires-dist = [
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.1" },
     { name = "certifi", specifier = "==2026.5.20" },
     { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = "==0.2.116" },
+    { name = "claude-agent-sdk", marker = "extra == 'dev'", specifier = "==0.2.116" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==46.0.7" },

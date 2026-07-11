@@ -197,6 +197,15 @@ def test_dev_extra_excluded_from_all():
     )
 
 
+def test_dev_extra_includes_claude_agent_sdk_for_runtime_tests():
+    """CI's dev install must satisfy tests that import SDK types directly."""
+    optional_dependencies = _load_optional_dependencies()
+
+    assert set(optional_dependencies["claude-agent-sdk"]).issubset(
+        optional_dependencies["dev"]
+    )
+
+
 def test_messaging_extra_includes_qrcode_for_weixin_setup():
     optional_dependencies = _load_optional_dependencies()
 
