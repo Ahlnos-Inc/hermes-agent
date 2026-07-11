@@ -7163,6 +7163,26 @@ _QUOTA_RESPAWN_GUARD_REASONS = frozenset({"blocker_auth", "rate_limit_cooldown"}
 CAPACITY_ONLY_CAUSES = frozenset({"concurrency_cap", "concurrency_cap(per_profile)"})
 
 
+@dataclass
+class DispatchHealthLogCooldowns:
+    """Rate-limit capacity and actionable dispatcher health logs separately."""
+
+    cooldown_seconds: float = 300.0
+    last_capacity_at: Optional[float] = None
+    last_actionable_at: Optional[float] = None
+
+    def should_emit(self, *, capacity_only: bool, now: float) -> bool:
+        attr = "last_capacity_at" if capacity_only else "last_actionable_at"
+        last_emitted = getattr(self, attr)
+        if (
+            last_emitted is not None
+            and now - last_emitted < self.cooldown_seconds
+        ):
+            return False
+        setattr(self, attr, now)
+        return True
+
+
 def dispatch_cause_counts(
     results: "Iterable[Optional[DispatchResult]]",
 ) -> "dict[str, int]":

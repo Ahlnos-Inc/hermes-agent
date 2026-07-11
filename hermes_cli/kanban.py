@@ -2440,7 +2440,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # each task quietly but the operator has no signal that the dispatcher
     # itself is dysfunctional.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0, "results": []}
+    health_state = {
+        "bad_ticks": 0,
+        "log_cooldowns": kb.DispatchHealthLogCooldowns(),
+        "results": [],
+    }
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
@@ -2457,10 +2461,14 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         # so log volume stays bounded while the problem persists.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
-            # Rate-limit repeats: at most one warning per 5 minutes.
-            if now - health_state["last_warn_at"] >= 300:
-                counts = kb.dispatch_cause_counts(health_state["results"])
-                if kb.dispatch_causes_capacity_only(counts):
+            # Rate-limit repeats per classification: at most one capacity
+            # INFO and one actionable WARN per 5 minutes.
+            counts = kb.dispatch_cause_counts(health_state["results"])
+            capacity_only = kb.dispatch_causes_capacity_only(counts)
+            if health_state["log_cooldowns"].should_emit(
+                capacity_only=capacity_only, now=now,
+            ):
+                if capacity_only:
                     # Counts accumulate across the streak, so no per-task
                     # figure here — the causes breakdown carries the
                     # cumulative counts, same convention as the WARN path.
@@ -2484,7 +2492,6 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                         f"spawn_failed tasks.",
                         file=sys.stderr, flush=True,
                     )
-                health_state["last_warn_at"] = now
         if not verbose:
             return
         did_work = (

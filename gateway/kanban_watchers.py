@@ -1217,7 +1217,7 @@ class GatewayKanbanWatchersMixin:
         # usually means broken PATH, missing venv, or credential loss.
         HEALTH_WINDOW = 6
         bad_ticks = 0
-        last_warn_at = 0
+        health_log_cooldowns = _kb.DispatchHealthLogCooldowns()
         # Per-cause DispatchResults accumulated across the CURRENT bad-tick
         # streak (BUILD-263) — reset the moment the streak clears — so the
         # "stuck" warning/escalation can say *why* nothing spawned
@@ -1586,7 +1586,9 @@ class GatewayKanbanWatchersMixin:
                         # a per-task "N deferred" figure would inflate with
                         # streak length — the causes breakdown carries the
                         # cumulative counts, same convention as the WARN path.
-                        if now - last_warn_at >= 300:
+                        if health_log_cooldowns.should_emit(
+                            capacity_only=True, now=now,
+                        ):
                             logger.info(
                                 "kanban dispatcher at capacity: ready tasks "
                                 "deferred by concurrency caps for %d consecutive "
@@ -1594,9 +1596,10 @@ class GatewayKanbanWatchersMixin:
                                 "running worker finishes.",
                                 bad_ticks, causes,
                             )
-                            last_warn_at = now
                     else:
-                        if now - last_warn_at >= 300:
+                        if health_log_cooldowns.should_emit(
+                            capacity_only=False, now=now,
+                        ):
                             logger.warning(
                                 "kanban dispatcher stuck: ready queue non-empty for "
                                 "%d consecutive ticks but 0 workers spawned. Check "
@@ -1604,7 +1607,6 @@ class GatewayKanbanWatchersMixin:
                                 "`hermes kanban list --status ready`.%s",
                                 bad_ticks, causes_suffix,
                             )
-                            last_warn_at = now
                         # Escalation (BUILD-263): once the streak is long enough
                         # that it's clearly not a transient blip, page via
                         # Telegram — logs alone went unread for ~6 hours in the

@@ -24,7 +24,7 @@ from gateway.kanban_watchers import (
     GatewayKanbanWatchersMixin,
     classify_stuck_streak,
 )
-from hermes_cli.kanban_db import DispatchResult
+from hermes_cli.kanban_db import DispatchHealthLogCooldowns, DispatchResult
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,18 @@ def test_classify_stuck_streak_rejects_mixed_capacity_and_spawn_exception():
 @pytest.mark.parametrize("results", [[], [None]])
 def test_classify_stuck_streak_treats_empty_or_none_results_as_suspicious(results):
     assert classify_stuck_streak(results) == (False, "")
+
+
+def test_health_log_cooldowns_do_not_hide_actionable_transition_or_spam():
+    cooldowns = DispatchHealthLogCooldowns(cooldown_seconds=300)
+
+    assert cooldowns.should_emit(capacity_only=True, now=1000) is True
+    assert cooldowns.should_emit(capacity_only=True, now=1001) is False
+    assert cooldowns.should_emit(capacity_only=False, now=1001) is True
+    assert cooldowns.should_emit(capacity_only=False, now=1002) is False
+    assert cooldowns.should_emit(capacity_only=True, now=1002) is False
+    assert cooldowns.should_emit(capacity_only=True, now=1300) is True
+    assert cooldowns.should_emit(capacity_only=False, now=1301) is True
 
 
 # ---------------------------------------------------------------------------
