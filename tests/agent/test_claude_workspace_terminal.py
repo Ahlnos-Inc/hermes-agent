@@ -467,6 +467,23 @@ def test_workspace_terminal_fails_closed_off_macos(tmp_path):
         )
 
 
+def test_read_only_mutation_rejects_before_platform_preflight(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="Read-only worker terminal"):
+        build_workspace_terminal_args(
+            {"command": "touch changed.txt"},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            platform_name="Linux",
+            read_only=True,
+        )
+
+    assert not (workspace / "changed.txt").exists()
+
+
 @pytest.mark.parametrize("read_only", [False, True])
 def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(
     tmp_path, read_only

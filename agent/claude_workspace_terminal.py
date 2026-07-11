@@ -674,17 +674,17 @@ def build_workspace_terminal_args(
 ) -> dict[str, Any]:
     """Wrap a Hermes terminal call in exact-env macOS Seatbelt isolation."""
 
-    if (platform_name or platform.system()) != "Darwin":
-        raise RuntimeError("Workspace terminal sandbox is unsupported on this OS")
     root = Path(workspace).expanduser().resolve()
-    host = Path(host_home).expanduser().resolve()
-    if not root.is_dir():
-        raise RuntimeError(f"Worker workspace does not exist: {root}")
     command = str(arguments.get("command") or "").strip()
     if not command:
         raise RuntimeError("Workspace terminal requires a command")
     if read_only:
         _validate_read_only_terminal_command(command)
+    if (platform_name or platform.system()) != "Darwin":
+        raise RuntimeError("Workspace terminal sandbox is unsupported on this OS")
+    host = Path(host_home).expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"Worker workspace does not exist: {root}")
     _reject_linked_workspace_files(root)
     git = _selected_git(str(exact_env.get("PATH", "")))
     executable_paths = [

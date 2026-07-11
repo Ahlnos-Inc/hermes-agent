@@ -155,10 +155,15 @@ def test_read_only_worker_profiles_omit_mutation_capabilities(
     ]
 
 
-def test_read_only_worker_terminal_rejects_mutation_before_dispatch(tmp_path):
+def test_read_only_worker_terminal_rejects_mutation_before_dispatch(
+    monkeypatch, tmp_path
+):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     calls = []
+    monkeypatch.setattr(
+        "agent.claude_workspace_terminal.platform.system", lambda: "Linux"
+    )
 
     options = build_claude_agent_options(
         sdk=FakeSdk,
