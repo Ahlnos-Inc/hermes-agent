@@ -18,6 +18,14 @@ from agent.claude_workspace_files import WorkspaceFileBroker
 
 
 _BUILTIN_TOOLS: tuple[str, ...] = ()
+_READ_ONLY_WORKER_PROFILES = frozenset({"reviewer", "verifier"})
+
+
+def _is_read_only_worker(capability_mode: str, worker_profile: str | None) -> bool:
+    return (
+        capability_mode == "worker"
+        and str(worker_profile or "").strip().lower() in _READ_ONLY_WORKER_PROFILES
+    )
 
 
 def load_claude_agent_sdk() -> Any:
@@ -36,6 +44,7 @@ def _mcp_tool_names(
     *,
     capability_mode: str,
     auxiliary_tool_names: Iterable[str],
+    worker_profile: str | None,
 ) -> list[str]:
     available: set[str] = set()
     names: list[str] = []
@@ -46,13 +55,12 @@ def _mcp_tool_names(
         name = str(function.get("name") or "")
         if name:
             available.add(name)
-        if capability_mode == "worker" and (name.startswith("kanban_") or name in {
-            "terminal",
-            "process",
-            "read_file",
-            "write_file",
-        }):
-            names.append(name)
+        if capability_mode == "worker":
+            worker_tools = {"terminal", "process", "read_file", "write_file"}
+            if _is_read_only_worker(capability_mode, worker_profile):
+                worker_tools = {"terminal", "read_file"}
+            if name.startswith("kanban_") or name in worker_tools:
+                names.append(name)
     if capability_mode == "auxiliary":
         required = {str(name) for name in auxiliary_tool_names if str(name)}
         if not required:
@@ -89,6 +97,7 @@ def build_claude_agent_options(
     file_broker: WorkspaceFileBroker | None = None,
     capability_mode: str = "worker",
     auxiliary_tool_names: Iterable[str] = (),
+    worker_profile: str | None = None,
 ) -> Any:
     """Create the sole supported Claude runtime policy: an isolated worker.
 
@@ -112,6 +121,7 @@ def build_claude_agent_options(
         tool_definitions,
         capability_mode=capability_mode,
         auxiliary_tool_names=auxiliary_tool_names,
+        worker_profile=worker_profile,
     )
     file_broker = file_broker or WorkspaceFileBroker(workspace_path)
     process_broker = WorkerProcessBroker(effective_task_id) if "process" in tool_names else None
@@ -124,6 +134,7 @@ def build_claude_agent_options(
             workspace=workspace_path,
             host_home=host_home_path,
             exact_env=env,
+            read_only=_is_read_only_worker(capability_mode, worker_profile),
         )
 
     mcp_server = build_hermes_sdk_mcp_server(

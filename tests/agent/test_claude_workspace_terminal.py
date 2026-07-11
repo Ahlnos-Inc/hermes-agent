@@ -372,6 +372,77 @@ def test_workspace_terminal_preserves_process_controls(tmp_path):
     assert transformed["workdir"] == str(workspace.resolve())
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg -n TODO agent",
+        "git diff --check",
+        "scripts/run_tests.sh tests/agent/test_claude_sdk_session.py -q",
+        "python -m pytest tests/agent -q",
+        "uv run pytest tests/agent -q",
+        "ruff check agent tests/agent",
+        "npm test -- --runInBand",
+    ],
+)
+def test_read_only_workspace_terminal_allows_inspection_and_tests(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    transformed = build_workspace_terminal_args(
+        {"command": command},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"HOME": str(tmp_path / "host"), "PATH": "/usr/bin:/bin"},
+        platform_name="Darwin",
+        read_only=True,
+    )
+
+    assert "sandbox-exec" in transformed["command"]
+    assert command in transformed["command"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "touch changed.txt",
+        "rm -rf .",
+        "git add .",
+        "git commit -m nope",
+        "sed -i '' 's/a/b/' source.py",
+        "rg TODO . > report.txt",
+        "rg TODO .; touch changed.txt",
+        "rg TODO . && touch changed.txt",
+        "find . -delete",
+        "ln ../outside linked",
+        "python -c 'open(\"changed.txt\", \"w\").write(\"x\")'",
+        "./rg TODO .",
+        "/tmp/git status",
+        "git grep --open-files-in-pager=touch TODO",
+        "git grep -Otouch TODO",
+        "git cat-file --filters HEAD:source.py",
+        "npm test -- -u",
+        "pytest --snapshot-update",
+    ],
+)
+def test_read_only_workspace_terminal_rejects_mutation_and_shell_escapes(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="Read-only worker terminal"):
+        build_workspace_terminal_args(
+            {"command": command},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"HOME": str(tmp_path / "host"), "PATH": "/usr/bin:/bin"},
+            platform_name="Darwin",
+            read_only=True,
+        )
+
+
 def test_workspace_terminal_rejects_outside_workdir(tmp_path):
     workspace = tmp_path / "work"
     workspace.mkdir()
@@ -396,7 +467,10 @@ def test_workspace_terminal_fails_closed_off_macos(tmp_path):
         )
 
 
-def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(tmp_path):
+@pytest.mark.parametrize("read_only", [False, True])
+def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(
+    tmp_path, read_only
+):
     workspace = tmp_path / "work"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
@@ -410,6 +484,7 @@ def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(tmp_path):
             host_home=tmp_path / "host",
             exact_env={"PATH": "/usr/bin:/bin"},
             platform_name="Darwin",
+            read_only=read_only,
         )
 
 
@@ -440,6 +515,40 @@ def test_workspace_terminal_denies_symlink_to_outside_created_after_profile(tmp_
     assert result.returncode != 0
     assert "secret" not in result.stdout
     assert not (outside / "escaped.txt").exists()
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+@pytest.mark.parametrize(
+    "command",
+    ["cat ../outside/secret.txt", "cat escape/secret.txt"],
+)
+def test_read_only_workspace_terminal_denies_path_and_symlink_escape(
+    tmp_path, command
+):
+    workspace = tmp_path / "work"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("host-secret", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    transformed = build_workspace_terminal_args(
+        {"command": command},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": os.environ["PATH"]},
+        read_only=True,
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "host-secret" not in result.stdout
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")

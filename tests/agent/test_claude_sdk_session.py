@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,7 @@ def test_options_are_subscription_only_strict_and_workspace_sandboxed(tmp_path):
         max_turns=40,
         resume="sdk-session-1",
         cli_path=tmp_path / "claude-wrapper",
+        worker_profile="coder",
     )
 
     assert options.system_prompt == "stable prompt"
@@ -116,6 +118,109 @@ def test_options_are_subscription_only_strict_and_workspace_sandboxed(tmp_path):
     outside = asyncio.run(read_tool({"path": "../host/sentinel"}))
     assert outside["is_error"] is True
     assert "relative path" in outside["content"][0]["text"]
+
+
+@pytest.mark.parametrize("worker_profile", ["reviewer", "verifier"])
+def test_read_only_worker_profiles_omit_mutation_capabilities(
+    tmp_path, worker_profile
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    options = build_claude_agent_options(
+        sdk=FakeSdk,
+        model="claude-sonnet-4-6",
+        system_prompt="inspect only",
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        profile_home=tmp_path / "profile",
+        inherited_env={"PATH": "/usr/bin:/bin"},
+        tool_definitions=[
+            _kanban_tool("kanban_complete"),
+            _kanban_tool("terminal"),
+            _kanban_tool("process"),
+            _kanban_tool("read_file"),
+            _kanban_tool("write_file"),
+        ],
+        dispatch=lambda *args, **kwargs: "ok",
+        effective_task_id="worker-task",
+        kanban_task_id="BUILD-425",
+        worker_profile=worker_profile,
+    )
+
+    assert options.tools == [
+        "mcp__hermes__kanban_complete",
+        "mcp__hermes__read_file",
+        "mcp__hermes__terminal",
+    ]
+
+
+def test_read_only_worker_terminal_rejects_mutation_before_dispatch(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    calls = []
+
+    options = build_claude_agent_options(
+        sdk=FakeSdk,
+        model="claude-sonnet-4-6",
+        system_prompt="inspect only",
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        profile_home=tmp_path / "profile",
+        inherited_env={"PATH": "/usr/bin:/bin"},
+        tool_definitions=[_kanban_tool("terminal")],
+        dispatch=lambda *args, **kwargs: calls.append((args, kwargs)),
+        effective_task_id="worker-task",
+        kanban_task_id="BUILD-425",
+        worker_profile="reviewer",
+    )
+    terminal = options.mcp_servers["hermes"]["tools"][0]
+
+    result = asyncio.run(terminal({"command": "touch changed.txt"}))
+
+    assert result["is_error"] is True
+    assert "read-only" in result["content"][0]["text"].lower()
+    assert calls == []
+    assert not (workspace / "changed.txt").exists()
+
+
+def test_read_only_worker_file_capability_rejects_path_and_link_escapes(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    (workspace / "symlink.txt").symlink_to(secret)
+    os.link(secret, workspace / "hardlink.txt")
+
+    options = build_claude_agent_options(
+        sdk=FakeSdk,
+        model="claude-sonnet-4-6",
+        system_prompt="inspect only",
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        profile_home=tmp_path / "profile",
+        inherited_env={"PATH": "/usr/bin:/bin"},
+        tool_definitions=[_kanban_tool("read_file"), _kanban_tool("write_file")],
+        dispatch=lambda *args, **kwargs: "unexpected",
+        effective_task_id="worker-task",
+        kanban_task_id="BUILD-425",
+        worker_profile="verifier",
+    )
+    assert [tool.sdk_name for tool in options.mcp_servers["hermes"]["tools"]] == [
+        "read_file"
+    ]
+    read_file = options.mcp_servers["hermes"]["tools"][0]
+
+    results = [
+        asyncio.run(read_file({"path": "../outside/secret.txt"})),
+        asyncio.run(read_file({"path": "symlink.txt"})),
+        asyncio.run(read_file({"path": "hardlink.txt"})),
+    ]
+
+    assert all(result["is_error"] is True for result in results)
+    assert secret.read_text(encoding="utf-8") == "secret"
 
 
 def test_orchestrator_mode_fails_closed(tmp_path):

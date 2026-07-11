@@ -19,6 +19,166 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 
+_READ_ONLY_COMMANDS = frozenset(
+    {
+        "cat",
+        "cmp",
+        "diff",
+        "file",
+        "git",
+        "grep",
+        "head",
+        "ls",
+        "pwd",
+        "rg",
+        "stat",
+        "tail",
+        "test",
+        "wc",
+    }
+)
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset(
+    {
+        "blame",
+        "cat-file",
+        "describe",
+        "diff",
+        "for-each-ref",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-tree",
+        "merge-base",
+        "name-rev",
+        "rev-parse",
+        "shortlog",
+        "show",
+        "show-ref",
+        "status",
+    }
+)
+_READ_ONLY_SHELL_ESCAPE_MARKERS = ("\n", "\r", ";", "&", "|", ">", "<", "`", "$(", "${")
+_READ_ONLY_DANGEROUS_OPTIONS = (
+    "--exec",
+    "--ext-diff",
+    "--fix",
+    "--fix-only",
+    "--filters",
+    "--open-files-in-pager",
+    "--output",
+    "--pre",
+    "--snapshot-update",
+    "--textconv",
+    "--unsafe-fixes",
+    "--update-snapshots",
+    "--updateSnapshot",
+)
+
+
+def _git_subcommand(tokens: list[str]) -> str:
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"--no-pager", "--paginate"}:
+            index += 1
+            continue
+        if token == "-C" and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token.startswith("-"):
+            return ""
+        return token
+    return ""
+
+
+def _is_project_test_runner(executable_path: Path) -> bool:
+    return (
+        not executable_path.is_absolute()
+        and executable_path.parts == ("scripts", "run_tests.sh")
+    )
+
+
+def _is_read_only_test_command(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    executable_path = Path(tokens[0])
+    executable = executable_path.name
+    if _is_project_test_runner(executable_path):
+        return True
+    if executable in {"py.test", "pytest"}:
+        return True
+    if executable.startswith("python"):
+        return len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {
+            "pytest",
+            "unittest",
+        }
+    if executable == "uv":
+        return len(tokens) >= 3 and tokens[1] == "run" and _is_read_only_test_command(
+            tokens[2:]
+        )
+    if executable == "ruff":
+        return len(tokens) >= 2 and tokens[1] == "check"
+    if executable in {"npm", "pnpm", "yarn", "bun"}:
+        if len(tokens) >= 2 and tokens[1] == "test":
+            return True
+        return (
+            len(tokens) >= 3
+            and tokens[1] == "run"
+            and tokens[2] in {"check", "lint", "test", "typecheck"}
+        )
+    if executable == "cargo":
+        return len(tokens) >= 2 and tokens[1] in {"check", "clippy", "test"}
+    if executable == "go":
+        return len(tokens) >= 2 and tokens[1] in {"test", "vet"}
+    if executable == "make":
+        return len(tokens) >= 2 and tokens[1] in {"check", "lint", "test"}
+    return False
+
+
+def _validate_read_only_terminal_command(command: str) -> None:
+    """Reject commands outside the reviewer/verifier inspection surface."""
+
+    if any(marker in command for marker in _READ_ONLY_SHELL_ESCAPE_MARKERS):
+        raise RuntimeError(
+            "Read-only worker terminal rejected shell control or redirection"
+        )
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise RuntimeError("Read-only terminal command could not be parsed") from exc
+    raw_executable = tokens[0] if tokens else ""
+    executable_path = Path(raw_executable)
+    executable = executable_path.name
+    if "/" in raw_executable and not _is_project_test_runner(executable_path):
+        raise RuntimeError(
+            "Read-only worker terminal rejected executable path override"
+        )
+    if executable not in _READ_ONLY_COMMANDS and not _is_read_only_test_command(tokens):
+        raise RuntimeError(
+            f"Read-only worker terminal rejected mutation-capable command: {executable or '<empty>'}"
+        )
+    if any(
+        token == option or token.startswith(option + "=")
+        for token in tokens[1:]
+        for option in _READ_ONLY_DANGEROUS_OPTIONS
+    ):
+        raise RuntimeError(
+            "Read-only worker terminal rejected mutation-capable command option"
+        )
+    if executable == "git" and _git_subcommand(tokens) not in _READ_ONLY_GIT_SUBCOMMANDS:
+        raise RuntimeError("Read-only worker terminal rejected mutating git command")
+    if executable == "git" and any(
+        token == "-O" or token.startswith("-O") for token in tokens[2:]
+    ):
+        raise RuntimeError(
+            "Read-only worker terminal rejected external git viewer command"
+        )
+    if executable in {"npm", "pnpm", "yarn", "bun"} and "-u" in tokens[2:]:
+        raise RuntimeError(
+            "Read-only worker terminal rejected snapshot update command"
+        )
+
+
 def _seatbelt_string(path: Path) -> str:
     return json.dumps(str(path), ensure_ascii=False)
 
@@ -510,6 +670,7 @@ def build_workspace_terminal_args(
     host_home: str | Path,
     exact_env: Mapping[str, str],
     platform_name: str | None = None,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     """Wrap a Hermes terminal call in exact-env macOS Seatbelt isolation."""
 
@@ -522,6 +683,8 @@ def build_workspace_terminal_args(
     command = str(arguments.get("command") or "").strip()
     if not command:
         raise RuntimeError("Workspace terminal requires a command")
+    if read_only:
+        _validate_read_only_terminal_command(command)
     _reject_linked_workspace_files(root)
     git = _selected_git(str(exact_env.get("PATH", "")))
     executable_paths = [
@@ -607,6 +770,8 @@ def build_workspace_terminal_args(
     terminal_env["GIT_CONFIG_VALUE_0"] = "false"
     terminal_env["GIT_CONFIG_KEY_1"] = "gc.auto"
     terminal_env["GIT_CONFIG_VALUE_1"] = "0"
+    terminal_env["GIT_PAGER"] = "cat"
+    terminal_env["PAGER"] = "cat"
     terminal_env["UV_LINK_MODE"] = "copy"
     env_argv = [f"{key}={value}" for key, value in sorted(terminal_env.items())]
     wrapped_argv = [
