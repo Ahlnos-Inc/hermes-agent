@@ -126,14 +126,23 @@ def test_classify_stuck_streak_treats_empty_or_none_results_as_suspicious(result
 
 def test_health_log_cooldowns_do_not_hide_actionable_transition_or_spam():
     cooldowns = DispatchHealthLogCooldowns(cooldown_seconds=300)
+    capacity_only, _ = classify_stuck_streak([
+        DispatchResult(max_in_progress_deferred=1),
+    ])
+    actionable, _ = classify_stuck_streak([
+        DispatchResult(max_in_progress_deferred=1),
+        DispatchResult(spawn_errors=[("t-failed", "boom")]),
+    ])
 
-    assert cooldowns.should_emit(capacity_only=True, now=1000) is True
-    assert cooldowns.should_emit(capacity_only=True, now=1001) is False
-    assert cooldowns.should_emit(capacity_only=False, now=1001) is True
-    assert cooldowns.should_emit(capacity_only=False, now=1002) is False
-    assert cooldowns.should_emit(capacity_only=True, now=1002) is False
-    assert cooldowns.should_emit(capacity_only=True, now=1300) is True
-    assert cooldowns.should_emit(capacity_only=False, now=1301) is True
+    assert capacity_only is True
+    assert actionable is False
+    assert cooldowns.should_emit(capacity_only=capacity_only, now=1000) is True
+    assert cooldowns.should_emit(capacity_only=capacity_only, now=1001) is False
+    assert cooldowns.should_emit(capacity_only=actionable, now=1001) is True
+    assert cooldowns.should_emit(capacity_only=actionable, now=1002) is False
+    assert cooldowns.should_emit(capacity_only=capacity_only, now=1002) is False
+    assert cooldowns.should_emit(capacity_only=capacity_only, now=1300) is True
+    assert cooldowns.should_emit(capacity_only=actionable, now=1301) is True
 
 
 # ---------------------------------------------------------------------------
