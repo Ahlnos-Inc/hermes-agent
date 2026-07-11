@@ -219,10 +219,17 @@ def test_workspace_terminal_cannot_retarget_head_between_invocations(tmp_path):
 def test_workspace_terminal_denies_non_loose_git_object_paths(tmp_path):
     repo, workspace = _linked_worktree(tmp_path)
     object_dir = repo / ".git" / "objects"
+    (object_dir / "aa").mkdir()
+    (object_dir / "info" / "ab").mkdir()
+    (object_dir / "pack" / "cd").mkdir()
     denied_paths = [
         object_dir / "info" / "worker-created",
         object_dir / "pack" / "worker-created",
         object_dir / "tmp_obj_worker_created",
+        object_dir / "info" / "aa",
+        object_dir / "info" / "ab" / "tmp_obj_ABC123",
+        object_dir / "pack" / "cd" / ("e" * 38),
+        object_dir / "aa" / "bb",
     ]
     transformed = build_workspace_terminal_args(
         {

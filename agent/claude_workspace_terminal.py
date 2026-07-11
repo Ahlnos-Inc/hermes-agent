@@ -186,27 +186,36 @@ def build_workspace_seatbelt_profile(
         lines.append(f"(allow file-write* (subpath {_seatbelt_string(path)}))")
     for object_root in git_object_roots or []:
         path = Path(object_root).expanduser().resolve(strict=False)
-        hex_pair = "[0-9a-f][0-9a-f]"
         sha1_tail = "[0-9a-f]" * 38
         temp_suffix = "[A-Za-z0-9]" * 6
-        fanout_pattern = json.dumps(f"/{hex_pair}$")
-        loose_pattern = json.dumps(f"/{hex_pair}/{sha1_tail}$")
-        temp_pattern = json.dumps(f"/tmp_obj_{temp_suffix}$")
         # Git creates an immutable SHA-1 loose object through a six-character
         # tmp_obj_* file. Permit only that exact lifecycle: create the two-hex
         # fan-out directory, temporary file, and 38-hex tail; mutate/unlink only
         # the temporary file. Existing objects and objects/{info,pack} remain
         # immutable.
+        for value in range(256):
+            prefix = f"{value:02x}"
+            fanout = path / prefix
+            lines.append(
+                f"(allow file-write-create (literal {_seatbelt_string(fanout)}))"
+            )
+        loose_pattern = json.dumps(f"/[0-9a-f][0-9a-f]/{sha1_tail}$")
+        temp_pattern = json.dumps(
+            f"/[0-9a-f][0-9a-f]/tmp_obj_{temp_suffix}$"
+        )
+        exclusions = (
+            f"(require-not (subpath {_seatbelt_string(path / 'info')})) "
+            f"(require-not (subpath {_seatbelt_string(path / 'pack')}))"
+        )
         lines.append(
             "(allow file-write-create "
-            f"(require-all (subpath {_seatbelt_string(path)}) "
-            f"(require-any (regex #{fanout_pattern}) "
-            f"(regex #{loose_pattern}) (regex #{temp_pattern}))))"
+            f"(require-all (subpath {_seatbelt_string(path)}) {exclusions} "
+            f"(require-any (regex #{loose_pattern}) (regex #{temp_pattern}))))"
         )
         lines.append(
             "(allow file-write-create file-write-data file-write-mode "
             "file-write-unlink "
-            f"(require-all (subpath {_seatbelt_string(path)}) "
+            f"(require-all (subpath {_seatbelt_string(path)}) {exclusions} "
             f"(regex #{temp_pattern})))"
         )
     return "\n".join(lines)
@@ -350,6 +359,34 @@ def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata |
                 "Claude terminal rejected Git object storage outside the common "
                 f"directory: {object_dir}"
             )
+        for entry in os.scandir(object_dir):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Claude terminal could not inspect Git object path: {entry.path}"
+                ) from exc
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            if entry.name in {"info", "pack"}:
+                continue
+            if len(entry.name) != 2 or any(
+                char not in "0123456789abcdef" for char in entry.name
+            ):
+                raise RuntimeError(
+                    f"Claude terminal rejected unexpected Git object directory: {entry.path}"
+                )
+            for child in os.scandir(entry.path):
+                try:
+                    child_info = child.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Claude terminal could not inspect Git loose object: {child.path}"
+                    ) from exc
+                if not stat.S_ISREG(child_info.st_mode):
+                    raise RuntimeError(
+                        f"Claude terminal rejected nested Git object path: {child.path}"
+                    )
         control_paths: list[Path] = [
             git_dir / "index",
             git_dir / "index.lock",
