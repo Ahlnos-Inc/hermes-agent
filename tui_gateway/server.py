@@ -2001,6 +2001,39 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 _BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
 
 
+def _safe_moa_runtime_config(
+    raw: object,
+    *,
+    provider: str = "",
+    model: str = "",
+    runtime: str = "",
+) -> dict | None:
+    """Return a normalized, secret-free MoA preset matching this actor."""
+
+    if not isinstance(raw, dict):
+        return None
+    try:
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        preset = resolve_moa_preset(raw)
+    except Exception:
+        return None
+    aggregator = preset.get("aggregator") or {}
+    expected = (
+        str(provider or "").strip().lower(),
+        str(model or "").strip(),
+        str(runtime or "").strip().lower(),
+    )
+    actual = (
+        str(aggregator.get("provider") or "").strip().lower(),
+        str(aggregator.get("model") or "").strip(),
+        str(aggregator.get("runtime") or "").strip().lower(),
+    )
+    if any(expected) and actual != expected:
+        return None
+    return preset
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -2042,6 +2075,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
     runtime = str(model_config.get("runtime") or "").strip()
+    moa_config = _safe_moa_runtime_config(
+        model_config.get("moa_config"),
+        provider=provider,
+        model=model,
+        runtime=runtime,
+    )
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
@@ -2081,6 +2120,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         }
         if runtime:
             model_override["runtime"] = runtime
+        if moa_config is not None:
+            model_override["moa_config"] = moa_config
         overrides["model_override"] = model_override
     if provider:
         overrides["provider_override"] = provider
@@ -2099,6 +2140,12 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     base_url = str(getattr(agent, "base_url", "") or "").strip()
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     runtime = str(getattr(agent, "runtime", "") or "").strip()
+    moa_config = _safe_moa_runtime_config(
+        getattr(agent, "_moa_config", None),
+        provider=provider,
+        model=model,
+        runtime=runtime,
+    )
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
@@ -2143,6 +2190,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["runtime"] = runtime
     else:
         config.pop("runtime", None)
+    if moa_config is not None:
+        config["moa_config"] = moa_config
+    else:
+        config.pop("moa_config", None)
     if isinstance(reasoning_config, dict):
         config["reasoning_config"] = reasoning_config
     else:
@@ -3961,6 +4012,12 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "provider": getattr(agent, "provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "runtime": getattr(agent, "runtime", None) or "hermes",
+        "moa_config": _safe_moa_runtime_config(
+            getattr(agent, "_moa_config", None),
+            provider=getattr(agent, "provider", None) or "",
+            model=getattr(agent, "model", None) or "",
+            runtime=getattr(agent, "runtime", None) or "hermes",
+        ),
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
@@ -4421,12 +4478,21 @@ def _make_agent(
             "target_model": model or None,
             "route_config": configured_route,
         })
+    if isinstance(model_override, dict):
+        restored_moa_config = _safe_moa_runtime_config(
+            model_override.get("moa_config"),
+            provider=runtime.get("provider") or "",
+            model=runtime.get("model") or model,
+            runtime=runtime.get("runtime") or "hermes",
+        )
+        if restored_moa_config is not None:
+            runtime["moa_config"] = restored_moa_config
     fallback_model = str(runtime.pop("_fallback_model", "") or "")
     if fallback_model:
         model = fallback_model
     _pr = _load_provider_routing()
     return AIAgent(
-        model=model,
+        model=str(runtime.get("model") or model),
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
@@ -4436,6 +4502,7 @@ def _make_agent(
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        moa_config=runtime.get("moa_config"),
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

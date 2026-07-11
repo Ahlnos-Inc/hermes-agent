@@ -200,6 +200,42 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_cli_first_turn_without_kanban_task_keeps_native_moa(monkeypatch):
+    cli = _import_cli()
+    from hermes_cli import runtime_provider as rp
+
+    config = {
+        "model": {"provider": "moa", "default": "architect"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            },
+        },
+    }
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    shell = cli.HermesCLI(model="architect", compact=True, max_turns=1)
+    shell.requested_provider = "moa"
+    shell.provider = "moa"
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.model == "architect"
+    assert shell.provider == "moa"
+    assert shell.agent_runtime == "hermes"
+    assert shell.moa_config is None
+
+
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)

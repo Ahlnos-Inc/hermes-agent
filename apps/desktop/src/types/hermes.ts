@@ -827,6 +827,7 @@ export interface AuxiliaryModelsResponse {
 export interface MoaModelSlot {
   provider: string
   model: string
+  runtime?: string
 }
 
 export interface MoaConfigResponse {

@@ -49,7 +49,7 @@ To **switch** to a MoA preset for the rest of the session, select it from the mo
 
 ## How it works in the agent loop
 
-For each main model call when provider `moa` is selected, Hermes:
+For each main model call when provider `moa` is selected, Hermes normally:
 
 1. resolves the selected preset by name;
 2. runs the configured reference models without tool schemas (they receive only the conversation's user/assistant text — not the Hermes system prompt or tool-call transcript — so reference calls stay cheap and avoid strict-provider rejections);
@@ -60,6 +60,15 @@ For each main model call when provider `moa` is selected, Hermes:
 7. on the next model iteration, the same MoA process runs again over the updated conversation, including tool results.
 
 Because MoA is selected through the normal model system, it composes automatically with `/goal`, gateway sessions, TUI sessions, and Desktop chat.
+
+For dispatcher-spawned Kanban workers, an aggregator can instead be configured
+as an external whole-agent runtime. In that worker context Hermes runs the
+reference models once, supplies their successful output as private guidance,
+and lets that runtime reason, call tools, and finish the task. Hermes does not
+make a separate direct aggregator API call. If every reference fails, the
+acting runtime proceeds on its own. Ordinary CLI, gateway, TUI, Desktop, cron,
+and orchestrator sessions remain on native MoA even when the preset includes an
+external runtime; the Claude Agent SDK worker boundary is not opened there.
 
 ## Configure presets
 
@@ -90,6 +99,31 @@ moa:
       max_tokens: 4096
       enabled: true
 ```
+
+To use a Claude Max subscription as the acting aggregator, set its runtime
+explicitly:
+
+```yaml
+moa:
+  default_preset: architect
+  presets:
+    architect:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.6-sol
+      aggregator:
+        provider: anthropic
+        model: claude-fable-5
+        runtime: claude_agent_sdk
+```
+
+This route uses the Claude Agent SDK/Claude CLI subscription session rather
+than an Anthropic API key when the process is an authorized Kanban worker. The
+reference provider still follows its own normal credential and billing route;
+Hermes records advisor token usage and per-provider estimated cost separately
+from the included Claude Max actor. Select the acting runtime explicitly in the
+CLI, dashboard, or Desktop preset editor—choosing Hermes API billing removes
+the subscription runtime deliberately.
 
 Default preset:
 

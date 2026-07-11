@@ -130,14 +130,25 @@ def test_tui_session_derivatives_preserve_external_runtime(monkeypatch):
 
     from tui_gateway import server
 
+    moa_config = {
+        "reference_models": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ],
+        "aggregator": {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "runtime": "claude_agent_sdk",
+        },
+    }
     agent = SimpleNamespace(
-        model="claude-opus-4-6",
+        model="claude-fable-5",
         provider="anthropic",
         runtime="claude_agent_sdk",
         base_url="",
         api_key="",
         api_mode="anthropic_messages",
         enabled_toolsets=["terminal", "file"],
+        _moa_config=moa_config,
     )
 
     persisted = server._runtime_model_config(agent)
@@ -149,8 +160,116 @@ def test_tui_session_derivatives_preserve_external_runtime(monkeypatch):
     background = server._background_agent_kwargs(agent, "background-1")
 
     assert persisted["runtime"] == "claude_agent_sdk"
+    assert persisted["moa_config"]["aggregator"]["runtime"] == (
+        "claude_agent_sdk"
+    )
     assert restored["model_override"]["runtime"] == "claude_agent_sdk"
+    assert restored["model_override"]["moa_config"] == persisted["moa_config"]
     assert background["runtime"] == "claude_agent_sdk"
+    assert background["moa_config"] == persisted["moa_config"]
+
+
+def test_tui_resume_rebinds_external_moa_advisors(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli import runtime_provider
+    import run_agent
+    from tui_gateway import server
+
+    original = SimpleNamespace(
+        model="claude-fable-5",
+        provider="anthropic",
+        runtime="claude_agent_sdk",
+        base_url="",
+        api_mode="anthropic_messages",
+        reasoning_config=None,
+        service_tier=None,
+        _moa_config={
+            "reference_models": [
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+            ],
+            "aggregator": {
+                "provider": "anthropic",
+                "model": "claude-fable-5",
+                "runtime": "claude_agent_sdk",
+            },
+        },
+    )
+    persisted = server._runtime_model_config(original)
+    restored = server._stored_session_runtime_overrides(
+        {"model": original.model, "model_config": persisted}
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {}})
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [])
+    monkeypatch.setattr(server, "_get_db", lambda: MagicMock())
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "api_mode": "anthropic_messages",
+            "runtime": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(run_agent, "AIAgent", _Agent)
+
+    resumed = server._make_agent("sid-moa", "key-moa", **restored)
+
+    assert resumed.kwargs["moa_config"]["reference_models"] == [
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+    ]
+    assert resumed.kwargs["moa_config"]["aggregator"]["runtime"] == (
+        "claude_agent_sdk"
+    )
+
+
+def test_tui_first_turn_without_kanban_task_keeps_native_moa(monkeypatch, tmp_path):
+    import run_agent
+    from tui_gateway import server
+
+    cfg = {
+        "model": {"provider": "moa", "default": "architect"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            },
+        },
+    }
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    import yaml
+
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("architect", "moa"))
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [])
+    monkeypatch.setattr(server, "_get_db", lambda: MagicMock())
+    monkeypatch.setattr(run_agent, "AIAgent", _Agent)
+
+    agent = server._make_agent("sid-native", "key-native")
+
+    assert agent.kwargs["model"] == "architect"
+    assert agent.kwargs["provider"] == "moa"
+    assert agent.kwargs["runtime"] == "hermes"
+    assert agent.kwargs["moa_config"] is None
 
 
 def test_tui_explicit_alternate_provider_does_not_inherit_claude_runtime(

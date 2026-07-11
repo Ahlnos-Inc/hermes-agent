@@ -255,6 +255,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
     if (patch.provider) {
       next.model = ''
+      if (patch.provider.toLowerCase() !== 'anthropic') {
+        delete next.runtime
+      }
+    }
+    if (patch.runtime === 'hermes' || patch.runtime === '') {
+      delete next.runtime
     }
 
     return next
@@ -920,7 +926,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <Button
               disabled={applying}
               onClick={() =>
-                updateMoaPreset(prev => ({ ...prev, reference_models: [...prev.reference_models, prev.aggregator] }))
+                updateMoaPreset(prev => ({
+                  ...prev,
+                  reference_models: [
+                    ...prev.reference_models,
+                    { provider: prev.aggregator.provider, model: prev.aggregator.model }
+                  ]
+                }))
               }
               size="sm"
               variant="textStrong"
@@ -973,6 +985,25 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                       ))}
                     </SelectContent>
                   </Select>
+                  {currentMoaPreset.aggregator.provider.toLowerCase() === 'anthropic' && (
+                    <Select
+                      onValueChange={value =>
+                        updateMoaPreset(prev => ({
+                          ...prev,
+                          aggregator: updateMoaSlot(prev.aggregator, { runtime: value })
+                        }))
+                      }
+                      value={currentMoaPreset.aggregator.runtime || 'hermes'}
+                    >
+                      <SelectTrigger className={cn('min-w-52', CONTROL_TEXT)}>
+                        <SelectValue placeholder="Acting runtime" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="hermes">Hermes API billing</SelectItem>
+                        <SelectItem value="claude_agent_sdk">Claude Max · Kanban workers only</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  )}
                 </div>
               }
               description={

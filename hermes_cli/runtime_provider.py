@@ -2050,6 +2050,36 @@ def resolve_runtime_provider(
     provider_hint = str(
         requested or effective_route.get("provider") or "anthropic"
     ).strip().lower()
+    external_moa_config: dict[str, Any] | None = None
+    if provider_hint == "moa":
+        from agent.runtime_target import HERMES_RUNTIME
+        from hermes_cli.moa_config import normalize_moa_config, resolve_moa_preset
+
+        moa = normalize_moa_config((load_config().get("moa") or {}))
+        preset_name = str(target_model or moa.get("default_preset") or "default")
+        try:
+            preset = resolve_moa_preset(moa, preset_name)
+        except KeyError:
+            preset = None
+        aggregator = dict((preset or {}).get("aggregator") or {})
+        aggregator_runtime = str(aggregator.get("runtime") or "").strip().lower()
+        kanban_worker_authorized = bool(
+            os.getenv("HERMES_KANBAN_TASK", "").strip()
+        )
+        if (
+            aggregator_runtime
+            and aggregator_runtime != HERMES_RUNTIME
+            and kanban_worker_authorized
+        ):
+            # The configured aggregator is the acting whole-agent runtime, not
+            # an auxiliary `call_llm` synthesis. Route the primary agent to the
+            # aggregator target and carry the full preset alongside it so the
+            # acting loop can compute references once before the first attempt.
+            effective_route = aggregator
+            requested = str(aggregator.get("provider") or "")
+            target_model = str(aggregator.get("model") or "")
+            provider_hint = requested.strip().lower()
+            external_moa_config = preset
     runtime_identity = resolve_runtime_identity(
         provider=provider_hint,
         api_mode=str(effective_route.get("api_mode") or "anthropic_messages"),
@@ -2060,7 +2090,7 @@ def resolve_runtime_provider(
             raise RuntimeError(
                 "claude_agent_sdk runtime only supports provider=anthropic"
             )
-        return {
+        target = {
             "provider": "anthropic",
             "model": str(
                 target_model or effective_route.get("model") or effective_route.get("default") or ""
@@ -2072,6 +2102,9 @@ def resolve_runtime_provider(
             "source": "claude_max_subscription",
             "credential_pool": None,
         }
+        if external_moa_config is not None:
+            target["moa_config"] = external_moa_config
+        return target
 
     resolved = _resolve_runtime_provider(
         requested=requested,
@@ -2081,7 +2114,10 @@ def resolve_runtime_provider(
     )
     from agent.runtime_target import attach_runtime_identity
 
-    return attach_runtime_identity(resolved, route_config=effective_route)
+    target = attach_runtime_identity(resolved, route_config=effective_route)
+    if external_moa_config is not None:
+        target["moa_config"] = external_moa_config
+    return target
 
 
 def format_runtime_provider_error(error: Exception) -> str:

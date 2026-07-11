@@ -42,6 +42,31 @@ def test_normalize_moa_config_preserves_named_presets():
     assert cfg["reference_models"] == [{"provider": "openai-codex", "model": "gpt-5.5"}]
 
 
+def test_normalize_moa_config_preserves_external_aggregator_runtime():
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            }
+        }
+    )
+
+    assert cfg["presets"]["architect"]["aggregator"] == {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "runtime": "claude_agent_sdk",
+    }
+
+
 def test_legacy_flat_config_becomes_default_preset():
     cfg = normalize_moa_config(
         {

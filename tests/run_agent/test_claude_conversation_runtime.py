@@ -23,19 +23,27 @@ def _tools():
     ]
 
 
-def _agent(fallback_model=None, *, runtime="claude_agent_sdk", provider="anthropic"):
+def _agent(
+    fallback_model=None,
+    *,
+    runtime="claude_agent_sdk",
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    moa_config=None,
+):
     with (
         patch("run_agent.get_tool_definitions", return_value=_tools()),
         patch("run_agent.check_toolset_requirements", return_value={}),
     ):
         return AIAgent(
             provider=provider,
-            model="claude-sonnet-4-6",
+            model=model,
             runtime=runtime,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            moa_config=moa_config,
         )
 
 
@@ -764,6 +772,239 @@ def test_moa_advisor_context_feeds_external_acting_runtime_only_once():
     assert captured == ["do the card\n\n[private advisor guidance]"]
     aggregate.assert_called_once()
     assert sum(message.get("role") == "user" for message in result["messages"]) == 1
+
+
+def test_external_moa_aggregator_uses_claude_runtime_without_direct_api_call():
+    moa_config = {
+        "reference_models": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ],
+        "aggregator": {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "runtime": "claude_agent_sdk",
+        },
+    }
+    agent = _agent(model="claude-fable-5", moa_config=moa_config)
+    captured_prompts = []
+    llm_calls = []
+
+    def fake_resolve(*, requested, target_model=None):
+        assert requested == "openai-codex"
+        return {
+            "provider": requested,
+            "model": target_model,
+            "runtime": "hermes",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-oauth",
+        }
+
+    def fake_call_llm(**kwargs):
+        llm_calls.append(kwargs)
+        assert kwargs["task"] == "moa_reference"
+        assert kwargs["provider"] == "openai-codex"
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Sol advisor guidance",
+                        tool_calls=[],
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+
+    def attempt(agent, *, user_message, effective_task_id):
+        captured_prompts.append(user_message)
+        return ClaudeProjection(
+            messages=[{"role": "assistant", "content": "Fable acted"}],
+            final_text="Fable acted",
+        )
+
+    with (
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=fake_resolve,
+        ),
+        patch("agent.moa_loop.call_llm", side_effect=fake_call_llm),
+        patch(
+            "agent.external_runtime.run_claude_agent_sdk_attempt",
+            side_effect=attempt,
+        ),
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Fable acted"
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["task"] == "moa_reference"
+    assert all(call["provider"] != "anthropic" for call in llm_calls)
+    assert len(captured_prompts) == 1
+    assert captured_prompts[0].startswith("do the card\n\n")
+    assert "Sol advisor guidance" in captured_prompts[0]
+    assert sum(message.get("role") == "user" for message in result["messages"]) == 1
+
+
+def test_external_moa_advisor_exhaustion_degrades_to_claude_solo():
+    moa_config = {
+        "reference_models": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ],
+        "aggregator": {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "runtime": "claude_agent_sdk",
+        },
+    }
+    agent = _agent(model="claude-fable-5", moa_config=moa_config)
+    captured_prompts = []
+
+    def attempt(agent, *, user_message, effective_task_id):
+        captured_prompts.append(user_message)
+        return ClaudeProjection(
+            messages=[{"role": "assistant", "content": "Fable solo"}],
+            final_text="Fable solo",
+        )
+
+    with (
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "runtime": "hermes",
+                "api_mode": "codex_responses",
+            },
+        ),
+        patch("agent.moa_loop.call_llm", side_effect=RuntimeError("Codex exhausted")),
+        patch(
+            "agent.external_runtime.run_claude_agent_sdk_attempt",
+            side_effect=attempt,
+        ),
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Fable solo"
+    assert captured_prompts == ["do the card"]
+    assert sum(message.get("role") == "user" for message in result["messages"]) == 1
+
+
+def test_external_moa_keeps_claude_billing_and_fallback_events_accurate(caplog):
+    moa_config = {
+        "reference_models": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ],
+        "aggregator": {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "runtime": "claude_agent_sdk",
+        },
+    }
+    agent = _agent(
+        model="claude-fable-5",
+        moa_config=moa_config,
+        fallback_model={
+            "provider": "openai-codex",
+            "model": "gpt-5.4",
+            "runtime": "codex_app_server",
+        },
+    )
+    rejected = ClaudeProjection(
+        usage={"input_tokens": 7, "output_tokens": 3},
+        failure=RuntimeFailure(FailoverReason.billing, "subscription limit"),
+    )
+    advisor_calls = []
+
+    def fake_advisor(**kwargs):
+        advisor_calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="advisor", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=120,
+                output_tokens=30,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=0,
+                    cache_creation_tokens=0,
+                ),
+                output_tokens_details=None,
+            ),
+        )
+
+    def fake_codex_turn(self, user_input, **kwargs):
+        return TurnResult(
+            final_text="Codex fallback",
+            projected_messages=[
+                {"role": "assistant", "content": "Codex fallback"}
+            ],
+        )
+
+    with (
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "runtime": "hermes",
+                "api_mode": "codex_responses",
+            },
+        ),
+        patch("agent.moa_loop.call_llm", side_effect=fake_advisor),
+        patch(
+            "agent.usage_pricing.estimate_usage_cost",
+            return_value=SimpleNamespace(
+                amount_usd=0.0042,
+                status="estimated",
+                source="official_docs_snapshot",
+            ),
+        ),
+        patch(
+            "agent.external_runtime.run_claude_agent_sdk_attempt",
+            return_value=rejected,
+        ),
+        patch.object(CodexAppServerSession, "run_turn", fake_codex_turn),
+        patch.object(CodexAppServerSession, "ensure_started", return_value="thread"),
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Codex fallback"
+    assert len(advisor_calls) == 1
+    assert agent.session_input_tokens == 127
+    assert agent.session_output_tokens == 33
+    assert agent.session_estimated_cost_usd == pytest.approx(0.0042)
+    assert sum(message.get("role") == "user" for message in result["messages"]) == 1
+    events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "hermes.runtime_events"
+    ]
+    billing = next(event for event in events if event["event"] == "runtime_billing_mode")
+    advisor_billing = next(
+        event for event in events if event["event"] == "moa_reference_billing"
+    )
+    fallback = next(
+        event for event in events if event["event"] == "runtime_fallback_activated"
+    )
+    assert billing["provider"] == "anthropic"
+    assert billing["runtime"] == "claude_agent_sdk"
+    assert billing["billing_mode"] == "subscription_included"
+    assert advisor_billing["input_tokens"] == 120
+    assert advisor_billing["output_tokens"] == 30
+    assert advisor_billing["estimated_cost_usd"] == pytest.approx(0.0042)
+    assert advisor_billing["references"][0]["provider"] == "openai-codex"
+    assert fallback["from_provider"] == "anthropic"
+    assert fallback["from_runtime"] == "claude_agent_sdk"
+    assert fallback["to_provider"] == "openai-codex"
+    assert fallback["to_runtime"] == "codex_app_server"
 
 
 def test_claude_success_preserves_skill_review_cadence():

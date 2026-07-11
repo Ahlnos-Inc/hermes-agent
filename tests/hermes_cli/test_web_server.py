@@ -510,6 +510,40 @@ class TestWebServerEndpoints:
         assert cfg["moa"]["reference_models"] == payload["reference_models"]
         assert cfg["moa"]["aggregator"] == payload["aggregator"]
 
+    def test_put_moa_models_preserves_external_aggregator_runtime(self):
+        from hermes_cli.config import load_config
+
+        payload = {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                    "reference_temperature": 0.6,
+                    "aggregator_temperature": 0.4,
+                    "max_tokens": 4096,
+                    "enabled": True,
+                }
+            },
+        }
+
+        resp = self.client.put("/api/model/moa", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json()["presets"]["architect"]["aggregator"]["runtime"] == (
+            "claude_agent_sdk"
+        )
+        cfg = load_config()
+        assert cfg["moa"]["presets"]["architect"]["aggregator"]["runtime"] == (
+            "claude_agent_sdk"
+        )
+
     # ── GET /api/media (remote image display) ───────────────────────────
 
     def test_get_media_serves_image_in_root(self):

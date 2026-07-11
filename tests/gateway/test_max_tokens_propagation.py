@@ -155,6 +155,110 @@ def test_no_config_leaves_max_tokens_none(isolated_home):
     assert kw["max_tokens"] is None
 
 
+def test_external_moa_runtime_and_model_propagate_for_kanban_worker(
+    isolated_home, monkeypatch
+):
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          provider: moa
+          default: architect
+        moa:
+          default_preset: architect
+          presets:
+            architect:
+              reference_models:
+                - provider: openai-codex
+                  model: gpt-5.6-sol
+              aggregator:
+                provider: anthropic
+                model: claude-fable-5
+                runtime: claude_agent_sdk
+        """
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
+
+    runtime = fresh_gateway()._resolve_runtime_agent_kwargs()
+
+    assert runtime["provider"] == "anthropic"
+    assert runtime["model"] == "claude-fable-5"
+    assert runtime["runtime"] == "claude_agent_sdk"
+    assert runtime["api_key"] == ""
+    assert runtime["base_url"] == ""
+    assert runtime["moa_config"]["aggregator"]["runtime"] == (
+        "claude_agent_sdk"
+    )
+
+
+def test_external_moa_config_stays_native_for_gateway_without_worker_task(
+    isolated_home, monkeypatch
+):
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          provider: moa
+          default: architect
+        moa:
+          default_preset: architect
+          presets:
+            architect:
+              reference_models:
+                - provider: openai-codex
+                  model: gpt-5.6-sol
+              aggregator:
+                provider: anthropic
+                model: claude-fable-5
+                runtime: claude_agent_sdk
+        """
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    runtime = fresh_gateway()._resolve_runtime_agent_kwargs()
+
+    assert runtime["provider"] == "moa"
+    assert runtime["runtime"] == "hermes"
+    assert runtime["base_url"] == "moa://local"
+    assert runtime["moa_config"] is None
+
+
+def test_gateway_fallback_uses_resolved_external_moa_actor_model(
+    isolated_home, monkeypatch
+):
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          provider: openrouter
+          default: openai/gpt-5
+        fallback_providers:
+          - provider: moa
+            model: architect
+        moa:
+          default_preset: architect
+          presets:
+            architect:
+              reference_models:
+                - provider: openai-codex
+                  model: gpt-5.6-sol
+              aggregator:
+                provider: anthropic
+                model: claude-fable-5
+                runtime: claude_agent_sdk
+        """
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
+
+    runtime = fresh_gateway()._try_resolve_fallback_provider()
+
+    assert runtime is not None
+    assert runtime["provider"] == "anthropic"
+    assert runtime["model"] == "claude-fable-5"
+    assert runtime["runtime"] == "claude_agent_sdk"
+    assert runtime["moa_config"]["aggregator"]["model"] == "claude-fable-5"
+
+
 def test_lift_helper_accepts_alias_and_rejects_garbage(isolated_home):
     """_lift_max_output_tokens accepts both keys, ignores non-positive/non-int."""
     write_cfg, _ = isolated_home

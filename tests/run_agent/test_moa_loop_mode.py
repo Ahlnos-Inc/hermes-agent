@@ -81,6 +81,64 @@ def test_moa_runtime_provider_uses_virtual_endpoint():
     assert runtime["api_key"] == "moa-virtual-provider"
 
 
+def test_external_moa_runtime_resolves_from_real_config(monkeypatch, tmp_path):
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+model:
+  provider: moa
+  default: architect
+moa:
+  default_preset: architect
+  presets:
+    architect:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.6-sol
+      aggregator:
+        provider: anthropic
+        model: claude-fable-5
+        runtime: claude_agent_sdk
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
+
+    runtime = resolve_runtime_provider(
+        requested="moa",
+        target_model="architect",
+    )
+
+    assert runtime == {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "api_mode": "anthropic_messages",
+        "runtime": "claude_agent_sdk",
+        "api_key": "",
+        "base_url": "",
+        "source": "claude_max_subscription",
+        "credential_pool": None,
+        "moa_config": {
+            "reference_models": [
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+            ],
+            "aggregator": {
+                "provider": "anthropic",
+                "model": "claude-fable-5",
+                "runtime": "claude_agent_sdk",
+            },
+            "reference_temperature": 0.6,
+            "aggregator_temperature": 0.4,
+            "max_tokens": 4096,
+            "enabled": True,
+        },
+    }
+
+
 def test_moa_does_not_cap_output_tokens(monkeypatch, tmp_path):
     """MoA must not inject an output cap on reference or aggregator calls.
 
@@ -805,6 +863,58 @@ def test_run_reference_captures_usage_and_cost(monkeypatch):
     assert acct.usage.cache_read_tokens == 400
     assert acct.usage.output_tokens == 200
     assert acct.cost_usd == 0.0123
+
+
+def test_external_reference_guidance_returns_advisor_usage_and_cost(monkeypatch):
+    from agent.moa_loop import (
+        _RefAccounting,
+        build_moa_reference_guidance,
+    )
+    from agent.usage_pricing import CanonicalUsage
+
+    monkeypatch.setattr(
+        "agent.moa_loop._run_references_parallel",
+        lambda *_args, **_kwargs: [
+            (
+                "openai-codex:gpt-5.6-sol",
+                "advisor guidance",
+                _RefAccounting(
+                    CanonicalUsage(input_tokens=120, output_tokens=30),
+                    0.0042,
+                    "estimated",
+                    "official_docs_snapshot",
+                    model="gpt-5.6-sol",
+                    provider="openai-codex",
+                ),
+            )
+        ],
+    )
+
+    result = build_moa_reference_guidance(
+        api_messages=[{"role": "user", "content": "task"}],
+        reference_models=[
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        ],
+    )
+
+    assert "advisor guidance" in result.text
+    assert result.usage.input_tokens == 120
+    assert result.usage.output_tokens == 30
+    assert result.estimated_cost_usd == pytest.approx(0.0042)
+    assert result.references == (
+        {
+            "label": "openai-codex:gpt-5.6-sol",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "estimated_cost_usd": 0.0042,
+            "cost_status": "estimated",
+            "cost_source": "official_docs_snapshot",
+        },
+    )
 
 
 def test_references_parallel_sum_and_consume(monkeypatch, tmp_path):

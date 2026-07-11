@@ -1,5 +1,10 @@
 import asyncio
 import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -118,6 +123,129 @@ def test_options_are_subscription_only_strict_and_workspace_sandboxed(tmp_path):
     outside = asyncio.run(read_tool({"path": "../host/sentinel"}))
     assert outside["is_error"] is True
     assert "relative path" in outside["content"][0]["text"]
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_coder_and_architect_terminals_can_use_external_venv_read_only(
+    monkeypatch, request, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external_parent = (
+        Path(__file__).resolve().parents[2]
+        / ".hermes-claude-runtime"
+        / "test-toolchains"
+    )
+    external_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    external_venv = Path(
+        tempfile.mkdtemp(prefix="worker-venv-", dir=external_parent)
+    )
+    request.addfinalizer(lambda: shutil.rmtree(external_venv, ignore_errors=True))
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(external_venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    external_python = external_venv / "bin" / "python"
+    purelib = Path(
+        subprocess.run(
+            [
+                str(external_python),
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    (purelib / "hermes_external_venv_probe.py").write_text(
+        "VALUE = 'external-venv-ok'\n", encoding="utf-8"
+    )
+    outside_write = tmp_path / "must-remain-absent.txt"
+    (workspace / "worker_probe.py").write_text(
+        (
+            "from pathlib import Path\n"
+            "from hermes_external_venv_probe import VALUE\n\n"
+            f"outside = Path({str(outside_write)!r})\n"
+            "try:\n"
+            "    outside.write_text('escaped', encoding='utf-8')\n"
+            "except PermissionError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('external toolchain became writable')\n"
+            "Path('toolchain-proof.txt').write_text(VALUE, encoding='utf-8')\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent.claude_workspace_terminal.sys.executable", str(external_python)
+    )
+    monkeypatch.setattr(
+        "agent.claude_workspace_terminal.sys.prefix", str(external_venv)
+    )
+
+    transformed_commands = []
+
+    def dispatch(name, arguments, *, task_id):
+        assert name == "terminal"
+        assert task_id.startswith("worker-")
+        transformed_commands.append(arguments["command"])
+        completed = subprocess.run(
+            ["/bin/bash", "-lc", arguments["command"]],
+            cwd=arguments["workdir"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr)
+        return completed.returncode
+
+    for worker_profile in ("coder", "architect"):
+        proof = workspace / "toolchain-proof.txt"
+        proof.unlink(missing_ok=True)
+        options = build_claude_agent_options(
+            sdk=FakeSdk,
+            model="claude-sonnet-4-6",
+            system_prompt="worker",
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            profile_home=tmp_path / "profile",
+            inherited_env={"PATH": f"{external_venv / 'bin'}:/usr/bin:/bin"},
+            tool_definitions=[_kanban_tool("terminal")],
+            dispatch=dispatch,
+            effective_task_id=f"worker-{worker_profile}",
+            kanban_task_id="BUILD-425",
+            worker_profile=worker_profile,
+        )
+        terminal = options.mcp_servers["hermes"]["tools"][0]
+
+        result = asyncio.run(
+            terminal(
+                {
+                    "command": (
+                        "__PYVENV_LAUNCHER__="
+                        f"{shlex.quote(str(external_python))} "
+                        f"{shlex.quote(str(external_python.resolve()))} worker_probe.py"
+                    )
+                }
+            )
+        )
+
+        assert result.get("is_error") is not True, result
+        assert proof.read_text(encoding="utf-8") == "external-venv-ok"
+        assert not outside_write.exists()
+
+    assert len(transformed_commands) == 2
+    for command in transformed_commands:
+        argv = shlex.split(command)
+        profile = Path(argv[argv.index("-f") + 1]).read_text(encoding="utf-8")
+        external_read = f'(allow file-read* (subpath "{external_venv.resolve()}"))'
+        external_write = f'(allow file-write* (subpath "{external_venv.resolve()}"))'
+        assert external_read in profile
+        assert external_write not in profile
 
 
 @pytest.mark.parametrize("worker_profile", ["reviewer", "verifier"])

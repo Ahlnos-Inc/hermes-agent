@@ -35,6 +35,10 @@ import { useI18n } from "@/i18n";
 import { PluginSlot } from "@/plugins";
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
+import {
+  selectMoaAggregatorModel,
+  setMoaAggregatorRuntime,
+} from "@/lib/moa";
 
 const PERIODS = [
   { label: "7d", days: 7 },
@@ -821,7 +825,7 @@ function MoaModelsModal({
                 <Button size="sm" ghost disabled={preset.reference_models.length <= 1} onClick={() => updateSelectedPreset((prev) => ({ ...prev, reference_models: prev.reference_models.filter((_, i) => i !== index) }))}>Remove</Button>
               </div>
             ))}
-            <Button size="sm" outlined onClick={() => updateSelectedPreset((prev) => ({ ...prev, reference_models: [...prev.reference_models, prev.aggregator] }))}>Add reference model</Button>
+            <Button size="sm" outlined onClick={() => updateSelectedPreset((prev) => ({ ...prev, reference_models: [...prev.reference_models, { provider: prev.aggregator.provider, model: prev.aggregator.model }] }))}>Add reference model</Button>
           </div>
 
           <div className="space-y-2">
@@ -830,6 +834,26 @@ function MoaModelsModal({
               <div className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{slotLabel(preset.aggregator)}</div>
               <Button size="sm" outlined onClick={() => setPicker({ kind: "aggregator" })}>Change</Button>
             </div>
+            {preset.aggregator.provider.toLowerCase() === "anthropic" && (
+              <label className="flex items-center justify-between gap-3 text-xs text-text-secondary">
+                Acting runtime
+                <select
+                  aria-label="MoA aggregator acting runtime"
+                  className="border border-border bg-background px-2 py-1 font-mono text-xs"
+                  value={preset.aggregator.runtime === "claude_agent_sdk" ? "claude_agent_sdk" : "hermes"}
+                  onChange={(event) => updateSelectedPreset((prev) => ({
+                    ...prev,
+                    aggregator: setMoaAggregatorRuntime(
+                      prev.aggregator,
+                      event.target.value as "hermes" | "claude_agent_sdk",
+                    ),
+                  }))}
+                >
+                  <option value="hermes">Hermes API billing</option>
+                  <option value="claude_agent_sdk">Claude Max · Kanban workers only</option>
+                </select>
+              </label>
+            )}
           </div>
 
           {error && <div className="text-xs text-destructive">{error}</div>}
@@ -852,7 +876,12 @@ function MoaModelsModal({
             }
             setError(null);
             updateSelectedPreset((prev) => {
-              if (picker.kind === "aggregator") return { ...prev, aggregator: { provider, model } };
+              if (picker.kind === "aggregator") {
+                return {
+                  ...prev,
+                  aggregator: selectMoaAggregatorModel(prev.aggregator, provider, model),
+                };
+              }
               return {
                 ...prev,
                 reference_models: prev.reference_models.map((slot, i) => i === picker.index ? { provider, model } : slot),

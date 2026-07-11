@@ -803,9 +803,13 @@ def build_workspace_terminal_args(
     executable_paths.extend(_mach_o_dependencies(executable_paths))
 
     git_metadata = _git_sandbox_metadata(root, git) if git_metadata_enabled else None
-    toolchain_paths = [str(Path(sys.executable).resolve().parents[1])]
-    if runtime_root is not None:
-        toolchain_paths.append(str(Path(sys.prefix).resolve()))
+    toolchain_paths = [
+        str(Path(sys.executable).resolve().parents[1]),
+        # A venv's interpreter commonly resolves to its base Python outside
+        # the venv. Keep the venv itself readable so its site-packages remain
+        # importable for normal coder/architect workers as well as mirrors.
+        str(Path(sys.prefix).resolve()),
+    ]
     toolchain_roots = [Path(path) for path in toolchain_paths if Path(path).exists()]
     toolchain_roots.extend(_homebrew_formula_roots(executable_paths))
     toolchain_roots.extend(

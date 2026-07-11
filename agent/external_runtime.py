@@ -392,9 +392,106 @@ def record_claude_subscription_usage(agent: Any, usage: dict[str, Any] | None) -
     }
 
 
+def record_moa_reference_usage(agent: Any, guidance: Any) -> dict[str, Any]:
+    """Record externally aggregated advisor usage at each advisor's own cost."""
+
+    from agent.usage_pricing import CanonicalUsage
+
+    usage = getattr(guidance, "usage", None)
+    if not isinstance(usage, CanonicalUsage):
+        usage = CanonicalUsage(request_count=0)
+    references = tuple(getattr(guidance, "references", ()) or ())
+    estimated_cost = getattr(guidance, "estimated_cost_usd", None)
+    statuses = {
+        str(row.get("cost_status") or "unknown")
+        for row in references
+        if isinstance(row, dict)
+    }
+    sources = sorted(
+        {
+            str(row.get("cost_source") or "unknown")
+            for row in references
+            if isinstance(row, dict)
+        }
+    )
+    if statuses and statuses <= {"included"}:
+        cost_status = "included"
+    elif estimated_cost is not None:
+        cost_status = "actual" if statuses == {"actual"} else "estimated"
+    else:
+        cost_status = "unknown"
+    cost_source = ",".join(sources) if sources else "moa_reference_fanout"
+    _emit_runtime_event(
+        agent,
+        "moa_reference_billing",
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        estimated_cost_usd=estimated_cost,
+        cost_status=cost_status,
+        cost_source=cost_source,
+        references=references,
+    )
+
+    agent.session_api_calls += usage.request_count
+    agent.session_prompt_tokens += usage.prompt_tokens
+    agent.session_completion_tokens += usage.output_tokens
+    agent.session_total_tokens += usage.total_tokens
+    agent.session_input_tokens += usage.input_tokens
+    agent.session_output_tokens += usage.output_tokens
+    agent.session_cache_read_tokens += usage.cache_read_tokens
+    agent.session_cache_write_tokens += usage.cache_write_tokens
+    agent.session_reasoning_tokens += usage.reasoning_tokens
+    if estimated_cost is not None:
+        agent.session_estimated_cost_usd += float(estimated_cost)
+    agent.session_cost_status = cost_status
+    agent.session_cost_source = cost_source
+
+    if getattr(agent, "_session_db", None) is not None and getattr(
+        agent, "session_id", None
+    ):
+        try:
+            if not getattr(agent, "_session_db_created", False):
+                agent._ensure_db_session()
+            agent._session_db.update_token_counts(
+                agent.session_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                estimated_cost_usd=(
+                    float(estimated_cost) if estimated_cost is not None else None
+                ),
+                cost_status=cost_status,
+                cost_source=cost_source,
+                billing_provider=str(getattr(agent, "provider", "") or "") or None,
+                model=str(getattr(agent, "model", "") or "") or None,
+                api_call_count=usage.request_count,
+            )
+        except Exception:
+            pass
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "estimated_cost_usd": (
+            float(estimated_cost) if estimated_cost is not None else None
+        ),
+        "cost_status": cost_status,
+        "cost_source": cost_source,
+    }
+
+
 __all__ = [
     "_emit_runtime_event",
     "prepare_claude_agent_sdk_runtime",
     "record_claude_subscription_usage",
+    "record_moa_reference_usage",
     "run_claude_agent_sdk_attempt",
 ]

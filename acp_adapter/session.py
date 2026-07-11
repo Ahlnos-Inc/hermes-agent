@@ -679,7 +679,7 @@ class SessionManager:
             )
 
         if runtime is not None:
-            kwargs["model"] = effective_model
+            kwargs["model"] = str(runtime.get("model") or effective_model)
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
@@ -689,6 +689,7 @@ class SessionManager:
                     "api_key": runtime.get("api_key"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
+                    "moa_config": runtime.get("moa_config"),
                 }
             )
         elif isinstance(model_cfg, dict) and model_cfg.get("runtime"):
