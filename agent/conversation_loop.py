@@ -587,6 +587,10 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+    if moa_config is None:
+        bound_moa_config = getattr(agent, "_moa_config", None)
+        if isinstance(bound_moa_config, dict):
+            moa_config = bound_moa_config
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -672,6 +676,19 @@ def run_conversation(
     fallback_moa_guidance = (_prepared_context or {}).get("moa_guidance")
     current_moa_guidance = None
     external_user_message = user_message
+    moa_aggregator = (moa_config or {}).get("aggregator") or {}
+    configured_moa_runtime = str(moa_aggregator.get("runtime") or "").strip().lower()
+    external_moa_configured = bool(
+        configured_moa_runtime and configured_moa_runtime != HERMES_RUNTIME
+    )
+    external_moa_actor_active = bool(
+        external_moa_configured
+        and configured_moa_runtime == getattr(agent, "runtime", HERMES_RUNTIME)
+        and str(moa_aggregator.get("provider") or "").strip().lower()
+        == str(getattr(agent, "provider", "") or "").strip().lower()
+        and str(moa_aggregator.get("model") or "").strip()
+        == str(getattr(agent, "model", "") or "").strip()
+    )
 
     def finalize_external_turn(final_response, *, failed, exit_reason, **extras):
         from agent.turn_finalizer import finalize_turn
@@ -699,7 +716,10 @@ def run_conversation(
         and getattr(agent, "runtime", HERMES_RUNTIME) != HERMES_RUNTIME
     ):
         try:
-            from agent.moa_loop import aggregate_moa_context
+            from agent.moa_loop import (
+                aggregate_moa_context,
+                build_moa_reference_guidance,
+            )
 
             moa_messages = list(messages)
             if active_system_prompt:
@@ -707,22 +727,37 @@ def run_conversation(
                     0, {"role": "system", "content": active_system_prompt}
                 )
             if fallback_moa_guidance is None:
-                fallback_moa_guidance = aggregate_moa_context(
-                    user_prompt=(
-                        original_user_message
-                        if isinstance(original_user_message, str)
-                        else str(original_user_message)
-                    ),
-                    api_messages=moa_messages,
-                    reference_models=moa_config.get("reference_models") or [],
-                    aggregator=moa_config.get("aggregator") or {},
-                    temperature=float(
-                        moa_config.get("reference_temperature", 0.6) or 0.6
-                    ),
-                    aggregator_temperature=float(
-                        moa_config.get("aggregator_temperature", 0.4) or 0.4
-                    ),
-                )
+                if external_moa_actor_active:
+                    fallback_moa_guidance = build_moa_reference_guidance(
+                        api_messages=moa_messages,
+                        reference_models=moa_config.get("reference_models") or [],
+                        temperature=float(
+                            moa_config.get("reference_temperature", 0.6) or 0.6
+                        ),
+                    )
+                elif not external_moa_configured:
+                    fallback_moa_guidance = aggregate_moa_context(
+                        user_prompt=(
+                            original_user_message
+                            if isinstance(original_user_message, str)
+                            else str(original_user_message)
+                        ),
+                        api_messages=moa_messages,
+                        reference_models=moa_config.get("reference_models") or [],
+                        aggregator=moa_config.get("aggregator") or {},
+                        temperature=float(
+                            moa_config.get("reference_temperature", 0.6) or 0.6
+                        ),
+                        aggregator_temperature=float(
+                            moa_config.get("aggregator_temperature", 0.4) or 0.4
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        "External MoA aggregator target is not the active runtime; "
+                        "continuing without MoA to avoid a direct aggregator call"
+                    )
+                    fallback_moa_guidance = ""
             if fallback_moa_guidance:
                 external_user_message = f"{user_message}\n\n{fallback_moa_guidance}"
         except Exception as moa_exc:
@@ -1236,9 +1271,13 @@ def run_conversation(
             try:
                 from agent.moa_loop import aggregate_moa_context
 
-                _moa_context = fallback_moa_guidance
-                fallback_moa_guidance = None
-                if _moa_context is None:
+                if external_moa_configured:
+                    _moa_context = fallback_moa_guidance or current_moa_guidance
+                    fallback_moa_guidance = None
+                else:
+                    _moa_context = fallback_moa_guidance
+                    fallback_moa_guidance = None
+                if _moa_context is None and not external_moa_configured:
                     _moa_context = aggregate_moa_context(
                         user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
                         api_messages=api_messages,

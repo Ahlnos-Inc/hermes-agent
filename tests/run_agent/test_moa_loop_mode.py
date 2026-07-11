@@ -81,6 +81,63 @@ def test_moa_runtime_provider_uses_virtual_endpoint():
     assert runtime["api_key"] == "moa-virtual-provider"
 
 
+def test_external_moa_runtime_resolves_from_real_config(monkeypatch, tmp_path):
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+model:
+  provider: moa
+  default: architect
+moa:
+  default_preset: architect
+  presets:
+    architect:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.6-sol
+      aggregator:
+        provider: anthropic
+        model: claude-fable-5
+        runtime: claude_agent_sdk
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    runtime = resolve_runtime_provider(
+        requested="moa",
+        target_model="architect",
+    )
+
+    assert runtime == {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "api_mode": "anthropic_messages",
+        "runtime": "claude_agent_sdk",
+        "api_key": "",
+        "base_url": "",
+        "source": "claude_max_subscription",
+        "credential_pool": None,
+        "moa_config": {
+            "reference_models": [
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+            ],
+            "aggregator": {
+                "provider": "anthropic",
+                "model": "claude-fable-5",
+                "runtime": "claude_agent_sdk",
+            },
+            "reference_temperature": 0.6,
+            "aggregator_temperature": 0.4,
+            "max_tokens": 4096,
+            "enabled": True,
+        },
+    }
+
+
 def test_moa_does_not_cap_output_tokens(monkeypatch, tmp_path):
     """MoA must not inject an output cap on reference or aggregator calls.
 

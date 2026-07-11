@@ -4426,7 +4426,7 @@ def _make_agent(
         model = fallback_model
     _pr = _load_provider_routing()
     return AIAgent(
-        model=model,
+        model=str(runtime.get("model") or model),
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
@@ -4436,6 +4436,7 @@ def _make_agent(
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        moa_config=runtime.get("moa_config"),
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

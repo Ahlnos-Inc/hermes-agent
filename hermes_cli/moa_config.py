@@ -56,7 +56,14 @@ def _clean_slot(slot: Any) -> dict[str, str] | None:
     # an invalid slot is dropped, falling back to the preset's defaults.
     if provider.lower() == "moa":
         return None
-    return {"provider": provider, "model": model}
+    cleaned = {"provider": provider, "model": model}
+    runtime = str(slot.get("runtime") or "").strip().lower()
+    if runtime:
+        # Preserve even an unknown value so the runtime resolver can fail
+        # closed. Silently dropping a typo here would turn a subscription-only
+        # external aggregator into a native paid API call.
+        cleaned["runtime"] = runtime
+    return cleaned
 
 
 def _default_preset() -> dict[str, Any]:

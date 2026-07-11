@@ -324,6 +324,7 @@ def _run_agent(
         target_model=effective_model or None,
         explicit_base_url=explicit_base_url_from_alias,
     )
+    effective_model = str(runtime.get("model") or effective_model)
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
@@ -349,6 +350,7 @@ def _run_agent(
         platform="cli",
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
+        moa_config=runtime.get("moa_config"),
         fallback_model=_fb or None,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:

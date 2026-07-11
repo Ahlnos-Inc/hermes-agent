@@ -155,6 +155,39 @@ def test_no_config_leaves_max_tokens_none(isolated_home):
     assert kw["max_tokens"] is None
 
 
+def test_external_moa_runtime_and_model_propagate_from_config(isolated_home):
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          provider: moa
+          default: architect
+        moa:
+          default_preset: architect
+          presets:
+            architect:
+              reference_models:
+                - provider: openai-codex
+                  model: gpt-5.6-sol
+              aggregator:
+                provider: anthropic
+                model: claude-fable-5
+                runtime: claude_agent_sdk
+        """
+    )
+
+    runtime = fresh_gateway()._resolve_runtime_agent_kwargs()
+
+    assert runtime["provider"] == "anthropic"
+    assert runtime["model"] == "claude-fable-5"
+    assert runtime["runtime"] == "claude_agent_sdk"
+    assert runtime["api_key"] == ""
+    assert runtime["base_url"] == ""
+    assert runtime["moa_config"]["aggregator"]["runtime"] == (
+        "claude_agent_sdk"
+    )
+
+
 def test_lift_helper_accepts_alias_and_rejects_garbage(isolated_home):
     """_lift_max_output_tokens accepts both keys, ignores non-positive/non-int."""
     write_cfg, _ = isolated_home

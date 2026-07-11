@@ -21,6 +21,109 @@ def _fake_invoke_jwt(ttl_seconds=3600):
     return f"{header}.{payload}.sig"
 
 
+def test_moa_external_aggregator_routes_to_subscription_acting_runtime(monkeypatch):
+    config = {
+        "model": {"provider": "moa", "default": "architect"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="moa",
+        target_model="architect",
+    )
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["model"] == "claude-fable-5"
+    assert resolved["runtime"] == "claude_agent_sdk"
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == ""
+    assert resolved["moa_config"]["aggregator"]["runtime"] == "claude_agent_sdk"
+
+
+def test_moa_external_aggregator_unknown_runtime_fails_closed(monkeypatch):
+    config = {
+        "model": {"provider": "moa", "default": "architect"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_max_typo",
+                    },
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    with pytest.raises(ValueError, match="Unknown agent runtime: claude_max_typo"):
+        rp.resolve_runtime_provider(requested="moa", target_model="architect")
+
+
+def test_non_moa_route_does_not_pivot_to_external_aggregator(monkeypatch):
+    config = {
+        "model": {"provider": "anthropic", "default": "claude-fable-5"},
+        "moa": {
+            "default_preset": "architect",
+            "presets": {
+                "architect": {
+                    "reference_models": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+                    ],
+                    "aggregator": {
+                        "provider": "anthropic",
+                        "model": "claude-fable-5",
+                        "runtime": "claude_agent_sdk",
+                    },
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(rp, "_get_model_config", lambda: config["model"])
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setattr(
+        rp,
+        "_resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "direct-key",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        target_model="claude-fable-5",
+    )
+
+    assert resolved["runtime"] == "hermes"
+    assert "moa_config" not in resolved
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"

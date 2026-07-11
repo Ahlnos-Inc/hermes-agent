@@ -561,6 +561,50 @@ def aggregate_moa_context(
     )
 
 
+def build_moa_reference_guidance(
+    *,
+    api_messages: list[dict[str, Any]],
+    reference_models: list[dict[str, str]],
+    temperature: float = 0.6,
+    max_tokens: int | None = None,
+) -> str:
+    """Return successful advisor output for an external acting runtime.
+
+    Unlike :func:`aggregate_moa_context`, this path intentionally makes no
+    aggregator ``call_llm`` request. The configured whole-agent runtime is the
+    aggregator and receives the references as private context before it acts
+    with its own tools and fallback chain. If every advisor is unavailable,
+    return an empty string so the acting runtime proceeds solo.
+    """
+
+    reference_outputs = _run_references_parallel(
+        reference_models,
+        _reference_messages(api_messages),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    successful = [
+        (label, text)
+        for label, text, _usage in reference_outputs
+        if text
+        and not text.startswith("[failed:")
+        and not text.startswith("[skipped:")
+    ]
+    if not successful:
+        return ""
+    joined = "\n\n".join(
+        f"Reference {idx} — {label}:\n{text}"
+        for idx, (label, text) in enumerate(successful, start=1)
+    )
+    return (
+        "[Mixture of Agents advisor context — private guidance for the acting "
+        "whole-agent runtime. Use it as input, then independently reason, call "
+        "tools, and complete the task.]\n"
+        f"References: {', '.join(label for label, _text in successful)}\n\n"
+        f"{joined}"
+    )
+
+
 def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str) -> None:
     """Attach the per-turn reference block at the END of the aggregator prompt.
 

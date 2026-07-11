@@ -42,6 +42,7 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model or None,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -84,6 +85,7 @@ class CLIAgentSetupMixin:
         resolved_provider = runtime.get("provider", "openrouter")
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
         resolved_agent_runtime = runtime.get("runtime", "hermes")
+        resolved_moa_config = runtime.get("moa_config")
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
@@ -131,12 +133,14 @@ class CLIAgentSetupMixin:
             or resolved_agent_runtime != getattr(self, "agent_runtime", "hermes")
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
+            or resolved_moa_config != getattr(self, "moa_config", None)
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
         self.agent_runtime = resolved_agent_runtime
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
+        self.moa_config = resolved_moa_config
         self._credential_pool = resolved_credential_pool
         self._provider_source = runtime.get("source")
         self.api_key = api_key
@@ -155,7 +159,7 @@ class CLIAgentSetupMixin:
                 self.model == self.provider or  # Model is the provider slug
                 self.model == runtime.get("name")  # Model matches provider display name
             )
-            if should_use_runtime_model:
+            if should_use_runtime_model or resolved_moa_config is not None:
                 self.model = runtime_model
 
         # If model is still empty (e.g. user ran `hermes auth add openai-codex`
@@ -356,6 +360,7 @@ class CLIAgentSetupMixin:
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
+                "moa_config": getattr(self, "moa_config", None),
             }
             effective_model = model_override or self.model
             self.agent = AIAgent(
@@ -368,6 +373,7 @@ class CLIAgentSetupMixin:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                moa_config=runtime.get("moa_config"),
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
@@ -442,6 +448,7 @@ class CLIAgentSetupMixin:
                 runtime.get("runtime"),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
+                repr(runtime.get("moa_config")),
             )
 
             # Force-create DB row on /title intent, then apply title.

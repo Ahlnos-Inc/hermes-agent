@@ -2772,6 +2772,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
+            model = str(runtime.get("model") or model)
         except AuthError as auth_exc:
             # Primary provider auth failed — try fallback chain before giving up.
             # Uses the *effective* fallback chain resolved below so per-job
@@ -2909,6 +2910,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider=runtime.get("provider"),
             api_mode=runtime.get("api_mode"),
             runtime=runtime.get("runtime", "hermes"),
+            moa_config=runtime.get("moa_config"),
             acp_command=runtime.get("command"),
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,

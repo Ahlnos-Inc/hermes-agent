@@ -1823,6 +1823,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
+        "model": runtime.get("model"),
+        "moa_config": runtime.get("moa_config"),
     }
 
 
@@ -1885,6 +1887,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    "moa_config": runtime.get("moa_config"),
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -3680,6 +3683,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
+            "moa_config": runtime_kwargs.get("moa_config"),
         }
         route = {
             "model": model,
@@ -3692,6 +3696,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["runtime"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                repr(runtime.get("moa_config")),
             ),
         }
 
@@ -14985,6 +14990,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
                 runtime.get("runtime", "hermes"),
+                runtime.get("moa_config"),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
