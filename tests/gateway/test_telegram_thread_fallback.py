@@ -128,6 +128,7 @@ def _make_adapter():
     adapter._dm_topics = {}
     adapter._dm_topics_config = []
     adapter._reply_to_mode = "first"
+    adapter._voice_via_send_audio = False
     adapter._fallback_ips = []
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
