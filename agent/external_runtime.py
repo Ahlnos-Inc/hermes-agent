@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import stat
 import json
 import logging
 import time
@@ -30,6 +31,36 @@ from hermes_constants import get_hermes_home, get_host_user_home
 
 
 _runtime_events_logger = logging.getLogger("hermes.runtime_events")
+_CLAUDE_SDK_TEMP_ROOT = Path("/tmp")
+
+
+def prepare_claude_sdk_temp_dir(*, temp_root: str | Path | None = None) -> Path:
+    """Return Claude Code's fixed owner-only per-user temporary directory.
+
+    Claude Code initializes ``/tmp/claude-<uid>`` before honoring ``TMPDIR``.
+    Keep that compatibility path private and grant Seatbelt access to only that
+    descendant rather than broad write access to ``/tmp``.
+    """
+
+    root = Path(temp_root) if temp_root is not None else _CLAUDE_SDK_TEMP_ROOT
+    path = root / f"claude-{os.geteuid()}"
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"Claude SDK temp directory could not be created: {path}") from exc
+    try:
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError(f"Claude SDK temp directory is not owner-only: {path}")
+        path.chmod(0o700)
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Claude SDK temp directory is not owner-only: {path}") from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+        raise RuntimeError(f"Claude SDK temp directory is not owner-only: {path}")
+    return path
 
 
 def _emit_runtime_event(agent: Any, event: str, **fields: Any) -> None:
@@ -153,10 +184,8 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
         cli_name = "claude.exe" if os.name == "nt" else "claude"
         bundled_cli = sdk_root / "_bundled" / cli_name
         exact_env = build_claude_subscription_env(os.environ, host_home=host_home)
-        worker_tmp = workspace / ".hermes-claude-runtime" / "tmp"
-        worker_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        worker_tmp.chmod(0o700)
-        exact_env["TMPDIR"] = str(worker_tmp)
+        claude_tmp = prepare_claude_sdk_temp_dir()
+        exact_env["TMPDIR"] = str(claude_tmp)
         sandbox_profile = build_workspace_seatbelt_profile(
             workspace=workspace,
             host_home=host_home,
@@ -167,7 +196,10 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
                 host_home / ".claude.json",
                 host_home / ".claude.json.lock",
             ],
-            control_write_roots=[_claude_project_state_dir(host_home, workspace)],
+            control_write_roots=[
+                _claude_project_state_dir(host_home, workspace),
+                claude_tmp,
+            ],
         )
         cli_wrapper = create_exact_env_cli_wrapper(
             bundled_cli,
@@ -491,6 +523,7 @@ def record_moa_reference_usage(agent: Any, guidance: Any) -> dict[str, Any]:
 __all__ = [
     "_emit_runtime_event",
     "prepare_claude_agent_sdk_runtime",
+    "prepare_claude_sdk_temp_dir",
     "record_claude_subscription_usage",
     "record_moa_reference_usage",
     "run_claude_agent_sdk_attempt",

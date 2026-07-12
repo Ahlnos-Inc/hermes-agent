@@ -1,10 +1,17 @@
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+import agent.external_runtime as external_runtime
 from agent.external_runtime import (
     _load_persisted_claude_session_id,
     _persist_claude_session_id,
+    prepare_claude_agent_sdk_runtime,
+    prepare_claude_sdk_temp_dir,
     run_claude_agent_sdk_attempt,
 )
 from agent.claude_agent_runtime import ClaudeProjection, RuntimeFailure
@@ -243,3 +250,78 @@ def test_raised_auth_failure_also_clears_preflight_and_session(monkeypatch, tmp_
     assert agent._claude_max_attestation is None
     assert agent._claude_sdk_sessions == {}
     assert session.closed is True
+
+
+def test_claude_sdk_temp_dir_is_exact_owner_only_private_directory(tmp_path):
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+
+    temp_dir = prepare_claude_sdk_temp_dir(temp_root=temp_root)
+
+    assert temp_dir == temp_root / f"claude-{os.geteuid()}"
+    info = temp_dir.lstat()
+    assert stat.S_ISDIR(info.st_mode)
+    assert info.st_uid == os.geteuid()
+    assert stat.S_IMODE(info.st_mode) == 0o700
+
+
+def test_claude_sdk_temp_dir_rejects_symlinked_owner_path(tmp_path):
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    expected = temp_root / f"claude-{os.geteuid()}"
+    expected.symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="owner-only"):
+        prepare_claude_sdk_temp_dir(temp_root=temp_root)
+
+
+def test_preflight_uses_exact_claude_temp_path_without_broad_tmp_write_grant(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    host_home = tmp_path / "host"
+    temp_root = tmp_path / "tmp"
+    workspace.mkdir()
+    host_home.mkdir()
+    temp_root.mkdir()
+    captured = {}
+
+    class FakeSdk:
+        __file__ = str(tmp_path / "sdk" / "__init__.py")
+
+    def create_wrapper(real_cli, exact_env, wrapper_dir, *, sandbox_profile):
+        captured["env"] = dict(exact_env)
+        captured["profile"] = sandbox_profile
+        return tmp_path / "claude-wrapper"
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setattr(external_runtime.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(external_runtime, "_CLAUDE_SDK_TEMP_ROOT", temp_root)
+    monkeypatch.setattr(external_runtime, "load_claude_agent_sdk", lambda: FakeSdk)
+    monkeypatch.setattr(external_runtime, "get_host_user_home", lambda: host_home)
+    monkeypatch.setattr(
+        external_runtime,
+        "build_claude_subscription_env",
+        lambda *_args, **_kwargs: {"PATH": "/usr/bin:/bin"},
+    )
+    monkeypatch.setattr(external_runtime, "create_exact_env_cli_wrapper", create_wrapper)
+    monkeypatch.setattr(
+        external_runtime,
+        "attest_claude_max_auth",
+        lambda _wrapper: SimpleNamespace(included_usage=True),
+    )
+    agent = SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6")
+
+    assert prepare_claude_agent_sdk_runtime(agent) is None
+
+    temp_dir = temp_root / f"claude-{os.geteuid()}"
+    assert captured["env"]["TMPDIR"] == str(temp_dir)
+    write_rules = [
+        line
+        for line in captured["profile"].splitlines()
+        if line.startswith("(allow file-write")
+    ]
+    assert f'(allow file-write* (subpath "{temp_dir.resolve()}"))' in write_rules
+    assert f'(allow file-write* (subpath "{temp_root.resolve()}"))' not in write_rules
+    assert not any('subpath "/tmp"' in rule for rule in write_rules)
