@@ -8579,12 +8579,21 @@ def _finish_tui_kanban_claim(session: dict, *, persisted: bool) -> None:
     try:
         sub = claim["sub"]
         if persisted:
-            for shadow in claim.get("shadows") or []:
-                _kb.advance_notify_cursor_monotonic(
-                    conn, task_id=shadow["task_id"], platform=shadow["platform"],
-                    chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
-                    new_cursor=claim["claimed_cursor"],
-                )
+            task = _kb.get_task(conn, sub["task_id"])
+            rows = [sub, *(claim.get("shadows") or [])]
+            if task is not None and task.status in {"done", "archived"}:
+                for row in rows:
+                    _kb.remove_notify_sub(
+                        conn, task_id=row["task_id"], platform=row["platform"],
+                        chat_id=row["chat_id"], thread_id=row.get("thread_id") or "",
+                    )
+            else:
+                for shadow in claim.get("shadows") or []:
+                    _kb.advance_notify_cursor_monotonic(
+                        conn, task_id=shadow["task_id"], platform=shadow["platform"],
+                        chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
+                        new_cursor=claim["claimed_cursor"],
+                    )
         else:
             rewound = _kb.rewind_notify_cursor(
                 conn, task_id=sub["task_id"], platform=sub["platform"],

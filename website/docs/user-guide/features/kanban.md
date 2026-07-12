@@ -775,7 +775,7 @@ This is the whole point of the separation:
 - You spot a card that needs human context → `/kanban comment t_xyz "use the 2026 schema, not 2025"` lands on the task thread and the *next* run of that task will read it in `kanban_show()`.
 - You want to know what your fleet is doing without stopping the orchestrator → `/kanban list --mine` or `/kanban stats` inspects the board without touching your main conversation.
 
-### Auto-subscribe on `/kanban create` (gateway only)
+### Auto-subscribe on create (gateway and Desktop)
 
 When you create a task from the gateway with `/kanban create "…"`, the originating chat (platform + chat id + thread id) is automatically subscribed to that task's terminal events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`). You'll get one message back per terminal event — including the first line of the worker's result summary on `completed` — without having to poll or remember the task id.
 
@@ -791,6 +791,44 @@ bot> ✓ t_9fc1a3 completed by transcriber
 ```
 
 Subscriptions auto-remove themselves once the task reaches `done` or `archived`. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
+
+Hermes Desktop and the native TUI use the same durable subscription rows. A
+task created from a live Desktop session subscribes that session's key with
+`platform=tui`; this originating TUI subscription takes precedence over any
+configured Telegram/home fallback, so one creation never produces duplicate
+return paths. Telegram-origin work remains bound to Telegram. An unattached
+CLI or cron creator has no implicit destination, but may opt into the
+configured home-channel fallback.
+
+When a Desktop conversation has compressed, only the exact canonical
+compression tip may consume its backlog. Live ancestors, branches, delegates,
+and ambiguous duplicate owners fail closed and leave the cursor untouched
+until the canonical tip is resumed. Across boards, eligible batches are
+selected oldest-first with stable path/task/session/event tie-breakers. Each
+claim is bounded to the events visible at admission, so a newer event waits for
+the next session cycle and cannot widen an in-flight batch.
+
+Desktop delivery is an internal control turn, not a synthetic user action: the
+backend does not emit `prompt.submit` or create a user-authored bubble. A stable
+delivery key is persisted with the control input so an at-least-once retry can
+avoid repeating orchestration side effects. Catchable failures before that
+early SessionDB append CAS-rewind the board cursor; once the input is durable,
+the cursor is retained even if the provider later fails.
+
+:::caution Best-effort hard-crash boundary
+The board database and SessionDB are separate SQLite files. A process death or
+power loss after the board claim commits but before the internal control turn
+is persisted cannot be rolled back atomically without a durable claim journal.
+Hermes deliberately does not claim exactly-once or zero-loss semantics here.
+Recovery is operator-confirmed: verify that the stable delivery key is absent
+from the canonical session, then CAS-rewind that subscription from the claimed
+cursor to its prior cursor. Never force a rewind over newer progress.
+:::
+
+To roll back the Desktop consumer, remove or disable the affected TUI
+subscriptions and revert the TUI consumer/persistence-callback changes. No
+schema rollback is required; task events remain durable. Advancing a cursor is
+an explicit decision to discard backlog, not a rollback step.
 
 ### Output truncation in messaging
 
