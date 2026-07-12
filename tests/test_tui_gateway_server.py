@@ -7536,6 +7536,45 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_process_event_wins_kanban_cadence(monkeypatch):
+    from tools.process_registry import process_registry
+
+    class FourPollQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, timeout=None):
+            self.calls += 1
+            if self.calls < 4:
+                return None
+            return {
+                "type": "completion", "session_id": "process-first",
+                "command": "echo done", "exit_code": 0, "output": "done",
+            }
+
+        def empty(self):
+            return True
+
+    stop = threading.Event()
+    order = []
+    session = _session(running=False)
+    monkeypatch.setattr(process_registry, "completion_queue", FourPollQueue())
+    process_registry._completion_consumed.discard("process-first")
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_poll_kanban_tui_subs", lambda *a, **k: order.append("kanban")
+    )
+
+    def run_process(*_args, **_kwargs):
+        order.append("process")
+        stop.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_process)
+    server._notification_poller_loop(stop, "sid-process-priority", session)
+
+    assert order == ["process"]
+
+
 def test_tui_kanban_only_canonical_tip_owns_lineage():
     from tui_gateway import server
 
@@ -7620,6 +7659,33 @@ def test_tui_kanban_user_queue_wins_before_reservation():
 
     assert server._reserve_tui_turn("sid", session, "kanban") is None
     assert session["running"] is False
+
+
+def test_tui_kanban_goal_followup_wins_before_reservation():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "_goal_followup_pending": True,
+        "queued_prompt": None,
+        "running": False,
+    }
+
+    assert server._reserve_tui_turn("sid", session, "kanban") is None
+
+
+def test_tui_internal_control_history_has_no_user_authored_row():
+    from tui_gateway import server
+
+    prior = [{"role": "user", "content": "real user"}]
+    messages = [*prior, {"role": "user", "content": "internal"}]
+
+    normalized = server._internal_control_history(messages, len(prior))
+
+    assert normalized[-1] == {
+        "role": "system", "content": "internal", "observed": True
+    }
+    assert messages[-1]["role"] == "user"
 
 
 def test_tui_kanban_candidate_order_is_oldest_then_stable_ties():
@@ -7771,6 +7837,57 @@ def test_tui_kanban_source_backend_completion_smoke(tmp_path, monkeypatch):
     assert [(sub["platform"], sub["chat_id"]) for sub in subs] == [
         ("telegram", "home")
     ]
+
+
+def test_tui_kanban_silent_archived_batch_removes_subscription(tmp_path, monkeypatch):
+    import contextlib
+    from hermes_cli import active_sessions
+    from hermes_cli import kanban_db as kb
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="archive", assignee="coder")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="tip")
+        kb.archive_task(conn, task_id)
+    finally:
+        conn.close()
+
+    class FakeSessionDB:
+        get_compression_tip = resolve_resume_session_id = lambda self, origin: origin
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeSessionDB()
+
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent_ready": ready, "history_lock": threading.Lock(),
+        "profile_home": None, "queued_prompt": None, "running": False,
+        "session_key": "tip",
+    }
+    sid = "desktop-archive"
+    turns = []
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    monkeypatch.setattr(active_sessions, "active_session_registry_snapshot", lambda: [])
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: turns.append(a))
+    server._sessions[sid] = session
+    try:
+        server._poll_kanban_tui_subs(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert turns == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):

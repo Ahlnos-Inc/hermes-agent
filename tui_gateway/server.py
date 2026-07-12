@@ -8568,6 +8568,19 @@ def _tui_kanban_candidate_sort_key(candidate: dict) -> tuple:
     )
 
 
+def _internal_control_history(messages: list, prior_history_len: int) -> list:
+    """Return live history with the internal inbound row normalized as system."""
+    normalized = list(messages)
+    if 0 <= prior_history_len < len(normalized):
+        inbound = normalized[prior_history_len]
+        if isinstance(inbound, dict) and inbound.get("role") == "user":
+            inbound = dict(inbound)
+            inbound["role"] = "system"
+            inbound["observed"] = True
+            normalized[prior_history_len] = inbound
+    return normalized
+
+
 def _finish_tui_kanban_claim(session: dict, *, persisted: bool) -> None:
     """Retain or CAS-rewind the current bounded claim at persistence boundary."""
     claim = session.get("_pending_kanban_claim")
@@ -8733,12 +8746,20 @@ def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
                 if message:
                     rendered.append(message)
             if not rendered:
-                for shadow in candidate["shadows"]:
-                    _kb.advance_notify_cursor_monotonic(
-                        conn, task_id=shadow["task_id"], platform=shadow["platform"],
-                        chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
-                        new_cursor=cursor,
-                    )
+                rows = [sub, *candidate["shadows"]]
+                if task is not None and task.status in {"done", "archived"}:
+                    for row in rows:
+                        _kb.remove_notify_sub(
+                            conn, task_id=row["task_id"], platform=row["platform"],
+                            chat_id=row["chat_id"], thread_id=row.get("thread_id") or "",
+                        )
+                else:
+                    for shadow in candidate["shadows"]:
+                        _kb.advance_notify_cursor_monotonic(
+                            conn, task_id=shadow["task_id"], platform=shadow["platform"],
+                            chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
+                            new_cursor=cursor,
+                        )
                 _release_tui_turn(session, token)
                 return
             delivery_key = _kb.notify_delivery_key(
@@ -8809,9 +8830,9 @@ def _notification_poller_loop(
             evt = None
         poll_count += 1
         # ponytail: fixed four-poll cadence keeps this in the existing loop without another knob/thread.
-        if poll_count % 4 == 0:
-            _poll_kanban_tui_subs(sid, session)
         if evt is None:
+            if poll_count % 4 == 0:
+                _poll_kanban_tui_subs(sid, session)
             continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
@@ -9174,10 +9195,13 @@ def _run_prompt_submit(
             status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
+                    next_history = result["messages"]
+                    if internal_control:
+                        next_history = _internal_control_history(next_history, len(history))
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = next_history
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn
@@ -9292,6 +9316,8 @@ def _run_prompt_submit(
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
                                     goal_followup = cont_prompt
+                                    with session["history_lock"]:
+                                        session["_goal_followup_pending"] = True
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -9413,6 +9439,8 @@ def _run_prompt_submit(
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            with session["history_lock"]:
+                session["_goal_followup_pending"] = False
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -9423,6 +9451,7 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
+                session["_goal_followup_pending"] = False
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
