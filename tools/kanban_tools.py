@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_hermes_home
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -1745,7 +1746,7 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
     if not task_id:
         return None
     gate = kb.get_architecture_gate_for_task(conn, task_id)
-    if gate is None or gate.enforcement_mode != "enforce":
+    if gate is None or gate.enforcement_mode not in kb.ARCHITECTURE_GATE_ENFORCING_MODES:
         return None
     return kb.MutationContext(
         board_key=gate.board_key,
@@ -1756,8 +1757,51 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
         workflow_key=gate.workflow_key,
         gate_id=gate.gate_id,
         profile=os.environ.get("HERMES_PROFILE") or None,
-        mode="enforce",
+        mode=gate.enforcement_mode,
         phase="protected",
+    )
+
+
+def _managed_architecture_gate_mode() -> str:
+    """Read the synced staged policy, failing closed to ``off``."""
+    try:
+        policy_path = get_hermes_home() / "rules" / "architecture-gate-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if not isinstance(policy, dict) or policy.get("version") != "v1":
+            return "off"
+        mode = policy.get("mode")
+        if mode in {"off", "shadow", "orchestrator_only"}:
+            return mode
+    except Exception:
+        logger.warning("Unable to read managed architecture-gate policy; using off", exc_info=True)
+    # ``enforce`` remains readable in existing gate rows but is deliberately
+    # not a new front-door activation target.
+    return "off"
+
+
+def _trusted_front_door_architecture_context(
+    kb: Any, *, board: Any, assignee: Any, turn_id: Any,
+) -> Any:
+    """Construct architecture authority from runtime identity, never tool args."""
+    if os.environ.get("HERMES_KANBAN_TASK") or str(assignee).strip() != "architect":
+        return None
+    if os.environ.get("HERMES_PROFILE") != "orchestrator":
+        return None
+    try:
+        from gateway.session_context import get_session_env
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        session_id = os.environ.get("HERMES_SESSION_ID", "")
+    session_id = str(session_id).strip()
+    trusted_turn_id = str(turn_id or "").strip()
+    mode = _managed_architecture_gate_mode()
+    if not session_id or not trusted_turn_id or mode == "off":
+        return None
+    return kb.MutationContext(
+        board_key=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "default"),
+        principal=f"orchestrator:{session_id}", actor_type="orchestrator_agent",
+        profile="orchestrator", session_id=session_id,
+        request_scope_id=f"front-door:{trusted_turn_id}", mode=mode, phase="architecture",
     )
 
 
@@ -1848,6 +1892,14 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            mutation_context = _worker_architecture_context(kb, conn)
+            if mutation_context is None:
+                mutation_context = _trusted_front_door_architecture_context(
+                    kb, board=board, assignee=assignee, turn_id=kw.get("turn_id"),
+                )
+                if mutation_context is not None:
+                    # Scope identity must not come from a model-visible argument.
+                    session_id = mutation_context.session_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1878,7 +1930,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_override=model_override,
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
-                mutation_context=_worker_architecture_context(kb, conn),
+                mutation_context=mutation_context,
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None

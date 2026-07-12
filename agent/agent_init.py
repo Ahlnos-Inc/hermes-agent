@@ -460,7 +460,11 @@ def init_agent(
     from agent.kanban_delivery_policy import policy_for_current_kanban_task
     agent._kanban_delivery_policy = policy_for_current_kanban_task()
     _delivery_policy = agent._kanban_delivery_policy
-    if _delivery_policy is not None and _delivery_policy.withholding:
+    # Install dynamic wrappers for every dispatcher-owned turn, including ones
+    # with no gate *yet*.  A same-turn architect creation can open a gate after
+    # this initializer returns; each wrapper re-resolves the authoritative
+    # projection before forwarding a byte.
+    if _delivery_policy is not None:
         _raw_stream_delta_callback = agent.stream_delta_callback
         _raw_interim_callback = agent.interim_assistant_callback
         _raw_tool_progress_callback = agent.tool_progress_callback
@@ -479,7 +483,10 @@ def init_agent(
             agent.interim_assistant_callback = _guarded_interim
         if _raw_tool_progress_callback is not None:
             def _guarded_tool_progress(*args, **kwargs):
-                _delivery_policy.buffer("tool_progress")
+                if _delivery_policy.withholding:
+                    _delivery_policy.buffer("tool_progress")
+                    return
+                _raw_tool_progress_callback(*args, **kwargs)
             agent.tool_progress_callback = _guarded_tool_progress
 
     
