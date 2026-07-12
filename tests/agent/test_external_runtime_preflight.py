@@ -275,7 +275,7 @@ def test_claude_sdk_temp_dir_rejects_symlinked_owner_path(tmp_path):
         prepare_claude_sdk_temp_dir(temp_root=temp_root)
 
 
-def test_preflight_uses_exact_claude_temp_path_without_broad_tmp_write_grant(
+def test_preflight_uses_per_worker_tmpdir_and_narrow_sdk_compatibility_grant(
     monkeypatch, tmp_path
 ):
     workspace = tmp_path / "workspace"
@@ -284,14 +284,14 @@ def test_preflight_uses_exact_claude_temp_path_without_broad_tmp_write_grant(
     workspace.mkdir()
     host_home.mkdir()
     temp_root.mkdir()
-    captured = {}
+    captured = {"envs": [], "profiles": []}
 
     class FakeSdk:
         __file__ = str(tmp_path / "sdk" / "__init__.py")
 
     def create_wrapper(real_cli, exact_env, wrapper_dir, *, sandbox_profile):
-        captured["env"] = dict(exact_env)
-        captured["profile"] = sandbox_profile
+        captured["envs"].append(dict(exact_env))
+        captured["profiles"].append(sandbox_profile)
         return tmp_path / "claude-wrapper"
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-425")
@@ -314,14 +314,60 @@ def test_preflight_uses_exact_claude_temp_path_without_broad_tmp_write_grant(
     agent = SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6")
 
     assert prepare_claude_agent_sdk_runtime(agent) is None
+    second_workspace = tmp_path / "second-workspace"
+    second_workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(second_workspace))
+    second_agent = SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6")
+    assert prepare_claude_agent_sdk_runtime(second_agent) is None
 
-    temp_dir = temp_root / f"claude-{os.geteuid()}"
-    assert captured["env"]["TMPDIR"] == str(temp_dir)
+    claude_tmp = temp_root / f"claude-{os.geteuid()}"
+    worker_tmp = workspace / ".hermes-claude-runtime" / "tmp"
+    second_worker_tmp = second_workspace / ".hermes-claude-runtime" / "tmp"
+    assert captured["envs"][0]["TMPDIR"] == str(worker_tmp)
+    assert captured["envs"][1]["TMPDIR"] == str(second_worker_tmp)
+    assert worker_tmp != second_worker_tmp
+    assert worker_tmp != claude_tmp
+    for path in (worker_tmp, second_worker_tmp, claude_tmp):
+        info = path.lstat()
+        assert stat.S_ISDIR(info.st_mode)
+        assert info.st_uid == os.geteuid()
+        assert stat.S_IMODE(info.st_mode) == 0o700
     write_rules = [
         line
-        for line in captured["profile"].splitlines()
+        for line in captured["profiles"][0].splitlines()
         if line.startswith("(allow file-write")
     ]
-    assert f'(allow file-write* (subpath "{temp_dir.resolve()}"))' in write_rules
+    assert f'(allow file-write* (subpath "{claude_tmp.resolve()}"))' in write_rules
     assert f'(allow file-write* (subpath "{temp_root.resolve()}"))' not in write_rules
     assert not any('subpath "/tmp"' in rule for rule in write_rules)
+
+
+@pytest.mark.parametrize("mode", [0o750, 0o777])
+def test_claude_sdk_temp_dir_rejects_existing_nonprivate_mode(tmp_path, mode):
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    temp_dir = temp_root / f"claude-{os.geteuid()}"
+    temp_dir.mkdir(mode=0o700)
+    temp_dir.chmod(mode)
+
+    with pytest.raises(RuntimeError, match="owner-only"):
+        prepare_claude_sdk_temp_dir(temp_root=temp_root)
+
+
+def test_claude_sdk_temp_dir_rejects_existing_wrong_owner(monkeypatch, tmp_path):
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    temp_dir = temp_root / f"claude-{os.geteuid()}"
+    temp_dir.mkdir(mode=0o700)
+    real_lstat = Path.lstat
+
+    def wrong_owner_lstat(path):
+        info = real_lstat(path)
+        if path == temp_dir:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", wrong_owner_lstat)
+
+    with pytest.raises(RuntimeError, match="owner-only"):
+        prepare_claude_sdk_temp_dir(temp_root=temp_root)
