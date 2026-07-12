@@ -7518,7 +7518,6 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
 
     try:
         server._notification_poller_loop(stop, "sid_busy", sess)
-
         # Status update was emitted (user sees it)
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
@@ -7531,6 +7530,108 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_tui_kanban_only_canonical_tip_owns_lineage():
+    from tui_gateway import server
+
+    class FakeDB:
+        def get_compression_tip(self, origin):
+            return "tip"
+
+        def resolve_resume_session_id(self, origin):
+            return "tip"
+
+    ready = threading.Event()
+    ready.set()
+    root = {"session_key": "root", "profile_home": None, "agent_ready": ready}
+    tip = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+    sessions = {"sid-root": root, "sid-tip": tip}
+    leases = [{"session_id": "tip", "metadata": {"live_session_id": "sid-tip"}}]
+
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-tip", tip, FakeDB(), sessions, leases
+    ) == ("tip", None)
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-root", root, FakeDB(), sessions, leases
+    ) == (None, "stale_live_owner")
+
+
+def test_tui_kanban_two_reservers_one_token():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "queued_prompt": None,
+    }
+    barrier = threading.Barrier(3)
+    tokens = []
+
+    def reserve():
+        barrier.wait()
+        tokens.append(server._reserve_tui_turn("sid", session, "kanban"))
+
+    threads = [threading.Thread(target=reserve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    winners = [token for token in tokens if token]
+    assert len(winners) == 1
+    assert session["_turn_reservation"]["token"] == winners[0]
+
+
+def test_tui_kanban_duplicate_tip_without_unique_lease_fails_closed():
+    from tui_gateway import server
+
+    class FakeDB:
+        get_compression_tip = resolve_resume_session_id = lambda self, origin: "tip"
+
+    ready = threading.Event()
+    ready.set()
+    one = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+    two = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-one", one, FakeDB(), {"sid-one": one, "sid-two": two}, []
+    ) == (None, "ambiguous_live_owner")
+
+
+def test_tui_kanban_user_queue_wins_before_reservation():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "queued_prompt": {"text": "human", "transport": None},
+        "running": False,
+    }
+
+    assert server._reserve_tui_turn("sid", session, "kanban") is None
+    assert session["running"] is False
+
+
+def test_tui_kanban_candidate_order_is_oldest_then_stable_ties():
+    from tui_gateway import server
+
+    def candidate(created_at, db_path, task_id, event_id):
+        event = type("Event", (), {"created_at": created_at, "id": event_id})()
+        return {
+            "db_path": db_path,
+            "events": [event],
+            "sub": {"task_id": task_id, "thread_id": ""},
+            "tip": "tip",
+        }
+
+    newer = candidate(20, "/a.db", "t_a", 1)
+    tied_b = candidate(10, "/b.db", "t_b", 1)
+    tied_a = candidate(10, "/a.db", "t_a", 2)
+
+    assert sorted(
+        [newer, tied_b, tied_a], key=server._tui_kanban_candidate_sort_key
+    ) == [tied_a, tied_b, newer]
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
