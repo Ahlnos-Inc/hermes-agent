@@ -81,6 +81,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -1800,6 +1801,48 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def _file_sha256(path: Path) -> Optional[str]:
+    """Return a file digest without loading forensic images into memory."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _atomic_copy2(source: Path, destination: Path) -> bool:
+    """Copy ``source`` to ``destination`` without publishing partial bytes."""
+    temp_fd = -1
+    staged: Optional[Path] = None
+    try:
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=str(destination.parent),
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+        )
+        staged = Path(temp_name)
+        os.close(temp_fd)
+        temp_fd = -1  # closed; sentinel cleared so we don't double-close
+        shutil.copy2(source, staged)
+        os.replace(staged, destination)
+    except OSError:
+        if temp_fd != -1:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if staged is not None:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        return False
+    return True
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
@@ -1823,22 +1866,33 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
-    digest = hashlib.sha256()
-    try:
-        with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
+    source_digest = _file_sha256(resolved)
+    if source_digest is None:
         return None
-    token = digest.hexdigest()[:16]
+    token = source_digest[:16]
     candidate = parent / f"{base_name}.corrupt.{token}.bak"
     # Defensive: candidate must still be inside parent after construction.
     if candidate.parent != parent:
         return None
-    if not candidate.exists():
-        try:
-            shutil.copy2(resolved, candidate)
-        except OSError:
+    if candidate.exists():
+        candidate_digest = _file_sha256(candidate)
+        if candidate_digest is None:
+            return None
+        if candidate_digest != source_digest:
+            incomplete = parent / (
+                f"{candidate.name}.incomplete.{candidate_digest[:16]}.bak"
+            )
+            if incomplete.parent != parent:
+                return None
+            if incomplete.exists():
+                if _file_sha256(incomplete) != candidate_digest:
+                    return None
+            elif not _atomic_copy2(candidate, incomplete):
+                return None
+            if not _atomic_copy2(resolved, candidate):
+                return None
+    else:
+        if not _atomic_copy2(resolved, candidate):
             return None
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
@@ -1847,10 +1901,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         sidecar_backup = parent / (candidate.name + suffix)
         if sidecar_backup.parent != parent or sidecar_backup.exists():
             continue
-        try:
-            shutil.copy2(sidecar, sidecar_backup)
-        except OSError:
-            pass
+        _atomic_copy2(sidecar, sidecar_backup)
     return candidate
 
 
