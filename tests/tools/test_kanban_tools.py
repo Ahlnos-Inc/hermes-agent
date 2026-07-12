@@ -2849,6 +2849,38 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["chat_id"] == "tui-session-abc"
 
 
+def test_create_tui_origin_suppresses_enabled_home_fallback(monkeypatch, worker_env):
+    """One originating TUI subscription wins over configured home copies."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-primary")
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "auto_subscribe_on_create": True,
+                "auto_subscribe_home_on_create": True,
+                "auto_subscribe_home_platforms": ["telegram"],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        kt,
+        "_configured_home_channels",
+        lambda: [{"platform": "telegram", "chat_id": "home-chat", "thread_id": ""}],
+    )
+
+    result = json.loads(kt._handle_create({"title": "one origin", "assignee": "peer"}))
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+
+    assert [(sub["platform"], sub["chat_id"]) for sub in subs] == [
+        ("tui", "tui-session-primary")
+    ]
+
+
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""

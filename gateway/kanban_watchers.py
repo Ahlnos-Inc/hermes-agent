@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.kanban_notifications import render_kanban_event
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -498,92 +499,15 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"]).strip()[:120]
                     event_runs = d.get("event_runs") or {}
-                    board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
                         kind = ev.kind
                         run = event_runs.get(ev.id)
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's full summary (the worker's
-                            # intentional human-facing handoff), then fall
-                            # back to the compact event payload and finally
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            handoff_text = None
-                            if run and getattr(run, "summary", None):
-                                handoff_text = str(run.summary)
-                            elif ev.payload and ev.payload.get("summary"):
-                                handoff_text = str(ev.payload["summary"])
-                            elif task and task.result:
-                                handoff_text = str(task.result)
-                            if handoff_text:
-                                h = handoff_text.strip()
-                                if h:
-                                    handoff = f"\n{h}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason_text = str(ev.payload["reason"]).strip()
-                                if reason_text:
-                                    reason = f": {reason_text}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                error_text = str(ev.payload["error"]).strip()
-                                if error_text:
-                                    err = f"\n{error_text}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            # BUILD-343: surface the reap classifier's own
-                            # exit_kind/exit_code (hermes_cli/kanban_db.py
-                            # `_classify_worker_exit` / dispatch reap loop)
-                            # instead of the fixed "(pid gone)" for every
-                            # crash — lets an operator tell a real crash
-                            # apart from other failure shapes at a glance.
-                            # Falls back to the original wording when the
-                            # reap registry didn't capture a classification
-                            # (kind == "unknown" — no new plumbing added).
-                            _exit_kind = ev.payload.get("exit_kind") if ev.payload else None
-                            _exit_code = ev.payload.get("exit_code") if ev.payload else None
-                            if _exit_kind == "signaled" and _exit_code is not None:
-                                _crash_detail = f"killed by signal {_exit_code}"
-                            elif _exit_kind == "nonzero_exit" and _exit_code is not None:
-                                _crash_detail = f"exited {_exit_code}"
-                            else:
-                                _crash_detail = "pid gone"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"({_crash_detail}); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        else:
+                        msg = render_kanban_event(
+                            task_id=sub["task_id"], task=task, event=ev,
+                            run=run, board_slug=board_slug,
+                        )
+                        if msg is None:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an

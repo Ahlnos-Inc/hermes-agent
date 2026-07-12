@@ -198,6 +198,17 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
     assert kb.kanban_db_path().resolve() != production_db.resolve()
 
 
+def test_shared_kanban_renderer_preserves_completed_handoff():
+    from gateway.kanban_notifications import render_kanban_event
+
+    task = type("Task", (), {"title": "Ship it", "assignee": "coder", "result": None})()
+    event = type("Event", (), {"kind": "completed", "payload": {"summary": "compact"}})()
+    run = type("Run", (), {"summary": "full handoff"})()
+
+    assert render_kanban_event(
+        task_id="t_123", task=task, event=event, run=run, board_slug="hermes"
+    ) == "✔ [hermes] @coder Kanban t_123 done — Ship it\nfull handoff"
+
 class FailingAdapter:
     """Adapter whose send() always raises, simulating a transient send error."""
 
