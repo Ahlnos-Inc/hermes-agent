@@ -190,6 +190,36 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_internal_control_acknowledges_persistence_without_user_accounting():
+    agent = _FakeAgent()
+    acknowledged = MagicMock()
+
+    _build(
+        agent,
+        internal_control=True,
+        persistence_ack_callback=acknowledged,
+    )
+
+    acknowledged.assert_called_once_with()
+    assert agent._user_turn_count == 0
+    assert agent._turns_since_memory == 0
+
+
+def test_internal_control_aborts_when_early_persistence_fails():
+    agent = _FakeAgent()
+    agent._persist_session = MagicMock(return_value=False)
+    failed = MagicMock()
+
+    with pytest.raises(RuntimeError, match="not durably persisted"):
+        _build(
+            agent,
+            internal_control=True,
+            persistence_failure_callback=failed,
+        )
+
+    assert failed.call_count >= 1
+
+
 def test_task_id_passthrough():
     agent = _FakeAgent()
     ctx = _build(agent, task_id="fixed-task")
@@ -363,4 +393,3 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-

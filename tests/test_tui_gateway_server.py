@@ -6605,7 +6605,11 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
             ),
-        ):
+            patch(
+                "hermes_cli.browser_connect.manual_chrome_debug_command",
+                return_value="",
+            ),
+            ):
             resp = server.handle_request(
                 {
                     "id": "1",
@@ -7518,7 +7522,6 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
 
     try:
         server._notification_poller_loop(stop, "sid_busy", sess)
-
         # Status update was emitted (user sees it)
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
@@ -7531,6 +7534,360 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_process_event_wins_kanban_cadence(monkeypatch):
+    from tools.process_registry import process_registry
+
+    class FourPollQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, timeout=None):
+            self.calls += 1
+            if self.calls < 4:
+                return None
+            return {
+                "type": "completion", "session_id": "process-first",
+                "command": "echo done", "exit_code": 0, "output": "done",
+            }
+
+        def empty(self):
+            return True
+
+    stop = threading.Event()
+    order = []
+    session = _session(running=False)
+    monkeypatch.setattr(process_registry, "completion_queue", FourPollQueue())
+    process_registry._completion_consumed.discard("process-first")
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_poll_kanban_tui_subs", lambda *a, **k: order.append("kanban")
+    )
+
+    def run_process(*_args, **_kwargs):
+        order.append("process")
+        stop.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_process)
+    server._notification_poller_loop(stop, "sid-process-priority", session)
+
+    assert order == ["process"]
+
+
+def test_tui_kanban_only_canonical_tip_owns_lineage():
+    from tui_gateway import server
+
+    class FakeDB:
+        def get_compression_tip(self, origin):
+            return "tip"
+
+        def resolve_resume_session_id(self, origin):
+            return "tip"
+
+    ready = threading.Event()
+    ready.set()
+    root = {"session_key": "root", "profile_home": None, "agent_ready": ready}
+    tip = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+    sessions = {"sid-root": root, "sid-tip": tip}
+    leases = [{"session_id": "tip", "metadata": {"live_session_id": "sid-tip"}}]
+
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-tip", tip, FakeDB(), sessions, leases
+    ) == ("tip", None)
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-root", root, FakeDB(), sessions, leases
+    ) == (None, "stale_live_owner")
+
+
+def test_tui_kanban_two_reservers_one_token():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "queued_prompt": None,
+    }
+    barrier = threading.Barrier(3)
+    tokens = []
+    sid = "sid-kanban-reserve"
+
+    def reserve():
+        barrier.wait()
+        tokens.append(server._reserve_tui_turn(sid, session, "kanban"))
+
+    server._sessions[sid] = session
+    try:
+        threads = [threading.Thread(target=reserve) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+    finally:
+        server._sessions.pop(sid, None)
+
+    winners = [token for token in tokens if token]
+    assert len(winners) == 1
+    assert session["_turn_reservation"]["token"] == winners[0]
+
+
+def test_tui_kanban_duplicate_tip_without_unique_lease_fails_closed():
+    from tui_gateway import server
+
+    class FakeDB:
+        get_compression_tip = resolve_resume_session_id = lambda self, origin: "tip"
+
+    ready = threading.Event()
+    ready.set()
+    one = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+    two = {"session_key": "tip", "profile_home": None, "agent_ready": ready}
+
+    assert server._resolve_tui_kanban_owner(
+        "root", "sid-one", one, FakeDB(), {"sid-one": one, "sid-two": two}, []
+    ) == (None, "ambiguous_live_owner")
+
+
+def test_tui_kanban_user_queue_wins_before_reservation():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "queued_prompt": {"text": "human", "transport": None},
+        "running": False,
+    }
+
+    assert server._reserve_tui_turn("sid", session, "kanban") is None
+    assert session["running"] is False
+
+
+def test_tui_kanban_goal_followup_wins_before_reservation():
+    from tui_gateway import server
+
+    session = {
+        "history_lock": threading.Lock(),
+        "_goal_followup_pending": True,
+        "queued_prompt": None,
+        "running": False,
+    }
+
+    assert server._reserve_tui_turn("sid", session, "kanban") is None
+
+
+def test_tui_internal_control_history_has_no_user_authored_row():
+    from tui_gateway import server
+
+    prior = [{"role": "user", "content": "real user"}]
+    messages = [*prior, {"role": "user", "content": "internal"}]
+
+    normalized = server._internal_control_history(messages, len(prior))
+
+    assert normalized[-1] == {
+        "role": "system", "content": "internal", "observed": True
+    }
+    assert messages[-1]["role"] == "user"
+
+
+def test_tui_kanban_candidate_order_is_oldest_then_stable_ties():
+    from tui_gateway import server
+
+    def candidate(created_at, db_path, task_id, event_id):
+        event = type("Event", (), {"created_at": created_at, "id": event_id})()
+        return {
+            "db_path": db_path,
+            "events": [event],
+            "sub": {"task_id": task_id, "thread_id": ""},
+            "tip": "tip",
+        }
+
+    newer = candidate(20, "/a.db", "t_a", 1)
+    tied_b = candidate(10, "/b.db", "t_b", 1)
+    tied_a = candidate(10, "/a.db", "t_a", 2)
+
+    assert sorted(
+        [newer, tied_b, tied_a], key=server._tui_kanban_candidate_sort_key
+    ) == [tied_a, tied_b, newer]
+
+
+@pytest.mark.parametrize("persisted,expected_cursor", [(False, 0), (True, "claimed")])
+def test_tui_kanban_persistence_boundary_rewinds_or_retains(
+    tmp_path, monkeypatch, persisted, expected_cursor
+):
+    from hermes_cli import kanban_db as kb
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="delivery", assignee="coder")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="tip")
+        kb.block_task(conn, task_id, reason="waiting")
+        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="tui", chat_id="tip",
+            kinds=["blocked"],
+        )
+        assert events
+    finally:
+        conn.close()
+
+    token = "reservation"
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "_turn_reservation": {"token": token, "kind": "kanban"},
+        "_pending_kanban_claim": {
+            "board": kb.DEFAULT_BOARD,
+            "claimed_cursor": claimed_cursor,
+            "delivery_key": "key",
+            "old_cursor": old_cursor,
+            "shadows": [],
+            "sub": {
+                "task_id": task_id, "platform": "tui", "chat_id": "tip",
+                "thread_id": "",
+            },
+            "token": token,
+        },
+    }
+
+    server._finish_tui_kanban_claim(session, persisted=persisted)
+
+    conn = kb.connect()
+    try:
+        cursor = kb.list_notify_subs(conn, task_id)[0]["last_event_id"]
+    finally:
+        conn.close()
+    assert cursor == (claimed_cursor if expected_cursor == "claimed" else expected_cursor)
+    assert session["_pending_kanban_claim"] is None
+    assert session["_turn_reservation"] is None
+    assert session["running"] is True
+
+
+def test_tui_kanban_source_backend_completion_smoke(tmp_path, monkeypatch):
+    import contextlib
+    from hermes_cli import active_sessions
+    from hermes_cli import kanban_db as kb
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Desktop return", assignee="coder")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="root")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="home")
+        kb.complete_task(conn, task_id, result="delivered")
+    finally:
+        conn.close()
+
+    class FakeSessionDB:
+        def get_compression_tip(self, origin):
+            return "tip" if origin == "root" else origin
+
+        def resolve_resume_session_id(self, origin):
+            return "tip" if origin == "root" else origin
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeSessionDB()
+
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent_ready": ready,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "profile_home": None,
+        "queued_prompt": None,
+        "running": False,
+        "session_key": "tip",
+    }
+    sid = "desktop-live"
+    emitted = []
+    turns = []
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    monkeypatch.setattr(active_sessions, "active_session_registry_snapshot", lambda: [])
+    monkeypatch.setattr(server, "_emit", lambda event, *args: emitted.append(event))
+
+    def run_internal(_rid, _sid, _session, text, **kwargs):
+        turns.append((text, kwargs))
+        kwargs["persistence_ack_callback"]()
+        _session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_internal)
+    server._sessions[sid] = session
+    try:
+        server._poll_kanban_tui_subs(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert len(turns) == 1
+    assert "delivery_key=" in turns[0][0]
+    assert turns[0][1]["internal_control"] is True
+    assert "prompt.submit" not in emitted
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+    assert [(sub["platform"], sub["chat_id"]) for sub in subs] == [
+        ("telegram", "home")
+    ]
+
+
+def test_tui_kanban_silent_archived_batch_removes_subscription(tmp_path, monkeypatch):
+    import contextlib
+    from hermes_cli import active_sessions
+    from hermes_cli import kanban_db as kb
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="archive", assignee="coder")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="tip")
+        kb.archive_task(conn, task_id)
+    finally:
+        conn.close()
+
+    class FakeSessionDB:
+        get_compression_tip = resolve_resume_session_id = lambda self, origin: origin
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeSessionDB()
+
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent_ready": ready, "history_lock": threading.Lock(),
+        "profile_home": None, "queued_prompt": None, "running": False,
+        "session_key": "tip",
+    }
+    sid = "desktop-archive"
+    turns = []
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    monkeypatch.setattr(active_sessions, "active_session_registry_snapshot", lambda: [])
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: turns.append(a))
+    server._sessions[sid] = session
+    try:
+        server._poll_kanban_tui_subs(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert turns == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):

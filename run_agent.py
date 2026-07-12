@@ -1673,7 +1673,7 @@ class AIAgent:
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        return self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1758,9 +1758,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return True
         if not self._session_db:
-            return
+            return False
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -1773,6 +1773,8 @@ class AIAgent:
         _ov_idx = getattr(self, "_persist_user_message_idx", None)
         _ov_content = getattr(self, "_persist_user_message_override", None)
         _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
+        _ov_role = getattr(self, "_persist_user_role_override", None)
+        _ov_observed = bool(getattr(self, "_persist_user_observed_override", False))
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
@@ -1844,6 +1846,8 @@ class AIAgent:
                 # content is replaced; multimodal (list) content is left intact
                 # so image/audio blocks aren't clobbered by the text override.
                 if _ov_idx == _msg_idx and msg.get("role") == "user":
+                    if _ov_role is not None:
+                        role = _ov_role
                     if _ov_content is not None and not isinstance(content, list):
                         content = _ov_content
                     if _ov_timestamp is not None:
@@ -1884,6 +1888,7 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
+                    observed=(_ov_observed and _ov_idx == _msg_idx),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -1891,8 +1896,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -5723,6 +5730,10 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        *,
+        persistence_ack_callback=None,
+        persistence_failure_callback=None,
+        internal_control: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
@@ -5735,6 +5746,9 @@ class AIAgent:
             stream_callback,
             persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persistence_ack_callback=persistence_ack_callback,
+            persistence_failure_callback=persistence_failure_callback,
+            internal_control=internal_control,
             moa_config=moa_config,
         )
 

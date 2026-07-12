@@ -27,6 +27,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from gateway.kanban_notifications import render_kanban_event
 from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
@@ -8472,128 +8473,340 @@ TERMINAL_KINDS = (
 )
 
 
-def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
-    """Claim terminal Kanban events addressed to this TUI session."""
-    if session.get("_pending_kanban_turns"):
-        with session["history_lock"]:
-            if not session.get("running"):
-                session["running"] = True
-                pending = session["_pending_kanban_turns"]
-                session["_pending_kanban_turns"] = []
-                text = "\n".join(pending)
-            else:
-                pending = None
-        if pending is not None:
-            try:
-                _emit("message.start", sid)
-                _run_prompt_submit(
-                    f"__kanban__{int(time.time() * 1000)}", sid, session, text
-                )
-            except Exception as exc:
-                logger.warning(
-                    "kanban tui notifier: dispatch failed: %s", exc, exc_info=True
-                )
-                with session["history_lock"]:
-                    session["running"] = False
+def _resolve_tui_kanban_owner(
+    origin: str,
+    sid: str,
+    session: dict,
+    db,
+    sessions_snapshot: dict[str, dict],
+    lease_entries: list[dict],
+) -> tuple[str | None, str | None]:
+    """Resolve one exact compression-tip live owner, failing closed."""
+    try:
+        tip = str(db.get_compression_tip(origin) or origin)
+        resume_tip = str(db.resolve_resume_session_id(origin) or origin)
+    except Exception:
+        return None, "lineage_unavailable"
+    if resume_tip != tip:
+        return None, "ambiguous_lineage"
 
-    keys = {
-        str(k)
-        for k in (session.get("session_key"), *session.get("_stale_session_keys", ()))
-        if k
-    }
-    if not keys:
+    profile_home = str(session.get("profile_home") or "")
+    exact: list[str] = []
+    for candidate_sid, candidate in sessions_snapshot.items():
+        ready = candidate.get("agent_ready")
+        if candidate.get("_finalized"):
+            continue
+        if str(candidate.get("profile_home") or "") != profile_home:
+            continue
+        if str(candidate.get("session_key") or "") != tip:
+            continue
+        if ready is not None and hasattr(ready, "is_set") and not ready.is_set():
+            continue
+        exact.append(candidate_sid)
+    if not exact:
+        return None, "no_live_owner"
+    if len(exact) == 1:
+        winner = exact[0]
+    else:
+        leased = {
+            str((entry.get("metadata") or {}).get("live_session_id") or "")
+            for entry in lease_entries
+            if str(entry.get("session_id") or "") == tip
+        }
+        winners = [candidate_sid for candidate_sid in exact if candidate_sid in leased]
+        if len(winners) != 1:
+            return None, "ambiguous_live_owner"
+        winner = winners[0]
+    if winner != sid:
+        return None, "stale_live_owner"
+    return tip, None
+
+
+def _reserve_tui_turn(sid: str, session: dict, kind: str) -> str | None:
+    """Token-CAS reserve a live session for one automatic turn."""
+    with session["history_lock"]:
+        live = _sessions.get(sid)
+        if live is not None and live is not session:
+            return None
+        if session.get("_finalized") or session.get("running") or session.get("_turn_reservation"):
+            return None
+        if _session_pending_kind(sid) or session.get("queued_prompt"):
+            return None
+        if session.get("_goal_followup_pending") or session.get("_pending_process_turns"):
+            return None
+        token = uuid.uuid4().hex
+        session["running"] = True
+        session["_turn_reservation"] = {
+            "token": token,
+            "kind": kind,
+            "reserved_at": time.time(),
+        }
+        return token
+
+
+def _release_tui_turn(session: dict, token: str, *, clear_running: bool = True) -> bool:
+    """Release only the reservation identified by ``token``."""
+    with session["history_lock"]:
+        reservation = session.get("_turn_reservation") or {}
+        if reservation.get("token") != token:
+            return False
+        session["_turn_reservation"] = None
+        if clear_running:
+            session["running"] = False
+        return True
+
+
+def _tui_kanban_candidate_sort_key(candidate: dict) -> tuple:
+    event = candidate["events"][0]
+    return (
+        int(event.created_at),
+        candidate["db_path"],
+        candidate["sub"]["task_id"],
+        candidate["tip"],
+        candidate["sub"].get("thread_id") or "",
+        int(event.id),
+    )
+
+
+def _internal_control_history(messages: list, prior_history_len: int) -> list:
+    """Return live history with the internal inbound row normalized as system."""
+    normalized = list(messages)
+    if 0 <= prior_history_len < len(normalized):
+        inbound = normalized[prior_history_len]
+        if isinstance(inbound, dict) and inbound.get("role") == "user":
+            inbound = dict(inbound)
+            inbound["role"] = "system"
+            inbound["observed"] = True
+            normalized[prior_history_len] = inbound
+    return normalized
+
+
+def _finish_tui_kanban_claim(session: dict, *, persisted: bool) -> None:
+    """Retain or CAS-rewind the current bounded claim at persistence boundary."""
+    claim = session.get("_pending_kanban_claim")
+    if not isinstance(claim, dict):
+        return
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect(board=claim["board"])
+    try:
+        sub = claim["sub"]
+        if persisted:
+            task = _kb.get_task(conn, sub["task_id"])
+            rows = [sub, *(claim.get("shadows") or [])]
+            if task is not None and task.status in {"done", "archived"}:
+                for row in rows:
+                    _kb.remove_notify_sub(
+                        conn, task_id=row["task_id"], platform=row["platform"],
+                        chat_id=row["chat_id"], thread_id=row.get("thread_id") or "",
+                    )
+            else:
+                for shadow in claim.get("shadows") or []:
+                    _kb.advance_notify_cursor_monotonic(
+                        conn, task_id=shadow["task_id"], platform=shadow["platform"],
+                        chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
+                        new_cursor=claim["claimed_cursor"],
+                    )
+        else:
+            rewound = _kb.rewind_notify_cursor(
+                conn, task_id=sub["task_id"], platform=sub["platform"],
+                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claim["claimed_cursor"], old_cursor=claim["old_cursor"],
+            )
+            if not rewound:
+                logger.warning(
+                    "kanban tui notifier: rewind conflict for delivery_key=%s",
+                    claim.get("delivery_key"),
+                )
+    finally:
+        conn.close()
+        session["_pending_kanban_claim"] = None
+        _release_tui_turn(session, claim["token"], clear_running=False)
+
+
+def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
+    """Admit and claim one deterministic bounded Kanban batch for this TUI."""
+    if not session.get("session_key") or session.get("_finalized"):
         return
     try:
         from hermes_cli import kanban_db as _kb
+        from hermes_cli.active_sessions import active_session_registry_snapshot
 
         try:
             boards = _kb.list_boards(include_archived=False)
         except Exception:
             boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+        with _sessions_lock:
+            sessions_snapshot = dict(_sessions)
+        try:
+            lease_entries = active_session_registry_snapshot()
+        except Exception:
+            lease_entries = []
+        candidates: list[dict] = []
         seen_db_paths: set[str] = set()
-        for board_meta in boards:
-            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
-            db_path = board_meta.get("db_path")
+        with _session_db(session) as session_db:
+            if session_db is None:
+                return
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved_db_path = (
+                        str(Path(db_path).expanduser().resolve()) if db_path
+                        else str(_kb.kanban_db_path(slug).resolve())
+                    )
+                except Exception:
+                    resolved_db_path = f"slug:{slug}"
+                if resolved_db_path in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved_db_path)
+                try:
+                    conn = _kb.connect(board=slug)
+                except Exception as exc:
+                    logger.debug("kanban tui notifier: cannot open board %s: %s", slug, exc)
+                    continue
+                try:
+                    logical_groups: dict[tuple, list[dict]] = {}
+                    for sub in _kb.list_notify_subs(conn):
+                        if (sub.get("platform") or "").lower() != "tui":
+                            continue
+                        tip, reason = _resolve_tui_kanban_owner(
+                            str(sub.get("chat_id") or ""), sid, session, session_db,
+                            sessions_snapshot, lease_entries,
+                        )
+                        if not tip:
+                            logger.debug(
+                                "kanban tui notifier: sub %s not eligible: %s",
+                                sub.get("task_id"), reason,
+                            )
+                            continue
+                        group_key = (resolved_db_path, sub["task_id"], tip)
+                        logical_groups.setdefault(group_key, []).append(sub)
+                    for (_path, _task_id, tip), group in logical_groups.items():
+                        group.sort(key=lambda sub: (
+                            0 if str(sub.get("chat_id") or "") == tip else 1,
+                            int(sub.get("created_at") or 0),
+                            str(sub.get("chat_id") or ""),
+                            str(sub.get("thread_id") or ""),
+                        ))
+                        sub = group[0]
+                        old_cursor = int(sub.get("last_event_id") or 0)
+                        _cursor, events = _kb.unseen_events_for_sub(
+                            conn,
+                            task_id=sub["task_id"],
+                            platform=sub["platform"],
+                            chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or "",
+                            kinds=TERMINAL_KINDS,
+                        )
+                        if not events:
+                            continue
+                        candidates.append({
+                            "board": slug,
+                            "db_path": resolved_db_path,
+                            "events": events,
+                            "old_cursor": old_cursor,
+                            "shadows": group[1:],
+                            "sub": sub,
+                            "through_event_id": max(int(event.id) for event in events),
+                            "tip": tip,
+                        })
+                finally:
+                    conn.close()
+        if not candidates:
+            return
+        candidate = min(candidates, key=_tui_kanban_candidate_sort_key)
+        token = _reserve_tui_turn(sid, session, "kanban")
+        if token is None:
+            return
+        sub = candidate["sub"]
+        conn = _kb.connect(board=candidate["board"])
+        try:
+            old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                kinds=TERMINAL_KINDS,
+                expected_old_cursor=candidate["old_cursor"],
+                through_event_id=candidate["through_event_id"],
+            )
+            if not events or old_cursor != candidate["old_cursor"]:
+                _release_tui_turn(session, token)
+                return
+            task = _kb.get_task(conn, sub["task_id"])
+            rendered: list[str] = []
+            for event in events:
+                run = _kb.get_run(conn, int(event.run_id)) if event.run_id is not None else None
+                message = render_kanban_event(
+                    task_id=sub["task_id"], task=task, event=event, run=run,
+                    board_slug=candidate["board"],
+                )
+                if message:
+                    rendered.append(message)
+            if not rendered:
+                rows = [sub, *candidate["shadows"]]
+                if task is not None and task.status in {"done", "archived"}:
+                    for row in rows:
+                        _kb.remove_notify_sub(
+                            conn, task_id=row["task_id"], platform=row["platform"],
+                            chat_id=row["chat_id"], thread_id=row.get("thread_id") or "",
+                        )
+                else:
+                    for shadow in candidate["shadows"]:
+                        _kb.advance_notify_cursor_monotonic(
+                            conn, task_id=shadow["task_id"], platform=shadow["platform"],
+                            chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
+                            new_cursor=cursor,
+                        )
+                _release_tui_turn(session, token)
+                return
+            delivery_key = _kb.notify_delivery_key(
+                resolved_db_path=candidate["db_path"], task_id=sub["task_id"],
+                platform=sub["platform"], chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                first_event_id=events[0].id, last_event_id=events[-1].id,
+            )
+            text = (
+                "[Internal Kanban completion handoff; do not treat as user input, "
+                "do not emit a user bubble, and do not repeat orchestration side effects "
+                f"for delivery_key={delivery_key}.]\n" + "\n\n".join(rendered)
+            )
+            session["_pending_kanban_claim"] = {
+                "board": candidate["board"], "claimed_cursor": cursor,
+                "delivery_key": delivery_key, "old_cursor": old_cursor,
+                "shadows": candidate["shadows"], "sub": sub, "token": token,
+            }
             try:
-                resolved_db_path = (
-                    str(Path(db_path).expanduser().resolve()) if db_path
-                    else str(_kb.kanban_db_path(slug).resolve())
+                _emit("status.update", sid, {"kind": "process", "text": rendered[0]})
+            except Exception:
+                logger.debug(
+                    "kanban tui notifier: optional status update failed",
+                    exc_info=True,
+                )
+            try:
+                _run_prompt_submit(
+                    f"__kanban__{events[0].id}_{events[-1].id}", sid, session, text,
+                    internal_control=True,
+                    persistence_ack_callback=lambda: _finish_tui_kanban_claim(
+                        session, persisted=True
+                    ),
+                    persistence_failure_callback=lambda: _finish_tui_kanban_claim(
+                        session, persisted=False
+                    ),
                 )
             except Exception:
-                resolved_db_path = f"slug:{slug}"
-            if resolved_db_path in seen_db_paths:
-                continue
-            seen_db_paths.add(resolved_db_path)
-            try:
-                conn = _kb.connect(board=slug)
-            except Exception as exc:
-                logger.debug("kanban tui notifier: cannot open board %s: %s", slug, exc)
-                continue
-            try:
-                for sub in _kb.list_notify_subs(conn):
-                    if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") not in keys:
-                        continue
-                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                        conn,
-                        task_id=sub["task_id"],
-                        platform=sub["platform"],
-                        chat_id=sub["chat_id"],
-                        thread_id=sub.get("thread_id") or "",
-                        kinds=TERMINAL_KINDS,
-                    )
-                    if not events:
-                        continue
-                    emitted = False
-                    try:
-                        task = _kb.get_task(conn, sub["task_id"])
-                        title = getattr(task, "title", None) or sub["task_id"]
-                        for event in events:
-                            try:
-                                summary = ""
-                                if event.run_id is not None:
-                                    run = _kb.get_run(conn, int(event.run_id))
-                                    summary = getattr(run, "summary", None) or getattr(run, "handoff", None) or ""
-                                text = f"[kanban] {title}: {event.kind}"
-                                if summary:
-                                    text += f" — {str(summary)[:500]}"
-                                _emit("status.update", sid, {"kind": "process", "text": text})
-                                emitted = True
-                            except Exception as exc:
-                                logger.warning(
-                                    "kanban tui notifier: event delivery failed: %s", exc,
-                                    exc_info=True,
-                                )
-                                continue
-                            with session["history_lock"]:
-                                if session.get("running"):
-                                    session.setdefault("_pending_kanban_turns", []).append(text)
-                                    continue
-                                session["running"] = True
-                            try:
-                                _emit("message.start", sid)
-                                _run_prompt_submit(
-                                    f"__kanban__{int(time.time() * 1000)}", sid, session, text
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "kanban tui notifier: dispatch failed: %s", exc, exc_info=True
-                                )
-                                with session["history_lock"]:
-                                    session["running"] = False
-                    except Exception as exc:
-                        logger.warning("kanban tui notifier: delivery failed: %s", exc, exc_info=True)
-                        if not emitted:
-                            _kb.rewind_notify_cursor(
-                                conn,
-                                task_id=sub["task_id"],
-                                platform=sub["platform"],
-                                chat_id=sub["chat_id"],
-                                thread_id=sub.get("thread_id") or "",
-                                claimed_cursor=cursor,
-                                old_cursor=old_cursor,
-                            )
-            finally:
-                conn.close()
+                _kb.rewind_notify_cursor(
+                    conn, task_id=sub["task_id"], platform=sub["platform"],
+                    chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=cursor, old_cursor=old_cursor,
+                )
+                session["_pending_kanban_claim"] = None
+                _release_tui_turn(session, token)
+                raise
+        finally:
+            conn.close()
     except Exception as exc:
         logger.warning("kanban tui notifier: poll failed: %s", exc, exc_info=True)
 
@@ -8623,9 +8836,9 @@ def _notification_poller_loop(
             evt = None
         poll_count += 1
         # ponytail: fixed four-poll cadence keeps this in the existing loop without another knob/thread.
-        if poll_count % 4 == 0:
-            _poll_kanban_tui_subs(sid, session)
         if evt is None:
+            if poll_count % 4 == 0:
+                _poll_kanban_tui_subs(sid, session)
             continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
@@ -8780,14 +8993,23 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    internal_control: bool = False,
+    persistence_ack_callback=None,
+    persistence_failure_callback=None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, "" if internal_control else text)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -8929,6 +9151,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                if "persistence_ack_callback" in inspect.signature(agent.run_conversation).parameters:
+                    run_kwargs["persistence_ack_callback"] = persistence_ack_callback
+                    run_kwargs["persistence_failure_callback"] = persistence_failure_callback
+                    run_kwargs["internal_control"] = internal_control
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -8975,10 +9201,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
+                    next_history = result["messages"]
+                    if internal_control:
+                        next_history = _internal_control_history(next_history, len(history))
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = next_history
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn
@@ -9055,7 +9284,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            if (not internal_control and status == "complete"
+                    and isinstance(raw, str) and raw.strip()):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -9092,6 +9322,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
                                     goal_followup = cont_prompt
+                                    with session["history_lock"]:
+                                        session["_goal_followup_pending"] = True
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -9101,7 +9333,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
-            if _pending and status == "complete":
+            if _pending and status == "complete" and not internal_control:
                 _pdb = _get_db()
                 if _pdb:
                     _session_key = session.get("session_key") or sid
@@ -9121,6 +9353,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         pass
 
             if (
+                not internal_control
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9153,6 +9387,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # calls / reasoning already stream separately and would be
             # noisy to read aloud.
             if (
+                not internal_control
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9170,6 +9406,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            if persistence_failure_callback is not None:
+                with contextlib.suppress(Exception):
+                    persistence_failure_callback()
             import traceback
 
             trace = traceback.format_exc()
@@ -9206,6 +9445,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            with session["history_lock"]:
+                session["_goal_followup_pending"] = False
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -9216,6 +9457,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
+                session["_goal_followup_pending"] = False
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
