@@ -1752,6 +1752,30 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
     )
 
 
+def _trusted_front_door_architecture_context(kb: Any, *, board: Any, assignee: Any, routing: Any) -> Any:
+    """Construct architecture authority from runtime identity, never tool args."""
+    if os.environ.get("HERMES_KANBAN_TASK") or str(assignee).strip() != "architect":
+        return None
+    if os.environ.get("HERMES_PROFILE") != "orchestrator":
+        return None
+    if not isinstance(routing, dict) or routing.get("resolved_preset") != "architecture_design":
+        return None
+    try:
+        from gateway.session_context import get_session_env
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        session_id = os.environ.get("HERMES_SESSION_ID", "")
+    session_id = str(session_id).strip()
+    if not session_id:
+        return None
+    return kb.MutationContext(
+        board_key=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "default"),
+        principal=f"orchestrator:{session_id}", actor_type="orchestrator_agent",
+        profile="orchestrator", session_id=session_id,
+        request_scope_id=f"front-door:{session_id}", mode="orchestrator_only", phase="architecture",
+    )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1839,6 +1863,14 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            mutation_context = _worker_architecture_context(kb, conn)
+            if mutation_context is None:
+                mutation_context = _trusted_front_door_architecture_context(
+                    kb, board=board, assignee=assignee, routing=model_routing_decision,
+                )
+                if mutation_context is not None:
+                    # Scope identity must not come from a model-visible argument.
+                    session_id = mutation_context.session_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1869,7 +1901,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_override=model_override,
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
-                mutation_context=_worker_architecture_context(kb, conn),
+                mutation_context=mutation_context,
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None

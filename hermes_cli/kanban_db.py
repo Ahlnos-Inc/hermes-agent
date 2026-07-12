@@ -3659,6 +3659,47 @@ def invalidate_architecture_gate(conn: sqlite3.Connection, gate_id: str, *, reas
         return _invalidate_architecture_gate_in_txn(conn, gate_id, reason=reason)
 
 
+def reopen_architecture_gate(
+    conn: sqlite3.Connection, gate_id: str, context: MutationContext,
+) -> ArchitectureGate:
+    """CAS-reopen an invalidated handoff for its original architecture owner."""
+    with write_txn(conn):
+        gate = get_architecture_gate(conn, gate_id)
+        if gate is None:
+            raise ValueError("unknown architecture gate")
+        if (
+            context.phase != "architecture"
+            or context.board_key != gate.board_key
+            or context.principal != gate.creator_principal
+            or context.request_scope_id != gate.request_scope_id
+        ):
+            raise ArchitectureGateError("architecture_gate_reopen_requires_owner")
+        if gate.state == "open":
+            return gate
+        if gate.state != "invalidated":
+            raise ArchitectureGateError("architecture_gate_reopen_requires_invalidation")
+        cur = conn.execute(
+            """UPDATE architecture_gates
+               SET state = 'open', accepted_run_id = NULL, accepted_snapshot = NULL,
+                   design_digest = NULL, approval_actor_id = NULL, approval_actor_type = NULL,
+                   approval_surface = NULL, approved_digest = NULL, approved_at = NULL,
+                   authorization_event_id = NULL, row_version = row_version + 1, updated_at = ?
+             WHERE gate_id = ? AND state = 'invalidated' AND row_version = ?""",
+            (int(time.time()), gate_id, gate.row_version),
+        )
+        if cur.rowcount != 1:
+            raise ArchitectureGateError("architecture_gate_cas_conflict")
+        conn.execute(
+            """UPDATE tasks SET status = 'ready', current_run_id = NULL, completed_at = NULL
+                 WHERE id = ? AND status = 'done'""",
+            (gate.architect_task_id,),
+        )
+        reopened = get_architecture_gate(conn, gate_id)
+        assert reopened is not None
+        _append_gate_audit(conn, reopened, "architecture_gate_reopened", "owner_retry")
+        return reopened
+
+
 def _authorize_mutation(
     conn: sqlite3.Connection,
     context: Optional[MutationContext],
@@ -6082,9 +6123,29 @@ def edit_completed_task_result(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
-        _invalidate_architect_gate_for_mutation(
+        invalidated_gate = _invalidate_architect_gate_for_mutation(
             conn, task_id, reason="accepted_architect_handoff_edited",
         )
+        if invalidated_gate is not None:
+            # This owning mutation already holds the transaction; reopen with
+            # the same CAS contract without nesting ``write_txn``.
+            cur = conn.execute(
+                """UPDATE architecture_gates SET state = 'open', accepted_run_id = NULL,
+                   accepted_snapshot = NULL, design_digest = NULL, approval_actor_id = NULL,
+                   approval_actor_type = NULL, approval_surface = NULL, approved_digest = NULL,
+                   approved_at = NULL, authorization_event_id = NULL, row_version = row_version + 1,
+                   updated_at = ? WHERE gate_id = ? AND state = 'invalidated' AND row_version = ?""",
+                (int(time.time()), invalidated_gate.gate_id, invalidated_gate.row_version),
+            )
+            if cur.rowcount != 1:
+                raise ArchitectureGateError("architecture_gate_cas_conflict")
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL, completed_at = NULL "
+                "WHERE id = ? AND status = 'done'", (task_id,),
+            )
+            reopened_gate = get_architecture_gate(conn, invalidated_gate.gate_id)
+            assert reopened_gate is not None
+            _append_gate_audit(conn, reopened_gate, "architecture_gate_reopened", "accepted_handoff_edited")
         ev_summary = (
             handoff_summary.strip().splitlines()[0][:400]
             if handoff_summary else ""

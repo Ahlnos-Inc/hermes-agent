@@ -621,6 +621,43 @@ def test_authorized_graph_and_post_approval_descendants_are_not_quarantined(kanb
         assert kb.classify_policy_quarantine(conn, approved.gate_id) == []
 
 
+def test_invalidated_handoff_reopens_clears_authority_and_revalidates_new_run(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(conn, title="Design workflow", assignee="architect", mutation_context=_architect_context())
+        first = kb.claim_task(conn, architect)
+        assert first is not None and first.current_run_id is not None
+        assert kb.complete_task(conn, architect, metadata=_formal_handoff(), expected_run_id=first.current_run_id)
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None
+        accepted = kb.accept_architecture_handoff(conn, gate.gate_id)
+        kb.invalidate_architecture_gate(conn, accepted.gate_id, reason="retry")
+        reopened = kb.reopen_architecture_gate(conn, accepted.gate_id, _architect_context())
+        assert reopened.state == "open"
+        assert reopened.accepted_run_id is None and reopened.accepted_snapshot is None
+        assert reopened.design_digest is None and reopened.approval_actor_id is None
+        assert reopened.authorization_event_id is None
+        assert kb.get_task(conn, architect).status == "ready"
+        second = kb.claim_task(conn, architect)
+        assert second is not None and second.current_run_id != first.current_run_id
+        updated = {**_formal_handoff(), "chosen_approach": "Use a fresh retry snapshot."}
+        assert kb.complete_task(conn, architect, metadata=updated, expected_run_id=second.current_run_id)
+        revalidated = kb.accept_architecture_handoff(conn, accepted.gate_id)
+        assert revalidated.accepted_run_id == second.current_run_id
+
+
+def test_invalidated_handoff_reopen_requires_owning_architecture_context(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(conn, title="Design workflow", assignee="architect", mutation_context=_architect_context())
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None
+        kb.invalidate_architecture_gate(conn, gate.gate_id, reason="retry")
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_reopen_requires_owner"):
+            kb.reopen_architecture_gate(conn, gate.gate_id, _implementation_context())
+        reopened = kb.reopen_architecture_gate(conn, gate.gate_id, _architect_context())
+        assert reopened.state == "open" and reopened.row_version == gate.row_version + 2
+        assert kb.reopen_architecture_gate(conn, gate.gate_id, _architect_context()).row_version == reopened.row_version
+
+
 def test_accepted_architect_edit_invalidates_within_owning_mutation(kanban_home):
     with kb.connect() as conn:
         architect = kb.create_task(
@@ -637,5 +674,6 @@ def test_accepted_architect_edit_invalidates_within_owning_mutation(kanban_home)
         assert accepted.state == "policy_accepted"
 
         assert kb.edit_completed_task_result(conn, architect, result="corrected handoff")
-        invalidated = kb.get_architecture_gate(conn, gate.gate_id)
-        assert invalidated is not None and invalidated.state == "invalidated"
+        reopened = kb.get_architecture_gate(conn, gate.gate_id)
+        assert reopened is not None and reopened.state == "open"
+        assert kb.get_task(conn, architect).status == "ready"

@@ -61,7 +61,7 @@ class ArchitectureDeliveryPolicy:
     def withholding(self) -> bool:
         self.refresh()
         return self.lookup_failed or (
-            self.gate_id is not None and self.state != "human_approved"
+            self.gate_id is not None and self.state not in {"policy_accepted", "human_approved"}
         )
 
     @property

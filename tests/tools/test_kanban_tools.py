@@ -1603,6 +1603,31 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
         conn.close()
 
 
+def test_front_door_architecture_create_opens_or_reuses_trusted_gate(monkeypatch, worker_env):
+    """The production tool path owns architecture authority, not model args."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    args = {
+        "title": "Design the workflow", "assignee": "architect",
+        "model_routing": "architecture_design", "session_id": "forged-model-session",
+    }
+    first = json.loads(kt._handle_create(args))
+    second = json.loads(kt._handle_create(args))
+    assert first["ok"] and second["ok"]
+    assert first["task_id"] == second["task_id"]
+    with kb.connect() as conn:
+        gate = kb.get_architecture_gate_for_task(conn, first["task_id"])
+        assert gate is not None and gate.state == "open"
+        assert gate.enforcement_mode == "orchestrator_only"
+        assert gate.session_id == "trusted-session"
+        assert gate.session_id != args["session_id"]
+        assert conn.execute("SELECT COUNT(*) FROM architecture_gates").fetchone()[0] == 1
+
+
 def test_create_rejects_no_title(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"assignee": "x"})).get("error")
