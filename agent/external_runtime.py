@@ -34,6 +34,15 @@ _runtime_events_logger = logging.getLogger("hermes.runtime_events")
 _CLAUDE_SDK_TEMP_ROOT = Path("/tmp")
 
 
+def _effective_uid() -> int:
+    """Return the POSIX effective uid behind the macOS-only SDK boundary."""
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        raise RuntimeError("Claude SDK filesystem isolation requires a POSIX effective uid")
+    return int(get_effective_uid())
+
+
 def _prepare_owner_only_directory(path: Path, *, label: str) -> Path:
     """Create or validate an exact private runtime directory without repair."""
 
@@ -44,7 +53,7 @@ def _prepare_owner_only_directory(path: Path, *, label: str) -> Path:
         raise RuntimeError(f"{label} is not owner-only: {path}") from exc
     if (
         not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.geteuid()
+        or info.st_uid != _effective_uid()
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise RuntimeError(f"{label} is not owner-only: {path}")
@@ -61,7 +70,7 @@ def prepare_claude_sdk_temp_dir(*, temp_root: str | Path | None = None) -> Path:
 
     root = Path(temp_root) if temp_root is not None else _CLAUDE_SDK_TEMP_ROOT
     return _prepare_owner_only_directory(
-        root / f"claude-{os.geteuid()}", label="Claude SDK temp directory"
+        root / f"claude-{_effective_uid()}", label="Claude SDK temp directory"
     )
 
 
