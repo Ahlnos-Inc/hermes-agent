@@ -8778,7 +8778,13 @@ def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
                 "delivery_key": delivery_key, "old_cursor": old_cursor,
                 "shadows": candidate["shadows"], "sub": sub, "token": token,
             }
-            _emit("status.update", sid, {"kind": "process", "text": rendered[0]})
+            try:
+                _emit("status.update", sid, {"kind": "process", "text": rendered[0]})
+            except Exception:
+                logger.debug(
+                    "kanban tui notifier: optional status update failed",
+                    exc_info=True,
+                )
             try:
                 _run_prompt_submit(
                     f"__kanban__{events[0].id}_{events[-1].id}", sid, session, text,

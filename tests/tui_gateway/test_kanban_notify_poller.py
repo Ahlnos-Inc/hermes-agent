@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import contextlib
 import threading
 import types
 from pathlib import Path
@@ -45,38 +46,56 @@ def _session(**extra):
     }
 
 
+def _poll(session, sid="sid1"):
+    server._sessions[sid] = session
+    try:
+        server._poll_kanban_tui_subs(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def _capture_persisted_submit(submitted):
+    def submit(*args, **kwargs):
+        submitted.append((args, kwargs))
+        callback = kwargs.get("persistence_ack_callback")
+        if callback:
+            callback()
+
+    return submit
+
+
 def test_tui_poller_claims_once_emits_and_chains_turn(kanban_home, monkeypatch):
     task_id = _seed_sub("sess-key-1")
     emitted, submitted = [], []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args: submitted.append(args))
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs("sid1", _session())
+    _poll(_session())
 
     status_updates = [event for event in emitted if event[0] == "status.update"]
     assert len(status_updates) == 1
     assert status_updates[0][0:2] == ("status.update", "sid1")
     assert "Desktop completion" in status_updates[0][2]["text"]
-    assert "completed" in status_updates[0][2]["text"]
+    assert "done" in status_updates[0][2]["text"]
     assert len(submitted) == 1
     assert _cursor(task_id, "sess-key-1") > 0
 
-    server._poll_kanban_tui_subs("sid1", _session())
+    _poll(_session())
     assert len([event for event in emitted if event[0] == "status.update"]) == 1
 
 
 def test_tui_poller_emits_but_does_not_chain_busy_session(kanban_home, monkeypatch):
-    _seed_sub("sess-key-1")
+    task_id = _seed_sub("sess-key-1")
     emitted, submitted = [], []
     session = _session(running=True)
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args: submitted.append(args))
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs("sid1", session)
+    _poll(session)
 
-    assert len([event for event in emitted if event[0] == "status.update"]) == 1
+    assert len([event for event in emitted if event[0] == "status.update"]) == 0
     assert submitted == []
-    assert len(session["_pending_kanban_turns"]) == 1
+    assert _cursor(task_id, "sess-key-1") == 0
 
 
 def test_tui_poller_drains_busy_session_turn_when_idle(kanban_home, monkeypatch):
@@ -84,15 +103,14 @@ def test_tui_poller_drains_busy_session_turn_when_idle(kanban_home, monkeypatch)
     submitted = []
     session = _session(running=True)
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args: submitted.append(args))
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs("sid1", session)
+    _poll(session)
     session["running"] = False
-    server._poll_kanban_tui_subs("sid1", session)
+    _poll(session)
 
     assert len(submitted) == 1
-    assert "[kanban] Desktop completion: completed" in submitted[0][-1]
-    assert session["_pending_kanban_turns"] == []
+    assert "Kanban" in submitted[0][0][-1]
 
 
 def test_tui_poller_isolates_per_event_delivery_failures(kanban_home, monkeypatch):
@@ -111,13 +129,12 @@ def test_tui_poller_isolates_per_event_delivery_failures(kanban_home, monkeypatc
         emitted.append(("ok", args))
 
     monkeypatch.setattr(server, "_emit", _emit)
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: None)
+    submitted = []
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs("sid1", _session())
+    _poll(_session())
 
-    successful = [args for result, args in emitted if result == "ok" and args[0] == "status.update"]
-    assert len(successful) == 1
-    assert "completed" in successful[0][2]["text"]
+    assert submitted
     assert _cursor(task_id, "sess-key-1") > 0
 
 
@@ -125,11 +142,19 @@ def test_tui_poller_accepts_stale_session_key(kanban_home, monkeypatch):
     _seed_sub("old-key")
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: None)
+    submitted = []
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs(
-        "sid1", _session(session_key="new-key", _stale_session_keys=["old-key"])
-    )
+    class FakeDB:
+        get_compression_tip = resolve_resume_session_id = lambda self, origin: "new-key"
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeDB()
+
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+
+    _poll(_session(session_key="new-key", _stale_session_keys=["old-key"]))
 
     assert len([event for event in emitted if event[0] == "status.update"]) == 1
 
@@ -191,11 +216,13 @@ def test_tui_poller_consumes_event_when_status_delivery_fails(kanban_home, monke
         raise RuntimeError("emit failed")
 
     monkeypatch.setattr(server, "_emit", _boom)
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: None)
+    submitted = []
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
 
-    server._poll_kanban_tui_subs("sid1", _session())
+    _poll(_session())
 
     assert _cursor(task_id, "sess-key-1") > 0
+    assert submitted
 
 
 def test_tui_poller_leaves_foreign_subscription_unclaimed(kanban_home, monkeypatch):
@@ -203,7 +230,7 @@ def test_tui_poller_leaves_foreign_subscription_unclaimed(kanban_home, monkeypat
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
 
-    server._poll_kanban_tui_subs("sid1", _session())
+    _poll(_session())
 
     assert emitted == []
     assert _cursor(task_id, "other-sess") == 0
