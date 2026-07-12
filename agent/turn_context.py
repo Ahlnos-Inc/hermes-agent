@@ -125,6 +125,9 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[str],
     persist_user_timestamp: Optional[float] = None,
+    persistence_ack_callback=None,
+    persistence_failure_callback=None,
+    internal_control: bool = False,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -206,6 +209,8 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._persist_user_role_override = "system" if internal_control else None
+    agent._persist_user_observed_override = bool(internal_control)
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
@@ -280,7 +285,8 @@ def build_turn_context(
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if not internal_control:
+        agent._user_turn_count += 1
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -296,7 +302,8 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not internal_control
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -330,13 +337,24 @@ def build_turn_context(
 
     # Crash-resilience: persist the inbound user turn as soon as the session row exists.
     try:
-        agent._persist_session(messages, conversation_history)
+        persisted = agent._persist_session(messages, conversation_history)
+        if persisted is False:
+            if persistence_failure_callback is not None:
+                persistence_failure_callback()
+            if internal_control:
+                raise RuntimeError("internal control turn was not durably persisted")
+        elif persistence_ack_callback is not None:
+            persistence_ack_callback()
     except Exception:
+        if persistence_failure_callback is not None:
+            persistence_failure_callback()
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
             agent.session_id or "none",
             exc_info=True,
         )
+        if internal_control:
+            raise
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.

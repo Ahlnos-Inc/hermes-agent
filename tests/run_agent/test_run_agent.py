@@ -7318,6 +7318,22 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_internal_control_persists_without_user_role(self, agent):
+        agent._session_db = MagicMock()
+        agent.session_id = "session-123"
+        agent._last_flushed_db_idx = 0
+        agent._persist_user_message_idx = 0
+        agent._persist_user_role_override = "system"
+        agent._persist_user_observed_override = True
+        messages = [{"role": "user", "content": "internal handoff"}]
+
+        assert agent._persist_session(messages, []) is True
+
+        write = agent._session_db.append_message.call_args_list[0].kwargs
+        assert write["role"] == "system"
+        assert write["observed"] is True
+        assert messages[0]["role"] == "user"
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""

@@ -8568,6 +8568,40 @@ def _tui_kanban_candidate_sort_key(candidate: dict) -> tuple:
     )
 
 
+def _finish_tui_kanban_claim(session: dict, *, persisted: bool) -> None:
+    """Retain or CAS-rewind the current bounded claim at persistence boundary."""
+    claim = session.get("_pending_kanban_claim")
+    if not isinstance(claim, dict):
+        return
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect(board=claim["board"])
+    try:
+        sub = claim["sub"]
+        if persisted:
+            for shadow in claim.get("shadows") or []:
+                _kb.advance_notify_cursor_monotonic(
+                    conn, task_id=shadow["task_id"], platform=shadow["platform"],
+                    chat_id=shadow["chat_id"], thread_id=shadow.get("thread_id") or "",
+                    new_cursor=claim["claimed_cursor"],
+                )
+        else:
+            rewound = _kb.rewind_notify_cursor(
+                conn, task_id=sub["task_id"], platform=sub["platform"],
+                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claim["claimed_cursor"], old_cursor=claim["old_cursor"],
+            )
+            if not rewound:
+                logger.warning(
+                    "kanban tui notifier: rewind conflict for delivery_key=%s",
+                    claim.get("delivery_key"),
+                )
+    finally:
+        conn.close()
+        session["_pending_kanban_claim"] = None
+        _release_tui_turn(session, claim["token"], clear_running=False)
+
+
 def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
     """Admit and claim one deterministic bounded Kanban batch for this TUI."""
     if not session.get("session_key") or session.get("_finalized"):
@@ -8716,7 +8750,16 @@ def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
             }
             _emit("status.update", sid, {"kind": "process", "text": rendered[0]})
             try:
-                _run_prompt_submit(f"__kanban__{events[0].id}_{events[-1].id}", sid, session, text)
+                _run_prompt_submit(
+                    f"__kanban__{events[0].id}_{events[-1].id}", sid, session, text,
+                    internal_control=True,
+                    persistence_ack_callback=lambda: _finish_tui_kanban_claim(
+                        session, persisted=True
+                    ),
+                    persistence_failure_callback=lambda: _finish_tui_kanban_claim(
+                        session, persisted=False
+                    ),
+                )
             except Exception:
                 _kb.rewind_notify_cursor(
                     conn, task_id=sub["task_id"], platform=sub["platform"],
@@ -8914,14 +8957,23 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    internal_control: bool = False,
+    persistence_ack_callback=None,
+    persistence_failure_callback=None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, "" if internal_control else text)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -9063,6 +9115,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                if "persistence_ack_callback" in inspect.signature(agent.run_conversation).parameters:
+                    run_kwargs["persistence_ack_callback"] = persistence_ack_callback
+                    run_kwargs["persistence_failure_callback"] = persistence_failure_callback
+                    run_kwargs["internal_control"] = internal_control
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -9189,7 +9245,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            if (not internal_control and status == "complete"
+                    and isinstance(raw, str) and raw.strip()):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -9235,7 +9292,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
-            if _pending and status == "complete":
+            if _pending and status == "complete" and not internal_control:
                 _pdb = _get_db()
                 if _pdb:
                     _session_key = session.get("session_key") or sid
@@ -9255,6 +9312,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         pass
 
             if (
+                not internal_control
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9287,6 +9346,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # calls / reasoning already stream separately and would be
             # noisy to read aloud.
             if (
+                not internal_control
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9304,6 +9365,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            if persistence_failure_callback is not None:
+                with contextlib.suppress(Exception):
+                    persistence_failure_callback()
             import traceback
 
             trace = traceback.format_exc()

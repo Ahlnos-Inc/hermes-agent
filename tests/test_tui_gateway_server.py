@@ -7634,6 +7634,62 @@ def test_tui_kanban_candidate_order_is_oldest_then_stable_ties():
     ) == [tied_a, tied_b, newer]
 
 
+@pytest.mark.parametrize("persisted,expected_cursor", [(False, 0), (True, "claimed")])
+def test_tui_kanban_persistence_boundary_rewinds_or_retains(
+    tmp_path, monkeypatch, persisted, expected_cursor
+):
+    from hermes_cli import kanban_db as kb
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="delivery", assignee="coder")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="tip")
+        kb.complete_task(conn, task_id, result="done")
+        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="tui", chat_id="tip",
+            kinds=["completed"],
+        )
+        assert events
+    finally:
+        conn.close()
+
+    token = "reservation"
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "_turn_reservation": {"token": token, "kind": "kanban"},
+        "_pending_kanban_claim": {
+            "board": kb.DEFAULT_BOARD,
+            "claimed_cursor": claimed_cursor,
+            "delivery_key": "key",
+            "old_cursor": old_cursor,
+            "shadows": [],
+            "sub": {
+                "task_id": task_id, "platform": "tui", "chat_id": "tip",
+                "thread_id": "",
+            },
+            "token": token,
+        },
+    }
+
+    server._finish_tui_kanban_claim(session, persisted=persisted)
+
+    conn = kb.connect()
+    try:
+        cursor = kb.list_notify_subs(conn, task_id)[0]["last_event_id"]
+    finally:
+        conn.close()
+    assert cursor == (claimed_cursor if expected_cursor == "claimed" else expected_cursor)
+    assert session["_pending_kanban_claim"] is None
+    assert session["_turn_reservation"] is None
+    assert session["running"] is True
+
+
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
     """TUI /save (session.save RPC) must snapshot under the Hermes profile
     home — not the project/workspace CWD — and include the system prompt,
