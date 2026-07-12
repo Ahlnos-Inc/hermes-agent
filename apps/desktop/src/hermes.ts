@@ -49,6 +49,8 @@ import type {
 
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+// Edge synthesis of long passages can exceed Electron's 15 s default fetch timeout.
+const AUDIO_SPEAK_REQUEST_TIMEOUT_MS = 90_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -876,7 +878,8 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
   return window.hermesDesktop.api<AudioSpeakResponse>({
     path: '/api/audio/speak',
     method: 'POST',
-    body: { text }
+    body: { text },
+    timeoutMs: AUDIO_SPEAK_REQUEST_TIMEOUT_MS
   })
 }
 

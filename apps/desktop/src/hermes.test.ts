@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getSessionMessages, listAllProfileSessions, listSessions } from './hermes'
+import { getSessionMessages, listAllProfileSessions, listSessions, speakText } from './hermes'
 
 const emptySessionsResponse = {
   limit: 0,
@@ -55,6 +55,17 @@ describe('Hermes REST session helpers', () => {
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
+    })
+  })
+
+  it('allows long-running audio synthesis without changing the global request timeout', async () => {
+    await speakText('Hello, world!')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/audio/speak',
+      method: 'POST',
+      body: { text: 'Hello, world!' },
+      timeoutMs: 90_000
     })
   })
 })
