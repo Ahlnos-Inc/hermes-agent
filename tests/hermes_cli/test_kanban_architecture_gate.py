@@ -77,6 +77,8 @@ def test_schema_migrates_architecture_gates_projection(kanban_home):
     assert {
         "gate_id",
         "board_key",
+        "creator_actor_type",
+        "creator_profile",
         "architect_task_id",
         "state",
         "design_digest",
@@ -656,6 +658,36 @@ def test_invalidated_handoff_reopen_requires_owning_architecture_context(kanban_
         reopened = kb.reopen_architecture_gate(conn, gate.gate_id, _architect_context())
         assert reopened.state == "open" and reopened.row_version == gate.row_version + 2
         assert kb.reopen_architecture_gate(conn, gate.gate_id, _architect_context()).row_version == reopened.row_version
+
+
+def test_invalidated_handoff_reopen_requires_all_persisted_owner_bindings(kanban_home):
+    owner = kb.MutationContext(
+        **{
+            **_architect_context().__dict__,
+            "workflow_key": "workflow-1",
+            "profile": "architect",
+        }
+    )
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn, title="Design workflow", assignee="architect", mutation_context=owner,
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None
+        kb.invalidate_architecture_gate(conn, gate.gate_id, reason="retry")
+
+        for binding, forged in (
+            ("actor_type", "other_actor"),
+            ("profile", "other_profile"),
+            ("session_id", "other_session"),
+            ("workflow_key", "other_workflow"),
+            ("request_scope_id", "other_turn"),
+        ):
+            forged_owner = kb.MutationContext(**{**owner.__dict__, binding: forged})
+            with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_reopen_requires_owner"):
+                kb.reopen_architecture_gate(conn, gate.gate_id, forged_owner)
+
+        assert kb.reopen_architecture_gate(conn, gate.gate_id, owner).state == "open"
 
 
 def test_accepted_architect_edit_invalidates_within_owning_mutation(kanban_home):

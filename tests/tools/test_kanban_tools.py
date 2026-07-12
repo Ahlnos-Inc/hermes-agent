@@ -1611,12 +1611,15 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate(monkeypatch
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
     monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "kanban:\n  architecture_gate:\n    version: v1\n    mode: orchestrator_only\n"
+    )
     args = {
         "title": "Design the workflow", "assignee": "architect",
         "model_routing": "architecture_design", "session_id": "forged-model-session",
     }
-    first = json.loads(kt._handle_create(args))
-    second = json.loads(kt._handle_create(args))
+    first = json.loads(kt._handle_create(args, turn_id="trusted-turn"))
+    second = json.loads(kt._handle_create(args, turn_id="trusted-turn"))
     assert first["ok"] and second["ok"]
     assert first["task_id"] == second["task_id"]
     with kb.connect() as conn:
@@ -1626,6 +1629,58 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate(monkeypatch
         assert gate.session_id == "trusted-session"
         assert gate.session_id != args["session_id"]
         assert conn.execute("SELECT COUNT(*) FROM architecture_gates").fetchone()[0] == 1
+
+
+def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(monkeypatch, worker_env):
+    """The trusted boundary reads managed policy and never scopes to model data."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    policy_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    assert kt._managed_architecture_gate_mode() == "off"
+    args = {
+        "title": "Design the workflow",
+        "assignee": "architect",
+        "model_routing": "architecture_design",
+        "request_scope_id": "forged-model-scope",
+    }
+
+    policy_path.write_text("kanban:\n  architecture_gate:\n    version: v1\n    mode: off\n")
+    off = json.loads(kt._handle_create(args, turn_id="trusted-turn-off"))
+    assert off["ok"]
+    with kb.connect() as conn:
+        assert kb.get_architecture_gate_for_task(conn, off["task_id"]) is None
+
+    policy_path.write_text("kanban:\n  architecture_gate:\n    version: v1\n    mode: shadow\n")
+    shadow_first = json.loads(kt._handle_create(args, turn_id="trusted-turn-shadow"))
+    shadow_retry = json.loads(kt._handle_create(args, turn_id="trusted-turn-shadow"))
+    shadow_next_turn = json.loads(kt._handle_create(args, turn_id="trusted-turn-shadow-next"))
+    assert shadow_first["task_id"] == shadow_retry["task_id"]
+    assert shadow_next_turn["task_id"] != shadow_first["task_id"]
+    with kb.connect() as conn:
+        shadow_gate = kb.get_architecture_gate_for_task(conn, shadow_first["task_id"])
+        assert shadow_gate is not None
+        assert shadow_gate.enforcement_mode == "shadow"
+        assert shadow_gate.request_scope_id == "front-door:trusted-turn-shadow"
+        assert shadow_gate.request_scope_id != args["request_scope_id"]
+
+    policy_path.write_text("kanban:\n  architecture_gate:\n    version: v1\n    mode: orchestrator_only\n")
+    enforcing = json.loads(kt._handle_create(args, turn_id="trusted-turn-enforcing"))
+    with kb.connect() as conn:
+        enforcing_gate = kb.get_architecture_gate_for_task(conn, enforcing["task_id"])
+        assert enforcing_gate is not None
+        assert enforcing_gate.enforcement_mode == "orchestrator_only"
+
+    policy_path.write_text("kanban:\n  architecture_gate:\n    version: v1\n    mode: enforce\n")
+    legacy = json.loads(kt._handle_create(args, turn_id="trusted-turn-legacy"))
+    policy_path.write_text("kanban:\n  architecture_gate:\n    version: malformed\n    mode: orchestrator_only\n")
+    malformed = json.loads(kt._handle_create(args, turn_id="trusted-turn-malformed"))
+    with kb.connect() as conn:
+        assert kb.get_architecture_gate_for_task(conn, legacy["task_id"]) is None
+        assert kb.get_architecture_gate_for_task(conn, malformed["task_id"]) is None
 
 
 def test_create_rejects_no_title(worker_env):

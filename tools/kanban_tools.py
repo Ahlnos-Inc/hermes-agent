@@ -1752,7 +1752,25 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
     )
 
 
-def _trusted_front_door_architecture_context(kb: Any, *, board: Any, assignee: Any, routing: Any) -> Any:
+def _managed_architecture_gate_mode() -> str:
+    """Read the staged policy from profile config, failing closed to ``off``."""
+    try:
+        policy = cfg_get(load_config(), "kanban", "architecture_gate", default={})
+        if not isinstance(policy, dict) or policy.get("version") != "v1":
+            return "off"
+        mode = policy.get("mode")
+        if mode in {"off", "shadow", "orchestrator_only"}:
+            return mode
+    except Exception:
+        logger.warning("Unable to read managed architecture-gate policy; using off", exc_info=True)
+    # ``enforce`` remains readable in existing gate rows but is deliberately
+    # not a new front-door activation target.
+    return "off"
+
+
+def _trusted_front_door_architecture_context(
+    kb: Any, *, board: Any, assignee: Any, routing: Any, turn_id: Any,
+) -> Any:
     """Construct architecture authority from runtime identity, never tool args."""
     if os.environ.get("HERMES_KANBAN_TASK") or str(assignee).strip() != "architect":
         return None
@@ -1766,13 +1784,15 @@ def _trusted_front_door_architecture_context(kb: Any, *, board: Any, assignee: A
     except Exception:
         session_id = os.environ.get("HERMES_SESSION_ID", "")
     session_id = str(session_id).strip()
-    if not session_id:
+    trusted_turn_id = str(turn_id or "").strip()
+    mode = _managed_architecture_gate_mode()
+    if not session_id or not trusted_turn_id or mode == "off":
         return None
     return kb.MutationContext(
         board_key=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "default"),
         principal=f"orchestrator:{session_id}", actor_type="orchestrator_agent",
         profile="orchestrator", session_id=session_id,
-        request_scope_id=f"front-door:{session_id}", mode="orchestrator_only", phase="architecture",
+        request_scope_id=f"front-door:{trusted_turn_id}", mode=mode, phase="architecture",
     )
 
 
@@ -1867,6 +1887,7 @@ def _handle_create(args: dict, **kw) -> str:
             if mutation_context is None:
                 mutation_context = _trusted_front_door_architecture_context(
                     kb, board=board, assignee=assignee, routing=model_routing_decision,
+                    turn_id=kw.get("turn_id"),
                 )
                 if mutation_context is not None:
                     # Scope identity must not come from a model-visible argument.

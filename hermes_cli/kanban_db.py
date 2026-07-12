@@ -1168,6 +1168,8 @@ class ArchitectureGate:
     gate_id: str
     board_key: str
     creator_principal: str
+    creator_actor_type: Optional[str]
+    creator_profile: Optional[str]
     request_scope_id: Optional[str]
     session_id: Optional[str]
     workflow_key: Optional[str]
@@ -1194,6 +1196,8 @@ class ArchitectureGate:
         return cls(
             gate_id=row["gate_id"], board_key=row["board_key"],
             creator_principal=row["creator_principal"],
+            creator_actor_type=row["creator_actor_type"] if "creator_actor_type" in row.keys() else None,
+            creator_profile=row["creator_profile"] if "creator_profile" in row.keys() else None,
             request_scope_id=row["request_scope_id"], session_id=row["session_id"],
             workflow_key=row["workflow_key"], architect_task_id=row["architect_task_id"],
             accepted_run_id=row["accepted_run_id"], state=row["state"],
@@ -1437,6 +1441,8 @@ CREATE TABLE IF NOT EXISTS architecture_gates (
     gate_id                  TEXT PRIMARY KEY,
     board_key                TEXT NOT NULL,
     creator_principal        TEXT NOT NULL,
+    creator_actor_type       TEXT,
+    creator_profile          TEXT,
     request_scope_id         TEXT,
     session_id               TEXT,
     workflow_key             TEXT,
@@ -2253,6 +2259,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if gate_table is not None:
         gate_cols = {row["name"] for row in conn.execute("PRAGMA table_info(architecture_gates)")}
         for name, definition in (
+            ("creator_actor_type", "creator_actor_type TEXT"),
+            ("creator_profile", "creator_profile TEXT"),
             ("approval_actor_id", "approval_actor_id TEXT"),
             ("approval_actor_type", "approval_actor_type TEXT"),
             ("approval_surface", "approval_surface TEXT"),
@@ -3068,13 +3076,14 @@ def _open_architecture_gate(
     now = int(time.time())
     conn.execute(
         """INSERT INTO architecture_gates (
-            gate_id, board_key, creator_principal, request_scope_id, session_id,
-            workflow_key, architect_task_id, state, policy_version,
-            canonicalization_version, enforcement_mode, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+            gate_id, board_key, creator_principal, creator_actor_type, creator_profile,
+            request_scope_id, session_id, workflow_key, architect_task_id, state,
+            policy_version, canonicalization_version, enforcement_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
         (
             _new_gate_id(), context.board_key, context.principal,
-            context.request_scope_id, context.session_id, context.workflow_key,
+            context.actor_type, context.profile, context.request_scope_id,
+            context.session_id, context.workflow_key,
             task_id, ARCHITECTURE_GATE_POLICY_VERSION,
             ARCHITECTURE_GATE_CANONICALIZATION_VERSION, mode, now, now,
         ),
@@ -3671,6 +3680,16 @@ def reopen_architecture_gate(
             context.phase != "architecture"
             or context.board_key != gate.board_key
             or context.principal != gate.creator_principal
+            or (
+                gate.creator_actor_type is not None
+                and context.actor_type != gate.creator_actor_type
+            )
+            or (
+                gate.creator_profile is not None
+                and context.profile != gate.creator_profile
+            )
+            or context.session_id != gate.session_id
+            or context.workflow_key != gate.workflow_key
             or context.request_scope_id != gate.request_scope_id
         ):
             raise ArchitectureGateError("architecture_gate_reopen_requires_owner")
