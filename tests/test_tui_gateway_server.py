@@ -664,6 +664,20 @@ def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     assert tts_resp["result"]["tts"] is True
 
 
+def test_is_autonomous_rid_gates_host_tts():
+    """Host TTS (the always-on daemon speaking aloud) must fire only for turns
+    a live human submitted, never for auto-chained ones. Autonomous dispatchers
+    use ``__``-prefixed synthetic request ids; real ``prompt.submit`` ids don't.
+    """
+    # Synthetic rids produced by the autonomous dispatchers in server.py.
+    assert server._is_autonomous_rid(f"__notif__{int(time.time() * 1000)}")
+    assert server._is_autonomous_rid("__kanban__abc123")
+    # Real client-supplied request ids (uuid / numeric / method-tagged).
+    assert not server._is_autonomous_rid("9f8c1e2a-1234-4a5b-8cde-000000000000")
+    assert not server._is_autonomous_rid("voice-tts")
+    assert not server._is_autonomous_rid(42)
+
+
 def test_load_enabled_toolsets_prefers_tui_env(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "web, terminal, ,memory")
 

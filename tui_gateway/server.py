@@ -8993,6 +8993,17 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _is_autonomous_rid(rid) -> bool:
+    """True for auto-chained turns that reuse the prompt-submit path but were
+    not initiated by a live human — background process completions
+    (``__notif__``), kanban pokes (``__kanban__``), and any future synthetic
+    dispatch. These carry a ``__``-prefixed request id; real client
+    ``prompt.submit`` ids never do. Used to keep host TTS (the always-on
+    daemon speaking aloud) off autonomous turns.
+    """
+    return str(rid).startswith("__")
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -9386,10 +9397,18 @@ def _run_prompt_submit(
             # (cli.py:_voice_speak_response).  Only the final text — tool
             # calls / reasoning already stream separately and would be
             # noisy to read aloud.
+            #
+            # ...but only for turns a live human actually submitted. Background
+            # process completions (__notif__), kanban pokes (__kanban__), and
+            # other auto-chained turns reuse this same completion path; speaking
+            # them makes the always-on daemon talk "out of nowhere" while nobody
+            # is interacting. Real client `prompt.submit` requests carry a
+            # non-"__" request id, so gate host TTS to those. Revert: drop the
+            # `_autonomous_turn` clause.
             if (
                 not internal_control
-                and
-                status == "complete"
+                and not _is_autonomous_rid(rid)
+                and status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
                 and _voice_tts_enabled()
