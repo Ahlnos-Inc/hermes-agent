@@ -632,6 +632,114 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
+def test_notify_bounded_claim_rejects_stale_expected_cursor(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="session")
+        kb.complete_task(conn, tid, result="ok")
+
+        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id="session",
+            kinds=["completed"],
+            expected_old_cursor=99,
+        )
+
+        assert old_cursor == 0
+        assert claimed_cursor == 0
+        assert events == []
+    finally:
+        conn.close()
+
+
+def test_notify_bounded_claim_excludes_events_after_snapshot(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="session")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "blocked", {"reason": "first"})
+        _, initial = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="tui", chat_id="session", kinds=["blocked"]
+        )
+        through = initial[-1].id
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "blocked", {"reason": "second"})
+
+        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id="session",
+            kinds=["blocked"],
+            expected_old_cursor=0,
+            through_event_id=through,
+        )
+
+        assert old_cursor == 0
+        assert claimed_cursor == through
+        assert [event.payload["reason"] for event in events] == ["first"]
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="tui", chat_id="session", kinds=["blocked"]
+        )
+        assert [event.payload["reason"] for event in remaining] == ["second"]
+    finally:
+        conn.close()
+
+
+def test_notify_shadow_cursor_advance_is_monotonic(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="shadow")
+        assert kb.advance_notify_cursor_monotonic(
+            conn, task_id=tid, platform="tui", chat_id="shadow", new_cursor=8
+        )
+        assert not kb.advance_notify_cursor_monotonic(
+            conn, task_id=tid, platform="tui", chat_id="shadow", new_cursor=5
+        )
+        assert kb.list_notify_subs(conn, tid)[0]["last_event_id"] == 8
+    finally:
+        conn.close()
+
+
+def test_notify_delivery_key_is_stable_and_range_specific(tmp_path):
+    first = kb.notify_delivery_key(
+        resolved_db_path=tmp_path / "board.db",
+        task_id="t_1",
+        platform="tui",
+        chat_id="session",
+        thread_id="",
+        first_event_id=4,
+        last_event_id=8,
+    )
+    same = kb.notify_delivery_key(
+        resolved_db_path=str(tmp_path / "board.db"),
+        task_id="t_1",
+        platform="tui",
+        chat_id="session",
+        thread_id=None,
+        first_event_id=4,
+        last_event_id=8,
+    )
+    later = kb.notify_delivery_key(
+        resolved_db_path=tmp_path / "board.db",
+        task_id="t_1",
+        platform="tui",
+        chat_id="session",
+        thread_id="",
+        first_event_id=9,
+        last_event_id=9,
+    )
+
+    assert first == same
+    assert first != later
+    assert first.endswith("/t_1/tui/session/-/4/8")
+
+
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------

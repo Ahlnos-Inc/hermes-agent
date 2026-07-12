@@ -10604,6 +10604,7 @@ def unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    through_event_id: Optional[int] = None,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
@@ -10622,10 +10623,13 @@ def unseen_events_for_sub(
     kind_list = list(kinds) if kinds else None
     q = (
         "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        + ("AND id <= ? " if through_event_id is not None else "")
         + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
         + "ORDER BY id ASC"
     )
     params: list[Any] = [task_id, cursor]
+    if through_event_id is not None:
+        params.append(int(through_event_id))
     if kind_list:
         params.extend(kind_list)
     rows = conn.execute(q, params).fetchall()
@@ -10653,6 +10657,8 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    expected_old_cursor: Optional[int] = None,
+    through_event_id: Optional[int] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -10677,6 +10683,8 @@ def claim_unseen_events_for_sub(
         if row is None:
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
+        if expected_old_cursor is not None and old_cursor != int(expected_old_cursor):
+            return old_cursor, old_cursor, []
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -10684,6 +10692,7 @@ def claim_unseen_events_for_sub(
             chat_id=chat_id,
             thread_id=thread_id,
             kinds=kinds,
+            through_event_id=through_event_id,
         )
         if not events:
             return old_cursor, old_cursor, []
@@ -10711,6 +10720,55 @@ def advance_notify_cursor(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
+
+
+def advance_notify_cursor_monotonic(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    new_cursor: int,
+) -> bool:
+    """Advance a subscription cursor without ever regressing newer progress."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id < ?",
+            (
+                int(new_cursor), task_id, platform, chat_id, thread_id or "",
+                int(new_cursor),
+            ),
+        )
+    return cur.rowcount > 0
+
+
+def notify_delivery_key(
+    *,
+    resolved_db_path: str | os.PathLike[str],
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    first_event_id: int,
+    last_event_id: int,
+) -> str:
+    """Return stable idempotency material for one bounded delivery range."""
+    canonical_path = str(Path(resolved_db_path).expanduser().resolve(strict=False))
+    path_hash = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
+    return "/".join(
+        (
+            path_hash,
+            str(task_id),
+            str(platform).lower(),
+            str(chat_id),
+            str(thread_id or "-"),
+            str(int(first_event_id)),
+            str(int(last_event_id)),
+        )
+    )
 
 
 def rewind_notify_cursor(
