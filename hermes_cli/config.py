@@ -2597,13 +2597,6 @@ DEFAULT_CONFIG = {
         # decomposition is manual via `hermes kanban decompose <id>` or
         # the dashboard's Decompose button.
         "auto_decompose": True,
-        # Architecture-first gate rollout. The front-door boundary accepts
-        # only v1/off, shadow, and orchestrator_only; legacy enforce rows
-        # remain readable but can never be activated here.
-        "architecture_gate": {
-            "version": "v1",
-            "mode": "off",
-        },
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.

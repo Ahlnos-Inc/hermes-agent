@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_hermes_home
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -1753,9 +1754,10 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
 
 
 def _managed_architecture_gate_mode() -> str:
-    """Read the staged policy from profile config, failing closed to ``off``."""
+    """Read the synced staged policy, failing closed to ``off``."""
     try:
-        policy = cfg_get(load_config(), "kanban", "architecture_gate", default={})
+        policy_path = get_hermes_home() / "rules" / "architecture-gate-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
         if not isinstance(policy, dict) or policy.get("version") != "v1":
             return "off"
         mode = policy.get("mode")
@@ -1769,14 +1771,12 @@ def _managed_architecture_gate_mode() -> str:
 
 
 def _trusted_front_door_architecture_context(
-    kb: Any, *, board: Any, assignee: Any, routing: Any, turn_id: Any,
+    kb: Any, *, board: Any, assignee: Any, turn_id: Any,
 ) -> Any:
     """Construct architecture authority from runtime identity, never tool args."""
     if os.environ.get("HERMES_KANBAN_TASK") or str(assignee).strip() != "architect":
         return None
     if os.environ.get("HERMES_PROFILE") != "orchestrator":
-        return None
-    if not isinstance(routing, dict) or routing.get("resolved_preset") != "architecture_design":
         return None
     try:
         from gateway.session_context import get_session_env
@@ -1886,8 +1886,7 @@ def _handle_create(args: dict, **kw) -> str:
             mutation_context = _worker_architecture_context(kb, conn)
             if mutation_context is None:
                 mutation_context = _trusted_front_door_architecture_context(
-                    kb, board=board, assignee=assignee, routing=model_routing_decision,
-                    turn_id=kw.get("turn_id"),
+                    kb, board=board, assignee=assignee, turn_id=kw.get("turn_id"),
                 )
                 if mutation_context is not None:
                     # Scope identity must not come from a model-visible argument.
