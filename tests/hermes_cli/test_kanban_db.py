@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import sqlite3
@@ -4174,6 +4175,41 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert second_backup is not None
     assert second_backup != backup
     assert second_backup.exists()
+
+
+def test_corrupt_backup_does_not_publish_partial_copy(tmp_path, monkeypatch):
+    """An interrupted forensic copy must not masquerade as a reusable backup."""
+    db_path = tmp_path / "kanban.db"
+    original = _write_corrupt_db(db_path)
+    digest = hashlib.sha256(original).hexdigest()[:16]
+    expected_backup = tmp_path / f"kanban.db.corrupt.{digest}.bak"
+
+    def interrupted_copy(_source, destination, *args, **kwargs):
+        Path(destination).write_bytes(b"partial forensic copy")
+        raise OSError("simulated interrupted copy")
+
+    monkeypatch.setattr(kb.shutil, "copy2", interrupted_copy)
+
+    assert kb._backup_corrupt_db(db_path) is None
+    assert db_path.read_bytes() == original
+    assert not expected_backup.exists()
+    assert list(tmp_path.glob(f".{expected_backup.name}.*.tmp")) == []
+
+
+def test_corrupt_backup_repairs_preexisting_partial_copy(tmp_path):
+    """A legacy partial backup is preserved, then replaced with complete bytes."""
+    db_path = tmp_path / "kanban.db"
+    original = _write_corrupt_db(db_path)
+    source_digest = hashlib.sha256(original).hexdigest()[:16]
+    expected_backup = tmp_path / f"kanban.db.corrupt.{source_digest}.bak"
+    partial = b"partial legacy forensic copy"
+    expected_backup.write_bytes(partial)
+    partial_digest = hashlib.sha256(partial).hexdigest()[:16]
+    preserved_partial = tmp_path / f"{expected_backup.name}.incomplete.{partial_digest}.bak"
+
+    assert kb._backup_corrupt_db(db_path) == expected_backup
+    assert expected_backup.read_bytes() == original
+    assert preserved_partial.read_bytes() == partial
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
