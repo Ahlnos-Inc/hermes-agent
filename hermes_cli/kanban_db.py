@@ -1815,21 +1815,30 @@ def _file_sha256(path: Path) -> Optional[str]:
 
 def _atomic_copy2(source: Path, destination: Path) -> bool:
     """Copy ``source`` to ``destination`` without publishing partial bytes."""
-    temp_fd, temp_name = tempfile.mkstemp(
-        dir=str(destination.parent),
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-    )
-    os.close(temp_fd)
-    staged = Path(temp_name)
+    temp_fd = -1
+    staged: Optional[Path] = None
     try:
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=str(destination.parent),
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+        )
+        staged = Path(temp_name)
+        os.close(temp_fd)
+        temp_fd = -1  # closed; sentinel cleared so we don't double-close
         shutil.copy2(source, staged)
         os.replace(staged, destination)
     except OSError:
-        try:
-            staged.unlink()
-        except OSError:
-            pass
+        if temp_fd != -1:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if staged is not None:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
         return False
     return True
 

@@ -4243,6 +4243,86 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+def test_atomic_copy2_mkstemp_failure_returns_false(tmp_path, monkeypatch):
+    """tempfile.mkstemp failure must not escape _atomic_copy2 as a raw OSError."""
+    src = tmp_path / "source.db"
+    src.write_bytes(b"source content")
+    dst = tmp_path / "dest.db"
+
+    def failing_mkstemp(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(kb.tempfile, "mkstemp", failing_mkstemp)
+
+    # Must return False, not raise
+    result = kb._atomic_copy2(src, dst)
+    assert result is False
+    # Source must be preserved
+    assert src.read_bytes() == b"source content"
+    # Destination must not have been created
+    assert not dst.exists()
+
+
+def test_atomic_copy2_close_failure_returns_false_and_no_staged_file(tmp_path, monkeypatch):
+    """os.close failure must not escape _atomic_copy2; staged file must be cleaned up."""
+    src = tmp_path / "source.db"
+    src.write_bytes(b"source content")
+    dst = tmp_path / "dest.db"
+
+    def failing_close(fd):
+        raise OSError("close failure")
+
+    monkeypatch.setattr(kb.os, "close", failing_close)
+
+    result = kb._atomic_copy2(src, dst)
+    assert result is False
+    assert src.read_bytes() == b"source content"
+    assert not dst.exists()
+    # No staging temp file must remain visible in the destination directory
+    assert list(tmp_path.glob(f".{dst.name}.*.tmp")) == []
+
+
+def test_backup_corrupt_db_mkstemp_failure_returns_none_source_preserved(tmp_path, monkeypatch):
+    """A staging-allocation failure in _atomic_copy2 must propagate as None from
+    _backup_corrupt_db; the source corrupt DB must survive unchanged."""
+    db_path = tmp_path / "kanban.db"
+    original = _write_corrupt_db(db_path)
+
+    def failing_mkstemp(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(kb.tempfile, "mkstemp", failing_mkstemp)
+
+    result = kb._backup_corrupt_db(db_path)
+    assert result is None
+    # Source must be preserved — the backup attempt must never touch it
+    assert db_path.read_bytes() == original
+    # No partial backup file must have been written
+    assert list(tmp_path.glob("*.corrupt.*")) == []
+
+
+def test_connect_raises_corrupt_error_when_backup_staging_fails(tmp_path, monkeypatch):
+    """connect() must raise KanbanDbCorruptError (not silently recreate) when
+    _backup_corrupt_db returns None due to a staging-file allocation failure.
+    The source corrupt DB must remain unchanged after the connect() attempt."""
+    db_path = tmp_path / "kanban.db"
+    original = _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    def failing_mkstemp(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(kb.tempfile, "mkstemp", failing_mkstemp)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    # backup_path is None because the backup itself failed
+    assert excinfo.value.backup_path is None
+    # Source must still be preserved after the failed connect attempt
+    assert db_path.read_bytes() == original
+
+
 def test_init_db_allows_missing_then_healthy(tmp_path):
     db_path = tmp_path / "fresh.db"
     assert not db_path.exists()
