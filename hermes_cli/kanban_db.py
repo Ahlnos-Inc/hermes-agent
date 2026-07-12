@@ -6641,13 +6641,16 @@ def decompose_triage_task(
     if not children:
         return None
     gate = get_architecture_gate_for_task(conn, task_id)
-    if gate is not None and gate.enforcement_mode == "enforce" and gate.state == "human_approved":
-        issued = conn.execute(
-            "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
-        ).fetchone()
-        if issued is not None:
-            raise ArchitectureGateError("architecture_graph_issued")
-        raise ArchitectureGateError("architecture_graph_issuance_required")
+    if gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+        if gate.state == "human_approved":
+            issued = conn.execute(
+                "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
+            ).fetchone()
+            if issued is not None:
+                raise ArchitectureGateError("architecture_graph_issued")
+            raise ArchitectureGateError("architecture_graph_issuance_required")
+        else:
+            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
