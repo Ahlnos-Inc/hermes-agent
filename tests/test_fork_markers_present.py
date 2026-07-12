@@ -43,6 +43,8 @@ PRESENT = [
     ("developer-role downgrade on failover (BUILD-345)", "_normalize_developer_role", "agent/transports/chat_completions.py"),
     ("runtime circuit breaker", "open_runtime_circuit", "agent/runtime_circuit.py"),
     ("kanban github-handoff guidance", "is not a human blocker", "agent/prompt_builder.py"),
+    ("tui_gateway arms shell hooks (desktop delegation)", "register_from_config", "tui_gateway/entry.py"),
+    ("dashboard arms shell hooks (in-memory desktop delegation)", "register_from_config", "hermes_cli/web_server.py"),
 ]
 
 # Fork-only files — upstream has no version, so a merge can't overwrite them,
@@ -55,11 +57,13 @@ FORK_ONLY_FILES = [
     "cron/ahlnos_jobs_ext.py",
 ]
 
-# Known-regressed: already dropped in a past upstream merge; restore pending.
-# Asserted ABSENT so the manifest doesn't pretend it's covered. When restored,
-# MOVE the entry to PRESENT (this test will then fail, reminding you to).
+# Intentionally NOT restored: e525dac82's inline route-contract enforcement was
+# accidentally dropped in merge b4e4ae9a9, but the orchestrator is pure-delegate
+# by design, so inline enforcement is moot — we chose not to restore it (routing
+# effort is now managed per-role-profile + a front-door hook). Asserted ABSENT so
+# the manifest doesn't pretend it's covered; flags if it ever silently reappears.
 REGRESSED = [
-    ("lane reasoning_effort inline application (e525dac82)", "parse_reasoning_effort", "agent/conversation_loop.py"),
+    ("lane reasoning_effort inline application (e525dac82) — intentionally not restored", "parse_reasoning_effort", "agent/conversation_loop.py"),
 ]
 
 

@@ -203,6 +203,22 @@ async def _lifespan(app: "FastAPI"):
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
 
+    # Arm declarative shell hooks (pre_tool_call / post_tool_call) from config so
+    # the dashboard's in-memory tui_gateway dispatch path (non-scoped chats run
+    # the agent here under the dashboard's own profile) enforces them — notably
+    # the front-door-delegation-guard that forces the orchestrator to delegate
+    # rather than do inline work. Profile-scoped chats spawn tui_gateway.entry,
+    # which arms them itself; the full gateway (gateway/run.py) does the same.
+    # Without this, in-memory desktop chats ran with no hooks armed. Headless, so
+    # consent resolves from hooks_auto_accept / HERMES_ACCEPT_HOOKS. Idempotent +
+    # must never block startup.
+    try:
+        from hermes_cli.config import load_config
+        from agent.shell_hooks import register_from_config
+        register_from_config(load_config(), accept_hooks=False)
+    except Exception:
+        _log.warning("shell-hook registration failed at dashboard startup", exc_info=True)
+
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
     # On a cold Windows install the module chain triggers .pyc compilation
