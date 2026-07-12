@@ -6649,8 +6649,7 @@ def decompose_triage_task(
             if issued is not None:
                 raise ArchitectureGateError("architecture_graph_issued")
             raise ArchitectureGateError("architecture_graph_issuance_required")
-        else:
-            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+        raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 

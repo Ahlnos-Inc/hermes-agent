@@ -4,6 +4,8 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -229,20 +231,15 @@ def test_decompose_per_child_workspace_override(kanban_home):
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
 
-
-
 # ---------------------------------------------------------------------------
 # Architecture-gate rejection tests (BUILD-382 backstop)
 # ---------------------------------------------------------------------------
-
-import time as _time
-
 
 def _insert_gate(conn, architect_task_id, *, enforcement_mode, state="open"):
     """Directly insert an architecture_gate row for testing without going
     through the full accept/approve handshake.  Lets us freeze any gate
     state cheaply."""
-    now = int(_time.time())
+    now = int(time.time())
     conn.execute(
         """INSERT INTO architecture_gates (
             gate_id, board_key, creator_principal, creator_actor_type,
@@ -320,6 +317,50 @@ def test_decompose_rejects_orchestrator_only_gate_human_approved_without_issuanc
         assert exc_info.value.code == "architecture_graph_issuance_required"
 
     with kb.connect() as conn:
+        assert _count_tasks(conn) == before
+
+
+def test_decompose_rejects_orchestrator_only_gate_after_graph_issuance(kanban_home):
+    """A second graph path stays closed after the canonical graph is issued."""
+    with kb.connect() as conn:
+        architect_id = kb.create_task(conn, title="architect task issued")
+        _insert_gate(
+            conn,
+            architect_id,
+            enforcement_mode="orchestrator_only",
+            state="human_approved",
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect_id)
+        assert gate is not None
+        conn.execute(
+            """INSERT INTO architecture_graph_issuances
+               (gate_id, idempotency_key, task_ids, issued_by, issued_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                gate.gate_id,
+                "issued-once",
+                json.dumps(["t_existing"]),
+                "orchestrator",
+                int(time.time()),
+            ),
+        )
+        triage_id = kb.create_task(conn, title="triage issued", triage=True)
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (architect_id, triage_id),
+        )
+        before = _count_tasks(conn)
+
+    with kb.connect() as conn:
+        with pytest.raises(kb.ArchitectureGateError) as exc_info:
+            kb.decompose_triage_task(
+                conn,
+                triage_id,
+                root_assignee="orch",
+                children=[{"title": "second graph child"}],
+                author="tester",
+            )
+        assert exc_info.value.code == "architecture_graph_issued"
         assert _count_tasks(conn) == before
 
 
