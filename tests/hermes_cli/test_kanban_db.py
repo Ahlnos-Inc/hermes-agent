@@ -4139,6 +4139,39 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
+def test_cached_connect_quarantines_tls_page_one_overwrite(tmp_path):
+    """A live process must preserve the exact FD-recycle corruption image.
+
+    The #29507 failure starts with an SSL BIO writing a TLS application-data
+    record over byte 5 of a freshly-reused ``kanban.db`` FD. The per-process
+    initialization cache used to skip the header/integrity guard on the next
+    connection, leaving the dispatcher to emit a raw SQLite error without a
+    forensic backup. Keep the DB's length unchanged to match the incident:
+    this is not a torn write and the post-commit page-count check cannot see it.
+    """
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path=db_path) as conn:
+        kb.create_task(conn, title="survives-forensics")
+
+    assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+    with db_path.open("r+b") as handle:
+        handle.seek(5)
+        # TLS 1.2 application-data header plus a 19-byte encrypted payload.
+        handle.write(b"\x17\x03\x03\x00\x13" + b"x" * 19)
+    corrupted = db_path.read_bytes()
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    backup = excinfo.value.backup_path
+    assert backup is not None
+    assert backup.exists()
+    assert backup.read_bytes() == corrupted
+    # Fail closed: never recreate an empty schema on top of incident bytes.
+    assert db_path.read_bytes() == corrupted
+    assert "TLS record header detected at byte offset 5" in excinfo.value.reason
+
+
 def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
 
