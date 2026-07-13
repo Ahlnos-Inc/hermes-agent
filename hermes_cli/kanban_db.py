@@ -1801,6 +1801,27 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def _guard_cached_db_header(path: Path) -> None:
+    """Quarantine a newly-corrupt cached DB before SQLite opens it.
+
+    ``_INITIALIZED_PATHS`` avoids an expensive integrity scan on every Kanban
+    operation, but a long-lived gateway can keep that cache after an external
+    writer has clobbered page one. Re-run only the 64-byte header check on the
+    fast path so the exact TLS FD-recycle shape fails closed with a preserved
+    forensic image instead of surfacing later as an unclassified raw SQLite
+    error from WAL setup.
+    """
+    try:
+        _validate_sqlite_header(path)
+    except sqlite3.DatabaseError as exc:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        backup = _backup_corrupt_db(resolved)
+        raise KanbanDbCorruptError(resolved, backup, str(exc)) from exc
+
+
 def _file_sha256(path: Path) -> Optional[str]:
     """Return a file digest without loading forensic images into memory."""
     digest = hashlib.sha256()
@@ -2004,6 +2025,9 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
+        # Preserve the cached fast path while detecting an external page-one
+        # overwrite before SQLite's WAL setup turns it into an opaque error.
+        _guard_cached_db_header(path)
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
