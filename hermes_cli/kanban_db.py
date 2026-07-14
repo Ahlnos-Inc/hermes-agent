@@ -1264,6 +1264,19 @@ class PolicyQuarantineClassification:
     reason: str = "architecture_gate_premature_card"
 
 
+class WorkflowGraphError(ValueError):
+    """Stable workflow-compilation conflict or topology error."""
+
+
+@dataclass(frozen=True)
+class CompiledWorkflowGraph:
+    """Task ids produced by one atomic workflow compilation."""
+
+    workflow_key: str
+    task_ids: dict[str, str]
+    terminal_task_id: str
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1510,6 +1523,19 @@ CREATE TABLE IF NOT EXISTS architecture_graph_issuances (
     task_ids         TEXT NOT NULL,
     issued_by        TEXT NOT NULL,
     issued_at        INTEGER NOT NULL
+);
+
+-- One immutable, idempotent compilation per workflow. The graph specification
+-- digest lets retries return the original ids while rejecting a request that
+-- reuses the workflow identity for different work.
+CREATE TABLE IF NOT EXISTS workflow_graph_compilations (
+    workflow_key      TEXT PRIMARY KEY,
+    idempotency_key   TEXT NOT NULL,
+    spec_digest       TEXT NOT NULL,
+    task_ids          TEXT NOT NULL,
+    terminal_step_key TEXT NOT NULL,
+    created_by        TEXT NOT NULL,
+    created_at        INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -3575,6 +3601,409 @@ def issue_architecture_graph(
         )
         _append_gate_audit(conn, gate, "architecture_graph_issued")
         return task_ids
+
+
+def compile_workflow_graph(
+    conn: sqlite3.Connection,
+    *,
+    workflow_key: str,
+    idempotency_key: str,
+    created_by: str,
+    steps: list[dict[str, Any]],
+    notification: Optional[dict[str, Any]] = None,
+    tenant: Optional[str] = None,
+    session_id: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+) -> CompiledWorkflowGraph:
+    """Compile one validated workflow graph into the Kanban kernel atomically.
+
+    ``steps`` reference parents by stable step key and declare exactly one
+    ``terminal`` step. Every step must reach that terminal. A notification, if
+    supplied, is written only for the terminal task in the same transaction.
+    Exact retries return the original ids; identity reuse with a different
+    graph is rejected without modifying the board.
+    """
+
+    workflow_key = str(workflow_key or "").strip()
+    idempotency_key = str(idempotency_key or "").strip()
+    created_by = str(created_by or "").strip()
+    if not workflow_key:
+        raise WorkflowGraphError("workflow_key is required")
+    if not idempotency_key:
+        raise WorkflowGraphError("idempotency_key is required")
+    if not created_by:
+        raise WorkflowGraphError("created_by is required")
+    if workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise WorkflowGraphError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}"
+        )
+    if not isinstance(steps, list) or not steps:
+        raise WorkflowGraphError("workflow steps must be a non-empty list")
+
+    allowed_step_fields = {
+        "key", "title", "body", "assignee", "parents", "role", "terminal",
+        "initial_status", "result", "skills", "max_runtime_seconds", "priority",
+    }
+    terminal_roles = {"finalizer", "synthesizer", "reporter"}
+    normalized_steps: list[dict[str, Any]] = []
+    step_keys: set[str] = set()
+    for index, raw in enumerate(steps):
+        if not isinstance(raw, dict):
+            raise WorkflowGraphError(f"steps[{index}] must be an object")
+        unknown_fields = set(raw) - allowed_step_fields
+        if unknown_fields:
+            raise WorkflowGraphError(
+                f"steps[{index}] has unsupported fields: {sorted(unknown_fields)}"
+            )
+        step_key = str(raw.get("key") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        assignee = _canonical_assignee(raw.get("assignee"))
+        body = raw.get("body")
+        parents = raw.get("parents") or []
+        role = str(raw.get("role") or "worker").strip().lower()
+        terminal = raw.get("terminal", False)
+        initial_status = raw.get("initial_status")
+        result = raw.get("result")
+        raw_skills = raw.get("skills")
+        max_runtime_seconds = raw.get("max_runtime_seconds")
+        step_priority = raw.get("priority", priority)
+        if not step_key:
+            raise WorkflowGraphError(f"steps[{index}].key is required")
+        if step_key in step_keys:
+            raise WorkflowGraphError(f"duplicate workflow step key: {step_key}")
+        if not title:
+            raise WorkflowGraphError(f"steps[{index}].title is required")
+        if not assignee:
+            raise WorkflowGraphError(f"steps[{index}].assignee is required")
+        if body is not None and not isinstance(body, str):
+            raise WorkflowGraphError(f"steps[{index}].body must be a string")
+        if not role:
+            raise WorkflowGraphError(f"steps[{index}].role is required")
+        if not isinstance(parents, list) or any(
+            not isinstance(parent, str) or not parent.strip() for parent in parents
+        ):
+            raise WorkflowGraphError(f"steps[{index}].parents must be step keys")
+        normalized_parents = [parent.strip() for parent in parents]
+        if len(set(normalized_parents)) != len(normalized_parents):
+            raise WorkflowGraphError(f"steps[{index}].parents has duplicates")
+        if not isinstance(terminal, bool):
+            raise WorkflowGraphError(f"steps[{index}].terminal must be boolean")
+        if initial_status not in {None, "ready", "todo", "done"}:
+            raise WorkflowGraphError(
+                f"steps[{index}].initial_status must be ready, todo, or done"
+            )
+        if result is not None and not isinstance(result, str):
+            raise WorkflowGraphError(f"steps[{index}].result must be a string")
+        if raw_skills is not None and not isinstance(raw_skills, list):
+            raise WorkflowGraphError(f"steps[{index}].skills must be a list")
+        skills: list[str] = []
+        for skill in raw_skills or []:
+            name = str(skill or "").strip()
+            if not name:
+                continue
+            if "," in name:
+                raise WorkflowGraphError(
+                    f"steps[{index}].skill names cannot contain commas"
+                )
+            if name not in skills:
+                skills.append(name)
+        if max_runtime_seconds is not None:
+            try:
+                max_runtime_seconds = int(max_runtime_seconds)
+            except (TypeError, ValueError) as exc:
+                raise WorkflowGraphError(
+                    f"steps[{index}].max_runtime_seconds must be an integer"
+                ) from exc
+            if max_runtime_seconds <= 0:
+                raise WorkflowGraphError(
+                    f"steps[{index}].max_runtime_seconds must be positive"
+                )
+        try:
+            step_priority = int(step_priority)
+        except (TypeError, ValueError) as exc:
+            raise WorkflowGraphError(
+                f"steps[{index}].priority must be an integer"
+            ) from exc
+        step_keys.add(step_key)
+        normalized_steps.append(
+            {
+                "key": step_key,
+                "title": title,
+                "assignee": assignee,
+                "body": body,
+                "parents": normalized_parents,
+                "role": role,
+                "terminal": terminal,
+                "initial_status": initial_status,
+                "result": result,
+                "skills": skills,
+                "max_runtime_seconds": max_runtime_seconds,
+                "priority": step_priority,
+            }
+        )
+
+    by_key = {step["key"]: step for step in normalized_steps}
+    for step in normalized_steps:
+        unknown = [parent for parent in step["parents"] if parent not in by_key]
+        if unknown:
+            raise WorkflowGraphError(
+                f"workflow step {step['key']} has unknown parent(s): {', '.join(unknown)}"
+            )
+        if step["key"] in step["parents"]:
+            raise WorkflowGraphError(f"workflow step {step['key']} cannot depend on itself")
+        if step["initial_status"] == "done" and step["parents"]:
+            raise WorkflowGraphError(
+                f"precompleted workflow step {step['key']} cannot have parents"
+            )
+        if step["initial_status"] == "ready" and step["parents"]:
+            raise WorkflowGraphError(
+                f"ready workflow step {step['key']} cannot have unfinished parents"
+            )
+
+    terminal_keys = [step["key"] for step in normalized_steps if step["terminal"]]
+    if len(terminal_keys) != 1:
+        raise WorkflowGraphError("workflow graph must declare exactly one terminal step")
+    terminal_key = terminal_keys[0]
+    if by_key[terminal_key]["role"] not in terminal_roles:
+        raise WorkflowGraphError(
+            "workflow terminal role must be finalizer, synthesizer, or reporter"
+        )
+    if by_key[terminal_key]["initial_status"] == "done":
+        raise WorkflowGraphError("workflow terminal cannot start completed")
+
+    children: dict[str, list[str]] = {key: [] for key in by_key}
+    in_degree = {key: len(step["parents"]) for key, step in by_key.items()}
+    for step in normalized_steps:
+        for parent in step["parents"]:
+            children[parent].append(step["key"])
+    ready = [key for key, degree in in_degree.items() if degree == 0]
+    visited = 0
+    while ready:
+        current = ready.pop()
+        visited += 1
+        for child in children[current]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                ready.append(child)
+    if visited != len(normalized_steps):
+        raise WorkflowGraphError("workflow graph contains a cycle")
+
+    reaches_terminal = {terminal_key}
+    frontier = [terminal_key]
+    while frontier:
+        current = frontier.pop()
+        for parent in by_key[current]["parents"]:
+            if parent not in reaches_terminal:
+                reaches_terminal.add(parent)
+                frontier.append(parent)
+    unreachable = [step["key"] for step in normalized_steps if step["key"] not in reaches_terminal]
+    if unreachable:
+        raise WorkflowGraphError(
+            "every workflow step must reach the terminal; unreachable: "
+            + ", ".join(unreachable)
+        )
+
+    normalized_notification: Optional[dict[str, Optional[str]]] = None
+    if notification is not None:
+        if not isinstance(notification, dict):
+            raise WorkflowGraphError("notification must be an object")
+        platform = str(notification.get("platform") or "").strip()
+        chat_id = str(notification.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            raise WorkflowGraphError("notification platform and chat_id are required")
+        normalized_notification = {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": str(notification.get("thread_id") or ""),
+            "user_id": (
+                str(notification["user_id"])
+                if notification.get("user_id") is not None
+                else None
+            ),
+            "notifier_profile": (
+                str(notification["notifier_profile"])
+                if notification.get("notifier_profile") is not None
+                else None
+            ),
+        }
+
+    canonical_steps = [
+        {**step, "parents": sorted(step["parents"])}
+        for step in sorted(normalized_steps, key=lambda item: item["key"])
+    ]
+    canonical_spec = {
+        "version": 1,
+        "workflow_key": workflow_key,
+        "created_by": created_by,
+        "steps": canonical_steps,
+        "notification": normalized_notification,
+        "tenant": tenant,
+        "session_id": session_id,
+        "workspace_kind": workspace_kind,
+        "workspace_path": workspace_path,
+        "priority": int(priority),
+    }
+    spec_digest = hashlib.sha256(
+        json.dumps(
+            canonical_spec,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM workflow_graph_compilations WHERE workflow_key = ?",
+            (workflow_key,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["idempotency_key"] != idempotency_key
+                or existing["spec_digest"] != spec_digest
+            ):
+                raise WorkflowGraphError("workflow graph identity conflict")
+            try:
+                existing_ids = json.loads(existing["task_ids"])
+                if not isinstance(existing_ids, dict):
+                    raise TypeError("task_ids must be an object")
+                terminal_task_id = existing_ids[existing["terminal_step_key"]]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise WorkflowGraphError("workflow graph compilation is corrupt") from exc
+            return CompiledWorkflowGraph(
+                workflow_key=workflow_key,
+                task_ids={str(key): str(value) for key, value in existing_ids.items()},
+                terminal_task_id=str(terminal_task_id),
+            )
+
+        partial = conn.execute(
+            "SELECT 1 FROM tasks WHERE workflow_key = ? LIMIT 1",
+            (workflow_key,),
+        ).fetchone()
+        if partial is not None:
+            raise WorkflowGraphError("workflow graph identity conflict")
+
+        now = int(time.time())
+        task_ids = {step["key"]: _new_task_id() for step in normalized_steps}
+        for step in normalized_steps:
+            if step["initial_status"] is not None:
+                task_status = step["initial_status"]
+            else:
+                task_status = (
+                    "ready"
+                    if all(by_key[parent]["initial_status"] == "done" for parent in step["parents"])
+                    else "todo"
+                )
+            conn.execute(
+                """INSERT INTO tasks (
+                    id, title, body, assignee, status, priority, created_by,
+                    created_at, workspace_kind, workspace_path, tenant,
+                    session_id, workflow_key, current_step_key, result,
+                    completed_at, skills, max_runtime_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_ids[step["key"]],
+                    step["title"],
+                    step["body"],
+                    step["assignee"],
+                    task_status,
+                    step["priority"],
+                    created_by,
+                    now,
+                    workspace_kind,
+                    workspace_path,
+                    tenant,
+                    session_id,
+                    workflow_key,
+                    step["key"],
+                    step["result"],
+                    now if task_status == "done" else None,
+                    json.dumps(step["skills"]) if step["skills"] else None,
+                    step["max_runtime_seconds"],
+                ),
+            )
+            _append_event(
+                conn,
+                task_ids[step["key"]],
+                "created",
+                {
+                    "by": "workflow-compiler",
+                    "workflow_key": workflow_key,
+                    "step_key": step["key"],
+                    "role": step["role"],
+                    "parents": list(step["parents"]),
+                    "terminal": step["terminal"],
+                    "status": task_status,
+                },
+            )
+            if task_status == "done":
+                _append_event(
+                    conn,
+                    task_ids[step["key"]],
+                    "completed",
+                    {
+                        "by": "workflow-compiler",
+                        "workflow_key": workflow_key,
+                        "step_key": step["key"],
+                    },
+                )
+        for step in normalized_steps:
+            for parent in step["parents"]:
+                conn.execute(
+                    "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (task_ids[parent], task_ids[step["key"]]),
+                )
+                _append_event(
+                    conn,
+                    task_ids[step["key"]],
+                    "linked",
+                    {
+                        "parent": task_ids[parent],
+                        "child": task_ids[step["key"]],
+                        "workflow_key": workflow_key,
+                    },
+                )
+
+        terminal_task_id = task_ids[terminal_key]
+        if normalized_notification is not None:
+            conn.execute(
+                """INSERT OR IGNORE INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, user_id,
+                     notifier_profile, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    terminal_task_id,
+                    normalized_notification["platform"],
+                    normalized_notification["chat_id"],
+                    normalized_notification["thread_id"],
+                    normalized_notification["user_id"],
+                    normalized_notification["notifier_profile"],
+                    now,
+                ),
+            )
+        conn.execute(
+            """INSERT INTO workflow_graph_compilations
+                (workflow_key, idempotency_key, spec_digest, task_ids,
+                 terminal_step_key, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                workflow_key,
+                idempotency_key,
+                spec_digest,
+                json.dumps(task_ids, sort_keys=True),
+                terminal_key,
+                created_by,
+                now,
+            ),
+        )
+        return CompiledWorkflowGraph(
+            workflow_key=workflow_key,
+            task_ids=task_ids,
+            terminal_task_id=terminal_task_id,
+        )
 
 
 def issue_discovery_capability(

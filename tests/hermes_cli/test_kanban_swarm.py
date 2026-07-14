@@ -1,4 +1,8 @@
 
+import sqlite3
+
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
@@ -37,7 +41,43 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         assert synthesizer.status == "todo"
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
-        assert all(created.root_id in (task.body or "") for task in workers)
+        assert len({task.workflow_key for task in [root, *workers, verifier, synthesizer]}) == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workflow_graph_compilations"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_create_swarm_rolls_back_the_entire_topology_on_late_failure(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        conn.execute(
+            """CREATE TRIGGER reject_swarm_synthesizer
+               BEFORE INSERT ON tasks
+               WHEN NEW.title = 'Synthesize swarm outputs'
+               BEGIN SELECT RAISE(ABORT, 'injected swarm failure'); END"""
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected swarm failure"):
+            create_swarm(
+                conn,
+                goal="This topology must be all-or-nothing.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile="researcher", title="Research", body="Find evidence",
+                    ),
+                ],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+                idempotency_key="atomic-swarm-request",
+            )
+
+        for table in (
+            "tasks", "task_links", "task_comments", "task_events",
+            "workflow_graph_compilations",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     finally:
         conn.close()
 
