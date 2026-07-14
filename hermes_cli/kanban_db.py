@@ -312,6 +312,8 @@ _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 _CTX_MAX_TOTAL_BYTES    = 48 * 1024  # hard aggregate prompt boundary
 _CTX_MAX_ATTACHMENTS_BYTES = 3 * 1024
+_CTX_MAX_DOWNSTREAM_TASKS = 32
+_CTX_MAX_DOWNSTREAM_BYTES = 4 * 1024
 _CTX_MAX_ATTEMPTS_BYTES = 7 * 1024
 _CTX_MAX_PARENTS_BYTES  = 14 * 1024
 _CTX_MAX_COMMENTS_BYTES = 7 * 1024
@@ -11906,17 +11908,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+      3. Compact identities of direct downstream child tasks, when any are
+         already declared. Bodies and results are deliberately excluded.
+      4. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
+      5. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
+      6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      7. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
@@ -12017,6 +12021,71 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 f"section budget: {_cap(', '.join(omitted_attachments), 512)})_"
             )
         lines.extend([*attachment_lines, ""])
+
+    # Planned downstream work — expose only compact identities for direct
+    # children. Atomic workflow compilation creates the whole graph before the
+    # first worker starts, so hiding child cards causes workers to recreate work
+    # that is already waiting behind them. Dynamic/remediation children and
+    # ordinary non-workflow children use the same direct-link contract: showing
+    # their explicit workflow identity (or ``(none)``) makes the distinction
+    # visible without leaking their bodies, results, comments, or run history.
+    child_count_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_links WHERE parent_id = ?",
+        (task_id,),
+    ).fetchone()
+    child_count = int(child_count_row["n"]) if child_count_row else 0
+    if child_count:
+        child_rows = conn.execute(
+            """SELECT t.id, t.title, t.assignee, t.status,
+                      t.current_step_key, t.workflow_key
+                 FROM task_links l
+                 JOIN tasks t ON t.id = l.child_id
+                WHERE l.parent_id = ?
+                ORDER BY
+                      CASE WHEN ? IS NOT NULL AND t.workflow_key = ? THEN 0 ELSE 1 END,
+                      COALESCE(t.workflow_key, ''),
+                      CASE WHEN t.current_step_key IS NULL OR t.current_step_key = ''
+                           THEN 1 ELSE 0 END,
+                      COALESCE(t.current_step_key, ''),
+                      t.id
+                LIMIT ?""",
+            (
+                task_id,
+                task.workflow_key,
+                task.workflow_key,
+                _CTX_MAX_DOWNSTREAM_TASKS,
+            ),
+        ).fetchall()
+        downstream_section = [
+            "## Planned downstream workflow steps",
+            "_These direct child tasks are already declared. Reuse the declared "
+            "task IDs and workflow steps; do not create duplicate delegated or "
+            "Kanban cards for the same work._",
+        ]
+        omitted_children = child_count - len(child_rows)
+        for row in child_rows:
+            title = " ".join(str(row["title"] or "").split())
+            assignee = " ".join(str(row["assignee"] or "(unassigned)").split())
+            status = " ".join(str(row["status"] or "(unknown)").split())
+            step_key = " ".join(str(row["current_step_key"] or "(none)").split())
+            workflow_key = " ".join(str(row["workflow_key"] or "(none)").split())
+            entry = (
+                f"- `{row['id']}` — {_cap(title, 512)} | "
+                f"assignee: {_cap(assignee, 128)} | status: {_cap(status, 64)} | "
+                f"step: {_cap(step_key, 256)} | workflow: {_cap(workflow_key, 256)}"
+            )
+            if _section_size([*downstream_section, entry]) <= (
+                _CTX_MAX_DOWNSTREAM_BYTES - 512
+            ):
+                downstream_section.append(entry)
+            else:
+                omitted_children += 1
+        if omitted_children:
+            downstream_section.append(
+                f"_({omitted_children} additional direct child task"
+                f"{'s' if omitted_children != 1 else ''} omitted by section budget)_"
+            )
+        lines.extend([*downstream_section, ""])
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).

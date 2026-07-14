@@ -69,6 +69,137 @@ def test_compile_workflow_graph_creates_one_terminal_subscription(tmp_path):
         conn.close()
 
 
+def test_compiled_worker_context_names_declared_direct_downstream_step(tmp_path):
+    """A workflow worker sees its already-compiled child before delegating."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        compiled = kb.compile_workflow_graph(
+            conn,
+            workflow_key="peptimate-build",
+            idempotency_key="peptimate-build-v1",
+            created_by="orchestrator",
+            steps=[
+                {
+                    "key": "implement",
+                    "title": "Implement the deterministic renderer",
+                    "assignee": "coder",
+                },
+                {
+                    "key": "curate-vault",
+                    "title": "Curate durable Peptimate findings",
+                    "body": "FULL-DOWNSTREAM-BODY-MUST-STAY-HIDDEN",
+                    "assignee": "vault-v2-curator",
+                    "parents": ["implement"],
+                },
+                {
+                    "key": "verify",
+                    "title": "Verify the completed workflow",
+                    "assignee": "verifier",
+                    "parents": ["curate-vault"],
+                    "role": "reporter",
+                    "terminal": True,
+                },
+            ],
+        )
+
+        context = kb.build_worker_context(conn, compiled.task_ids["implement"])
+
+        downstream_id = compiled.task_ids["curate-vault"]
+        assert "## Planned downstream workflow steps" in context
+        assert downstream_id in context
+        assert "Curate durable Peptimate findings" in context
+        assert "vault-v2-curator" in context
+        assert "status: todo" in context
+        assert "step: curate-vault" in context
+        assert "workflow: peptimate-build" in context
+        assert "reuse" in context.lower()
+        assert "do not create duplicate" in context.lower()
+        assert "FULL-DOWNSTREAM-BODY-MUST-STAY-HIDDEN" not in context
+        assert compiled.task_ids["verify"] not in context
+    finally:
+        conn.close()
+
+
+def test_worker_context_shows_only_direct_dynamic_children_with_workflow_identity(
+    tmp_path,
+):
+    """Ad-hoc remediation children stay visible without implying ancestry."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        parent = kb.create_task(conn, title="Ordinary implementation", assignee="coder")
+        ad_hoc_child = kb.create_task(
+            conn,
+            title="Ad-hoc documentation follow-up",
+            assignee="writer",
+            parents=[parent],
+        )
+        remediation_child = kb.create_task(
+            conn,
+            title="Repair release diagnostics",
+            assignee="releaser",
+            parents=[parent],
+            workflow_key="release-remediation-1",
+            current_step_key="repair",
+        )
+        completed_child = kb.create_task(
+            conn,
+            title="Previously completed follow-up",
+            assignee="writer",
+        )
+        assert kb.claim_task(conn, completed_child)
+        assert kb.complete_task(
+            conn,
+            completed_child,
+            result="PRIVATE-CHILD-RESULT-MUST-STAY-HIDDEN",
+        )
+        kb.link_tasks(conn, parent, completed_child)
+        nested = kb.create_task(
+            conn,
+            title="Nested verification",
+            assignee="verifier",
+            parents=[remediation_child],
+            workflow_key="release-remediation-1",
+            current_step_key="verify",
+        )
+
+        context = kb.build_worker_context(conn, parent)
+
+        assert ad_hoc_child in context
+        assert remediation_child in context
+        assert completed_child in context
+        assert "workflow: (none)" in context
+        assert "step: (none)" in context
+        assert "workflow: release-remediation-1" in context
+        assert "step: repair" in context
+        assert "PRIVATE-CHILD-RESULT-MUST-STAY-HIDDEN" not in context
+        assert nested not in context
+    finally:
+        conn.close()
+
+
+def test_worker_context_without_children_keeps_the_ordinary_rendering(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Ordinary standalone task",
+            assignee="coder",
+        )
+
+        context = kb.build_worker_context(conn, task_id)
+
+        assert context == (
+            f"# Kanban task {task_id}: Ordinary standalone task\n"
+            "\n"
+            "Assignee: coder\n"
+            "Status:   ready\n"
+            "Workspace: scratch @ (unresolved)\n"
+        )
+        assert "Planned downstream workflow steps" not in context
+    finally:
+        conn.close()
+
+
 def test_compile_workflow_graph_retry_is_idempotent_by_step_identity(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
