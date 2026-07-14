@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,32 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_project_linked_task_uses_project_worktree(client, tmp_path):
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Target Repo", folders=[str(repo)])
+        project = pdb.get_project(conn, project_id)
+    assert project is not None
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Implement safely",
+            "assignee": "coder",
+            "project": project.slug,
+            "branch_name": "feature/scoped-worktree",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["project_id"] == project.id
+    assert task["workspace_kind"] == "worktree"
+    assert task["workspace_path"] == str(repo / ".worktrees" / task["id"])
+    assert task["branch_name"] == "feature/scoped-worktree"
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):

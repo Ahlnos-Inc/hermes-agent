@@ -312,13 +312,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+                               "(default: scratch; use --project or an explicit "
+                               "worktree/dir path for repository work)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
-                               "deterministic branch. See `hermes project list`.")
+                               "deterministic branch. Preferred for repository "
+                               "implementation tasks; scratch workers cannot access "
+                               "another repo. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",

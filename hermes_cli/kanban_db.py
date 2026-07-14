@@ -3914,8 +3914,6 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -3957,6 +3955,13 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    # A valid project link upgrades the default scratch workspace to its
+    # scoped worktree. Validate an explicit branch only after that upgrade so
+    # every creation surface can request ``project`` + ``branch_name`` without
+    # manually duplicating the workspace_kind conversion.
+    if branch_name and workspace_kind != "worktree":
+        raise ValueError("branch_name is only valid for worktree workspaces")
 
     parents = tuple(p for p in parents if p)
 

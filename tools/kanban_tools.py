@@ -2552,7 +2552,10 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
                     "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "absolute workspace_path), 'worktree' (git worktree). "
+                    "For repository implementation, use project (preferred) "
+                    "or an explicit dir/worktree path; scratch is isolated and "
+                    "cannot access another repository."
                 ),
             },
             "workspace_path": {
@@ -2568,7 +2571,9 @@ KANBAN_CREATE_SCHEMA = {
                     "Optional project id or slug to link the task to. When "
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
-                    "task id), instead of a random branch."
+                    "task id), instead of a random branch. Use this for repo "
+                    "implementation cards so the worker receives an explicit, "
+                    "scoped writable worktree."
                 ),
             },
             "triage": {
