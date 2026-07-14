@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.credential_pool import CredentialPool, CredentialPoolExhausted
+from agent.runtime_circuit import runtime_circuit_status
 from run_agent import AIAgent
 
 
@@ -187,8 +188,10 @@ class TestCredentialPoolExhaustedChainExhaustedStillParks:
     the fix must not turn every pool exhaustion into an infinite chain
     walk or silently swallow a genuine dead end."""
 
-    def test_no_fallback_configured_still_parks(self):
+    def test_no_fallback_configured_still_parks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         agent = _make_agent(fallback_model=None)
+        primary_route = dict(agent._primary_runtime)
 
         def fake_api_call(api_kwargs):
             raise _billing_error()
@@ -213,6 +216,9 @@ class TestCredentialPoolExhaustedChainExhaustedStillParks:
         # incident's worker would exit 1 ("crashed") instead of 75
         # ("rate_limited"), tripping the circuit breaker on a quota wall.
         assert result["failure_reason"] == "billing"
+        status = runtime_circuit_status(agent, target=primary_route)
+        assert status is not None
+        assert status.reason == "billing"
 
     def test_fallback_chain_already_exhausted_still_parks(self):
         """The chain exists but every entry has already been consumed
@@ -244,22 +250,20 @@ class TestCredentialPoolExhaustedChainExhaustedStillParks:
         assert result["failure_reason"] == "billing"
 
 
-class TestParkReportsRecordedQuotaOriginOverOwnNonQuotaReason:
-    """BUILD-343: the park path's failure_reason must prefer a quota
-    origin recorded EARLIER in the turn even when the pool-exhaustion
-    park itself is triggered by a non-quota-class error.
+class TestParkReportsQuotaFromAvailabilityOnlyChain:
+    """A quota wall survives a later transport-availability failure.
 
     Sequence: primary hits billing -> eager fallback activates the (only)
-    fallback tier and records quota_origin_reason="billing" ->  that
+    fallback tier and records billing in the turn-wide route ledger -> that
     tier then hits a plain transport error whose OWN credential-pool
     recovery attempt raises CredentialPoolExhausted -> chain is already
     exhausted (one entry, already consumed) -> park. The park's own
-    ``classified.reason`` is ``timeout`` (not quota-class), so without
-    the recorded-origin override the deepseek-style incident would still
-    report "timeout" and miss the kanban exit-75 gate.
+    ``classified.reason`` is ``timeout`` (not quota-class but still route
+    availability), so the complete availability-only chain remains eligible
+    for quota parking.
     """
 
-    def test_park_after_non_quota_pool_exhaustion_reports_earlier_quota_origin(self):
+    def test_park_after_transport_pool_exhaustion_reports_quota(self):
         agent = _make_agent(fallback_model=_FB_CHAIN)
 
         calls = []
@@ -313,8 +317,7 @@ class TestParkReportsRecordedQuotaOriginOverOwnNonQuotaReason:
         assert result["completed"] is False
         # The park's own error text is the pool-exhaustion message for the
         # SECOND hop ("zai") — that part is unchanged by this fix. Only
-        # the failure_reason classification prefers the earlier quota
-        # origin ("billing") over this hop's own transport-triggered
-        # pool exhaustion.
+        # the availability aggregate preserves the concrete quota wall
+        # ("billing") over this hop's transport-triggered pool exhaustion.
         assert result["failure_reason"] == "billing"
         assert "zai" in result["error"]

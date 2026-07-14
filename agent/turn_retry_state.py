@@ -26,11 +26,71 @@ imported by the turn loop without an import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover — type-only, keeps this module dependency-free
-    from agent.error_classifier import ClassifiedError
+    from agent.error_classifier import ClassifiedError, FailoverReason
+
+
+@dataclass
+class RouteFailureLedger:
+    """Availability failures accumulated across one logical user turn.
+
+    Unlike ``TurnRetryState`` this object survives provider switches and the
+    native/external runtime recursion boundary.  The route key is optional for
+    unit callers; production supplies it so repeated bookkeeping for the same
+    abandoned route is idempotent.
+    """
+
+    reasons: list[str] = field(default_factory=list)
+    _recorded_routes: set[tuple[str, str, str]] = field(
+        default_factory=set, repr=False
+    )
+
+    def record(
+        self,
+        reason: "FailoverReason | str",
+        *,
+        route: dict[str, Any] | None = None,
+    ) -> None:
+        value = str(getattr(reason, "value", reason) or "").strip()
+        if not value:
+            return
+        if route is not None:
+            route_key = (
+                str(route.get("runtime") or "hermes").strip().lower(),
+                str(route.get("provider") or "").strip().lower(),
+                str(route.get("model") or "").strip(),
+            )
+            if route_key in self._recorded_routes:
+                return
+            self._recorded_routes.add(route_key)
+        self.reasons.append(value)
+
+    def resolve(self, current: "FailoverReason | str") -> str:
+        """Return the turn-level terminal class for the attempted routes."""
+        from agent.error_classifier import (
+            FailoverReason,
+            is_provider_availability_reason,
+        )
+
+        current_value = str(getattr(current, "value", current) or "").strip()
+        attempted = [*self.reasons, current_value]
+        if attempted and all(is_provider_availability_reason(item) for item in attempted):
+            # Preserve a concrete quota wall for the dispatcher when one was
+            # observed.  Otherwise collapse transport/auth/capacity mixtures
+            # to the typed provider-unavailable outcome.
+            quota_values = {
+                FailoverReason.billing.value,
+                FailoverReason.rate_limit.value,
+                FailoverReason.upstream_rate_limit.value,
+            }
+            for item in attempted:
+                if item in quota_values:
+                    return item
+            return FailoverReason.provider_unavailable.value
+        return current_value
 
 
 @dataclass
@@ -78,34 +138,19 @@ class TurnRetryState:
     # call against the newly-activated provider (#32421).
     restart_with_rebuilt_messages: bool = False
 
-    # ── Cross-hop quota-origin memory (BUILD-343) ────────────────────────
-    # First quota-class (rate_limit / billing / upstream_rate_limit)
-    # FailoverReason value seen this turn, set where the loop escalates to
-    # a fallback/failover for such a reason. A fallback chain can end at a
-    # local/transport-only tier (e.g. omlx-local) with no billing/rate-
-    # limit concept of its own; if THAT hop is what ultimately exhausts
-    # the turn, the terminal failure_reason prefers this recorded origin
-    # over the last hop's transport-class classification — implementing
-    # the documented contract in hermes-runtime-routing-debugging/
-    # SKILL.md: "when the fallback chain exhausts, Hermes surfaces the
-    # original primary error, not the last fallback error." First quota
-    # reason wins; never overwritten once set.
-    quota_origin_reason: Optional[str] = None
+    # Shared across all API-attempt state objects created for one logical
+    # user turn, including native/external runtime hand-offs.
+    route_failures: RouteFailureLedger = field(default_factory=RouteFailureLedger)
 
     def resolve_failure_reason(
         self, classified: ClassifiedError | None = None, *, reason: str | None = None
     ) -> str:
         """Resolve the terminal ``failure_reason`` value for a turn result.
 
-        Implements the BUILD-343 origin-preference contract (previously
-        duplicated inline at every terminal ``return`` in
-        ``conversation_loop.py``): report the CURRENT site's own reason
-        unless it is non-quota-class AND an earlier quota-class origin was
-        recorded this turn via ``quota_origin_reason`` — in which case the
-        earlier origin wins. A fallback chain's tail hop is often a local/
-        transport-only tier with no billing/rate-limit concept of its own;
-        without this preference its plain transport error would mask the
-        real quota-wall cause and the kanban exit-75 gate would never fire.
+        Delegates to the turn-wide route ledger.  Availability-only chains
+        preserve a concrete quota reason when present, otherwise collapse to
+        ``provider_unavailable``.  Any request-specific failure remains the
+        terminal reason so an unchanged bad request is not parked forever.
 
         Exactly one of the two calling conventions applies:
           - ``classified``: pass the current attempt's ``ClassifiedError``
@@ -121,12 +166,10 @@ class TurnRetryState:
                 "resolve_failure_reason: pass classified or reason, not both"
             )
         if classified is not None:
-            if not classified.is_quota_exhaustion and self.quota_origin_reason:
-                return self.quota_origin_reason
-            return classified.reason.value
+            return self.route_failures.resolve(classified.reason)
         if reason is None:
             raise ValueError("resolve_failure_reason requires classified or reason")
-        return reason
+        return self.route_failures.resolve(reason)
 
     def __iter__(self):
         # Convenience for debugging / tests: iterate (name, value) pairs.

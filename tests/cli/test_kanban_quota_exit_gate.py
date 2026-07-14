@@ -42,3 +42,7 @@ def test_kanban_exit_gate_includes_all_quota_class_reasons():
         "429) and belongs in the same exit-75 bucket as rate_limit/billing "
         "— see agent/chat_completion_helpers.py's cooldown grouping."
     )
+    assert "provider_unavailable" in gate_source, (
+        "all-availability fallback exhaustion must use the same exit-75 "
+        "parking path instead of counting as a task crash"
+    )

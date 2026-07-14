@@ -42,6 +42,11 @@ class FailoverReason(enum.Enum):
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
 
+    # Terminal aggregate: every attempted route failed for provider/runtime
+    # availability reasons.  This is not a new provider error classification;
+    # the turn ledger emits it only after the fallback chain is exhausted.
+    provider_unavailable = "provider_unavailable"
+
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload
@@ -65,6 +70,39 @@ class FailoverReason(enum.Enum):
 
     # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
+
+
+_PROVIDER_AVAILABILITY_REASONS = frozenset(
+    {
+        FailoverReason.auth,
+        FailoverReason.auth_permanent,
+        FailoverReason.billing,
+        FailoverReason.rate_limit,
+        FailoverReason.upstream_rate_limit,
+        FailoverReason.overloaded,
+        FailoverReason.server_error,
+        FailoverReason.timeout,
+        FailoverReason.model_not_found,
+        FailoverReason.provider_policy_blocked,
+        FailoverReason.provider_unavailable,
+    }
+)
+
+
+def is_provider_availability_reason(reason: FailoverReason | str) -> bool:
+    """Return whether ``reason`` means the selected route is unavailable.
+
+    Request-specific failures (context, payload, format, and content policy)
+    intentionally stay out of this group: retrying another worker later does
+    not make an unchanged bad request valid.
+    """
+    try:
+        normalized = (
+            reason if isinstance(reason, FailoverReason) else FailoverReason(reason)
+        )
+    except (TypeError, ValueError):
+        return False
+    return normalized in _PROVIDER_AVAILABILITY_REASONS
 
 
 # ── Classification result ───────────────────────────────────────────────
@@ -129,6 +167,10 @@ _BILLING_PATTERNS = [
     "account is deactivated",
     "plan does not include",
     "out of extra usage",  # Anthropic OAuth Pro/Max overage bucket depleted (HTTP 400)
+    # Anthropic OAuth rejects requests it fingerprints as third-party apps
+    # when they cannot draw from the subscription's plan allowance.  This is
+    # an entitlement/billing-lane failure, not a malformed request.
+    "third-party apps now draw from extra usage, not plan limits",
     "out of funds",
     "run out of funds",
     "balance_depleted",

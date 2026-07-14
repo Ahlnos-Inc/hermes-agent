@@ -13,7 +13,7 @@ from dataclasses import fields
 import pytest
 
 from agent.error_classifier import ClassifiedError, FailoverReason
-from agent.turn_retry_state import TurnRetryState
+from agent.turn_retry_state import RouteFailureLedger, TurnRetryState
 
 
 EXPECTED_FIELDS = {
@@ -35,11 +35,11 @@ EXPECTED_FIELDS = {
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
-    "quota_origin_reason",
+    "route_failures",
 }
 
 # Fields that aren't one-shot boolean guards — checked separately below.
-_NON_BOOL_FIELDS = {"quota_origin_reason"}
+_NON_BOOL_FIELDS = {"route_failures"}
 
 
 def test_all_guards_default_false():
@@ -48,15 +48,6 @@ def test_all_guards_default_false():
         if name in _NON_BOOL_FIELDS:
             continue
         assert value is False, f"{name} should default to False"
-
-
-def test_quota_origin_reason_defaults_to_none():
-    # BUILD-343: cross-hop memory of the first quota-class (rate_limit /
-    # billing / upstream_rate_limit) FailoverReason seen this turn, so the
-    # terminal failure_reason can report the quota origin even when the
-    # last hop in the fallback chain fails with a transport-class error.
-    s = TurnRetryState()
-    assert s.quota_origin_reason is None
 
 
 def test_field_set_matches_contract():
@@ -86,33 +77,29 @@ def test_guards_are_independently_mutable():
 
 
 class TestResolveFailureReason:
-    """BUILD-343/BUILD-371: the origin-preference contract, now shared by
-    all 4 terminal-return call sites instead of being duplicated inline."""
+    """BUILD-472: one availability aggregate serves every terminal site."""
 
     def test_quota_class_classified_reports_its_own_reason(self):
         s = TurnRetryState()
         classified = ClassifiedError(reason=FailoverReason.billing)
         assert s.resolve_failure_reason(classified) == "billing"
 
-    def test_nonquota_classified_with_no_recorded_origin_reports_its_own_reason(self):
+    def test_single_availability_failure_reports_provider_unavailable(self):
         s = TurnRetryState()
         classified = ClassifiedError(reason=FailoverReason.timeout)
-        assert s.resolve_failure_reason(classified) == "timeout"
+        assert s.resolve_failure_reason(classified) == "provider_unavailable"
 
-    def test_nonquota_classified_with_recorded_origin_prefers_the_origin(self):
+    def test_availability_chain_with_quota_preserves_quota_reason(self):
         s = TurnRetryState()
-        s.quota_origin_reason = "billing"
+        s.route_failures.record(FailoverReason.billing)
         classified = ClassifiedError(reason=FailoverReason.timeout)
         assert s.resolve_failure_reason(classified) == "billing"
 
-    def test_quota_class_classified_ignores_a_different_recorded_origin(self):
-        # The CURRENT hop is itself quota-class — report it directly, even
-        # if an earlier (different) quota-class origin was recorded. Only
-        # a non-quota current hop falls back to the recorded origin.
+    def test_request_specific_tail_is_not_masked_by_earlier_quota(self):
         s = TurnRetryState()
-        s.quota_origin_reason = "billing"
-        classified = ClassifiedError(reason=FailoverReason.rate_limit)
-        assert s.resolve_failure_reason(classified) == "rate_limit"
+        s.route_failures.record(FailoverReason.billing)
+        classified = ClassifiedError(reason=FailoverReason.format_error)
+        assert s.resolve_failure_reason(classified) == "format_error"
 
     def test_raw_reason_string_with_no_classified_error(self):
         # Sites that die before any ClassifiedError exists this turn (the
@@ -132,3 +119,14 @@ class TestResolveFailureReason:
         classified = ClassifiedError(reason=FailoverReason.billing)
         with pytest.raises(ValueError):
             s.resolve_failure_reason(classified, reason="rate_limit")
+
+
+class TestRouteFailureLedger:
+    def test_all_availability_failures_resolve_to_provider_unavailable(self):
+        ledger = RouteFailureLedger()
+        ledger.record(FailoverReason.timeout)
+
+        assert (
+            ledger.resolve(FailoverReason.overloaded)
+            == FailoverReason.provider_unavailable.value
+        )

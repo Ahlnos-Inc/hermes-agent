@@ -160,8 +160,40 @@ def build_turn_context(
     # Bind the skill write-origin ContextVar for this thread.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
+    # One ledger spans every provider/runtime attempted for this logical turn.
+    # It must exist before native circuit preflight because that preflight may
+    # skip the primary and activate a fallback before the loop starts.
+    from agent.turn_retry_state import RouteFailureLedger
+
+    agent._turn_route_failures = RouteFailureLedger()
+
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+
+    # Native routes share the same reset-aware circuit as whole-agent
+    # runtimes.  Consult it before any request or prompt construction so a
+    # fresh worker does not probe a route another worker already proved
+    # unavailable.  Fallback activation mutates only the live route; the
+    # immutable ``_primary_runtime`` launch/request snapshot is preserved.
+    try:
+        from agent.runtime_circuit import preflight_native_runtime_circuit
+
+        agent._runtime_circuit_preflight_failure = (
+            preflight_native_runtime_circuit(agent)
+        )
+    except RuntimeError as exc:
+        # RuntimeObservationError deliberately subclasses RuntimeError.  A
+        # Kanban ownership/observation failure is not provider availability
+        # and must never be hidden behind fail-open circuit behavior.
+        from hermes_cli.kanban_runtime_contract import RuntimeObservationError
+
+        if isinstance(exc, RuntimeObservationError):
+            raise
+        logger.warning("native runtime circuit preflight failed open", exc_info=True)
+        agent._runtime_circuit_preflight_failure = None
+    except Exception:
+        logger.warning("native runtime circuit preflight failed open", exc_info=True)
+        agent._runtime_circuit_preflight_failure = None
 
     # Tell auxiliary_client what the restored live main route is for this turn.
     # This must run after primary restoration; otherwise a prior turn's

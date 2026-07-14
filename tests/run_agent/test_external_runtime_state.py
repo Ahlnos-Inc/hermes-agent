@@ -1,4 +1,5 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import time
 
@@ -25,6 +26,21 @@ def _make_agent(*, runtime="claude_agent_sdk", fallback_model=None):
             skip_memory=True,
             fallback_model=fallback_model,
         )
+
+
+def _mock_response(content: str):
+    message = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], model="fallback/model", usage=None)
+
+
+def _mock_native_fallback_client():
+    client = MagicMock()
+    client.base_url = "http://localhost:8080/v1"
+    client.api_key = "local"
+    client._custom_headers = None
+    client.default_headers = None
+    return client
 
 
 def test_subscription_runtime_needs_no_api_key_and_is_snapshotted():
@@ -129,6 +145,220 @@ def test_classified_failure_opens_reason_aware_circuit_for_native_route(
     assert status is not None
     assert status.reason == "timeout"
     assert status.until >= started + 299
+
+
+def test_request_specific_failure_does_not_poison_shared_route_circuit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    agent = _make_agent(runtime="hermes")
+    primary_route = dict(agent._primary_runtime)
+
+    assert agent._try_activate_fallback(reason=FailoverReason.format_error) is False
+    assert runtime_circuit_status(agent, target=primary_route) is None
+
+
+def test_native_primary_preflights_shared_circuit_before_first_network_call(
+    tmp_path, monkeypatch
+):
+    """A fresh native worker must skip a primary route another worker opened.
+
+    The immutable primary snapshot is launch intent, so circuit preflight may
+    activate a fallback but must not rewrite that requested route in place.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    fallback = {
+        "provider": "omlx-local",
+        "model": "local-model",
+        "base_url": "http://localhost:8080/v1",
+    }
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        agent = AIAgent(
+            api_key="primary-key",
+            base_url="https://api.deepseek.com/v1",
+            provider="deepseek",
+            model="deepseek-chat",
+            runtime="hermes",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=fallback,
+        )
+    requested_route = dict(agent._primary_runtime)
+    open_runtime_circuit(
+        agent,
+        target=requested_route,
+        reset_at=time.time() + 3600,
+        reason=FailoverReason.billing,
+    )
+    attempts = []
+    observations = []
+    agent._runtime_observer = lambda **payload: observations.append(payload)
+
+    def api_call(_api_kwargs):
+        attempts.append((agent.provider, agent.model))
+        return _mock_response("fallback succeeded")
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=api_call),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_native_fallback_client(), "local-model"),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, _provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert result["completed"] is True
+    assert attempts == [("omlx-local", "local-model")]
+    assert agent._primary_runtime == requested_route
+    assert observations == [
+        {
+            "phase": "fallback",
+            "reason": FailoverReason.billing,
+            "from_route": {
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "runtime": "hermes",
+                "api_mode": "chat_completions",
+            },
+        }
+    ]
+
+
+def test_native_open_circuit_without_fallback_parks_without_network_call(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        agent = AIAgent(
+            api_key="primary-key",
+            base_url="https://api.deepseek.com/v1",
+            provider="deepseek",
+            model="deepseek-chat",
+            runtime="hermes",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    open_runtime_circuit(
+        agent,
+        target=agent._primary_runtime,
+        reset_at=time.time() + 3600,
+        reason=FailoverReason.billing,
+    )
+
+    with (
+        patch.object(agent, "_interruptible_api_call") as api_call,
+        patch.object(agent, "_interruptible_streaming_api_call") as streaming_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do the card")
+
+    api_call.assert_not_called()
+    streaming_call.assert_not_called()
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["failure_reason"] == "billing"
+    assert "circuit" in result["error"].lower()
+
+
+def test_native_chain_records_primary_and_anthropic_entitlement_failures(
+    tmp_path, monkeypatch
+):
+    """Every unavailable route is circuit-opened before chain exhaustion."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    fallback = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-6",
+        "base_url": "https://api.anthropic.com/v1",
+    }
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        agent = AIAgent(
+            api_key="primary-key",
+            base_url="https://api.deepseek.com/v1",
+            provider="deepseek",
+            model="deepseek-chat",
+            runtime="hermes",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=fallback,
+        )
+    agent._disable_streaming = True
+    agent._api_max_retries = 1
+    primary_route = dict(agent._primary_runtime)
+    attempts = []
+
+    def api_call(_api_kwargs):
+        attempts.append((agent.provider, agent.model))
+        if agent.provider == "deepseek":
+            error = Exception("402 Insufficient balance, please add funds")
+            error.status_code = 402
+            raise error
+        error = Exception(
+            "400 invalid_request_error: Third-party apps now draw from extra "
+            "usage, not plan limits"
+        )
+        error.status_code = 400
+        raise error
+
+    anthropic_client = _mock_native_fallback_client()
+    anthropic_client.base_url = "https://api.anthropic.com/v1"
+    anthropic_client.api_key = "anthropic-key"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=api_call),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(anthropic_client, "claude-opus-4-6"),
+        ),
+        patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        patch("agent.anthropic_adapter._is_oauth_token", return_value=True),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, _provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert attempts == [
+        ("deepseek", "deepseek-chat"),
+        ("anthropic", "claude-opus-4-6"),
+    ]
+    assert result["failed"] is True
+    assert result["failure_reason"] == "billing"
+    primary_status = runtime_circuit_status(agent, target=primary_route)
+    fallback_status = runtime_circuit_status(agent, target={**fallback, "runtime": "hermes"})
+    assert primary_status is not None
+    assert primary_status.reason == "billing"
+    assert fallback_status is not None
+    assert fallback_status.reason == "billing"
 
 
 def test_exhausted_credential_pool_skips_fallback_before_activation(

@@ -31,10 +31,14 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.credential_pool import CredentialPoolExhausted
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    is_provider_availability_reason,
+)
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
-from agent.turn_retry_state import TurnRetryState
+from agent.turn_retry_state import RouteFailureLedger, TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -649,6 +653,12 @@ def run_conversation(
         _plugin_user_context = _prepared_context["plugin_user_context"]
         _ext_prefetch_cache = _prepared_context["ext_prefetch_cache"]
 
+    route_failures = getattr(agent, "_turn_route_failures", None)
+    if route_failures is None:
+        # Defensive path for prepared contexts constructed by older callers.
+        route_failures = RouteFailureLedger()
+        agent._turn_route_failures = route_failures
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = int((_prepared_context or {}).get("api_call_count") or 0)
     final_response = None
@@ -719,6 +729,31 @@ def run_conversation(
         )
         result.update(extras)
         return result
+
+    native_preflight_failure = getattr(
+        agent, "_runtime_circuit_preflight_failure", None
+    )
+    if (
+        native_preflight_failure is not None
+        and getattr(agent, "runtime", HERMES_RUNTIME) == HERMES_RUNTIME
+    ):
+        preflight_reason = (
+            native_preflight_failure.reason or FailoverReason.rate_limit.value
+        )
+        error = (
+            "Provider runtime circuit is open until "
+            f"{int(native_preflight_failure.until)} "
+            f"({preflight_reason}); no fallback route is available."
+        )
+        messages.append({"role": "assistant", "content": error})
+        return finalize_external_turn(
+            error,
+            failed=True,
+            exit_reason="native_runtime_circuit_open",
+            error=error,
+            failure_reason=route_failures.resolve(preflight_reason),
+            agent_persisted=True,
+        )
 
     if (
         moa_config
@@ -836,6 +871,7 @@ def run_conversation(
                 continue
             result["api_calls"] = api_call_count
             result["failed"] = True
+            result["failure_reason"] = route_failures.resolve(classified.reason)
             return result
 
         if active_runtime != CLAUDE_AGENT_SDK_RUNTIME:
@@ -1012,14 +1048,7 @@ def run_conversation(
         # session, so that case is checked after selecting the next target.
         if projection.messages:
             messages.extend(projection.messages)
-        if failure.reason in {
-            FailoverReason.rate_limit,
-            FailoverReason.billing,
-            FailoverReason.auth,
-            FailoverReason.auth_permanent,
-            FailoverReason.overloaded,
-            FailoverReason.server_error,
-        }:
+        if is_provider_availability_reason(failure.reason):
             reset_at = open_runtime_circuit(
                 agent,
                 reset_at=failure.reset_at,
@@ -1076,7 +1105,7 @@ def run_conversation(
             failed=True,
             exit_reason="claude_fallback_exhausted",
             error=failure.message,
-            failure_reason=failure.reason.value,
+            failure_reason=route_failures.resolve(failure.reason),
             agent_persisted=True,
         )
 
@@ -1482,7 +1511,7 @@ def run_conversation(
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
-        _retry = TurnRetryState()
+        _retry = TurnRetryState(route_failures=route_failures)
         max_compression_attempts = 3
 
         finish_reason = "stop"
@@ -1517,7 +1546,9 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(
+                            reason=FailoverReason.rate_limit
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -1867,7 +1898,9 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(
+                        reason=FailoverReason.server_error
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -1940,7 +1973,9 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(
+                            reason=FailoverReason.server_error
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -1959,7 +1994,10 @@ def run_conversation(
                             "completed": False,
                             "api_calls": api_call_count,
                             "error": _final_response,
-                            "failed": True  # Mark as failure for filtering
+                            "failed": True,  # Mark as failure for filtering
+                            "failure_reason": route_failures.resolve(
+                                FailoverReason.server_error
+                            ),
                         }
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
@@ -3052,22 +3090,17 @@ def run_conversation(
                             agent._buffer_status(
                                 f"⚠️ {_pool_exhausted} — switching to fallback provider..."
                             )
-                            # BUILD-343: same quota-origin memory as the
-                            # eager rate-limit/billing failover below —
-                            # pool exhaustion escalating to fallback is
-                            # itself a quota-class event.
-                            if (
-                                classified.is_quota_exhaustion
-                                and _retry.quota_origin_reason is None
-                            ):
-                                _retry.quota_origin_reason = classified.reason.value
-                            if agent._try_activate_fallback(reason=classified.reason):
-                                active_system_prompt = _sync_failover_system_message(
-                                    agent, api_messages, active_system_prompt)
-                                retry_count = 0
-                                compression_attempts = 0
-                                _retry.primary_recovery_attempted = False
-                                continue
+                        # Record the dead route even when the chain is empty or
+                        # already exhausted.  _try_activate_fallback is the
+                        # single bounded transition/recording primitive and
+                        # returns False immediately when there is nowhere to go.
+                        if agent._try_activate_fallback(reason=classified.reason):
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
                     except Exception:
                         logger.exception(
                             "%sfallback activation raised while handling pool "
@@ -3647,14 +3680,6 @@ def run_conversation(
                         )
                     )
                     if not pool_may_recover:
-                        # BUILD-343: remember the quota-class origin before
-                        # walking to the next hop — see TurnRetryState.
-                        # quota_origin_reason. `is_rate_limited` is exactly
-                        # the quota-class check (rate_limit/billing/
-                        # upstream_rate_limit); `_is_transport_failure`
-                        # shares this block but must not be recorded.
-                        if is_rate_limited and _retry.quota_origin_reason is None:
-                            _retry.quota_origin_reason = classified.reason.value
                         if _is_upstream:
                             _upstream_name = (classified.error_context or {}).get(
                                 "upstream_provider", "aggregator"
@@ -4192,7 +4217,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4325,13 +4350,9 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
-                        # BUILD-371: billing is deliberately NOT excluded
-                        # from is_client_error (see the comment on
-                        # is_client_error above) so a quota death can land
-                        # here even though this branch is mostly non-quota
-                        # client errors (auth_permanent, format_error,
-                        # etc). Same origin-preference semantics as the
-                        # other terminal returns.
+                        # Resolve across every abandoned route. Availability-
+                        # only exhaustion is parkable; a request-specific tail
+                        # (format/content/context) remains a task failure.
                         "failure_reason": _retry.resolve_failure_reason(classified),
                     }
 
@@ -4356,7 +4377,7 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0

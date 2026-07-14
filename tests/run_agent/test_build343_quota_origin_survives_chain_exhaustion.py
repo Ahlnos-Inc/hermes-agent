@@ -19,11 +19,10 @@ hermes-runtime-routing-debugging/SKILL.md``: "when the fallback chain
 exhausts, Hermes surfaces the original primary error, not the last
 fallback error."
 
-Fix: ``TurnRetryState.quota_origin_reason`` remembers the first quota-class
-FailoverReason seen this turn (set at the eager-fallback quota gate in
-conversation_loop.py). The terminal return prefers that recorded reason
-over the last hop's classification when the last hop is NOT itself
-quota-class.
+Fix: a turn-wide ``RouteFailureLedger`` records each abandoned route.  When
+the complete chain contains only provider-availability failures, the terminal
+result preserves a concrete quota reason when one exists; otherwise it emits
+``provider_unavailable``.  Request-specific failures are never masked.
 
 Harness mirrors test_32646_fallback_429_after_timeout.py and
 test_build342_pool_exhausted_fallback.py: drive the real
@@ -36,6 +35,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.runtime_circuit import runtime_circuit_status
 from run_agent import AIAgent
 
 
@@ -145,13 +145,18 @@ class TestQuotaOriginSurvivesTransportTailFailure:
         # only the failure_reason classification prefers the origin.
         assert "omlx-local" in result["error"] or "connection refused" in result["error"].lower()
 
-    def test_no_quota_event_keeps_transport_reason_unchanged(self):
-        """Control: a turn with NO quota-class event anywhere in the chain
-        (pure transport failure from the start, no fallback configured)
-        must be unaffected by the fix — failure_reason stays the plain
-        transport classification and exit stays 1 (generic), not 75."""
+    def test_transport_only_exhaustion_is_typed_provider_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """A route exhausted only by infrastructure faults is parkable.
+
+        The terminal type describes the turn-wide availability outcome rather
+        than exposing whichever transport subtype happened to be last.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         agent = _make_agent(fallback_model=None)
         agent._api_max_retries = 2
+        primary_route = dict(agent._primary_runtime)
 
         def fake_api_call(api_kwargs):
             raise ConnectionError("connection refused")
@@ -167,4 +172,7 @@ class TestQuotaOriginSurvivesTransportTailFailure:
 
         assert result["failed"] is True
         assert result["completed"] is False
-        assert result["failure_reason"] == "timeout"
+        assert result["failure_reason"] == "provider_unavailable"
+        status = runtime_circuit_status(agent, target=primary_route)
+        assert status is not None
+        assert status.reason == "timeout"

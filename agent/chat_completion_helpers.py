@@ -1219,6 +1219,10 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 def _record_failed_runtime_circuit(agent, reason: "FailoverReason") -> None:
     """Persist current-route health before fallback mutates agent identity."""
+    from agent.error_classifier import is_provider_availability_reason
+
+    if not is_provider_availability_reason(reason):
+        return
     try:
         from agent.runtime_circuit import open_runtime_circuit
 
@@ -1254,6 +1258,18 @@ def try_activate_fallback(
     mappings.
     """
     from hermes_cli.kanban_runtime_contract import RuntimeObservationError
+
+    if reason is not None:
+        route_failures = getattr(agent, "_turn_route_failures", None)
+        if route_failures is not None:
+            route_failures.record(
+                reason,
+                route={
+                    "provider": getattr(agent, "provider", ""),
+                    "model": getattr(agent, "model", ""),
+                    "runtime": getattr(agent, "runtime", "hermes"),
+                },
+            )
 
     if reason is not None and _record_failed_route:
         _record_failed_runtime_circuit(agent, reason)

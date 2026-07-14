@@ -5,6 +5,7 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     classify_api_error,
+    is_provider_availability_reason,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
@@ -55,6 +56,7 @@ class TestFailoverReason:
             "auth", "auth_permanent", "billing", "rate_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
+            "provider_unavailable",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
             "invalid_encrypted_content",
@@ -68,6 +70,34 @@ class TestFailoverReason:
         }
         actual = {r.value for r in FailoverReason}
         assert expected == actual
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            FailoverReason.billing,
+            FailoverReason.rate_limit,
+            FailoverReason.auth_permanent,
+            FailoverReason.overloaded,
+            FailoverReason.timeout,
+            FailoverReason.model_not_found,
+            FailoverReason.provider_policy_blocked,
+            FailoverReason.provider_unavailable,
+        ],
+    )
+    def test_provider_availability_group(self, reason):
+        assert is_provider_availability_reason(reason) is True
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            FailoverReason.format_error,
+            FailoverReason.context_overflow,
+            FailoverReason.content_policy_blocked,
+            FailoverReason.unknown,
+        ],
+    )
+    def test_request_specific_reasons_are_not_provider_availability(self, reason):
+        assert is_provider_availability_reason(reason) is False
 
 
 # ── Test: ClassifiedError ──────────────────────────────────────────────
@@ -1371,6 +1401,32 @@ class TestAdversarialEdgeCases:
         assert result.should_fallback is True
         assert result.retryable is False
         assert result.should_rotate_credential is True
+
+    def test_400_anthropic_third_party_app_entitlement_is_billing(self):
+        """Anthropic's OAuth billing-lane rejection is route availability.
+
+        This exact 400 is emitted when Anthropic identifies a request as a
+        third-party app whose subscription has no usable extra-usage lane.  It
+        must engage fallback/circuit handling rather than look like a malformed
+        task request.
+        """
+        message = "Third-party apps now draw from extra usage, not plan limits"
+        error = MockAPIError(
+            message,
+            status_code=400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": message,
+                }
+            },
+        )
+
+        result = classify_api_error(error, provider="anthropic")
+
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.retryable is False
 
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""

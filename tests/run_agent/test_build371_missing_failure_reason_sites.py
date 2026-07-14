@@ -9,13 +9,11 @@ loop, before any API call is attempted this iteration): a genuine quota
 death with no fallback provider configured must report
 ``failure_reason: "rate_limit"``.
 
-Site 2 — the ``is_client_error`` non-retryable terminal return: billing is
-deliberately NOT excluded from ``is_client_error`` (see the inline comment
-above it in conversation_loop.py), so a quota death can land here after the
-fallback chain exhausts on a non-quota client error. Must apply the same
-origin-preference semantics as the other three sites (BUILD-343): prefer
-an earlier-recorded quota-class origin over this hop's own non-quota
-classification.
+Site 2 — the ``is_client_error`` non-retryable terminal return must always
+carry its typed reason. BUILD-472 refines the old origin-preference rule:
+only all-availability chains preserve an earlier quota wall. A request-shape
+or content failure remains the terminal reason and must not enter exit-75
+parking merely because an earlier provider was unavailable.
 
 Harness mirrors test_build342_pool_exhausted_fallback.py and
 test_build343_quota_origin_survives_chain_exhaustion.py: drive the real
@@ -192,15 +190,14 @@ class TestClientErrorTerminalReportsFailureReason:
         assert result["completed"] is False
         assert result["failure_reason"] == "format_error"
 
-    def test_billing_then_nonquota_client_error_reports_billing_origin(self):
-        """Primary hits billing (402) -> eager fallback activates the
-        (only) fallback tier and records quota_origin_reason='billing' ->
-        that tier then hits a plain non-retryable 422 -> chain is already
-        exhausted (one entry, already consumed) -> is_client_error
-        terminal return. The park's own ``classified.reason`` is
-        'format_error' (not quota-class), so without the recorded-origin
-        override this would report 'format_error' and miss the kanban
-        exit-75 gate."""
+    def test_billing_then_request_error_reports_request_error(self):
+        """A non-availability tail prevents availability-only parking.
+
+        Primary billing followed by a 422 request-shape rejection is not an
+        all-provider-availability exhaustion.  The request-specific terminal
+        reason must win so the dispatcher does not defer an unchanged bad
+        request forever merely because an earlier route was out of quota.
+        """
         agent = _make_agent(fallback_model=_FB_CHAIN)
 
         calls = []
@@ -244,4 +241,4 @@ class TestClientErrorTerminalReportsFailureReason:
 
         assert result["failed"] is True
         assert result["completed"] is False
-        assert result["failure_reason"] == "billing"
+        assert result["failure_reason"] == "format_error"

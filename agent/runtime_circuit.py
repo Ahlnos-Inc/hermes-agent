@@ -224,9 +224,41 @@ def runtime_circuit_open_until(
     return state.until if state is not None else None
 
 
+def preflight_native_runtime_circuit(agent: Any) -> RuntimeCircuitState | None:
+    """Skip a known-unavailable native route before its first network call.
+
+    The primary runtime snapshot is immutable launch intent.  This helper only
+    advances the existing fallback state machine; it never rewrites that
+    snapshot.  Whole-agent runtimes perform their own attestation before
+    circuit lookup and therefore do not use this native preflight.
+
+    Returns the open state when no fallback can be activated, otherwise
+    ``None`` after either a clear circuit or a successful fallback switch.
+    """
+    if str(getattr(agent, "runtime", "hermes") or "hermes") != "hermes":
+        return None
+    state = runtime_circuit_status(agent)
+    if state is None:
+        return None
+
+    from agent.error_classifier import FailoverReason
+
+    try:
+        reason = FailoverReason(state.reason) if state.reason else FailoverReason.rate_limit
+    except ValueError:
+        reason = FailoverReason.rate_limit
+    if agent._try_activate_fallback(
+        reason=reason,
+        _record_failed_route=False,
+    ):
+        return None
+    return state
+
+
 __all__ = [
     "RuntimeCircuitState",
     "open_runtime_circuit",
+    "preflight_native_runtime_circuit",
     "runtime_circuit_open_until",
     "runtime_circuit_status",
     "runtime_circuit_ttl_seconds",

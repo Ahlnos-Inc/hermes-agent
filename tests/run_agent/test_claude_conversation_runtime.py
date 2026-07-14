@@ -6,6 +6,7 @@ import pytest
 
 from agent.claude_agent_runtime import ClaudeProjection, RuntimeFailure
 from agent.error_classifier import FailoverReason
+from agent.runtime_circuit import runtime_circuit_status
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 from run_agent import AIAgent
 
@@ -276,6 +277,29 @@ def test_billing_failure_opens_circuit_falls_back_and_records_usage(caplog):
     assert fallback_event["to_model"] == "gpt-5.4"
     assert fallback_event["to_runtime"] == "codex_app_server"
     assert events["runtime_billing_mode"]["billing_mode"] == "subscription_included"
+
+
+def test_claude_timeout_exhaustion_is_provider_unavailable_and_opens_circuit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    agent = _agent()
+    primary_route = dict(agent._primary_runtime)
+    rejected = ClaudeProjection(
+        failure=RuntimeFailure(FailoverReason.timeout, "subscription runtime timed out")
+    )
+
+    with patch(
+        "agent.external_runtime.run_claude_agent_sdk_attempt",
+        return_value=rejected,
+    ):
+        result = agent.run_conversation("do the card")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "provider_unavailable"
+    status = runtime_circuit_status(agent, target=primary_route)
+    assert status is not None
+    assert status.reason == "timeout"
 
 
 def test_auth_failure_activates_fallback():
@@ -776,7 +800,7 @@ def test_external_chain_exhaustion_returns_one_failed_user_turn():
     )
 
     def fake_codex_turn(self, user_input, **kwargs):
-        return TurnResult(error="codex also limited")
+        return TurnResult(error="codex also rate limit exceeded")
 
     with (
         patch(
@@ -790,6 +814,7 @@ def test_external_chain_exhaustion_returns_one_failed_user_turn():
 
     assert result["completed"] is False
     assert result["failed"] is True
+    assert result["failure_reason"] == "rate_limit"
     assert result["api_calls"] == 2
     assert sum(message.get("role") == "user" for message in result["messages"]) == 1
 
