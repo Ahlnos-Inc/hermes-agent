@@ -7689,21 +7689,154 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _exclude_managed_worktree_container(repo_root: Path, target: Path) -> None:
+    """Hide Hermes's in-repo worktree container from source status output."""
+    try:
+        relative = target.resolve(strict=False).relative_to(repo_root.resolve(strict=False))
+    except ValueError:
+        return
+    if not relative.parts or relative.parts[0] != ".worktrees":
+        return
+    common_dir = _git_common_dir(repo_root)
+    if common_dir is None:
+        return
+    exclude_path = common_dir / "info" / "exclude"
+    try:
+        existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        if any(line.strip() == ".worktrees/" for line in existing.splitlines()):
+            return
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
+        with exclude_path.open("a", encoding="utf-8") as handle:
+            handle.write(prefix + ".worktrees/\n")
+    except OSError:
+        # Status cleanliness is helpful but not required for recoverability.
+        pass
+
+
+def _create_git_checkpoint(
+    repo_root: Path,
+    *,
+    checkpoint_key: str,
+) -> tuple[str, str]:
+    """Snapshot tracked + non-ignored untracked WIP through an alternate index."""
+    safe_key = re.sub(r"[^A-Za-z0-9._-]+", "-", checkpoint_key).strip("-.")
+    if not safe_key:
+        raise ValueError("checkpoint key has no safe git-ref characters")
+    checkpoint_ref = f"refs/hermes/checkpoints/{safe_key}"
+    temp_dir = Path(tempfile.mkdtemp(prefix="hermes-kanban-index-"))
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(temp_dir / "index")
+    env["GIT_AUTHOR_NAME"] = "Hermes Kanban"
+    env["GIT_AUTHOR_EMAIL"] = "hermes-kanban@localhost"
+    env["GIT_COMMITTER_NAME"] = env["GIT_AUTHOR_NAME"]
+    env["GIT_COMMITTER_EMAIL"] = env["GIT_AUTHOR_EMAIL"]
+
+    def run(*args: str, input_text: Optional[str] = None) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=env,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+        return (result.stdout or "").strip()
+
+    try:
+        head_result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        head = (head_result.stdout or "").strip() if head_result.returncode == 0 else None
+        if head:
+            run("read-tree", head)
+        else:
+            run("read-tree", "--empty")
+        # The alternate index captures the source exactly while leaving the
+        # user's real index, branch, and files untouched. Git's ignore rules
+        # remain authoritative; the managed worktree container is never data.
+        run("add", "-A", "--", ".")
+        tree = run("write-tree")
+        commit_args = ["commit-tree", tree]
+        if head:
+            commit_args.extend(["-p", head])
+        commit_args.extend(["-m", f"Hermes recoverable checkpoint {safe_key}"])
+        checkpoint_sha = run(*commit_args)
+        run("update-ref", checkpoint_ref, checkpoint_sha)
+        return checkpoint_ref, checkpoint_sha
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _existing_checkpoint(
+    repo_root: Path,
+    checkpoint_key: str,
+) -> tuple[Optional[str], Optional[str]]:
+    safe_key = re.sub(r"[^A-Za-z0-9._-]+", "-", checkpoint_key).strip("-.")
+    if not safe_key:
+        return None, None
+    checkpoint_ref = f"refs/hermes/checkpoints/{safe_key}"
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", checkpoint_ref],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    checkpoint_sha = (result.stdout or "").strip()
+    if result.returncode != 0 or not checkpoint_sha:
+        return None, None
+    return checkpoint_ref, checkpoint_sha
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    checkpoint_key: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Materialize a linked worktree from a recoverable source checkpoint."""
     target = target.expanduser()
+    branch_check = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch_name],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if branch_check.returncode != 0:
+        raise ValueError(f"invalid worktree branch name: {branch_name!r}")
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
-            return
+            return _existing_checkpoint(repo_root, checkpoint_key)
+    _exclude_managed_worktree_container(repo_root, target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_ref: Optional[str] = None
+    checkpoint_sha: Optional[str] = None
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
+        checkpoint_ref, checkpoint_sha = _existing_checkpoint(
+            repo_root, checkpoint_key,
+        )
     else:
+        checkpoint_ref, checkpoint_sha = _create_git_checkpoint(
+            repo_root,
+            checkpoint_key=checkpoint_key,
+        )
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), checkpoint_sha,
         ]
     result = subprocess.run(
         cmd,
@@ -7717,11 +7850,12 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    return checkpoint_ref, checkpoint_sha
 
 
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
-) -> tuple[Path, str]:
+) -> tuple[Path, str, Optional[str], Optional[str]]:
     """Resolve + materialize a linked git worktree for ``task``.
 
     When ``task.workspace_path`` is unset, the anchor is the board's
@@ -7759,8 +7893,10 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
-        return target, branch_name
+        checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+            repo_root, target, branch_name, checkpoint_key=task.id,
+        )
+        return target, branch_name, checkpoint_ref, checkpoint_sha
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -7772,13 +7908,15 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        return requested_resolved, actual_branch or branch_name
+        return requested_resolved, actual_branch or branch_name, None, None
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
-        return target, branch_name
+        checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+            repo_root, target, branch_name, checkpoint_key=task.id,
+        )
+        return target, branch_name, checkpoint_ref, checkpoint_sha
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -7786,8 +7924,10 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+        repo_root, requested, branch_name, checkpoint_key=task.id,
+    )
+    return requested, branch_name, checkpoint_ref, checkpoint_sha
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -7847,7 +7987,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name, _checkpoint_ref, _checkpoint_sha = (
+            _resolve_worktree_workspace(task, board=board)
+        )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -10182,8 +10324,15 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
+            checkpoint_ref = None
+            checkpoint_sha = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                (
+                    workspace,
+                    resolved_branch_name,
+                    checkpoint_ref,
+                    checkpoint_sha,
+                ) = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10208,6 +10357,20 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            if checkpoint_ref and checkpoint_sha:
+                with write_txn(conn):
+                    if conn.execute(
+                        "SELECT 1 FROM task_events WHERE task_id = ? "
+                        "AND kind = 'workspace_checkpointed' LIMIT 1",
+                        (claimed.id,),
+                    ).fetchone() is None:
+                        _append_event(
+                            conn,
+                            claimed.id,
+                            "workspace_checkpointed",
+                            {"ref": checkpoint_ref, "sha": checkpoint_sha},
+                            run_id=claimed.current_run_id,
+                        )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10306,8 +10469,15 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
+            checkpoint_ref = None
+            checkpoint_sha = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                (
+                    workspace,
+                    resolved_branch_name,
+                    checkpoint_ref,
+                    checkpoint_sha,
+                ) = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10329,6 +10499,20 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            if checkpoint_ref and checkpoint_sha:
+                with write_txn(conn):
+                    if conn.execute(
+                        "SELECT 1 FROM task_events WHERE task_id = ? "
+                        "AND kind = 'workspace_checkpointed' LIMIT 1",
+                        (claimed.id,),
+                    ).fetchone() is None:
+                        _append_event(
+                            conn,
+                            claimed.id,
+                            "workspace_checkpointed",
+                            {"ref": checkpoint_ref, "sha": checkpoint_sha},
+                            run_id=claimed.current_run_id,
+                        )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
