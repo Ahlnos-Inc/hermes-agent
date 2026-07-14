@@ -14,11 +14,12 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -3643,6 +3644,16 @@ class LaunchdLabelProbe:
     disabled: tuple[str, ...]
     absent: tuple[str, ...]
     unknown: tuple[str, ...]
+    unknown_details: tuple[str, ...] = ()
+    disabled_unknown: tuple[str, ...] = ()
+    disabled_unknown_details: tuple[str, ...] = ()
+    pids: tuple[tuple[str, int | None], ...] = ()
+
+    def pid_for(self, domain: str) -> int | None:
+        for candidate, pid in self.pids:
+            if candidate == domain:
+                return pid
+        return None
 
 
 @dataclass(frozen=True)
@@ -3697,33 +3708,40 @@ def _launchd_label_is_disabled(domain: str, label: str) -> bool | None:
     release/domain, so an inability to inspect it is represented as ``None``
     rather than as a false claim about the desired state.
     """
-    try:
-        result = subprocess.run(
-            ["launchctl", "print-disabled", domain],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-
-    label_pattern = re.compile(
-        rf"^\s*(?:{re.escape(label)}|\"{re.escape(label)}\"|'"
-        rf"{re.escape(label)}')\s*=>\s*(?:true|disabled)(?:\s*[,;])?\s*$",
-        re.IGNORECASE,
-    )
-    return any(label_pattern.search(line) for line in (result.stdout or "").splitlines())
+    state, _detail = _launchd_disabled_probe(domain, label)
+    return state
 
 
 class LaunchdAllOperationError(RuntimeError):
     """One or more intended all-profile launchd targets were not verified."""
 
-    def __init__(self, message: str, failures: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        message: str,
+        failures: tuple[str, ...] = (),
+        outcomes: tuple["LaunchdAllTargetOutcome", ...] = (),
+    ):
         super().__init__(message)
         self.failures = failures
+        self.outcomes = outcomes
+
+
+@dataclass(frozen=True)
+class LaunchdAllTargetOutcome:
+    """The verified result for one all-profile target."""
+
+    label: str
+    domain: str
+    status: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class LaunchdAllResult:
+    """Structured result for a cross-profile launchd lifecycle operation."""
+
+    operation: str
+    outcomes: tuple[LaunchdAllTargetOutcome, ...]
 
 
 @dataclass(frozen=True)
@@ -3735,11 +3753,17 @@ class LaunchdAllTarget:
     plist_path: Path
     plist_fingerprint: str
     hermes_home: Path
-    was_disabled: bool
     was_loaded: bool
     pid: int | None
     start_time: int | None
-    profile_identity: str | None = None
+    probe: LaunchdLabelProbe = field(
+        default_factory=lambda: LaunchdLabelProbe((), (), (), ())
+    )
+    plist_stat_identity: tuple[int, ...] = ()
+
+    @property
+    def was_disabled(self) -> bool:
+        return bool(self.probe.disabled)
 
     @property
     def launchctl_target(self) -> str:
@@ -3752,140 +3776,178 @@ class _LaunchdAllPlistIdentity:
     path: Path
     fingerprint: str
     hermes_home: Path
+    stat_identity: tuple[int, ...]
 
 
-_LAUNCHD_ABSENCE_EXIT_CODES = frozenset({3, 113})
+@dataclass(frozen=True)
+class _SecureLaunchdPlist:
+    path: Path
+    document: dict
+    raw: bytes
+    fingerprint: str
+    stat_identity: tuple[int, ...]
 
 
 def _launchd_process_start_time(pid: int | None) -> int | None:
     if pid is None:
         return None
-    try:
-        from gateway.status import get_process_start_time
+    from gateway.status import get_process_start_time
 
-        return get_process_start_time(pid)
-    except Exception:
-        return None
+    return get_process_start_time(pid)
 
 
 def _launchd_pid_is_live(
     pid: int, expected_start_time: int | None = None
 ) -> bool:
-    try:
-        from gateway.status import _pid_exists, get_process_start_time
+    from gateway.status import _pid_exists, get_process_start_time
 
-        if not _pid_exists(pid):
-            return False
-        if expected_start_time is None:
-            return True
-        current_start_time = get_process_start_time(pid)
-        return current_start_time is not None and current_start_time == expected_start_time
-    except Exception:
+    if not _pid_exists(pid):
         return False
+    if expected_start_time is None:
+        return True
+    current_start_time = get_process_start_time(pid)
+    return current_start_time is not None and current_start_time == expected_start_time
 
 
-def _launchd_profile_suffix_for_home(
-    hermes_home: Path, *, default_root: Path | None = None
-) -> str:
-    """Derive the service suffix without changing the active profile."""
-    default = default_root
-    if default is None:
-        from hermes_constants import get_default_hermes_root
-
-        default = get_default_hermes_root()
-    home = hermes_home.resolve()
-    default = default.resolve()
-    if home == default:
-        return ""
-    profiles_root = default / "profiles"
+def _read_secure_launchd_plist(path: Path) -> _SecureLaunchdPlist:
+    """Read one LaunchAgent through an attested, non-following file descriptor."""
+    fd: int | None = None
     try:
-        relative = home.relative_to(profiles_root)
-    except ValueError:
-        return hashlib.sha256(str(home).encode()).hexdigest()[:8]
-    if len(relative.parts) == 1 and re.fullmatch(
-        r"[a-z0-9][a-z0-9_-]{0,63}", relative.parts[0]
-    ):
-        return relative.parts[0]
-    return hashlib.sha256(str(home).encode()).hexdigest()[:8]
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise LaunchdInventoryError(f"Refusing non-regular launchd plist: {path}")
+        if metadata.st_uid not in {os.getuid(), 0}:
+            raise LaunchdInventoryError(f"Refusing non-owned launchd plist: {path}")
+        if metadata.st_mode & 0o022:
+            raise LaunchdInventoryError(
+                f"Refusing writable launchd plist: {path}"
+            )
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read()
+        fd = None
+    except LaunchdInventoryError:
+        raise
+    except (OSError, ValueError) as exc:
+        if path.is_symlink():
+            raise LaunchdInventoryError(
+                f"Refusing non-regular launchd plist: {path}"
+            ) from exc
+        raise LaunchdInventoryError(
+            f"Could not securely read launchd plist {path}: {exc}"
+        ) from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
-
-def _read_launchd_all_plist_identity(path: Path) -> _LaunchdAllPlistIdentity:
-    """Read and attest one plist's label, profile invocation, and home."""
-    if path.is_symlink() or not path.is_file():
-        raise LaunchdAllOperationError(f"Refusing non-owned launchd plist: {path}")
+    stat_identity = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+    fingerprint = hashlib.sha256(
+        raw + b"\0" + repr(stat_identity).encode("ascii")
+    ).hexdigest()
     try:
-        raw = path.read_bytes()
         document = plistlib.loads(raw)
-    except (OSError, plistlib.InvalidFileException, ValueError, TypeError) as exc:
-        raise LaunchdAllOperationError(f"Could not validate launchd plist {path}") from exc
+    except (plistlib.InvalidFileException, ValueError, TypeError) as exc:
+        raise LaunchdInventoryError(f"Could not validate launchd plist {path}") from exc
     if not isinstance(document, dict):
-        raise LaunchdAllOperationError(f"Could not validate launchd plist {path}")
+        raise LaunchdInventoryError(f"Could not validate launchd plist {path}")
+    return _SecureLaunchdPlist(path, document, raw, fingerprint, stat_identity)
 
-    label = path.stem
-    if document.get("Label") != label:
-        raise LaunchdAllOperationError(f"Launchd plist label mismatch for {path}")
+
+def _launchd_gateway_profile_invocation(
+    label: str, document: dict
+) -> tuple[Path, str | None]:
+    """Validate a plist's Hermes identity without consulting the active caller."""
     environment = document.get("EnvironmentVariables")
     home_value = environment.get("HERMES_HOME") if isinstance(environment, dict) else None
     if not isinstance(home_value, str) or not home_value.strip():
         raise LaunchdAllOperationError(f"{label}: HERMES_HOME identity is missing")
-    hermes_home = Path(home_value).resolve()
-
-    from hermes_constants import get_default_hermes_root
-
-    default_root = get_default_hermes_root().resolve()
-    suffix = _launchd_profile_suffix_for_home(hermes_home, default_root=default_root)
-    expected_label = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    if label != expected_label:
-        raise LaunchdAllOperationError(
-            f"{label}: HERMES_HOME identity does not match the LaunchAgent label"
-        )
+    home_path = Path(home_value)
+    if not home_path.is_absolute():
+        raise LaunchdAllOperationError(f"{label}: HERMES_HOME must be absolute")
+    hermes_home = home_path.resolve()
 
     arguments = document.get("ProgramArguments")
     if not _launchd_program_arguments_are_hermes_gateway(arguments):
         raise LaunchdAllOperationError(f"{label}: foreign ProgramArguments")
-    expected_profile = _profile_arg(str(hermes_home), default_root=default_root)
-    expected_tail = expected_profile.split() + ["gateway", "run", "--replace"]
-    if arguments[3:] != expected_tail:
-        raise LaunchdAllOperationError(
-            f"{label}: ProgramArguments do not preserve its HERMES_HOME profile"
-        )
-    return _LaunchdAllPlistIdentity(
-        label=label,
-        path=path,
-        fingerprint=hashlib.sha256(raw).hexdigest(),
-        hermes_home=hermes_home,
+    try:
+        gateway_index = arguments.index("gateway")
+    except ValueError as exc:
+        raise LaunchdAllOperationError(f"{label}: gateway invocation is missing") from exc
+    if arguments[gateway_index:] != ["gateway", "run", "--replace"]:
+        raise LaunchdAllOperationError(f"{label}: ProgramArguments are not exact")
+
+    profile_name: str | None = None
+    profile_positions = [i for i, value in enumerate(arguments) if value == "--profile"]
+    if profile_positions:
+        if len(profile_positions) != 1:
+            raise LaunchdAllOperationError(f"{label}: duplicate --profile arguments")
+        profile_index = profile_positions[0]
+        if profile_index >= gateway_index or profile_index + 1 >= gateway_index:
+            raise LaunchdAllOperationError(f"{label}: malformed --profile invocation")
+        profile_name = arguments[profile_index + 1]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_name):
+            raise LaunchdAllOperationError(f"{label}: invalid profile name")
+
+    native_root = (_launchd_user_home() / ".hermes").resolve()
+    custom_suffix = hashlib.sha256(str(hermes_home).encode()).hexdigest()[:8]
+    custom_label = f"ai.hermes.gateway-{custom_suffix}"
+
+    if hermes_home == native_root:
+        if label != "ai.hermes.gateway" or profile_name is not None:
+            raise LaunchdAllOperationError(
+                f"{label}: native default HERMES_HOME has the wrong identity"
+            )
+        return hermes_home, None
+
+    # Check the hash/no-profile custom form before the structural profiles/name
+    # form. A user may intentionally have a custom root whose final components
+    # happen to be ``profiles/<name>``.
+    if label == custom_label and profile_name is None:
+        return hermes_home, None
+
+    if (
+        hermes_home.parent.name == "profiles"
+        and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", hermes_home.name)
+        and label == f"ai.hermes.gateway-{hermes_home.name}"
+        and profile_name == hermes_home.name
+    ):
+        return hermes_home, profile_name
+
+    raise LaunchdAllOperationError(
+        f"{label}: HERMES_HOME, label, and --profile do not describe one target"
     )
 
 
-def _launchd_all_query_target(domain: str, label: str) -> tuple[bool, int | None]:
-    """Query exactly one launchd target; unknown errors fail closed."""
-    command = ["launchctl", "print", f"{domain}/{label}"]
+def _read_launchd_all_plist_identity(path: Path) -> _LaunchdAllPlistIdentity:
+    """Read and attest one plist's label, profile invocation, and home."""
     try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
-        raise LaunchdAllOperationError(
-            f"Could not inspect launchd target {domain}/{label}"
-        ) from exc
-    if result.returncode in _LAUNCHD_ABSENCE_EXIT_CODES:
-        return False, None
-    if result.returncode != 0:
-        raise LaunchdAllOperationError(
-            f"Could not inspect launchd target {domain}/{label} "
-            f"(launchd exit {result.returncode})"
-        )
-    output = result.stdout or ""
-    pid = _parse_launchd_pid_from_list_output(output)
-    if pid is None:
-        match = re.search(r"\bpid\b\s*=\s*(-?\d+)", output, re.IGNORECASE)
-        if match and int(match.group(1)) > 0:
-            pid = int(match.group(1))
-    return True, pid
+        secure = _read_secure_launchd_plist(path)
+    except LaunchdInventoryError as exc:
+        raise LaunchdAllOperationError(str(exc)) from exc
+
+    label = path.stem
+    if secure.document.get("Label") != label:
+        raise LaunchdAllOperationError(f"Launchd plist label mismatch for {path}")
+    hermes_home, _ = _launchd_gateway_profile_invocation(
+        label, secure.document
+    )
+    return _LaunchdAllPlistIdentity(
+        label=label,
+        path=path,
+        fingerprint=secure.fingerprint,
+        hermes_home=hermes_home,
+        stat_identity=secure.stat_identity,
+    )
 
 
 def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
@@ -3898,12 +3960,33 @@ def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
 
     for label, plist_path in inventory:
         identity = _read_launchd_all_plist_identity(plist_path)
-        domain = _launchd_domain_for_label(label)
-        loaded, pid = _launchd_all_query_target(domain, label)
-        disabled = _launchd_label_is_disabled(domain, label)
-        if disabled is None:
+        probe = _probe_launchd_label_domains(label)
+        if probe.unknown or probe.disabled_unknown:
             raise LaunchdAllOperationError(
-                f"Could not verify disabled state for {domain}/{label}"
+                f"Could not verify launchd state for {label}: "
+                + "; ".join(
+                    probe.unknown_details
+                    + probe.disabled_unknown_details
+                    + tuple(probe.unknown)
+                    + tuple(probe.disabled_unknown)
+                )
+            )
+        if len(probe.registered) > 1:
+            raise LaunchdAllOperationError(
+                f"Refusing cross-profile launchd operation: {label} is registered "
+                f"in both {probe.registered[0]} and {probe.registered[1]}"
+            )
+        domain = (
+            probe.registered[0]
+            if probe.registered
+            else _launchd_validated_manager_domain()
+        )
+        loaded = bool(probe.registered)
+        pid = probe.pid_for(domain) if loaded else None
+        start_time = _launchd_process_start_time(pid) if pid is not None else None
+        if pid is not None and start_time is None:
+            raise LaunchdAllOperationError(
+                f"{domain}/{label}: loaded PID {pid} has no birth identity"
             )
         targets.append(
             LaunchdAllTarget(
@@ -3912,31 +3995,32 @@ def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
                 plist_path=identity.path,
                 plist_fingerprint=identity.fingerprint,
                 hermes_home=identity.hermes_home,
-                was_disabled=disabled,
                 was_loaded=loaded,
                 pid=pid,
-                start_time=_launchd_process_start_time(pid) if pid else None,
-                profile_identity=_profile_arg(str(identity.hermes_home)),
+                start_time=start_time,
+                probe=probe,
+                plist_stat_identity=identity.stat_identity,
             )
         )
     return tuple(targets)
 
 
 def _revalidate_launchd_target(target: LaunchdAllTarget) -> None:
-    """Re-attest a target immediately before bootstrap or a retry."""
+    """Re-attest a target immediately before a desired/runtime mutation."""
     identity = _read_launchd_all_plist_identity(target.plist_path)
     if (
         identity.label != target.label
         or identity.hermes_home != target.hermes_home
         or identity.fingerprint != target.plist_fingerprint
+        or identity.stat_identity != target.plist_stat_identity
     ):
         raise LaunchdAllOperationError(
-            f"Launchd target identity changed before bootstrap: {target.launchctl_target}"
+            f"Launchd target identity changed before mutation: {target.launchctl_target}"
         )
 
 
-def _launchd_all_bootstrap(target: LaunchdAllTarget) -> None:
-    """Bootstrap one target with identity revalidation on every attempt."""
+def _launchd_all_bootstrap(target: LaunchdAllTarget) -> bool:
+    """Bootstrap one definitively unloaded target without booting out races."""
     _revalidate_launchd_target(target)
     try:
         subprocess.run(
@@ -3944,36 +4028,63 @@ def _launchd_all_bootstrap(target: LaunchdAllTarget) -> None:
             check=True,
             timeout=30,
         )
+        return False
     except subprocess.CalledProcessError as exc:
         if exc.returncode != 5:
             raise
-        # A stale registration is target-local. Remove only that exact job,
-        # then attest the plist again before the replacement bootstrap.
-        subprocess.run(
-            ["launchctl", "bootout", target.launchctl_target],
-            check=False,
-            timeout=30,
-        )
-        _revalidate_launchd_target(target)
-        subprocess.run(
-            ["launchctl", "bootstrap", target.domain, str(target.plist_path)],
-            check=True,
-            timeout=30,
-        )
+        # Exit 5 means only that bootstrap did not complete. It is not
+        # permission to boot out a label: the label may have appeared in this
+        # exact domain concurrently, or may now be ambiguous across domains.
+        probe = _probe_launchd_label_domains(target.label)
+        _launchd_all_require_known_probe(target.label, probe)
+        if probe.registered != (target.domain,):
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: bootstrap exit 5 left registration "
+                f"ambiguous or absent ({probe.registered or 'none'})"
+            )
+        return True
 
 
 def _launchd_all_verify_live(
     target: LaunchdAllTarget,
     *,
     successor_of: tuple[int, int] | None = None,
+    expected_identity: tuple[int, int] | None = None,
+    expected_disabled: set[str] | None = None,
 ) -> bool:
     """Verify that launchd owns a live PID for the exact target."""
-    loaded, pid = _launchd_all_query_target(target.domain, target.label)
-    if not loaded or pid is None or not _launchd_pid_is_live(pid):
+    probe = _probe_launchd_label_domains(target.label)
+    _launchd_all_require_known_probe(target.label, probe)
+    if expected_disabled is not None and set(probe.disabled) != expected_disabled:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent disabled state changed while "
+            f"verifying to {list(probe.disabled)}"
+        )
+    if len(probe.registered) > 1:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: registration became ambiguous"
+        )
+    if not probe.registered:
         return False
+    if probe.registered != (target.domain,):
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: registration moved to {probe.registered[0]}"
+        )
+    pid = probe.pid_for(target.domain)
+    if pid is None or not _launchd_pid_is_live(pid):
+        return False
+    start_time = _launchd_process_start_time(pid)
+    if start_time is None:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: live PID {pid} has no birth identity"
+        )
+    if expected_identity is not None and (pid, start_time) != expected_identity:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: supervised PID identity changed while "
+            f"verifying from {expected_identity} to {(pid, start_time)}"
+        )
     if successor_of is not None:
-        start_time = _launchd_process_start_time(pid)
-        if start_time is None or (pid, start_time) == successor_of:
+        if (pid, start_time) == successor_of:
             return False
     return True
 
@@ -3982,20 +4093,23 @@ def _launchd_all_wait_for_live(
     target: LaunchdAllTarget,
     *,
     successor_of: tuple[int, int] | None = None,
+    expected_disabled: set[str] | None = None,
     timeout: float = 10.0,
 ) -> bool:
     deadline = time.monotonic() + max(timeout, 0.1)
     while time.monotonic() < deadline:
-        try:
-            if _launchd_all_verify_live(target, successor_of=successor_of):
-                return True
-        except LaunchdAllOperationError:
-            pass
+        if _launchd_all_verify_live(
+            target,
+            successor_of=successor_of,
+            expected_disabled=expected_disabled,
+        ):
+            return True
         time.sleep(0.2)
-    try:
-        return _launchd_all_verify_live(target, successor_of=successor_of)
-    except LaunchdAllOperationError:
-        return False
+    return _launchd_all_verify_live(
+        target,
+        successor_of=successor_of,
+        expected_disabled=expected_disabled,
+    )
 
 
 def _launchd_all_wait_for_successor(
@@ -4003,38 +4117,180 @@ def _launchd_all_wait_for_successor(
     old_pid: int,
     old_start_time: int,
     *,
+    expected_disabled: set[str] | None = None,
     timeout: float,
 ) -> bool:
     return _launchd_all_wait_for_live(
         target,
         successor_of=(old_pid, old_start_time),
+        expected_disabled=expected_disabled,
         timeout=timeout,
     )
 
 
-def _launchd_start_all_target(target: LaunchdAllTarget) -> None:
-    """Enable, bootstrap, kickstart, and verify one explicit start target."""
-    # Attest before clearing a persisted fence, then attest again immediately
-    # before every bootstrap attempt. A plist race must not even release the
-    # target's desired-state fence.
+def _launchd_all_require_known_probe(label: str, probe: LaunchdLabelProbe) -> None:
+    if probe.unknown or probe.disabled_unknown:
+        details = (
+            probe.unknown_details
+            + probe.disabled_unknown_details
+            + tuple(probe.unknown)
+            + tuple(probe.disabled_unknown)
+        )
+        raise LaunchdAllOperationError(
+            f"Could not inspect launchd state for {label}: " + "; ".join(details)
+        )
+
+
+def _launchd_all_observe_target(
+    target: LaunchdAllTarget, expected_disabled: set[str]
+) -> tuple[LaunchdLabelProbe, int | None, int | None]:
+    """Re-probe and compare the immutable plan before one target mutation."""
+    probe = _probe_launchd_label_domains(target.label)
+    _launchd_all_require_known_probe(target.label, probe)
+    if len(probe.registered) > 1:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent registration in {probe.registered}"
+        )
+    if probe.registered != target.probe.registered:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent registration changed from "
+            f"{target.probe.registered or 'none'} to {probe.registered or 'none'}"
+        )
+    if set(probe.disabled) != expected_disabled:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent disabled state changed from "
+            f"{sorted(expected_disabled)} to {list(probe.disabled)}"
+        )
+    current_domain = probe.registered[0] if probe.registered else _launchd_validated_manager_domain()
+    if current_domain != target.domain:
+        raise LaunchdAllOperationError(
+            f"{target.label}: concurrent launchd domain changed from "
+            f"{target.domain} to {current_domain}"
+        )
+    pid = probe.pid_for(current_domain) if probe.registered else None
+    start_time = _launchd_process_start_time(pid) if pid is not None else None
+    if pid != target.pid or start_time != target.start_time:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent PID identity changed from "
+            f"{(target.pid, target.start_time)} to {(pid, start_time)}"
+        )
+    return probe, pid, start_time
+
+
+def _launchd_all_prepare_mutation(
+    target: LaunchdAllTarget, expected_disabled: set[str]
+) -> None:
+    _launchd_all_observe_target(target, expected_disabled)
     _revalidate_launchd_target(target)
-    _launchd_enable(target.domain, target.label)
+
+
+def _launchd_all_prepare_post_bootstrap_kickstart(
+    target: LaunchdAllTarget, expected_disabled: set[str]
+) -> None:
+    """Validate the intended registration before kickstarting a new load."""
+    probe = _probe_launchd_label_domains(target.label)
+    _launchd_all_require_known_probe(target.label, probe)
+    if probe.registered != (target.domain,):
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: bootstrap registration is "
+            f"{probe.registered or 'absent'}"
+        )
+    if set(probe.disabled) != expected_disabled:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent disabled state changed "
+            f"after bootstrap to {list(probe.disabled)}"
+        )
+    pid = probe.pid_for(target.domain)
+    if pid is not None and _launchd_process_start_time(pid) is None:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: bootstrapped PID {pid} has no birth identity"
+        )
+    _revalidate_launchd_target(target)
+
+
+_LAUNCHD_ALL_OPERATIONAL_ERRORS = (
+    LaunchdAllOperationError,
+    subprocess.CalledProcessError,
+    subprocess.TimeoutExpired,
+    OSError,
+)
+
+
+def _launchd_all_failure_detail(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        return f"launchd exit {exc.returncode}"
+    return str(exc) or type(exc).__name__
+
+
+def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutcome:
+    """Start one target transactionally, without disturbing a live target."""
+    expected_disabled = set(target.probe.disabled)
+    newly_enabled: list[str] = []
     try:
-        _launchd_all_bootstrap(target)
-    except subprocess.CalledProcessError as exc:
-        if exc.returncode not in _LAUNCHD_ABSENCE_EXIT_CODES:
-            raise
-        _launchd_all_bootstrap(target)
-    subprocess.run(
-        ["launchctl", "kickstart", target.launchctl_target],
-        check=True,
-        timeout=30,
-    )
-    if not _launchd_all_wait_for_live(target):
-        raise LaunchdAllOperationError(f"{target.launchctl_target} has no live supervised PID")
+        for domain in target.probe.disabled:
+            _launchd_all_prepare_mutation(target, expected_disabled)
+            _launchd_enable(domain, target.label)
+            newly_enabled.append(domain)
+            expected_disabled.remove(domain)
+
+        if target.was_loaded:
+            if target.pid is not None:
+                if target.start_time is None:
+                    raise LaunchdAllOperationError(
+                        f"{target.launchctl_target}: loaded PID {target.pid} has no birth identity"
+                    )
+                _launchd_all_prepare_mutation(target, expected_disabled)
+                if not _launchd_all_verify_live(
+                    target,
+                    expected_identity=(target.pid, target.start_time),
+                    expected_disabled=expected_disabled,
+                ):
+                    raise LaunchdAllOperationError(
+                        f"{target.launchctl_target}: exact supervised PID is not live"
+                    )
+            else:
+                _launchd_all_prepare_mutation(target, expected_disabled)
+                subprocess.run(
+                    ["launchctl", "kickstart", target.launchctl_target],
+                    check=True,
+                    timeout=30,
+                )
+                if not _launchd_all_wait_for_live(
+                    target, expected_disabled=expected_disabled
+                ):
+                    raise LaunchdAllOperationError(
+                        f"{target.launchctl_target}: kickstart produced no live PID"
+                    )
+        else:
+            _launchd_all_prepare_mutation(target, expected_disabled)
+            _launchd_all_bootstrap(target)
+            if not _launchd_all_wait_for_live(
+                target, expected_disabled=expected_disabled
+            ):
+                raise LaunchdAllOperationError(
+                    f"{target.launchctl_target}: bootstrap produced no live PID"
+                )
+        return LaunchdAllTargetOutcome(target.label, target.domain, "started")
+    except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+        rollback_failures: list[str] = []
+        for domain in reversed(newly_enabled):
+            try:
+                _revalidate_launchd_target(target)
+                _launchd_disable(domain, target.label)
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as rollback_exc:
+                rollback_failures.append(
+                    f"{domain}/{target.label} rollback ({_launchd_all_failure_detail(rollback_exc)})"
+                )
+        detail = _launchd_all_failure_detail(exc)
+        if rollback_failures:
+            detail += "; rollback failed: " + "; ".join(rollback_failures)
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: {detail}",
+            (f"{target.launchctl_target}: {detail}",),
+        ) from exc
 
 
-def launchd_start_all() -> None:
+def launchd_start_all() -> LaunchdAllResult:
     """Start every installed Hermes LaunchAgent without a process sweep."""
     try:
         targets = _launchd_all_preflight_targets()
@@ -4042,74 +4298,84 @@ def launchd_start_all() -> None:
         raise
     if not targets:
         print("✓ No installed launchd gateways; nothing to start")
-        return
+        return LaunchdAllResult("start", ())
 
     failures: list[str] = []
+    outcomes: list[LaunchdAllTargetOutcome] = []
     for target in targets:
         try:
-            _launchd_start_all_target(target)
-        except Exception as exc:
-            failures.append(f"{target.launchctl_target}: {exc}")
+            outcomes.append(_launchd_start_all_target(target))
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            detail = _launchd_all_failure_detail(exc)
+            failure = f"{target.launchctl_target}: {detail}"
+            failures.append(failure)
+            outcomes.append(
+                LaunchdAllTargetOutcome(target.label, target.domain, "failed", detail)
+            )
+    result = LaunchdAllResult("start", tuple(outcomes))
     if failures:
         raise LaunchdAllOperationError(
             "Could not start every installed launchd gateway: " + "; ".join(failures),
             tuple(failures),
+            result.outcomes,
         )
-    print(f"✓ Started {len(targets)} launchd gateway target(s)")
+    started = sum(outcome.status == "started" for outcome in result.outcomes)
+    print(f"✓ Started {started} launchd gateway target(s)")
+    return result
 
 
-def _launchd_restart_all_target(target: LaunchdAllTarget) -> None:
+def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutcome:
     """Restart one enabled target and verify a new supervised process."""
-    disabled = _launchd_label_is_disabled(target.domain, target.label)
-    if disabled is None:
-        raise LaunchdAllOperationError(
-            f"{target.launchctl_target}: disabled state became unknown"
-        )
-    if disabled:
-        return
+    expected_disabled = set(target.probe.disabled)
+    _launchd_all_prepare_mutation(target, expected_disabled)
+    if expected_disabled:
+        return LaunchdAllTargetOutcome(target.label, target.domain, "preserved")
 
     if target.was_loaded and target.pid is not None:
         if target.start_time is None:
             raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: old PID birth identity is unavailable"
+                f"{target.launchctl_target}: loaded PID {target.pid} has no birth identity"
             )
-        loaded_now, current_pid = _launchd_all_query_target(
-            target.domain, target.label
-        )
-        if not loaded_now:
-            raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: target detached before restart"
-            )
-        if current_pid is not None and current_pid != target.pid:
-            raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: supervised PID changed before restart"
-            )
-        if current_pid == target.pid and _launchd_pid_is_live(
-            target.pid, target.start_time
+        if not _launchd_all_verify_live(
+            target,
+            expected_identity=(target.pid, target.start_time),
+            expected_disabled=expected_disabled,
         ):
-            if not _graceful_restart_via_sigusr1(
-                target.pid, _get_restart_drain_timeout()
-            ):
-                raise LaunchdAllOperationError(
-                    f"{target.launchctl_target}: old PID did not exit"
-                )
-            if not _launchd_all_wait_for_successor(
-                target,
-                target.pid,
-                target.start_time,
-                timeout=_get_restart_drain_timeout() + 30,
-            ):
-                raise LaunchdAllOperationError(
-                    f"{target.launchctl_target}: new supervised PID was not verified"
-                )
-            return
-
-    if not target.was_loaded:
-        _launchd_all_bootstrap(target)
-    else:
-        # The label is still exact and managed, but its snapshotted PID is gone.
-        # kickstart -k is scoped to this launchd target only.
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: old supervised PID is not live"
+            )
         _revalidate_launchd_target(target)
+        if not _graceful_restart_via_sigusr1(
+            target.pid, _get_restart_drain_timeout()
+        ):
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: old PID did not exit"
+            )
+        if not _launchd_all_wait_for_successor(
+            target,
+            target.pid,
+            target.start_time,
+            expected_disabled=expected_disabled,
+            timeout=_get_restart_drain_timeout() + 30,
+        ):
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: new supervised PID was not verified"
+            )
+        return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+
+    _launchd_all_prepare_mutation(target, expected_disabled)
+    if not target.was_loaded:
+        bootstrap_raced = _launchd_all_bootstrap(target)
+        if bootstrap_raced:
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: bootstrap raced with a concurrent "
+                "registration; no kickstart was attempted"
+            )
+        _launchd_all_prepare_post_bootstrap_kickstart(target, expected_disabled)
+    else:
+        # A loaded registration with no PID is a not-running job, not an
+        # unloaded job. Kickstart the exact target and never bootstrap it.
+        pass
     subprocess.run(
         ["launchctl", "kickstart", "-k", target.launchctl_target],
         check=True,
@@ -4120,13 +4386,18 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> None:
         if target.pid is not None and target.start_time is not None
         else None
     )
-    if not _launchd_all_wait_for_live(target, successor_of=successor):
+    if not _launchd_all_wait_for_live(
+        target,
+        successor_of=successor,
+        expected_disabled=expected_disabled,
+    ):
         raise LaunchdAllOperationError(
             f"{target.launchctl_target}: new supervised PID was not verified"
         )
+    return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
 
 
-def launchd_restart_all() -> None:
+def launchd_restart_all() -> LaunchdAllResult:
     """Restart enabled installed targets individually, never by global sweep."""
     try:
         targets = _launchd_all_preflight_targets()
@@ -4134,27 +4405,34 @@ def launchd_restart_all() -> None:
         raise
     if not targets:
         print("✓ No installed launchd gateways; nothing to restart")
-        return
+        return LaunchdAllResult("restart", ())
 
     failures: list[str] = []
-    skipped = 0
+    outcomes: list[LaunchdAllTargetOutcome] = []
     for target in targets:
-        if target.was_disabled:
-            skipped += 1
-            continue
         try:
-            _launchd_restart_all_target(target)
-        except Exception as exc:
-            failures.append(f"{target.launchctl_target}: {exc}")
+            outcomes.append(_launchd_restart_all_target(target))
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            detail = _launchd_all_failure_detail(exc)
+            failure = f"{target.launchctl_target}: {detail}"
+            failures.append(failure)
+            outcomes.append(
+                LaunchdAllTargetOutcome(target.label, target.domain, "failed", detail)
+            )
+    result = LaunchdAllResult("restart", tuple(outcomes))
     if failures:
         raise LaunchdAllOperationError(
             "Could not restart every enabled launchd gateway: " + "; ".join(failures),
             tuple(failures),
+            result.outcomes,
         )
+    restarted = sum(outcome.status == "restarted" for outcome in result.outcomes)
+    preserved = sum(outcome.status == "preserved" for outcome in result.outcomes)
     print(
-        f"✓ Restarted {len(targets) - skipped} launchd gateway target(s)"
-        + (f"; preserved {skipped} pre-disabled target(s)" if skipped else "")
+        f"✓ Restarted {restarted} launchd gateway target(s)"
+        + (f"; preserved {preserved} pre-disabled target(s)" if preserved else "")
     )
+    return result
 
 
 _LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
@@ -4205,13 +4483,11 @@ def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
         if not _LAUNCHD_GATEWAY_PLIST_PATTERN.fullmatch(path.name):
             continue
         try:
-            if path.is_symlink() or not path.is_file():
-                raise LaunchdInventoryError(
-                    f"Refusing cross-profile launchd operation: {path} is not a regular file"
-                )
-            payload = plistlib.loads(path.read_bytes())
-        except LaunchdInventoryError:
-            raise
+            payload = _read_secure_launchd_plist(path).document
+        except LaunchdInventoryError as exc:
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: {exc}"
+            ) from exc
         except (OSError, ValueError, plistlib.InvalidFileException) as exc:
             raise LaunchdInventoryError(
                 f"Refusing cross-profile launchd operation: could not validate {path}: {exc}"
@@ -4236,62 +4512,169 @@ def _launchd_candidate_domains() -> tuple[str, str]:
     return (f"gui/{uid}", f"user/{uid}")
 
 
+def _launchd_disabled_probe(
+    domain: str, label: str
+) -> tuple[bool | None, str | None]:
+    """Read one exact desired-state bit while retaining operational evidence."""
+    command = ["launchctl", "print-disabled", domain]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"{domain}/{label} print-disabled {type(exc).__name__}"
+    if result.returncode != 0:
+        detail = (
+            getattr(result, "stderr", "")
+            or getattr(result, "stdout", "")
+            or ""
+        ).strip()
+        suffix = f": {detail}" if detail else ""
+        return None, f"{domain}/{label} print-disabled exit {result.returncode}{suffix}"
+
+    label_pattern = re.compile(
+        rf"^\s*(?:{re.escape(label)}|\"{re.escape(label)}\"|'"
+        rf"{re.escape(label)}')\s*=>\s*(?:true|disabled)(?:\s*[,;])?\s*$",
+        re.IGNORECASE,
+    )
+    return (
+        any(label_pattern.search(line) for line in (result.stdout or "").splitlines()),
+        None,
+    )
+
+
 def _probe_launchd_label_domains(label: str) -> LaunchdLabelProbe:
-    """Probe registration and disabled state for one label in both domains."""
+    """Probe registration, PID, and disabled state in both user domains."""
     registered: list[str] = []
     disabled: list[str] = []
     absent: list[str] = []
     unknown: list[str] = []
+    unknown_details: list[str] = []
+    disabled_unknown: list[str] = []
+    disabled_unknown_details: list[str] = []
+    pids: list[tuple[str, int | None]] = []
     for domain in _launchd_candidate_domains():
+        command = ["launchctl", "print", f"{domain}/{label}"]
         try:
             result = subprocess.run(
-                ["launchctl", "print", f"{domain}/{label}"],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
             unknown.append(domain)
+            unknown_details.append(f"{domain}/{label} print {type(exc).__name__}")
         else:
             if result.returncode == 0:
                 registered.append(domain)
+                pid = _parse_launchd_pid_from_list_output(result.stdout or "")
+                if pid is None:
+                    match = re.search(
+                        r"\bpid\b\s*=\s*(-?\d+)",
+                        result.stdout or "",
+                        re.IGNORECASE,
+                    )
+                    if match and int(match.group(1)) > 0:
+                        pid = int(match.group(1))
+                pids.append((domain, pid))
             elif result.returncode in (3, 113):
                 absent.append(domain)
             else:
-                # In particular, exit 5/125 is not evidence that launchd is
-                # unable to supervise this exact label.
                 unknown.append(domain)
-        disabled_state = _launchd_label_is_disabled(domain, label)
+                detail = (
+                    getattr(result, "stderr", "")
+                    or getattr(result, "stdout", "")
+                    or ""
+                ).strip()
+                suffix = f": {detail}" if detail else ""
+                unknown_details.append(
+                    f"{domain}/{label} print exit {result.returncode}{suffix}"
+                )
+        disabled_state, disabled_detail = _launchd_disabled_probe(domain, label)
         if disabled_state is True:
             disabled.append(domain)
+        elif disabled_state is None:
+            disabled_unknown.append(domain)
+            if disabled_detail:
+                disabled_unknown_details.append(disabled_detail)
     return LaunchdLabelProbe(
-        tuple(registered), tuple(disabled), tuple(absent), tuple(unknown)
+        tuple(registered),
+        tuple(disabled),
+        tuple(absent),
+        tuple(unknown),
+        tuple(unknown_details),
+        tuple(disabled_unknown),
+        tuple(disabled_unknown_details),
+        tuple(pids),
+    )
+
+
+def _launchd_validated_manager_domain() -> str:
+    """Choose gui/user only from a successful, supported managername result."""
+    gui_domain, user_domain = _launchd_candidate_domains()
+    command = ["launchctl", "managername"]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LaunchdAllOperationError(
+            f"launchctl managername failed ({type(exc).__name__})"
+        ) from exc
+    if result.returncode != 0:
+        detail = (
+            getattr(result, "stderr", "")
+            or getattr(result, "stdout", "")
+            or ""
+        ).strip()
+        suffix = f": {detail}" if detail else ""
+        raise LaunchdAllOperationError(
+            f"launchctl managername exit {result.returncode}{suffix}"
+        )
+    manager = (result.stdout or "").strip()
+    if manager == "Aqua":
+        return gui_domain
+    if manager == "Background":
+        return user_domain
+    raise LaunchdAllOperationError(
+        f"launchctl managername returned unsupported manager {manager or '<empty>'}"
     )
 
 
 def _launchd_default_domain_for_unloaded_label() -> str:
     """Choose the active manager domain without consulting another label."""
-    gui_domain, user_domain = _launchd_candidate_domains()
     try:
-        result = subprocess.run(
-            ["launchctl", "managername"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and "Aqua" in (result.stdout or ""):
-            return gui_domain
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return user_domain
+        return _launchd_validated_manager_domain()
+    except LaunchdAllOperationError as exc:
+        raise LaunchdInventoryError(str(exc)) from exc
 
 
 def _launchd_domain_for_label(label: str) -> str:
     """Resolve the managing domain for one exact label, without shared cache."""
     probe = _probe_launchd_label_domains(label)
+    if probe.unknown or probe.disabled_unknown:
+        _launchd_all_require_known_probe(label, probe)
+    if len(probe.registered) > 1:
+        raise LaunchdInventoryError(
+            f"Refusing cross-profile launchd operation: {label} is registered "
+            f"in both {probe.registered[0]} and {probe.registered[1]}"
+        )
     if probe.registered:
         return probe.registered[0]
+    # Stop-all must preserve the exact domain whose disabled bit already
+    # represents this target's prior desired state.  This is separate from
+    # all-profile start/restart preflight, where an enabled unloaded target
+    # must be assigned only by the validated managername result.
     if probe.disabled:
         return probe.disabled[0]
     return _launchd_default_domain_for_unloaded_label()

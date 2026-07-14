@@ -1222,7 +1222,11 @@ class TestLaunchdServiceRecovery:
                 raise subprocess.CalledProcessError(rc, cmd)
             return result
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         stopped, failures = gateway_cli.launchd_stop_all()
@@ -1433,7 +1437,11 @@ class TestLaunchdServiceRecovery:
                 return SimpleNamespace(returncode=0, stdout="Aqua", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
@@ -1457,6 +1465,8 @@ class TestLaunchdServiceRecovery:
         def fake_run(cmd, **kwargs):
             if cmd[:2] == ["launchctl", "print"]:
                 return SimpleNamespace(returncode=113, stdout="", stderr="")
+            if cmd[:2] == ["launchctl", "managername"]:
+                return SimpleNamespace(returncode=0, stdout="Aqua", stderr="")
             if cmd[:2] == ["launchctl", "print-disabled"]:
                 domain = cmd[2]
                 disabled_label = labels[0] if domain == "gui/501" else labels[1]
@@ -1467,7 +1477,11 @@ class TestLaunchdServiceRecovery:
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
@@ -1497,7 +1511,11 @@ class TestLaunchdServiceRecovery:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
@@ -1544,7 +1562,11 @@ class TestLaunchdServiceRecovery:
                 raise subprocess.CalledProcessError(125, cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
@@ -1590,7 +1612,11 @@ class TestLaunchdServiceRecovery:
                 raise subprocess.CalledProcessError(125, cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_candidate_domains",
+            lambda: ("gui/501", "user/501"),
+        )
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
@@ -1746,7 +1772,7 @@ class TestLaunchdServiceRecovery:
         assert excinfo.value.code == 1
         assert link.is_symlink()
         assert target.exists()
-        assert "not a regular file" in capsys.readouterr().out
+        assert "regular launchd plist" in capsys.readouterr().out
 
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"

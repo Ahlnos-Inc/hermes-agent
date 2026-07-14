@@ -100,7 +100,10 @@ def build_gateway_parser(
     gateway_start.add_argument(
         "--all",
         action="store_true",
-        help="Kill ALL stale gateway processes across all profiles before starting",
+        help=(
+            "Start across profiles using platform-specific service handling; "
+            "on macOS, verify exact launchd labels without a global PID sweep"
+        ),
     )
     _add_compat_platform_flag(gateway_start)
 
@@ -114,7 +117,10 @@ def build_gateway_parser(
     gateway_stop.add_argument(
         "--all",
         action="store_true",
-        help="Stop ALL gateway processes across all profiles",
+        help=(
+            "Stop across profiles using platform-specific service handling; on "
+            "macOS, fence exact launchd labels before guarded PID cleanup"
+        ),
     )
 
     # gateway restart
@@ -129,7 +135,11 @@ def build_gateway_parser(
     gateway_restart.add_argument(
         "--all",
         action="store_true",
-        help="Kill ALL gateway processes across all profiles before restarting",
+        help=(
+            "Restart across profiles using platform-specific service handling; "
+            "on macOS, restart exact launchd labels with SIGUSR1 without a "
+            "global PID sweep"
+        ),
     )
     _add_compat_platform_flag(gateway_restart)
 
