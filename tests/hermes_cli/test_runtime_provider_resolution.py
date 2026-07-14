@@ -3211,6 +3211,16 @@ def test_resolve_runtime_provider_bedrock_nonclaude_target_model_uses_converse(m
     assert resolved.get("bedrock_anthropic") is not True
 
 
+def test_resolve_runtime_provider_rejects_explicitly_disabled_bedrock(monkeypatch):
+    _patch_bedrock(monkeypatch)
+    monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {"enabled": False}})
+
+    with pytest.raises(rp.AuthError, match="Bedrock is disabled") as exc_info:
+        rp.resolve_runtime_provider(requested="bedrock")
+
+    assert exc_info.value.code == "bedrock_disabled"
+
+
 def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     """provider:auto + base_url:localhost should NOT route to Anthropic even if
     ANTHROPIC_API_KEY is set in the environment. Regression test for #3846.

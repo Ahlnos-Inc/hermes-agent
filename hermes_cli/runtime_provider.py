@@ -1887,6 +1887,15 @@ def _resolve_runtime_provider(
 
     # AWS Bedrock (native Converse API via boto3)
     if provider == "bedrock":
+        # Read Bedrock-specific config before touching the AWS SDK. This lets a
+        # managed profile deliberately disable an unused provider even when
+        # unrelated AWS credentials exist in its process environment.
+        _bedrock_cfg = load_config().get("bedrock", {})
+        if isinstance(_bedrock_cfg, dict) and _bedrock_cfg.get("enabled", True) is False:
+            raise AuthError(
+                "AWS Bedrock is disabled by bedrock.enabled=false in config.yaml.",
+                code="bedrock_disabled",
+            )
         from agent.bedrock_adapter import (
             has_aws_credentials,
             resolve_aws_auth_env_var,
@@ -1907,8 +1916,6 @@ def _resolve_runtime_provider(
                 "Or run 'aws configure' to set up credentials.",
                 code="no_aws_credentials",
             )
-        # Read bedrock-specific config from config.yaml
-        _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
         region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
         auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"

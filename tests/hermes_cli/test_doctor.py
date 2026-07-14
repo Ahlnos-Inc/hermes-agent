@@ -51,6 +51,18 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+class TestBedrockDoctorOptOut:
+    def test_skips_optional_bedrock_probe_when_explicitly_disabled(self, monkeypatch):
+        monkeypatch.setattr(doctor, "load_config", lambda: {"bedrock": {"enabled": False}})
+
+        assert doctor._bedrock_enabled_for_doctor() is False
+
+    def test_keeps_bedrock_probe_enabled_by_default(self, monkeypatch):
+        monkeypatch.setattr(doctor, "load_config", lambda: {"bedrock": {}})
+
+        assert doctor._bedrock_enabled_for_doctor() is True
+
+
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):
         unavailable = [

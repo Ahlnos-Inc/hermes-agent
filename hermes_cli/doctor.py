@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import get_project_root, get_hermes_home, get_env_path, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
@@ -53,6 +53,16 @@ _PROVIDER_ENV_HINTS = (
     "XIAOMI_API_KEY",
     "TOKENHUB_API_KEY",
 )
+
+
+def _bedrock_enabled_for_doctor() -> bool:
+    """Return whether the optional Bedrock connectivity check is enabled."""
+    try:
+        bedrock_cfg = load_config().get("bedrock", {})
+    except Exception:
+        # A broken config must not silently suppress a health check.
+        return True
+    return not isinstance(bedrock_cfg, dict) or bedrock_cfg.get("enabled", True) is not False
 
 
 from hermes_constants import is_termux as _is_termux
@@ -1972,6 +1982,8 @@ def run_doctor(args):
             )
 
     def _probe_bedrock() -> _ConnectivityResult:
+        if not _bedrock_enabled_for_doctor():
+            return _ConnectivityResult("AWS Bedrock", [], [])
         try:
             from agent.bedrock_adapter import (
                 has_aws_credentials,

@@ -1419,8 +1419,10 @@ DEFAULT_CONFIG = {
     },
 
     # AWS Bedrock provider configuration.
-    # Only used when model.provider is "bedrock".
+    # Only used when model.provider is "bedrock". Set enabled: false to
+    # disable Bedrock routing and its optional doctor connectivity check.
     "bedrock": {
+        "enabled": True,
         "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
         "discovery": {
             "enabled": True,           # Auto-discover models via ListFoundationModels
