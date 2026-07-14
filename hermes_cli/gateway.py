@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -3610,30 +3611,62 @@ class LaunchdFenceError(RuntimeError):
     """The exact launchd label could not be put into stopped desired state."""
 
 
+class LaunchdInventoryError(RuntimeError):
+    """The installed LaunchAgents inventory could not be trusted."""
+
+
+@dataclass(frozen=True)
+class LaunchdLabelProbe:
+    """Observed launchd state for one exact label in both user domains."""
+
+    registered: tuple[str, ...]
+    disabled: tuple[str, ...]
+    absent: tuple[str, ...]
+    unknown: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LaunchdFencedGateway:
+    """One validated gateway plist and the domains changed by a stop fence."""
+
+    label: str
+    plist_path: Path
+    fenced_domains: tuple[str, ...]
+    restore_domains: tuple[str, ...]
+    changed_domains: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LaunchdStopAllResult:
+    """Result of the launchd phase of a cross-profile stop/restart."""
+
+    fenced: tuple[LaunchdFencedGateway, ...]
+    failures: tuple[str, ...]
+    sweep_safe: bool
+    stopped_count: int | None = None
+
+    @property
+    def stopped(self) -> int:
+        return len(self.fenced) if self.stopped_count is None else self.stopped_count
+
+    def __iter__(self):
+        """Preserve the historical ``stopped, failures`` unpacking API."""
+        yield self.stopped
+        yield list(self.failures)
+
+
 def _launchd_disable(domain: str, label: str) -> bool:
     """Persist a stopped desired state for one exact Hermes label.
 
-    A failed disable must never be followed by bootout: bootout would remove
-    the current registration while leaving a later naive bootstrap free to
-    start it again.  A domain that cannot manage services is the one
-    exception; there is no launchd supervision to fence, so callers can use
-    the existing detached/PID fallback while reporting that the fence was
-    unavailable.
+    A failed disable must never be treated as a fence, including launchctl
+    exit 5/125. Callers must prove the exact label is unsupervised or abort
+    before bootout/global process termination.
     """
-    try:
-        subprocess.run(
-            ["launchctl", "disable", f"{domain}/{label}"],
-            check=True,
-            timeout=30,
-        )
-    except subprocess.CalledProcessError as exc:
-        if _launchctl_domain_unsupported(exc.returncode):
-            print_warning(
-                f"Could not persist the launchd stop fence for {domain}/{label} "
-                f"(launchd exit {exc.returncode}); skipping bootout"
-            )
-            return False
-        raise
+    subprocess.run(
+        ["launchctl", "disable", f"{domain}/{label}"],
+        check=True,
+        timeout=30,
+    )
     return True
 
 
@@ -3670,6 +3703,26 @@ _LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
 )
 
 
+def _launchd_program_arguments_are_hermes_gateway(value) -> bool:
+    """Return True only for Hermes' Python module gateway entrypoint."""
+    if not isinstance(value, list) or not all(isinstance(arg, str) for arg in value):
+        return False
+    if not value or "python" not in Path(value[0]).name.lower():
+        return False
+    try:
+        module_index = value.index("-m")
+        gateway_index = value.index("gateway", module_index + 2)
+    except ValueError:
+        return False
+    return (
+        module_index == 1
+        and module_index + 1 < len(value)
+        and value[module_index + 1] == "hermes_cli.main"
+        and gateway_index + 1 < len(value)
+        and value[gateway_index + 1] == "run"
+    )
+
+
 def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
     """Return installed Hermes gateway plists, scoped by exact filenames.
 
@@ -3681,13 +3734,108 @@ def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
     agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
     try:
         entries = sorted(agents_dir.iterdir(), key=lambda path: path.name)
-    except OSError:
+    except FileNotFoundError:
         return []
-    return [
-        (path.stem, path)
-        for path in entries
-        if path.is_file() and _LAUNCHD_GATEWAY_PLIST_PATTERN.fullmatch(path.name)
-    ]
+    except OSError as exc:
+        raise LaunchdInventoryError(
+            f"Could not enumerate installed LaunchAgents at {agents_dir}: {exc}"
+        ) from exc
+
+    candidates: list[tuple[str, Path]] = []
+    for path in entries:
+        if not _LAUNCHD_GATEWAY_PLIST_PATTERN.fullmatch(path.name):
+            continue
+        try:
+            if not path.is_file():
+                raise LaunchdInventoryError(
+                    f"Refusing cross-profile launchd operation: {path} is not a regular file"
+                )
+            payload = plistlib.loads(path.read_bytes())
+        except LaunchdInventoryError:
+            raise
+        except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: could not validate {path}: {exc}"
+            ) from exc
+        label = path.stem
+        if not isinstance(payload, dict) or payload.get("Label") != label:
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: {path} Label must equal {label}"
+            )
+        if not _launchd_program_arguments_are_hermes_gateway(
+            payload.get("ProgramArguments")
+        ):
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: {path} is not a Hermes gateway runtime"
+            )
+        candidates.append((label, path))
+    return candidates
+
+
+def _launchd_candidate_domains() -> tuple[str, str]:
+    uid = os.getuid()  # windows-footgun: POSIX launchd helper
+    return (f"gui/{uid}", f"user/{uid}")
+
+
+def _probe_launchd_label_domains(label: str) -> LaunchdLabelProbe:
+    """Probe registration and disabled state for one label in both domains."""
+    registered: list[str] = []
+    disabled: list[str] = []
+    absent: list[str] = []
+    unknown: list[str] = []
+    for domain in _launchd_candidate_domains():
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            unknown.append(domain)
+        else:
+            if result.returncode == 0:
+                registered.append(domain)
+            elif result.returncode in (3, 113):
+                absent.append(domain)
+            else:
+                # In particular, exit 5/125 is not evidence that launchd is
+                # unable to supervise this exact label.
+                unknown.append(domain)
+        disabled_state = _launchd_label_is_disabled(domain, label)
+        if disabled_state is True:
+            disabled.append(domain)
+    return LaunchdLabelProbe(
+        tuple(registered), tuple(disabled), tuple(absent), tuple(unknown)
+    )
+
+
+def _launchd_default_domain_for_unloaded_label() -> str:
+    """Choose the active manager domain without consulting another label."""
+    gui_domain, user_domain = _launchd_candidate_domains()
+    try:
+        result = subprocess.run(
+            ["launchctl", "managername"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and "Aqua" in (result.stdout or ""):
+            return gui_domain
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return user_domain
+
+
+def _launchd_domain_for_label(label: str) -> str:
+    """Resolve the managing domain for one exact label, without shared cache."""
+    probe = _probe_launchd_label_domains(label)
+    if probe.registered:
+        return probe.registered[0]
+    if probe.disabled:
+        return probe.disabled[0]
+    return _launchd_default_domain_for_unloaded_label()
 
 
 # On macOS, exit code 125 ("Domain does not support specified action") and
@@ -4400,10 +4548,24 @@ def _launchd_stop_target(
     try:
         fenced = _launchd_disable(domain, label)
     except subprocess.CalledProcessError as exc:
-        raise LaunchdFenceError(
-            f"Could not persist the launchd stop fence for {domain}/{label} "
-            f"(launchd exit {exc.returncode}); bootout was skipped"
-        ) from exc
+        fenced = False
+        # The cached/current domain can become stale across an Aqua login
+        # transition. Re-probe this exact label and retry only a positively
+        # registered alternate domain; never treat exit 5/125 as success.
+        for actual_domain in _probe_launchd_label_domains(label).registered:
+            if actual_domain == domain:
+                continue
+            try:
+                fenced = _launchd_disable(actual_domain, label)
+            except subprocess.CalledProcessError:
+                continue
+            domain = actual_domain
+            break
+        if not fenced:
+            raise LaunchdFenceError(
+                f"Could not persist the launchd stop fence for {domain}/{label} "
+                f"(launchd exit {exc.returncode}); bootout was skipped"
+            ) from exc
     if not fenced:
         # Do not bootout after a failed disable: the exact ordering is the
         # maintenance fence.  The existing PID wait still handles detached
@@ -4435,32 +4597,166 @@ def _launchd_stop_target(
     return True
 
 
-def launchd_stop_all() -> tuple[int, list[str]]:
-    """Fence every installed Hermes launchd gateway without wildcard labels."""
-    domain = _launchd_domain()
-    stopped = 0
+def launchd_stop_all() -> LaunchdStopAllResult:
+    """Fence every validated Hermes LaunchAgent before a global PID sweep.
+
+    Inventory validation and all desired-state writes happen before any
+    ``bootout``.  Each label is probed independently across ``gui/<uid>`` and
+    ``user/<uid>``; the current caller's cached domain is never reused.
+    """
+    inventory = _installed_launchd_gateway_plists()
+    planned: list[tuple[str, Path, LaunchdLabelProbe, tuple[str, ...]]] = []
+    for label, plist_path in inventory:
+        probe = _probe_launchd_label_domains(label)
+        if probe.registered:
+            restore_domains = probe.registered
+        else:
+            # An installed-but-unloaded LaunchAgent can be loaded into either
+            # supported session domain later. Persist the maintenance fence in
+            # both exact domains rather than booting or killing it speculatively.
+            restore_domains = (_launchd_domain_for_label(label),)
+        planned.append((label, plist_path, probe, restore_domains))
+
+    fenced: list[LaunchdFencedGateway] = []
     failures: list[str] = []
-    for label, _plist_path in _installed_launchd_gateway_plists():
-        try:
-            if _launchd_stop_target(
-                label,
-                domain,
-                record_planned_stop=False,
-                wait=False,
-            ):
-                stopped += 1
-            else:
-                # The domain-unsupported path deliberately skips bootout and
-                # relies on the existing global PID sweep below; launchd
-                # cannot supervise or respawn the job in that mode.  It is
-                # already reported by _launchd_disable, so do not turn the
-                # safe detached fallback into a hard stop-all failure.
-                stopped += 1
-        except subprocess.CalledProcessError as exc:
-            failures.append(f"{label} (launchd exit {exc.returncode})")
-        except LaunchdFenceError as exc:
-            failures.append(str(exc))
-    return stopped, failures
+    sweep_safe = True
+    registered_to_bootout: list[tuple[str, str]] = []
+
+    for label, plist_path, probe, restore_domains in planned:
+        # Persist the exact stop intent in both possible session domains. A
+        # label registered under user/<uid> today can otherwise be loaded from
+        # the same installed plist under gui/<uid> after the next Aqua login.
+        domains = _launchd_candidate_domains()
+        successful = list(probe.disabled)
+        changed: list[str] = []
+        label_failures: list[str] = []
+        for domain in domains:
+            if domain in successful:
+                continue
+            try:
+                _launchd_disable(domain, label)
+                successful.append(domain)
+                changed.append(domain)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                rc = getattr(exc, "returncode", "unavailable")
+                label_failures.append(f"{domain}/{label} (launchd exit {rc})")
+
+        if label_failures:
+            # Re-probe after the failure in case the registration moved between
+            # gui/user while fencing. Retry any newly-observed actual domain.
+            retry_probe = _probe_launchd_label_domains(label)
+            for actual_domain in retry_probe.registered:
+                if actual_domain in successful:
+                    continue
+                try:
+                    _launchd_disable(actual_domain, label)
+                    successful.append(actual_domain)
+                    changed.append(actual_domain)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    pass
+            final_probe = _probe_launchd_label_domains(label)
+            supervised_unfenced = [
+                domain
+                for domain in final_probe.registered
+                if domain not in successful and domain not in final_probe.disabled
+            ]
+            if supervised_unfenced or final_probe.unknown:
+                sweep_safe = False
+            failures.extend(label_failures)
+
+        fenced.append(
+            LaunchdFencedGateway(
+                label=label,
+                plist_path=plist_path,
+                fenced_domains=tuple(dict.fromkeys(successful)),
+                restore_domains=restore_domains,
+                changed_domains=tuple(dict.fromkeys(changed)),
+            )
+        )
+        for registered_domain in probe.registered:
+            if registered_domain in successful:
+                registered_to_bootout.append((registered_domain, label))
+
+    # Never unload a registered job until every possible supervisor is either
+    # fenced or positively absent. This leaves a recoverable state on failure.
+    if sweep_safe:
+        for domain, label in registered_to_bootout:
+            try:
+                subprocess.run(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    check=True,
+                    timeout=90,
+                )
+            except subprocess.CalledProcessError as exc:
+                if not (
+                    _launchd_error_indicates_unloaded(exc)
+                    or _launchctl_domain_unsupported(exc.returncode)
+                ):
+                    failures.append(
+                        f"{domain}/{label} bootout (launchd exit {exc.returncode})"
+                    )
+
+    return LaunchdStopAllResult(tuple(fenced), tuple(failures), sweep_safe)
+
+
+def launchd_restore_all(
+    result: LaunchdStopAllResult,
+) -> tuple[int, list[str]]:
+    """Restore every exact LaunchAgent recorded by ``launchd_stop_all``."""
+    restored = 0
+    failures: list[str] = []
+    for target in result.fenced:
+        label_errors: list[str] = []
+        for domain in target.fenced_domains:
+            try:
+                _launchd_enable(domain, target.label)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                rc = getattr(exc, "returncode", "unavailable")
+                label_errors.append(f"{domain}/{target.label} enable (launchd exit {rc})")
+        if label_errors:
+            failures.extend(label_errors)
+            continue
+        for domain in target.restore_domains:
+            try:
+                _launchctl_bootstrap(
+                    domain, target.plist_path, target.label, timeout=30
+                )
+                subprocess.run(
+                    ["launchctl", "kickstart", f"{domain}/{target.label}"],
+                    check=True,
+                    timeout=30,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                rc = getattr(exc, "returncode", "unavailable")
+                label_errors.append(
+                    f"{domain}/{target.label} restore (launchd exit {rc})"
+                )
+        if label_errors:
+            failures.extend(label_errors)
+        else:
+            restored += 1
+    return restored, failures
+
+
+def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
+    """Rollback desired-state writes when restart aborts before bootout/sweep."""
+    failures: list[str] = []
+    for target in result.fenced:
+        for domain in target.changed_domains:
+            try:
+                _launchd_enable(domain, target.label)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                rc = getattr(exc, "returncode", "unavailable")
+                failures.append(f"{domain}/{target.label} enable (launchd exit {rc})")
+    return failures
+
+
+def _coerce_launchd_stop_all_result(value) -> LaunchdStopAllResult:
+    """Accept the historical tuple shape from third-party callers/tests."""
+    if isinstance(value, LaunchdStopAllResult):
+        return value
+    stopped, failures = value
+    return LaunchdStopAllResult((), tuple(failures), not failures, stopped)
 
 
 def _wait_for_gateway_exit(
@@ -4523,12 +4819,21 @@ def launchd_restart():
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
-    try:
-        pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+    pid = get_running_pid()
+    enabled_before_restart = False
+    if pid is not None:
+        # A self-restart exits cleanly and relies on launchd KeepAlive to
+        # create the replacement. Clear the exact label's maintenance fence
+        # before SIGUSR1; if enable fails, do not signal the running gateway
+        # and do not spawn a detached duplicate from the fallback below.
+        _launchd_enable(domain, label)
+        enabled_before_restart = True
+        if _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
+
+    try:
         if pid is None and not plist_path.exists():
             print_error(
                 f"Launchd plist is missing: {plist_path}\n"
@@ -4558,7 +4863,8 @@ def launchd_restart():
                     )
         # Clear a maintenance stop fence only after the drain preconditions
         # above have completed, and before any kickstart/bootstrap operation.
-        _launchd_enable(domain, label)
+        if not enabled_before_restart:
+            _launchd_enable(domain, label)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
@@ -6617,6 +6923,10 @@ def gateway_command(args):
         # error is raised.
         print(str(e))
         sys.exit(1)
+    except LaunchdInventoryError as e:
+        print_error(str(e))
+        print_error("No launchd service or global process state was changed.")
+        sys.exit(1)
 
 
 def _maybe_redirect_run_to_s6_supervision(args) -> bool:
@@ -6999,6 +7309,7 @@ def _gateway_command_inner(args):
         if stop_all:
             # --all: kill every gateway process on the machine
             service_count = 0
+            launchd_result: LaunchdStopAllResult | None = None
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
                 or get_systemd_unit_path(system=True).exists()
@@ -7010,15 +7321,17 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos():
                 try:
-                    launchd_stopped, fence_failures = launchd_stop_all()
-                    if fence_failures:
+                    launchd_result = _coerce_launchd_stop_all_result(
+                        launchd_stop_all()
+                    )
+                    if launchd_result.failures and not launchd_result.sweep_safe:
                         print_error(
                             "Could not durably fence every installed launchd gateway: "
-                            + ", ".join(fence_failures)
+                            + ", ".join(launchd_result.failures)
                         )
                         print_error("No global process sweep was performed; inspect the listed labels.")
                         raise SystemExit(1)
-                    service_count = launchd_stopped
+                    service_count = launchd_result.stopped
                 except subprocess.CalledProcessError:
                     pass
             elif is_windows():
@@ -7036,6 +7349,12 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             else:
                 print("✗ No gateway processes found")
+            if is_macos() and launchd_result is not None and launchd_result.failures:
+                print_error(
+                    "Gateway processes were stopped, but these labels were not durably fenced: "
+                    + ", ".join(launchd_result.failures)
+                )
+                raise SystemExit(1)
         else:
             # Default: stop only the current profile's gateway
             service_available = False
@@ -7106,6 +7425,7 @@ def _gateway_command_inner(args):
         if restart_all:
             # --all: stop every gateway process across all profiles, then start fresh
             service_count = 0
+            launchd_result: LaunchdStopAllResult | None = None
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
                 or get_systemd_unit_path(system=True).exists()
@@ -7117,15 +7437,23 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos():
                 try:
-                    stopped_count, fence_failures = launchd_stop_all()
-                    if fence_failures:
+                    launchd_result = _coerce_launchd_stop_all_result(
+                        launchd_stop_all()
+                    )
+                    if launchd_result.failures and not launchd_result.sweep_safe:
+                        rollback_failures = launchd_release_all_fences(launchd_result)
                         print_error(
                             "Could not durably fence every installed launchd gateway: "
-                            + ", ".join(fence_failures)
+                            + ", ".join(launchd_result.failures)
                         )
+                        if rollback_failures:
+                            print_error(
+                                "Restart also could not release these temporary fences: "
+                                + ", ".join(rollback_failures)
+                            )
                         print_error("Restart aborted before sweeping processes.")
                         raise SystemExit(1)
-                    service_count = stopped_count
+                    service_count = launchd_result.stopped
                 except subprocess.CalledProcessError:
                     pass
             elif is_windows():
@@ -7150,7 +7478,22 @@ def _gateway_command_inner(args):
                 or get_systemd_unit_path(system=True).exists()
             ):
                 systemd_start(system=system)
+            elif is_macos() and launchd_result is not None and launchd_result.fenced:
+                restored_count, restore_failures = launchd_restore_all(launchd_result)
+                if restored_count:
+                    print(
+                        f"✓ Restarted {restored_count} launchd gateway profile(s)"
+                    )
+                all_failures = list(launchd_result.failures) + restore_failures
+                if all_failures:
+                    print_error(
+                        "Restart left these launchd labels stranded: "
+                        + ", ".join(all_failures)
+                    )
+                    raise SystemExit(1)
             elif is_macos() and get_launchd_plist_path().exists():
+                # Compatibility for callers that monkeypatch the historical
+                # tuple return from launchd_stop_all().
                 launchd_start()
             elif is_windows():
                 from hermes_cli import gateway_windows
