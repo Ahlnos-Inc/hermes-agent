@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
-from agent.kanban_delivery_policy import policy_for_current_kanban_task
+from agent.kanban_delivery_policy import (
+    policy_for_current_kanban_task,
+    requeue_current_task_for_delivery_authorization,
+)
 
 
 @pytest.fixture
@@ -177,6 +180,19 @@ def test_valid_completed_architect_handoff_accepts_exact_snapshot_and_allows_cre
         )
         claimed = kb.claim_task(conn, architect)
         assert claimed is not None and claimed.current_run_id is not None
+        claimed_gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert claimed_gate is not None
+        architect_policy = kb.latest_run(conn, architect).run_spec["delivery_policy"]
+        assert architect_policy == {
+            "version": 1,
+            "disposition": "enforcing_unresolved",
+            "gate_id": claimed_gate.gate_id,
+            "architect_task_id": architect,
+            "state": "open",
+            "row_version": 0,
+            "accepted_run_id": None,
+            "design_digest": None,
+        }
         assert kb.complete_task(
             conn,
             architect,
@@ -186,6 +202,8 @@ def test_valid_completed_architect_handoff_accepts_exact_snapshot_and_allows_cre
 
         gate = kb.get_architecture_gate_for_task(conn, architect)
         assert gate is not None
+        assert gate.state == "policy_accepted"
+        assert gate.authorization_event_id is not None
         accepted = kb.accept_architecture_handoff(conn, gate.gate_id)
         assert accepted.state == "policy_accepted"
         assert accepted.design_digest
@@ -200,6 +218,11 @@ def test_valid_completed_architect_handoff_accepts_exact_snapshot_and_allows_cre
         )
         claimed_implementation = kb.claim_task(conn, implementation)
         assert claimed_implementation is not None and claimed_implementation.current_run_id is not None
+        implementation_policy = kb.latest_run(conn, implementation).run_spec["delivery_policy"]
+        assert implementation_policy["disposition"] == "enforcing_approved"
+        assert implementation_policy["gate_id"] == accepted.gate_id
+        assert implementation_policy["state"] == "policy_accepted"
+        assert implementation_policy["row_version"] == accepted.row_version
         assert not kb.complete_task(conn, implementation)
         assert kb.complete_task(
             conn,
@@ -274,9 +297,66 @@ def _awaiting_human_approval(conn) -> "kb.ArchitectureGate":
     assert kb.complete_task(conn, architect, metadata=handoff, expected_run_id=claimed.current_run_id)
     gate = kb.get_architecture_gate_for_task(conn, architect)
     assert gate is not None
+    assert gate.state == "validated_awaiting_approval"
+    completed = [event for event in kb.list_events(conn, architect) if event.kind == "completed"][-1]
+    assert completed.payload["delivery_withheld"] is True
+    assert completed.payload["gate_id"] == gate.gate_id
+    assert completed.payload["design_digest"] == gate.design_digest
+    assert "chosen_approach" not in json.dumps(completed.payload)
     accepted = kb.accept_architecture_handoff(conn, gate.gate_id)
     assert accepted.state == "validated_awaiting_approval"
     return accepted
+
+
+def test_malformed_architect_handoff_rolls_back_completion(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        claimed = kb.claim_task(conn, architect)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        with pytest.raises(ValueError, match="missing architecture handoff fields"):
+            kb.complete_task(
+                conn,
+                architect,
+                metadata={"role": "architect"},
+                expected_run_id=claimed.current_run_id,
+            )
+
+        assert kb.get_task(conn, architect).status == "running"
+        assert kb.get_architecture_gate_for_task(conn, architect).state == "open"
+
+
+def test_architect_handoff_ignores_only_trusted_operational_metadata(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        claimed = kb.claim_task(conn, architect)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = {
+            **_formal_handoff(),
+            "worker_session_id": "worker-session",
+            "model_used": {"provider": "anthropic", "model": "opus"},
+            "artifacts": ["/tmp/design.md"],
+        }
+
+        assert kb.complete_task(
+            conn,
+            architect,
+            metadata=metadata,
+            expected_run_id=claimed.current_run_id,
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert gate is not None and gate.state == "policy_accepted"
+        assert json.loads(gate.accepted_snapshot) == _formal_handoff()
 
 
 def test_human_approval_requires_authenticated_exact_digest_and_is_idempotent(kanban_home):
@@ -554,8 +634,8 @@ def test_policy_quarantine_dominates_readiness_claim_dependencies_and_stale_comp
         assert kb.recompute_ready(conn) == 0
 
 
-def test_same_turn_gate_open_withholds_tool_and_final_delivery(kanban_home, monkeypatch):
-    """The five-card incident cannot leak after its architect card is opened."""
+def test_gate_open_rejects_matching_running_ungated_run(kanban_home, monkeypatch):
+    """A new gate cannot retroactively replace an active RunSpec contract."""
     with kb.connect() as conn:
         dispatcher_task = kb.create_task(
             conn,
@@ -564,36 +644,311 @@ def test_same_turn_gate_open_withholds_tool_and_final_delivery(kanban_home, monk
             session_id="session-1",
             workflow_key="incident-5",
         )
+        claimed = kb.claim_task(conn, dispatcher_task)
+        assert claimed is not None and claimed.current_run_id is not None
         monkeypatch.setenv("HERMES_KANBAN_TASK", dispatcher_task)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DELIVERY_POLICY",
+            json.dumps(kb.latest_run(conn, dispatcher_task).run_spec["delivery_policy"]),
+        )
         policy = policy_for_current_kanban_task()
         assert policy is not None and not policy.withholding
 
+        with pytest.raises(
+            kb.ArchitectureGateError,
+            match="architecture_gate_running_ungated_run",
+        ):
+            kb.create_task(
+                conn,
+                title="Architect the incident",
+                assignee="architect",
+                session_id="session-1",
+                workflow_key="incident-5",
+                mutation_context=kb.MutationContext(
+                    board_key="default",
+                    principal="orchestrator-session",
+                    actor_type="orchestrator_agent",
+                    session_id="session-1",
+                    request_scope_id="incident-turn",
+                    workflow_key="incident-5",
+                    mode="orchestrator_only",
+                    phase="architecture",
+                ),
+            )
+
+        assert policy.stream_delta("still authorized") == "still authorized"
+        assert not policy.withholding
+
+
+def test_scope_gate_opened_before_claim_blocks_ready_and_review_workers(
+    kanban_home,
+):
+    """Claim enforcement and RunSpec snapshot share the scope resolver."""
+    with kb.connect() as conn:
+        ready = kb.create_task(
+            conn,
+            title="Scoped implementation",
+            assignee="coder",
+            session_id="session-claim-race",
+            workflow_key="workflow-claim-race",
+        )
+        review = kb.create_task(
+            conn,
+            title="Scoped review",
+            assignee="reviewer",
+            session_id="session-claim-race",
+            workflow_key="workflow-claim-race",
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
         architect = kb.create_task(
             conn,
-            title="Architect the incident",
+            title="Authorize scoped workflow",
             assignee="architect",
-            session_id="session-1",
-            workflow_key="incident-5",
+            session_id="session-claim-race",
+            workflow_key="workflow-claim-race",
             mutation_context=kb.MutationContext(
                 board_key="default",
-                principal="orchestrator-session",
+                principal="orchestrator:claim-race",
                 actor_type="orchestrator_agent",
-                session_id="session-1",
-                request_scope_id="incident-turn",
-                workflow_key="incident-5",
+                profile="orchestrator",
+                session_id="session-claim-race",
+                request_scope_id="front-door:claim-race",
+                workflow_key="workflow-claim-race",
                 mode="orchestrator_only",
                 phase="architecture",
             ),
         )
         gate = kb.get_architecture_gate_for_task(conn, architect)
-        assert gate is not None and gate.enforcement_mode == "orchestrator_only"
+        assert gate is not None and gate.state == "open"
 
-        assert policy.stream_delta("must not leak") is None
-        receipt = str(policy.tool_result('{"task_id":"must-not-leak"}'))
-        assert "must-not-leak" not in receipt
-        assert gate.gate_id in receipt
-        assert "architect " + architect in receipt
-        assert "state open" in receipt
+        assert kb.claim_task(conn, ready) is None
+        assert kb.get_task(conn, ready).status == "todo"
+        assert kb.latest_run(conn, ready) is None
+        assert kb.claim_review_task(conn, review) is None
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.latest_run(conn, review) is None
+
+
+def test_terminal_workflow_gate_does_not_poison_other_workflow_in_session(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Authorize workflow A",
+            assignee="architect",
+            session_id="long-lived-session",
+            workflow_key="workflow-a",
+            mutation_context=kb.MutationContext(
+                board_key="default",
+                principal="orchestrator:workflow-a",
+                actor_type="orchestrator_agent",
+                profile="orchestrator",
+                session_id="long-lived-session",
+                request_scope_id="front-door:workflow-a",
+                workflow_key="workflow-a",
+                mode="orchestrator_only",
+                phase="architecture",
+            ),
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        kb.invalidate_architecture_gate(conn, gate.gate_id, reason="replan A")
+
+        same_workflow = kb.create_task(
+            conn,
+            title="Still belongs to A",
+            assignee="coder",
+            session_id="long-lived-session",
+            workflow_key="workflow-a",
+        )
+        other_workflow = kb.create_task(
+            conn,
+            title="Independent workflow B",
+            assignee="coder",
+            session_id="long-lived-session",
+            workflow_key="workflow-b",
+        )
+
+        assert kb.claim_task(conn, same_workflow) is None
+        claimed_b = kb.claim_task(conn, other_workflow)
+        assert claimed_b is not None and claimed_b.current_run_id is not None
+        assert (
+            kb.latest_run(conn, other_workflow)
+            .run_spec["delivery_policy"]["disposition"]
+            == "none"
+        )
+
+
+def test_approved_run_latches_authority_epoch_change(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        architect_run = kb.claim_task(conn, architect)
+        assert architect_run is not None and architect_run.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            architect,
+            metadata=_formal_handoff(),
+            expected_run_id=architect_run.current_run_id,
+        )
+        implementation = kb.create_task(
+            conn,
+            title="Implement approved workflow",
+            assignee="coder",
+            parents=[architect],
+            mutation_context=_implementation_context(),
+        )
+        claimed = kb.claim_task(conn, implementation)
+        assert claimed is not None and claimed.current_run_id is not None
+        delivery = kb.latest_run(conn, implementation).run_spec["delivery_policy"]
+        monkeypatch.setenv("HERMES_KANBAN_TASK", implementation)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_DELIVERY_POLICY", json.dumps(delivery))
+        policy = policy_for_current_kanban_task()
+        assert policy is not None and not policy.withholding
+
+        gate = kb.get_architecture_gate_for_task(conn, implementation)
+        conn.execute(
+            "UPDATE architecture_gates SET row_version = row_version + 1 "
+            "WHERE gate_id = ?",
+            (gate.gate_id,),
+        )
+        assert "output withheld" in str(policy.tool_result("private"))
+        assert policy.authorization_conflict
+
+        # A later projection change cannot reauthorize the same immutable run.
+        conn.execute(
+            "UPDATE architecture_gates SET row_version = ? WHERE gate_id = ?",
+            (delivery["row_version"], gate.gate_id),
+        )
+        assert "output withheld" in str(policy.tool_result("still private"))
+
+
+def test_old_approved_epoch_cannot_complete_after_reacceptance(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        first_architect = kb.claim_task(conn, architect)
+        assert first_architect is not None
+        first_handoff = _formal_handoff()
+        assert kb.complete_task(
+            conn,
+            architect,
+            metadata=first_handoff,
+            expected_run_id=first_architect.current_run_id,
+        )
+        first_gate = kb.get_architecture_gate_for_task(conn, architect)
+        first_digest = first_gate.design_digest
+
+        implementation = kb.create_task(
+            conn,
+            title="Implement epoch A",
+            assignee="coder",
+            parents=[architect],
+            mutation_context=_implementation_context(),
+        )
+        old_run = kb.claim_task(conn, implementation)
+        assert old_run is not None and old_run.current_run_id is not None
+
+        kb.invalidate_architecture_gate(conn, first_gate.gate_id, reason="new design")
+        kb.reopen_architecture_gate(conn, first_gate.gate_id, _architect_context())
+        second_architect = kb.claim_task(conn, architect)
+        assert second_architect is not None
+        second_handoff = {
+            **first_handoff,
+            "chosen_approach": "Use a materially different epoch B design.",
+        }
+        assert kb.complete_task(
+            conn,
+            architect,
+            metadata=second_handoff,
+            expected_run_id=second_architect.current_run_id,
+        )
+        second_gate = kb.get_architecture_gate_for_task(conn, architect)
+        assert second_gate.design_digest != first_digest
+
+        assert not kb.complete_task(
+            conn,
+            implementation,
+            summary="OLD A OUTPUT",
+            expected_run_id=old_run.current_run_id,
+        )
+        assert kb.get_task(conn, implementation).status == "running"
+        assert not any(
+            event.kind == "completed" and "OLD A OUTPUT" in json.dumps(event.payload)
+            for event in kb.list_events(conn, implementation)
+        )
+        assert any(
+            event.kind == "completion_blocked"
+            and event.payload.get("reason") == "delivery_authority_epoch_mismatch"
+            for event in kb.list_events(conn, implementation)
+        )
+
+
+def test_authorization_lookup_outage_requeues_without_failure_count(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        architect_run = kb.claim_task(conn, architect)
+        assert architect_run is not None and architect_run.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            architect,
+            metadata=_formal_handoff(),
+            expected_run_id=architect_run.current_run_id,
+        )
+        implementation = kb.create_task(
+            conn,
+            title="Implement approved workflow",
+            assignee="coder",
+            parents=[architect],
+            mutation_context=_implementation_context(),
+        )
+        claimed = kb.claim_task(conn, implementation)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        delivery = kb.latest_run(conn, implementation).run_spec["delivery_policy"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", implementation)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DELIVERY_POLICY", json.dumps(delivery))
+    monkeypatch.setattr(
+        kb,
+        "get_delivery_architecture_gate",
+        lambda *_args: (_ for _ in ()).throw(OSError("resolver unavailable")),
+    )
+    policy = policy_for_current_kanban_task()
+    assert policy is not None and policy.requires_kernel_requeue
+    assert requeue_current_task_for_delivery_authorization(policy)
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, implementation)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert run.outcome == "delivery_authorization_unavailable"
+        assert kb.check_respawn_guard(conn, implementation) == (
+            "delivery_authorization_cooldown"
+        )
+        assert any(
+            event.kind == "delivery_authorization_unavailable"
+            for event in kb.list_events(conn, implementation)
+        )
 
 
 def test_authorized_graph_and_post_approval_descendants_are_not_quarantined(kanban_home):

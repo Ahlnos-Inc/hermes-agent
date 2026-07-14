@@ -595,6 +595,29 @@ def _resolve_active_context_length() -> int:
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+
+# Delivery authority is checked before tools that can mutate durable or
+# external state. Read-only discovery stays available inside the model's
+# private context during a resolver outage so the worker can preserve a useful
+# recovery handoff; its results are redacted from hooks and persistence.
+_DELIVERY_PRIVATE_READ_TOOLS = {
+    "read_file",
+    "list_directory",
+    "search_files",
+    "kanban_show",
+    "kanban_list",
+    "web_search",
+    "web_extract",
+    "browser_get_state",
+}
+
+
+def _delivery_tool_is_private_read(function_name: str) -> bool:
+    normalized = str(function_name or "").strip().lower()
+    # This is deliberately an exact core-tool allowlist. Plugin/MCP tools and
+    # unknown names are effectful by default; a benign-looking prefix is not
+    # an authorization capability.
+    return normalized in _DELIVERY_PRIVATE_READ_TOOLS
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -1048,12 +1071,18 @@ def handle_function_call(
             logger.debug("tool_request middleware error: %s", _mw_err)
 
     try:
-        # Dynamic architecture gate boundary.  The policy is re-resolved here
-        # (rather than at agent init) so a gate opened by an earlier tool in
-        # this exact turn prevents every later model-callable operation.
+        # Delivery policy is external-output containment, not an execution
+        # policy. Internal tools and lifecycle transitions must remain usable
+        # so an architect can produce a handoff and the kernel can recover.
+        # Keep the policy only to redact the externally observable post-tool
+        # hook below; return the raw result to the model's private context.
         from agent.kanban_delivery_policy import policy_for_current_kanban_task
         _kanban_delivery_policy = policy_for_current_kanban_task()
-        if _kanban_delivery_policy is not None and _kanban_delivery_policy.withholding:
+        if (
+            _kanban_delivery_policy is not None
+            and not _delivery_tool_is_private_read(function_name)
+            and _kanban_delivery_policy.withholding
+        ):
             return _kanban_delivery_policy.receipt
 
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1194,16 +1223,17 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
-        # Re-check after the handler.  A successful architect-create handler
-        # can itself open the gate; its raw tool envelope must not become the
-        # one-byte same-turn escape hatch into transcripts or transports.
+        externally_visible_result = result
+        externally_visible_args = function_args
         if _kanban_delivery_policy is not None:
-            result = str(_kanban_delivery_policy.tool_result(result))
+            if _kanban_delivery_policy.withholding:
+                externally_visible_result = _kanban_delivery_policy.receipt
+                externally_visible_args = {}
 
         _emit_post_tool_call_hook(
             function_name=function_name,
-            function_args=function_args,
-            result=result,
+            function_args=externally_visible_args,
+            result=externally_visible_result,
             task_id=task_id,
             session_id=session_id,
             tool_call_id=tool_call_id,
@@ -1253,12 +1283,6 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         error_result = json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
-        try:
-            _error_delivery_policy = locals().get("_kanban_delivery_policy")
-            if _error_delivery_policy is not None:
-                return str(_error_delivery_policy.tool_result(error_result))
-        except Exception:
-            pass
         return error_result
 
 

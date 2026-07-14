@@ -1480,6 +1480,16 @@ def test_claim_snapshots_an_immutable_versioned_run_spec(kanban_home):
                 "model": "gpt-5.6-sol",
                 "reasoning_effort": "xhigh",
             },
+            "delivery_policy": {
+                "version": 1,
+                "disposition": "none",
+                "gate_id": None,
+                "architect_task_id": None,
+                "state": None,
+                "row_version": None,
+                "accepted_run_id": None,
+                "design_digest": None,
+            },
         }
 
         conn.execute(
@@ -3788,6 +3798,16 @@ def test_review_claim_snapshots_its_own_run_spec(kanban_home):
                 "provider": "anthropic",
                 "model": "claude-opus-4-8",
                 "reasoning_effort": "xhigh",
+            },
+            "delivery_policy": {
+                "version": 1,
+                "disposition": "none",
+                "gate_id": None,
+                "architect_task_id": None,
+                "state": None,
+                "row_version": None,
+                "accepted_run_id": None,
+                "design_digest": None,
             },
         }
 

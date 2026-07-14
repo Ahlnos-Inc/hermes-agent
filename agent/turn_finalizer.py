@@ -289,8 +289,14 @@ def finalize_turn(
         for _message in reversed(messages):
             if _message.get("role") == "user":
                 break
-            if _message.get("role") == "assistant" and _message.get("content"):
-                _message["content"] = _delivery_policy.receipt
+            if _message.get("role") in {"assistant", "tool"}:
+                # Replace the entire envelope. Selective field redaction can
+                # leave tool-call arguments, attachments, reasoning variants,
+                # or provider-specific content parts behind.
+                _message.clear()
+                _message.update(
+                    {"role": "assistant", "content": _delivery_policy.receipt}
+                )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -655,5 +661,27 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # Delivery authority failures are lifecycle failures, not successful
+    # model turns. Requeue from trusted kernel code so containment cannot hide
+    # ``kanban_block`` feedback and turn the attempt into an rc=0 protocol
+    # violation. A fresh claim receives a fresh authority epoch after a short
+    # dispatcher cooldown.
+    _delivery_policy = getattr(agent, "_kanban_delivery_policy", None)
+    if _delivery_policy is not None and getattr(
+        _delivery_policy, "requires_kernel_requeue", False
+    ):
+        from agent.kanban_delivery_policy import (
+            requeue_current_task_for_delivery_authorization,
+        )
+
+        if not requeue_current_task_for_delivery_authorization(_delivery_policy):
+            raise RuntimeError(
+                "delivery authorization failed and kernel requeue did not commit"
+            )
+        result["completed"] = False
+        result["failed"] = True
+        result["turn_exit_reason"] = "delivery_authorization_requeued"
+        result["kanban_lifecycle_recovery"] = "requeued"
 
     return result

@@ -2146,6 +2146,43 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_rou
         assert conn.execute("SELECT COUNT(*) FROM architecture_gates").fetchone()[0] == 1
 
 
+def test_front_door_open_gate_denies_unparented_coder_in_same_turn(
+    monkeypatch, worker_env,
+):
+    """Every managed front-door mutation receives trusted gate context."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
+    _write_architecture_gate_policy(
+        os.environ["HERMES_HOME"], mode="orchestrator_only"
+    )
+
+    architect = json.loads(
+        kt._handle_create(
+            {"title": "Design workflow", "assignee": "architect"},
+            turn_id="trusted-turn",
+        )
+    )
+    assert architect["ok"]
+    with kb.connect() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    denied = json.loads(
+        kt._handle_create(
+            {"title": "Bypass implementation", "assignee": "coder"},
+            turn_id="trusted-turn",
+        )
+    )
+    assert "architecture_gate_open" in denied["error"]
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+
 @pytest.mark.parametrize(
     ("profile", "assignee"), [("worker", "architect"), ("orchestrator", "coder")],
 )

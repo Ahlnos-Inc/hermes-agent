@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 
 
@@ -220,6 +221,16 @@ def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
     assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "openai-codex"
     assert captured["cmd"][captured["cmd"].index("--reasoning-effort") + 1] == "xhigh"
     assert captured["env"]["HERMES_MODEL"] == "gpt-5.6-sol"
+    assert json.loads(captured["env"]["HERMES_KANBAN_DELIVERY_POLICY"]) == {
+        "version": 1,
+        "disposition": "none",
+        "gate_id": None,
+        "architect_task_id": None,
+        "state": None,
+        "row_version": None,
+        "accepted_run_id": None,
+        "design_digest": None,
+    }
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"

@@ -27,6 +27,12 @@ from gateway.kanban_notifications import render_kanban_event
 logger = logging.getLogger("gateway.run")
 
 
+def _architecture_delivery_withheld(event: Any) -> bool:
+    """Return whether an event may expose only its fixed gate receipt."""
+    payload = getattr(event, "payload", None)
+    return bool(isinstance(payload, dict) and payload.get("delivery_withheld"))
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -434,6 +440,12 @@ class GatewayKanbanWatchersMixin:
                                 # silently chop words mid-summary.
                                 event_runs = {}
                                 for ev in events:
+                                    if _architecture_delivery_withheld(ev):
+                                        # The event intentionally carries only
+                                        # a fixed approval receipt. Hydrating
+                                        # its run would reattach the withheld
+                                        # architecture handoff.
+                                        continue
                                     run_id = getattr(ev, "run_id", None)
                                     if run_id is None:
                                         continue
@@ -540,7 +552,10 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if (
+                                kind == "completed"
+                                and not _architecture_delivery_withheld(ev)
+                            ):
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

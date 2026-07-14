@@ -1672,7 +1672,31 @@ class AIAgent:
         # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
-        self._save_session_log(messages)
+        _log_messages = messages
+        _delivery_policy = getattr(self, "_kanban_delivery_policy", None)
+        if _delivery_policy is not None:
+            try:
+                if _delivery_policy.withholding:
+                    import copy
+
+                    _log_messages = copy.deepcopy(messages)
+                    for _message in reversed(_log_messages):
+                        if _message.get("role") == "user":
+                            break
+                        if _message.get("role") in {"assistant", "tool"}:
+                            _message.clear()
+                            _message.update(
+                                {
+                                    "role": "assistant",
+                                    "content": _delivery_policy.receipt,
+                                }
+                            )
+            except Exception:
+                # Policy failures are fail-closed at construction. If even the
+                # receipt projection fails, skip the optional JSON snapshot;
+                # the DB flush below applies its own containment check.
+                _log_messages = []
+        self._save_session_log(_log_messages)
         return self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
@@ -1815,6 +1839,27 @@ class AIAgent:
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)
             }
+            _delivery_withholding = False
+            _delivery_receipt = None
+            _delivery_policy = getattr(self, "_kanban_delivery_policy", None)
+            if _delivery_policy is not None:
+                try:
+                    _delivery_withholding = bool(_delivery_policy.withholding)
+                    if _delivery_withholding:
+                        _delivery_receipt = _delivery_policy.receipt
+                except Exception:
+                    _delivery_withholding = True
+                    _delivery_receipt = (
+                        "Architecture authorization unavailable; output withheld."
+                    )
+            _last_user_idx = max(
+                (
+                    idx
+                    for idx, item in enumerate(messages)
+                    if isinstance(item, dict) and item.get("role") == "user"
+                ),
+                default=-1,
+            )
 
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
@@ -1840,6 +1885,17 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                if (
+                    _delivery_withholding
+                    and _msg_idx > _last_user_idx
+                    and role in {"assistant", "tool"}
+                ):
+                    # Keep private tool output in the live model context until
+                    # the turn ends, but never append it to the durable session
+                    # during an authority outage or revocation. The finalizer
+                    # persists/delivers the fixed receipt instead.
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). Match the original guard: text-only

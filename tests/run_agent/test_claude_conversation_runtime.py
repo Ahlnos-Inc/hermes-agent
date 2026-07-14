@@ -108,7 +108,26 @@ def test_claude_success_honors_kanban_delivery_withholding():
         final=lambda _response: "Kanban receipt",
     )
     projection = ClaudeProjection(
-        messages=[{"role": "assistant", "content": "raw model prose"}],
+        messages=[
+            {
+                "role": "tool",
+                "content": "SENTINEL_PRIVATE_TOOL_RESULT",
+                "tool_call_id": "SENTINEL_PRIVATE_CALL_ID",
+            },
+            {
+                "role": "assistant",
+                "content": "raw model prose",
+                "reasoning": "SENTINEL_PRIVATE_REASONING",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "SENTINEL_PRIVATE_TOOL_ARGS",
+                        }
+                    }
+                ],
+            },
+        ],
         final_text="raw model prose",
     )
 
@@ -119,6 +138,42 @@ def test_claude_success_honors_kanban_delivery_withholding():
         result = agent.run_conversation("do the card")
 
     assert result["final_response"] == "Kanban receipt"
+
+
+def test_delivery_authorization_failure_uses_kernel_requeue():
+    agent = _agent()
+    agent._kanban_delivery_policy = SimpleNamespace(
+        withholding=True,
+        receipt="Authorization unavailable",
+        final=lambda _response: "Authorization unavailable",
+        requires_kernel_requeue=True,
+    )
+    projection = ClaudeProjection(
+        messages=[{"role": "assistant", "content": "raw model prose"}],
+        final_text="raw model prose",
+    )
+
+    with (
+        patch(
+            "agent.external_runtime.run_claude_agent_sdk_attempt",
+            return_value=projection,
+        ),
+        patch(
+            "agent.kanban_delivery_policy."
+            "requeue_current_task_for_delivery_authorization",
+            return_value=True,
+        ) as requeue,
+    ):
+        result = agent.run_conversation("do the card")
+
+    requeue.assert_called_once_with(agent._kanban_delivery_policy)
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "delivery_authorization_requeued"
+    assert result["kanban_lifecycle_recovery"] == "requeued"
+    assert "SENTINEL_PRIVATE_TOOL_RESULT" not in json.dumps(result["messages"])
+    assert "SENTINEL_PRIVATE_TOOL_ARGS" not in json.dumps(result["messages"])
+    assert "SENTINEL_PRIVATE_REASONING" not in json.dumps(result["messages"])
 
 
 def test_rate_limit_falls_through_to_codex_in_same_worker():

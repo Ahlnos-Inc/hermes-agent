@@ -26,6 +26,20 @@ def test_mixin_defines_kanban_methods():
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
 
 
+def test_architecture_delivery_withheld_is_payload_bound():
+    from types import SimpleNamespace
+
+    from gateway.kanban_watchers import _architecture_delivery_withheld
+
+    assert _architecture_delivery_withheld(
+        SimpleNamespace(payload={"delivery_withheld": True})
+    )
+    assert not _architecture_delivery_withheld(
+        SimpleNamespace(payload={"delivery_withheld": False})
+    )
+    assert not _architecture_delivery_withheld(SimpleNamespace(payload=None))
+
+
 def test_gateway_runner_inherits_mixin():
     # Import here so a heavy gateway import only happens if the first test passed.
     from gateway.run import GatewayRunner

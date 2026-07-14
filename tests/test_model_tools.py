@@ -5,6 +5,7 @@ from unittest.mock import ANY, call, patch
 
 
 from model_tools import (
+    _delivery_tool_is_private_read,
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
@@ -12,6 +13,14 @@ from model_tools import (
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+def test_delivery_private_read_capability_is_exact_allowlist():
+    assert _delivery_tool_is_private_read("read_file")
+    assert _delivery_tool_is_private_read("kanban_show")
+    assert not _delivery_tool_is_private_read("get_and_delete_credentials")
+    assert not _delivery_tool_is_private_read("query_then_publish")
+    assert not _delivery_tool_is_private_read("unknown_plugin_tool")
 
 
 # =========================================================================

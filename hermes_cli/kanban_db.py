@@ -3169,19 +3169,28 @@ def get_delivery_architecture_gate(
     task = get_task(conn, task_id)
     if task is None:
         return None
-    clauses: list[str] = []
-    params: list[Any] = []
-    if task.session_id:
-        clauses.append("session_id = ?")
-        params.append(task.session_id)
     if task.workflow_key:
-        clauses.append("workflow_key = ?")
-        params.append(task.workflow_key)
-    if not clauses:
+        # Workflow identity is stronger than the long-lived chat session. Do
+        # not OR the session into this predicate: a terminal gate for workflow
+        # A must not poison unrelated workflow B in the same conversation.
+        scope_sql = "workflow_key = ?"
+        params: list[Any] = [task.workflow_key]
+        state_sql = "state != 'human_approved'"
+    elif task.session_id:
+        # One-off tasks have no persisted request-scope id yet. Session is the
+        # legacy fallback only for active pre-approval gates; terminal rejected
+        # or invalidated one-offs cannot shadow the whole session forever.
+        scope_sql = "session_id = ?"
+        params = [task.session_id]
+        state_sql = (
+            "state IN ('open', 'validated_awaiting_approval', "
+            "'policy_accepted')"
+        )
+    else:
         return None
     row = conn.execute(
         "SELECT * FROM architecture_gates WHERE enforcement_mode IN (?, ?) "
-        "AND state != 'human_approved' AND (" + " OR ".join(clauses) + ") "
+        f"AND {state_sql} AND {scope_sql} "
         "ORDER BY updated_at DESC LIMIT 1",
         [*ARCHITECTURE_GATE_ENFORCING_MODES, *params],
     ).fetchone()
@@ -3250,6 +3259,31 @@ def _open_architecture_gate(
     mode = context.mode.strip().lower()
     if mode not in ARCHITECTURE_GATE_MODES:
         raise ValueError(f"architecture gate mode must be one of {sorted(ARCHITECTURE_GATE_MODES)}")
+    if mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if context.session_id:
+            clauses.append("session_id = ?")
+            params.append(context.session_id)
+        if context.workflow_key:
+            clauses.append("workflow_key = ?")
+            params.append(context.workflow_key)
+        if clauses:
+            running = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'running' AND ("
+                + " OR ".join(clauses)
+                + ") ORDER BY created_at LIMIT 1",
+                params,
+            ).fetchone()
+            if running is not None:
+                # A running attempt already carries an immutable claim-time
+                # delivery disposition. Opening a new enforcing gate in its
+                # scope would retroactively change that contract and create a
+                # lookup-failure race. Require the attempt to reach a terminal
+                # state, then open the gate before a fresh claim.
+                raise ArchitectureGateError(
+                    "architecture_gate_running_ungated_run"
+                )
     now = int(time.time())
     conn.execute(
         """INSERT INTO architecture_gates (
@@ -3299,7 +3333,8 @@ def canonicalize_architecture_handoff(metadata: dict[str, Any]) -> str:
         "role", "design_depth", "chosen_approach", "alternatives_rejected", "slices",
         "acceptance_criteria", "verification_plan", "human_approval_required", "rollout", "rollback",
     }
-    unknown = set(metadata) - allowed
+    operational = {"artifacts", "model_used", "worker_session_id"}
+    unknown = set(metadata) - allowed - operational
     if unknown:
         raise ValueError("unknown top-level authority fields: " + ", ".join(sorted(unknown)))
     required = allowed
@@ -3326,8 +3361,9 @@ def canonicalize_architecture_handoff(metadata: dict[str, Any]) -> str:
             raise ValueError("formal architecture handoff requires slices, acceptance criteria, and verification")
         if not any(isinstance(item, dict) and item.get("verification") for item in metadata["slices"]):
             raise ValueError("formal architecture handoff requires a slice verification")
-    _validate_json_value(metadata)
-    return json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    handoff = {key: metadata[key] for key in allowed}
+    _validate_json_value(handoff)
+    return json.dumps(handoff, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def architecture_handoff_digest(
@@ -3347,12 +3383,71 @@ def architecture_handoff_digest(
     ).hexdigest()
 
 
+def _accept_architecture_handoff_in_txn(
+    conn: sqlite3.Connection,
+    gate: ArchitectureGate,
+    *,
+    run_id: int,
+    metadata: dict[str, Any],
+) -> ArchitectureGate:
+    """Validate and accept one architect run inside its owning transaction."""
+    if gate.state != "open":
+        raise ArchitectureGateError("architecture_gate_not_open")
+    canonical = canonicalize_architecture_handoff(metadata)
+    digest = architecture_handoff_digest(
+        policy_version=gate.policy_version,
+        canonicalization_version=gate.canonicalization_version,
+        trusted_scope={
+            "board_key": gate.board_key,
+            "creator_principal": gate.creator_principal,
+            "request_scope_id": gate.request_scope_id,
+            "session_id": gate.session_id,
+            "workflow_key": gate.workflow_key,
+        },
+        architect_task_id=gate.architect_task_id,
+        accepted_run_id=int(run_id),
+        canonical_handoff_json=canonical,
+    )
+    target_state = (
+        "validated_awaiting_approval"
+        if metadata["human_approval_required"]
+        else "policy_accepted"
+    )
+    cur = conn.execute(
+        """UPDATE architecture_gates SET accepted_run_id = ?, state = ?, accepted_snapshot = ?,
+           design_digest = ?, row_version = row_version + 1, updated_at = ?
+           WHERE gate_id = ? AND state = 'open' AND row_version = ?""",
+        (
+            int(run_id), target_state, canonical, digest, int(time.time()),
+            gate.gate_id, gate.row_version,
+        ),
+    )
+    if cur.rowcount != 1:
+        raise ArchitectureGateError("architecture_gate_cas_conflict")
+    accepted = get_architecture_gate(conn, gate.gate_id)
+    assert accepted is not None
+    accepted_event_id = _append_gate_audit(
+        conn, accepted, "handoff_validation_passed"
+    )
+    if accepted.state == "policy_accepted":
+        conn.execute(
+            "UPDATE architecture_gates SET authorization_event_id = ? "
+            "WHERE gate_id = ? AND authorization_event_id IS NULL",
+            (accepted_event_id, accepted.gate_id),
+        )
+        accepted = get_architecture_gate(conn, gate.gate_id)
+        assert accepted is not None
+    return accepted
+
+
 def accept_architecture_handoff(conn: sqlite3.Connection, gate_id: str) -> ArchitectureGate:
     """Accept a completed architect run by immutable snapshot and CAS."""
     with write_txn(conn):
         gate = get_architecture_gate(conn, gate_id)
         if gate is None:
             raise ValueError("unknown architecture gate")
+        if gate.state in {"policy_accepted", "validated_awaiting_approval"}:
+            return gate
         if gate.state != "open":
             raise ArchitectureGateError("architecture_gate_not_open")
         task = get_task(conn, gate.architect_task_id)
@@ -3368,42 +3463,12 @@ def accept_architecture_handoff(conn: sqlite3.Connection, gate_id: str) -> Archi
             metadata = json.loads(run["metadata"])
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("architect completed run metadata is malformed") from exc
-        canonical = canonicalize_architecture_handoff(metadata)
-        digest = architecture_handoff_digest(
-            policy_version=gate.policy_version,
-            canonicalization_version=gate.canonicalization_version,
-            trusted_scope={
-                "board_key": gate.board_key,
-                "creator_principal": gate.creator_principal,
-                "request_scope_id": gate.request_scope_id,
-                "session_id": gate.session_id,
-                "workflow_key": gate.workflow_key,
-            },
-            architect_task_id=gate.architect_task_id,
-            accepted_run_id=int(run["id"]),
-            canonical_handoff_json=canonical,
+        return _accept_architecture_handoff_in_txn(
+            conn,
+            gate,
+            run_id=int(run["id"]),
+            metadata=metadata,
         )
-        target_state = "validated_awaiting_approval" if metadata["human_approval_required"] else "policy_accepted"
-        cur = conn.execute(
-            """UPDATE architecture_gates SET accepted_run_id = ?, state = ?, accepted_snapshot = ?,
-               design_digest = ?, row_version = row_version + 1, updated_at = ?
-               WHERE gate_id = ? AND state = 'open' AND row_version = ?""",
-            (int(run["id"]), target_state, canonical, digest, int(time.time()), gate_id, gate.row_version),
-        )
-        if cur.rowcount != 1:
-            raise ArchitectureGateError("architecture_gate_cas_conflict")
-        accepted = get_architecture_gate(conn, gate_id)
-        assert accepted is not None
-        accepted_event_id = _append_gate_audit(conn, accepted, "handoff_validation_passed")
-        if accepted.state == "policy_accepted":
-            conn.execute(
-                "UPDATE architecture_gates SET authorization_event_id = ? "
-                "WHERE gate_id = ? AND authorization_event_id IS NULL",
-                (accepted_event_id, accepted.gate_id),
-            )
-            accepted = get_architecture_gate(conn, gate_id)
-            assert accepted is not None
-        return accepted
 
 
 def approve_architecture_gate(
@@ -5366,7 +5431,121 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
-def _build_run_spec(task_row: Optional[sqlite3.Row]) -> dict:
+def _delivery_policy_snapshot(
+    gate: Optional[ArchitectureGate],
+) -> dict[str, Any]:
+    """Return the trusted claim-time delivery authorization for a run."""
+    enforcing = (
+        gate is not None
+        and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES
+    )
+    if not enforcing:
+        return {
+            "version": 1,
+            "disposition": "none",
+            "gate_id": None,
+            "architect_task_id": None,
+            "state": None,
+            "row_version": None,
+            "accepted_run_id": None,
+            "design_digest": None,
+        }
+    assert gate is not None
+    disposition = (
+        "enforcing_approved"
+        if gate.state in {"policy_accepted", "human_approved"}
+        else "enforcing_unresolved"
+    )
+    return {
+        "version": 1,
+        "disposition": disposition,
+        "gate_id": gate.gate_id,
+        "architect_task_id": gate.architect_task_id,
+        "state": gate.state,
+        "row_version": gate.row_version,
+        "accepted_run_id": gate.accepted_run_id,
+        "design_digest": gate.design_digest,
+    }
+
+
+def validate_delivery_policy_snapshot(value: Any) -> dict[str, Any]:
+    """Validate and normalize a trusted run delivery attestation."""
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("invalid delivery policy version")
+    disposition = value.get("disposition")
+    gate_id = value.get("gate_id")
+    architect_task_id = value.get("architect_task_id")
+    state = value.get("state")
+    row_version = value.get("row_version")
+    accepted_run_id = value.get("accepted_run_id")
+    design_digest = value.get("design_digest")
+    if disposition == "none":
+        if any(
+            item is not None
+            for item in (
+                gate_id,
+                architect_task_id,
+                state,
+                row_version,
+                accepted_run_id,
+                design_digest,
+            )
+        ):
+            raise ValueError("invalid ungated delivery policy")
+    elif disposition in {"enforcing_unresolved", "enforcing_approved"}:
+        if (
+            not isinstance(gate_id, str)
+            or not gate_id.strip()
+            or gate_id != gate_id.strip()
+            or not isinstance(architect_task_id, str)
+            or not architect_task_id.strip()
+            or architect_task_id != architect_task_id.strip()
+            or not isinstance(state, str)
+            or type(row_version) is not int
+            or row_version < 0
+        ):
+            raise ValueError("invalid enforcing delivery policy")
+        approved_states = {"policy_accepted", "human_approved"}
+        unresolved_states = {
+            "open",
+            "validated_awaiting_approval",
+            "invalidated",
+            "rejected",
+        }
+        if disposition == "enforcing_approved":
+            if (
+                state not in approved_states
+                or type(accepted_run_id) is not int
+                or accepted_run_id <= 0
+                or not isinstance(design_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", design_digest)
+            ):
+                raise ValueError("invalid approved delivery policy")
+        elif (
+            state not in unresolved_states
+            or accepted_run_id is not None
+            or design_digest is not None
+        ):
+            raise ValueError("invalid unresolved delivery policy")
+    else:
+        raise ValueError("invalid delivery policy disposition")
+    return {
+        "version": 1,
+        "disposition": disposition,
+        "gate_id": gate_id,
+        "architect_task_id": architect_task_id,
+        "state": state,
+        "row_version": row_version,
+        "accepted_run_id": accepted_run_id,
+        "design_digest": design_digest,
+    }
+
+
+def _build_run_spec(
+    task_row: Optional[sqlite3.Row],
+    *,
+    architecture_gate: Optional[ArchitectureGate] = None,
+) -> dict:
     """Build the immutable, secret-free launch contract for one run."""
     return {
         "version": 1,
@@ -5376,6 +5555,7 @@ def _build_run_spec(task_row: Optional[sqlite3.Row]) -> dict:
             "model": task_row["model_override"] if task_row else None,
             "reasoning_effort": task_row["model_reasoning_effort"] if task_row else None,
         },
+        "delivery_policy": _delivery_policy_snapshot(architecture_gate),
     }
 
 
@@ -5647,7 +5827,10 @@ def claim_task(
         if quarantined and quarantined["policy_quarantined"]:
             _append_event(conn, task_id, "claim_blocked", {"reason": "policy_quarantined"})
             return None
-        gate = get_architecture_gate_for_task(conn, task_id)
+        # Enforcement and the immutable delivery snapshot must use the same
+        # canonical resolver. A scope gate can exist before a ready task is
+        # claimed even when it is not yet linked by ancestry.
+        gate = get_delivery_architecture_gate(conn, task_id)
         if gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
             issued = conn.execute(
                 "SELECT task_ids FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
@@ -5782,7 +5965,9 @@ def claim_task(
             (task_id,),
         ).fetchone()
         run_spec_json = json.dumps(
-            _build_run_spec(trow), ensure_ascii=False, sort_keys=True,
+            _build_run_spec(trow, architecture_gate=gate),
+            ensure_ascii=False,
+            sort_keys=True,
         )
         run_cur = conn.execute(
             """
@@ -5848,6 +6033,39 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        gate = get_delivery_architecture_gate(conn, task_id)
+        if gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+            issued = conn.execute(
+                "SELECT task_ids FROM architecture_graph_issuances WHERE gate_id = ?",
+                (gate.gate_id,),
+            ).fetchone()
+            if issued is not None and task_id != gate.architect_task_id:
+                try:
+                    issued_ids = set(json.loads(issued["task_ids"]))
+                except (TypeError, json.JSONDecodeError):
+                    issued_ids = set()
+                if task_id not in issued_ids:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "claim_blocked",
+                        {
+                            "reason": "architecture_graph_issued",
+                            "gate_id": gate.gate_id,
+                        },
+                    )
+                    return None
+            if _gate_requires_enforcement(gate) and gate.architect_task_id != task_id:
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_blocked",
+                    {
+                        "reason": ARCHITECTURE_GATE_REASON_OPEN,
+                        "gate_id": gate.gate_id,
+                    },
+                )
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5870,7 +6088,9 @@ def claim_review_task(
             (task_id,),
         ).fetchone()
         run_spec_json = json.dumps(
-            _build_run_spec(trow), ensure_ascii=False, sort_keys=True,
+            _build_run_spec(trow, architecture_gate=gate),
+            ensure_ascii=False,
+            sort_keys=True,
         )
         run_cur = conn.execute(
             """
@@ -6362,6 +6582,9 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    delivery_withheld = False
+    delivery_gate_id: Optional[str] = None
+    delivery_digest: Optional[str] = None
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6397,7 +6620,43 @@ def complete_task(
         if quarantined and quarantined["policy_quarantined"]:
             _append_event(conn, task_id, "completion_blocked", {"reason": "policy_quarantined"})
             return False
-        gate = get_architecture_gate_for_task(conn, task_id)
+        gate = get_delivery_architecture_gate(conn, task_id)
+        if expected_run_id is not None and (
+            gate is None or gate.architect_task_id != task_id
+        ):
+            run_spec = get_run_spec(
+                conn,
+                int(expected_run_id),
+                task_id=task_id,
+                require_current=True,
+            )
+            try:
+                claimed_delivery = validate_delivery_policy_snapshot(
+                    run_spec.get("delivery_policy")
+                    if isinstance(run_spec, dict)
+                    else None
+                )
+            except ValueError:
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked",
+                    {"reason": "invalid_delivery_attestation"},
+                )
+                return False
+            current_delivery = _delivery_policy_snapshot(gate)
+            if claimed_delivery != current_delivery:
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked",
+                    {
+                        "reason": "delivery_authority_epoch_mismatch",
+                        "claimed_gate_id": claimed_delivery.get("gate_id"),
+                        "current_gate_id": current_delivery.get("gate_id"),
+                    },
+                )
+                return False
         if gate is not None and gate.enforcement_mode == "enforce" and gate.architect_task_id != task_id:
             task = get_task(conn, task_id)
             if task is not None and task.current_run_id is not None and expected_run_id is None:
@@ -6460,16 +6719,49 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        # Architecture completion and handoff acceptance are one atomic
+        # transition. A malformed handoff rolls the completion back, leaving
+        # the architect run alive so it can correct and retry. This removes
+        # the former production dead-end where only tests called the separate
+        # acceptance function after a successful completion.
+        accepted_gate: Optional[ArchitectureGate] = None
+        if gate is not None and gate.architect_task_id == task_id:
+            if run_id is None or not isinstance(metadata, dict):
+                raise ValueError(
+                    "architect completion requires formal handoff metadata"
+                )
+            accepted_gate = _accept_architecture_handoff_in_txn(
+                conn,
+                gate,
+                run_id=run_id,
+                metadata=metadata,
+            )
+            if accepted_gate.state == "validated_awaiting_approval":
+                delivery_withheld = True
+                delivery_gate_id = accepted_gate.gate_id
+                delivery_digest = accepted_gate.design_digest
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
-        completed_payload: dict = {
-            "result_len": len(result) if result else 0,
-            "summary": ev_summary or None,
-        }
+        if delivery_withheld:
+            completed_payload: dict = {
+                "result_len": 0,
+                "summary": (
+                    "Architecture handoff validated; awaiting exact-digest "
+                    "human approval."
+                ),
+                "delivery_withheld": True,
+                "gate_id": delivery_gate_id,
+                "design_digest": delivery_digest,
+            }
+        else:
+            completed_payload = {
+                "result_len": len(result) if result else 0,
+                "summary": ev_summary or None,
+            }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6478,7 +6770,7 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
+        if isinstance(metadata, dict) and not delivery_withheld:
             md_model_used = metadata.get("model_used")
             if isinstance(md_model_used, dict):
                 cleaned_model_used = {
@@ -6537,7 +6829,11 @@ def complete_task(
         board=get_current_board(),
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
-        summary=(summary if summary is not None else result),
+        summary=(
+            "Architecture handoff validated; awaiting exact-digest human approval."
+            if delivery_withheld
+            else (summary if summary is not None else result)
+        ),
     )
     return True
 
@@ -7105,6 +7401,49 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    return True
+
+
+def defer_task_for_delivery_authorization_retry(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    error: str = "delivery gate lookup unavailable",
+) -> bool:
+    """End one attempt and requeue it without counting a task failure.
+
+    This is a kernel-owned recovery transition for a transient authorization
+    resolver outage. It deliberately differs from ``kanban_block`` (which
+    requires an operator to unblock) and from ``_record_task_failure`` (which
+    can trip the task circuit breaker). The respawn guard spaces the next
+    attempt using a short, configurable cooldown.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE tasks
+               SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, last_failure_error = ?
+               WHERE id = ? AND status = 'running' AND current_run_id = ?""",
+            (error[:500], task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="delivery_authorization_unavailable",
+            status="delivery_authorization_unavailable",
+            error=error[:500],
+            metadata={"retryable": True},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "delivery_authorization_unavailable",
+            {"error": error[:500], "retryable": True},
+            run_id=run_id,
+        )
     return True
 
 
@@ -8221,6 +8560,22 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # without thrashing. Overridable via ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+DEFAULT_DELIVERY_AUTHORIZATION_COOLDOWN_SECONDS = 30
+
+
+def _resolve_delivery_authorization_cooldown_seconds() -> int:
+    """Return the retry delay after a delivery-authority lookup outage."""
+    raw = os.environ.get(
+        "HERMES_KANBAN_DELIVERY_AUTHORIZATION_COOLDOWN_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_DELIVERY_AUTHORIZATION_COOLDOWN_SECONDS
 
 
 @dataclass
@@ -9899,6 +10254,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+    ``"delivery_authorization_cooldown"``
+        The previous worker requeued itself because the canonical delivery
+        gate resolver was transiently unavailable. Retry after a short delay
+        without incrementing the task failure circuit breaker.
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -9945,6 +10305,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "delivery_authorization_unavailable"
+    ):
+        cooldown = _resolve_delivery_authorization_cooldown_seconds()
+        ended_at = latest_run["ended_at"]
+        if cooldown > 0 and ended_at is not None and now - int(ended_at) < cooldown:
+            return "delivery_authorization_cooldown"
+        # This outcome is self-classifying. Once its cooldown expires it must
+        # not fall into the generic auth-error regex and defer forever.
+        return None
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
@@ -10964,7 +11335,7 @@ def _spawn_contract(
     task: Task,
     *,
     board: Optional[str],
-) -> tuple[str, dict[str, Optional[str]]]:
+) -> tuple[str, dict[str, Optional[str]], dict[str, Any]]:
     """Load the active run's immutable launch contract.
 
     A task without a run spec is a legacy/manual spawn and keeps the old task
@@ -10977,7 +11348,7 @@ def _spawn_contract(
         "reasoning_effort": task.model_reasoning_effort,
     }
     if task.current_run_id is None:
-        return task.assignee or "", legacy_route
+        return task.assignee or "", legacy_route, _delivery_policy_snapshot(None)
 
     with connect(board=board) as conn:
         row = conn.execute(
@@ -10992,7 +11363,9 @@ def _spawn_contract(
         )
     raw = row["run_spec_json"]
     if not raw:
-        return task.assignee or "", legacy_route
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} has no run spec"
+        )
     try:
         spec = json.loads(raw)
     except (TypeError, ValueError) as exc:
@@ -11008,11 +11381,23 @@ def _spawn_contract(
         raise RuntimeError(
             f"task {task.id} run {task.current_run_id} has unsupported run spec"
         )
-    return str(spec.get("profile") or ""), {
-        "provider": route.get("provider"),
-        "model": route.get("model"),
-        "reasoning_effort": route.get("reasoning_effort"),
-    }
+    try:
+        delivery_policy = validate_delivery_policy_snapshot(
+            spec.get("delivery_policy")
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} has invalid delivery policy"
+        ) from exc
+    return (
+        str(spec.get("profile") or ""),
+        {
+            "provider": route.get("provider"),
+            "model": route.get("model"),
+            "reasoning_effort": route.get("reasoning_effort"),
+        },
+        delivery_policy,
+    )
 
 
 def _default_spawn(
@@ -11037,7 +11422,9 @@ def _default_spawn(
 
     from hermes_cli.profiles import normalize_profile_name
 
-    requested_profile, requested_route = _spawn_contract(task, board=board)
+    requested_profile, requested_route, delivery_policy = _spawn_contract(
+        task, board=board,
+    )
     profile_arg = normalize_profile_name(requested_profile)
     if not profile_arg:
         raise RuntimeError(f"task {task.id} run contract has no profile")
@@ -11104,6 +11491,15 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # The dispatcher already read and validated the immutable RunSpec before
+    # spawning. Pass only its delivery attestation to the child so output
+    # boundaries do not need SQLite merely to discover that this run is
+    # authoritatively ungated.
+    env["HERMES_KANBAN_DELIVERY_POLICY"] = json.dumps(
+        delivery_policy,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the

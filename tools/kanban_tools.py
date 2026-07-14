@@ -2224,7 +2224,7 @@ def _trusted_front_door_architecture_context(
     kb: Any, *, board: Any, assignee: Any, turn_id: Any,
 ) -> Any:
     """Construct architecture authority from runtime identity, never tool args."""
-    if os.environ.get("HERMES_KANBAN_TASK") or str(assignee).strip() != "architect":
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return None
     if os.environ.get("HERMES_PROFILE") != "orchestrator":
         return None
@@ -2242,7 +2242,12 @@ def _trusted_front_door_architecture_context(
         board_key=str(board or os.environ.get("HERMES_KANBAN_BOARD") or "default"),
         principal=f"orchestrator:{session_id}", actor_type="orchestrator_agent",
         profile="orchestrator", session_id=session_id,
-        request_scope_id=f"front-door:{trusted_turn_id}", mode=mode, phase="architecture",
+        request_scope_id=f"front-door:{trusted_turn_id}", mode=mode,
+        phase=(
+            "architecture"
+            if str(assignee).strip() == "architect"
+            else "implementation"
+        ),
     )
 
 
