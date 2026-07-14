@@ -197,7 +197,70 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
+    assert "runs" not in d
+    assert "comments" not in d
+    assert "events" not in d
+    assert "body" not in d["task"]
+
+
+def test_show_detail_full_retains_diagnostic_history(worker_env):
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_show({"detail": "full"}))
+
+    assert d["task"]["id"] == worker_env
+    assert "body" in d["task"]
     assert "runs" in d
+    assert "comments" in d
+    assert "events" in d
+
+
+def test_orchestrator_show_defaults_to_compact_status(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    d = json.loads(kt._handle_show({"task_id": worker_env}))
+
+    assert d["task"] == {
+        "id": worker_env,
+        "title": "worker-test",
+        "assignee": "test-worker",
+        "status": "running",
+        "current_run_id": d["task"]["current_run_id"],
+    }
+    assert d["dependencies"] == {
+        "parent_count": 0,
+        "child_count": 0,
+        "unfinished_parent_count": 0,
+    }
+    assert d["latest_run"]["status"] == "running"
+    assert "latest_event" in d
+    assert "worker_context" not in d
+    assert "runs" not in d
+    assert "comments" not in d
+    assert "events" not in d
+
+
+def test_orchestrator_compact_show_bounds_latest_run_and_event(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET summary = ?, error = ?, metadata = ? "
+                "WHERE task_id = ?",
+                ("s" * 100_000, "e" * 100_000, json.dumps({"blob": "m" * 100_000}), worker_env),
+            )
+            kb._append_event(conn, worker_env, "diagnostic", {"blob": "p" * 100_000})
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    raw = kt._handle_show({"task_id": worker_env})
+    d = json.loads(raw)
+
+    assert len(raw.encode("utf-8")) < 8 * 1024
+    assert "metadata" not in d["latest_run"]
+    assert d["latest_event"]["payload"]["truncated"] is True
 
 
 def test_show_explicit_task_id(worker_env):
@@ -233,7 +296,6 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert ids == [a, c]
     assert d["count"] == 2
     assert d["tasks"][0]["title"] == "alpha"
-    assert d["tasks"][0]["parent_count"] == 0
     assert b not in ids
 
     tenant_out = kt._handle_list({
@@ -243,6 +305,25 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
     assert tenant_ids == [c]
+
+
+def test_list_filters_one_workflow_without_dumping_the_board(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        wanted = kb.create_task(
+            conn, title="wanted", assignee="factory", workflow_key="wf-one",
+        )
+        kb.create_task(
+            conn, title="unrelated", assignee="factory", workflow_key="wf-two",
+        )
+
+    d = json.loads(kt._handle_list({"workflow_key": "wf-one"}))
+
+    assert [task["id"] for task in d["tasks"]] == [wanted]
+    assert d["tasks"][0]["parent_count"] == 0
 
 
 def test_list_rejects_invalid_status(monkeypatch, worker_env):
@@ -348,7 +429,7 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     })
     assert json.loads(complete_out)["ok"] is True
 
-    show_out = kt._handle_show({"task_id": worker_env})
+    show_out = kt._handle_show({"task_id": worker_env, "detail": "full"})
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"

@@ -310,6 +310,11 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_CTX_MAX_TOTAL_BYTES    = 48 * 1024  # hard aggregate prompt boundary
+_CTX_MAX_ATTACHMENTS_BYTES = 3 * 1024
+_CTX_MAX_ATTEMPTS_BYTES = 7 * 1024
+_CTX_MAX_PARENTS_BYTES  = 14 * 1024
+_CTX_MAX_COMMENTS_BYTES = 7 * 1024
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -11019,6 +11024,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             return s
         return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
+    def _section_size(section_lines: list[str]) -> int:
+        return len(("\n".join(section_lines) + "\n").encode("utf-8"))
+
+    def _omitted_ids(ids: list[str]) -> str:
+        """Bounded identifier sample that preserves both ends of a fan-in."""
+        if len(ids) <= 100:
+            return ", ".join(ids)
+        return ", ".join([*ids[:20], "…", *ids[-20:]])
+
+    def _hard_cap(text: str) -> str:
+        raw = text.encode("utf-8")
+        if len(raw) <= _CTX_MAX_TOTAL_BYTES:
+            return text
+        marker = b"\n\n_[additional context omitted by 48 KiB aggregate budget]_\n"
+        prefix = raw[: _CTX_MAX_TOTAL_BYTES - len(marker)]
+        return prefix.decode("utf-8", errors="ignore").rstrip() + marker.decode()
+
     lines: list[str] = []
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
@@ -11052,17 +11074,32 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # as-is; remote backends need the kanban attachments dir mounted.
     attachments = list_attachments(conn, task_id)
     if attachments:
-        lines.append("## Attachments")
-        lines.append(
+        attachment_lines = ["## Attachments"]
+        attachment_lines.append(
             "Files attached to this task. Read them with the file/terminal "
             "tools at the absolute paths below:"
         )
+        omitted_attachments: list[str] = []
         for att in attachments:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
-        lines.append("")
+            entry = _cap(
+                f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`",
+                1024,
+            )
+            if _section_size([*attachment_lines, entry]) <= (
+                _CTX_MAX_ATTACHMENTS_BYTES - 768
+            ):
+                attachment_lines.append(entry)
+            else:
+                omitted_attachments.append(att.filename)
+        if omitted_attachments:
+            attachment_lines.append(
+                f"_({len(omitted_attachments)} attachment path(s) omitted by "
+                f"section budget: {_cap(', '.join(omitted_attachments), 512)})_"
+            )
+        lines.extend([*attachment_lines, ""])
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
@@ -11080,12 +11117,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         shown = all_prior
         first_shown_idx = 1
     if shown:
-        lines.append("## Prior attempts on this task")
-        if omitted:
-            lines.append(
-                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
-                f"omitted; showing most recent {len(shown)})_"
-            )
+        attempt_groups: list[list[str]] = []
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
@@ -11093,18 +11125,41 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
             outcome = run.outcome or run.status
-            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
+            group = [f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})"]
             if run.summary and run.summary.strip():
-                lines.append(_cap(run.summary))
+                group.append(_cap(run.summary))
             if run.error and run.error.strip():
-                lines.append(f"_error_: {_cap(run.error)}")
+                group.append(f"_error_: {_cap(run.error)}")
             if run.metadata:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    lines.append(f"_metadata_: `{_cap(meta_str)}`")
+                    group.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
-            lines.append("")
+            group.append("")
+            attempt_groups.append(group)
+
+        selected_attempts: list[list[str]] = []
+        attempt_header = ["## Prior attempts on this task"]
+        # Prefer the newest recoverable state when aggregate history is large.
+        for group in reversed(attempt_groups):
+            candidate = [
+                *attempt_header,
+                *[line for selected in reversed(selected_attempts) for line in selected],
+                *group,
+            ]
+            if _section_size(candidate) <= _CTX_MAX_ATTEMPTS_BYTES - 512:
+                selected_attempts.append(group)
+            else:
+                omitted += 1
+        if omitted:
+            attempt_header.append(
+                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} omitted; "
+                f"showing most recent {len(selected_attempts)})_"
+            )
+        lines.extend(attempt_header)
+        for group in reversed(selected_attempts):
+            lines.extend(group)
 
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
@@ -11116,7 +11171,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     parent_ids = [r["parent_id"] for r in parent_rows]
 
     if parent_ids:
-        wrote_header = False
+        parent_groups: list[tuple[str, list[str]]] = []
         for pid in parent_ids:
             pt = get_task(conn, pid)
             if not pt or pt.status != "done":
@@ -11124,17 +11179,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
             runs.sort(key=lambda r: r.started_at, reverse=True)
             run = runs[0] if runs else None
-
-            if not wrote_header:
-                lines.append("## Parent task results")
-                lines.append(
-                    "_Handoffs from upstream tasks, captured when each parent "
-                    "completed (see age below). These are point-in-time "
-                    "snapshots, not live state — if a result drives your "
-                    "current work and it's not recent, re-verify against the "
-                    "source before acting on it as current._"
-                )
-                wrote_header = True
 
             # When did this parent's result get produced? Prefer the
             # completed run's end time; fall back to the task's completed_at.
@@ -11144,7 +11188,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             elif pt.completed_at:
                 done_ts = pt.completed_at
             age = _relative_age(done_ts, _now)
-            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+            group = [f"### {pid}" + (f" (completed {age})" if age else "")]
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
@@ -11160,8 +11204,32 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
-            lines.extend(body_lines)
-            lines.append("")
+            group.extend(body_lines)
+            group.append("")
+            parent_groups.append((pid, group))
+
+        if parent_groups:
+            parent_section = [
+                "## Parent task results",
+                "_Handoffs from upstream tasks are point-in-time snapshots, "
+                "not live state. Re-verify stale facts before treating them "
+                "as current._",
+            ]
+            omitted_parent_ids: list[str] = []
+            for pid, group in parent_groups:
+                if _section_size([*parent_section, *group]) <= (
+                    _CTX_MAX_PARENTS_BYTES - 1536
+                ):
+                    parent_section.extend(group)
+                else:
+                    omitted_parent_ids.append(pid)
+            if omitted_parent_ids:
+                parent_section.append(
+                    f"_({len(omitted_parent_ids)} parent handoff(s) omitted by "
+                    f"section budget; ids: {_omitted_ids(omitted_parent_ids)})_"
+                )
+                parent_section.append("")
+            lines.extend(parent_section)
 
     # Cross-task role history: what else has THIS assignee completed
     # recently? Gives the worker implicit continuity — "I'm the reviewer
@@ -11202,12 +11270,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         omitted_c = 0
         shown_c = all_comments
     if shown_c:
-        lines.append("## Comment thread")
-        if omitted_c:
-            lines.append(
-                f"_({omitted_c} earlier comment{'s' if omitted_c != 1 else ''} "
-                f"omitted; showing most recent {len(shown_c)})_"
-            )
+        comment_groups: list[list[str]] = []
         for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
             age = _relative_age(c.created_at, _now)
@@ -11219,11 +11282,35 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
-            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
-            lines.append("")
+            comment_groups.append(
+                [
+                    f"comment from worker `{safe_author}` at {ts_disp}:",
+                    _cap(c.body, _CTX_MAX_COMMENT_BYTES),
+                    "",
+                ]
+            )
 
-    return "\n".join(lines).rstrip() + "\n"
+        selected_comments: list[list[str]] = []
+        for group in reversed(comment_groups):
+            candidate = [
+                "## Comment thread",
+                *[line for selected in reversed(selected_comments) for line in selected],
+                *group,
+            ]
+            if _section_size(candidate) <= _CTX_MAX_COMMENTS_BYTES - 512:
+                selected_comments.append(group)
+            else:
+                omitted_c += 1
+        lines.append("## Comment thread")
+        if omitted_c:
+            lines.append(
+                f"_({omitted_c} earlier comment{'s' if omitted_c != 1 else ''} "
+                f"omitted; showing most recent {len(selected_comments)})_"
+            )
+        for group in reversed(selected_comments):
+            lines.extend(group)
+
+    return _hard_cap("\n".join(lines).rstrip() + "\n")
 
 
 # ---------------------------------------------------------------------------

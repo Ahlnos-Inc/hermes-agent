@@ -1278,13 +1278,15 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read bounded task state; ``detail=full`` is the diagnostic escape."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    detail = str(args.get("detail") or "compact").strip().lower()
+    if detail not in {"compact", "full"}:
+        return tool_error("detail must be 'compact' or 'full'")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1292,9 +1294,6 @@ def _handle_show(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
@@ -1322,27 +1321,132 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
+            def _compact_text(value: Any, limit: int) -> Optional[str]:
+                if value is None:
+                    return None
+                text = str(value)
+                if len(text) <= limit:
+                    return text
+                return text[:limit] + f"… [{len(text) - limit} chars omitted]"
+
+            def _compact_run_dict(r):
+                if r is None:
+                    return None
+                compact = {
+                    "id": r.id,
+                    "profile": r.profile,
+                    "status": r.status,
+                    "outcome": r.outcome,
+                    "summary": _compact_text(r.summary, 1024),
+                    "error": _compact_text(r.error, 512),
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
+                }
+                if isinstance(r.metadata, dict):
+                    compact["metadata_keys"] = sorted(str(key) for key in r.metadata)[:32]
+                    if isinstance(r.metadata.get("model_used"), dict):
+                        compact["model_used"] = {
+                            key: _compact_text(r.metadata["model_used"].get(key), 256)
+                            for key in ("provider", "model", "reasoning_effort")
+                            if r.metadata["model_used"].get(key) is not None
+                        }
+                return compact
+
+            def _bounded_event_payload(value: Any) -> Any:
+                try:
+                    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                except (TypeError, ValueError):
+                    return None
+                raw = serialized.encode("utf-8")
+                if len(raw) <= 2048:
+                    return value
+                preview = raw[:1800].decode("utf-8", errors="ignore")
+                return {
+                    "truncated": True,
+                    "original_bytes": len(raw),
+                    "preview": preview,
+                }
+
+            if detail == "full":
+                comments = kb.list_comments(conn, tid)
+                events = kb.list_events(conn, tid)
+                runs = kb.list_runs(conn, tid)
+                return json.dumps({
+                    "task": _task_dict(task),
+                    "parents": parents,
+                    "children": children,
+                    "comments": [
+                        {"author": c.author, "body": c.body,
+                         "created_at": c.created_at}
+                        for c in comments
+                    ],
+                    "events": [
+                        {"kind": e.kind, "payload": e.payload,
+                         "created_at": e.created_at, "run_id": e.run_id}
+                        for e in events[-50:]   # cap; full log via CLI
+                    ],
+                    "runs": [_run_dict(r) for r in runs],
+                    "worker_context": kb.build_worker_context(conn, tid),
+                    "detail": "full",
+                })
+
+            compact_task = {
+                "id": task.id,
+                "title": task.title,
+                "assignee": task.assignee,
+                "status": task.status,
+                "current_run_id": task.current_run_id,
+            }
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                # A worker already receives the complete bounded handoff in
+                # worker_context. Repeating raw body/comments/runs/events here
+                # creates the context-growth loop this compact view prevents.
+                return json.dumps({
+                    "task": compact_task,
+                    "worker_context": kb.build_worker_context(conn, tid),
+                    "detail": "compact",
+                })
+
+            unfinished_parents = 0
+            for parent_id in parents:
+                parent = kb.get_task(conn, parent_id)
+                if parent is not None and parent.status not in {"done", "archived"}:
+                    unfinished_parents += 1
+            event_row = conn.execute(
+                "SELECT kind, payload, created_at, run_id FROM task_events "
+                "WHERE task_id = ? AND kind != 'heartbeat' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            latest_event = None
+            if event_row is not None:
+                try:
+                    event_payload = (
+                        json.loads(event_row["payload"])
+                        if event_row["payload"] else None
+                    )
+                except (TypeError, ValueError):
+                    event_payload = None
+                latest_event = {
+                    "kind": event_row["kind"],
+                    "payload": _bounded_event_payload(event_payload),
+                    "created_at": event_row["created_at"],
+                    "run_id": event_row["run_id"],
+                }
+            latest_run = kb.latest_run(conn, tid)
             return json.dumps({
-                "task": _task_dict(task),
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
+                "task": compact_task,
+                "current_step_key": task.current_step_key,
+                "dependencies": {
+                    "parent_count": len(parents),
+                    "child_count": len(children),
+                    "unfinished_parent_count": unfinished_parents,
+                },
+                "latest_run": _compact_run_dict(latest_run),
+                "latest_event": latest_event,
+                "detail": "compact",
             })
+
         finally:
             conn.close()
     except ValueError as e:
@@ -1361,6 +1465,7 @@ def _handle_list(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     status = args.get("status")
     tenant = args.get("tenant")
+    workflow_key = args.get("workflow_key")
     include_archived, bool_error = _parse_bool_arg(args, "include_archived")
     if bool_error:
         return tool_error(bool_error)
@@ -1389,6 +1494,7 @@ def _handle_list(args: dict, **kw) -> str:
                 assignee=assignee,
                 status=status,
                 tenant=tenant,
+                workflow_key=workflow_key,
                 include_archived=include_archived,
                 limit=limit + 1,
             )
@@ -2255,12 +2361,10 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read bounded task state. Workers receive one compact task identity "
+        "plus the pre-formatted worker_context handoff; orchestrators receive "
+        "compact dependency/latest-run status. Use detail='full' only for "
+        "diagnosis when raw comments, attempts, and recent events are needed."
     ),
     "parameters": {
         "type": "object",
@@ -2268,6 +2372,11 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["compact", "full"],
+                "description": "Bounded compact view (default) or diagnostic full history.",
             },
             "board": _board_schema_prop(),
         },
@@ -2280,7 +2389,7 @@ KANBAN_LIST_SCHEMA = {
     "description": (
         "List Kanban task summaries so an orchestrator profile can discover "
         "work to route. Supports the same core filters as the CLI: assignee, "
-        "status, tenant, include_archived, and limit. Returns compact rows "
+        "status, tenant, workflow_key, include_archived, and limit. Returns compact rows "
         "with ids, title, status, assignee, priority, parent/child ids, and "
         "counts. Bounded to 50 rows by default, 200 max, with truncation "
         "metadata. Also recomputes ready tasks before listing, matching the "
@@ -2305,6 +2414,10 @@ KANBAN_LIST_SCHEMA = {
             "tenant": {
                 "type": "string",
                 "description": "Optional tenant/project namespace filter.",
+            },
+            "workflow_key": {
+                "type": "string",
+                "description": "Optional workflow instance key filter.",
             },
             "include_archived": {
                 "type": "boolean",
