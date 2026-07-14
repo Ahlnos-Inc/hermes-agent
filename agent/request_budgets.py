@@ -36,7 +36,14 @@ _orphaned_route_threads_lock = threading.Lock()
 
 @dataclass(frozen=True)
 class AttemptBudgets:
-    """Monotonic wall-clock limits for one provider attempt."""
+    """Monotonic wall-clock limits for one provider attempt.
+
+    ``first_event_seconds`` means the first observable provider protocol event.
+    Streaming transports (including Bedrock ConverseStream) satisfy it on any
+    decoded provider event, not only a text token.  Non-streaming APIs expose
+    no intermediate event, so their complete response is necessarily their
+    first observable event and this budget bounds the whole non-stream call.
+    """
 
     total_seconds: float | None
     first_event_seconds: float | None

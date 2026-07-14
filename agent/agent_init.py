@@ -215,6 +215,8 @@ def init_agent(
     stale_timeout_seconds: float = None,
     total_attempt_timeout_seconds: float = None,
     first_event_timeout_seconds: float = None,
+    local_model_max_wait_seconds: float = None,
+    local_model_lease_ttl_seconds: float = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
@@ -571,6 +573,19 @@ def init_agent(
     )
     agent._route_first_event_timeout_seconds = _route_timeout(
         first_event_timeout_seconds
+    )
+    from agent.local_model_lease import (
+        DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
+        DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
+    )
+
+    agent._route_local_model_max_wait_seconds = (
+        _route_timeout(local_model_max_wait_seconds)
+        or DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS
+    )
+    agent._route_local_model_lease_ttl_seconds = (
+        _route_timeout(local_model_lease_ttl_seconds)
+        or DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS
     )
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
@@ -1991,6 +2006,8 @@ def init_agent(
         "route_stale_timeout_seconds": agent._route_stale_timeout_seconds,
         "route_total_attempt_timeout_seconds": agent._route_total_attempt_timeout_seconds,
         "route_first_event_timeout_seconds": agent._route_first_event_timeout_seconds,
+        "route_local_model_max_wait_seconds": agent._route_local_model_max_wait_seconds,
+        "route_local_model_lease_ttl_seconds": agent._route_local_model_lease_ttl_seconds,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

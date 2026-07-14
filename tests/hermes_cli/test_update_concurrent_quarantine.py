@@ -466,7 +466,9 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     profile_home.mkdir(parents=True)
     profile_proc = SimpleNamespace(profile="work", path=profile_home, pid=101)
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [101, 202])
+    monkeypatch.setattr(
+        gateway_mod, "find_gateway_pids_strict", lambda **_k: [101, 202]
+    )
     monkeypatch.setattr(
         gateway_mod,
         "find_profile_gateway_processes",
@@ -612,7 +614,7 @@ def test_pause_returns_cold_start_token_when_installed_but_none_running(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids_strict", lambda **_k: [])
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
 
     token = cli_main._pause_windows_gateways_for_update()
@@ -639,7 +641,7 @@ def test_pause_returns_none_when_nothing_running_and_not_installed(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids_strict", lambda **_k: [])
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
 
     assert cli_main._pause_windows_gateways_for_update() is None
@@ -655,7 +657,7 @@ def test_resume_cold_starts_gateway_when_token_requests_it(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids_strict", lambda **_k: [])
     spawned = []
     monkeypatch.setattr(
         gateway_windows,
@@ -689,7 +691,9 @@ def test_resume_cold_start_skips_when_gateway_already_running(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [9001])
+    monkeypatch.setattr(
+        gateway_mod, "find_gateway_pids_strict", lambda **_k: [9001]
+    )
     spawned = []
     monkeypatch.setattr(
         gateway_windows,

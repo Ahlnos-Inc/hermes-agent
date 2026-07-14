@@ -26,11 +26,18 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_local_model_lease_ttl,
+    get_provider_local_model_max_wait,
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.local_model_lease import (
+    DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
+    DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
     LocalModelCapacityLease,
     LocalModelLeaseError,
     LocalModelLeaseTimeout,
@@ -255,6 +262,16 @@ def _acquire_local_model_lease_for_attempt(
             base_url=base_url,
             deadline_monotonic=deadline,
             lease_deadline_monotonic=lease_deadline,
+            max_wait_seconds=getattr(
+                agent,
+                "_route_local_model_max_wait_seconds",
+                DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
+            ),
+            lease_ttl_seconds=getattr(
+                agent,
+                "_route_local_model_lease_ttl_seconds",
+                DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
+            ),
             cancelled=cancelled,
         )
     except LocalModelLeaseTimeout as exc:
@@ -759,19 +776,27 @@ def interruptible_api_call(agent, api_kwargs: dict):
             logger.debug(
                 "Force-closing httpx client due to interrupt (not a network error)."
             )
-            # Force-close the in-flight worker-local HTTP connection to stop
-            # token generation without poisoning the shared client used to
-            # seed future retries.
-            try:
-                if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
-                else:
-                    _close_request_client_once("interrupt_abort")
-            except Exception:
-                pass
+            # Quarantine synchronously before any potentially-blocking SDK
+            # teardown.  The caller must regain control promptly; a daemon
+            # aborter unwinds the transport while exact-route quarantine
+            # prevents a replacement request from overlapping it.
             _quarantine_if_worker_alive(agent, api_kwargs, t)
-            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
+
+            def _abort_interrupted_request() -> None:
+                try:
+                    if agent.api_mode == "anthropic_messages":
+                        agent._anthropic_client.close()
+                        agent._rebuild_anthropic_client()
+                    else:
+                        _close_request_client_once("interrupt_abort")
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_abort_interrupted_request,
+                name="provider-interrupt-abort",
+                daemon=True,
+            ).start()
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -1371,6 +1396,18 @@ def _apply_fallback_route_limits(agent, fb: dict) -> None:
     )
     agent._route_first_event_timeout_seconds = _positive_route_timeout(
         fb, "first_event_timeout_seconds"
+    )
+    route_provider = str(fb.get("provider") or "")
+    route_model = str(fb.get("model") or "") or None
+    agent._route_local_model_max_wait_seconds = (
+        _positive_route_timeout(fb, "local_model_max_wait_seconds")
+        or get_provider_local_model_max_wait(route_provider, route_model)
+        or DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS
+    )
+    agent._route_local_model_lease_ttl_seconds = (
+        _positive_route_timeout(fb, "local_model_lease_ttl_seconds")
+        or get_provider_local_model_lease_ttl(route_provider, route_model)
+        or DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS
     )
 
 
@@ -2370,15 +2407,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         while t.is_alive():
             t.join(timeout=0.3)
             if agent._interrupt_requested:
-                client = bedrock_client_holder.get("client")
-                close = getattr(client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
                 _quarantine_if_worker_alive(agent, api_kwargs, t)
-                t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
+
+                def _abort_interrupted_bedrock() -> None:
+                    client = bedrock_client_holder.get("client")
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                threading.Thread(
+                    target=_abort_interrupted_bedrock,
+                    name="bedrock-interrupt-abort",
+                    daemon=True,
+                ).start()
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             elapsed = time.monotonic() - _attempt_started_monotonic
             deadline_message = None
@@ -3493,16 +3537,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "Force-closing streaming httpx client due to interrupt "
                 "(not a network error)."
             )
-            try:
-                if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
-                else:
-                    _close_request_client_once("stream_interrupt_abort")
-            except Exception:
-                pass
             _quarantine_if_worker_alive(agent, api_kwargs, t)
-            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
+
+            def _abort_interrupted_stream() -> None:
+                try:
+                    if agent.api_mode == "anthropic_messages":
+                        agent._anthropic_client.close()
+                        agent._rebuild_anthropic_client()
+                    else:
+                        _close_request_client_once("stream_interrupt_abort")
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_abort_interrupted_stream,
+                name="provider-stream-interrupt-abort",
+                daemon=True,
+            ).start()
             raise InterruptedError("Agent interrupted during streaming API call")
     if result["error"] is not None:
         if deltas_were_sent["yes"]:

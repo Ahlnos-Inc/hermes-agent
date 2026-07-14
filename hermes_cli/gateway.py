@@ -81,6 +81,10 @@ class ProfileGatewayProcess:
     pid: int
 
 
+class GatewayProcessEnumerationError(RuntimeError):
+    """The process table could not be enumerated completely and safely."""
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -324,6 +328,8 @@ def _scan_gateway_pids(
     exclude_pids: set[int],
     all_profiles: bool = False,
     include_restart_managers: bool = False,
+    *,
+    strict: bool = False,
 ) -> list[int]:
     """Best-effort process-table scan for gateway PIDs.
 
@@ -421,6 +427,11 @@ def _scan_gateway_pids(
                 # so the downstream parser below doesn't need to branch.
                 powershell = shutil.which("powershell") or shutil.which("pwsh")
                 if powershell is None:
+                    if strict:
+                        raise GatewayProcessEnumerationError(
+                            "gateway process enumeration is unavailable: "
+                            "neither wmic nor PowerShell is installed"
+                        )
                     return []
                 ps_cmd = (
                     "Get-CimInstance Win32_Process | "
@@ -440,10 +451,18 @@ def _scan_gateway_pids(
                         timeout=15,
                         **_no_window,
                     )
-                except (OSError, subprocess.TimeoutExpired):
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    if strict:
+                        raise GatewayProcessEnumerationError(
+                            "gateway process enumeration via PowerShell failed"
+                        ) from exc
                     return []
                 used_fallback = True
             if result.returncode != 0 or result.stdout is None:
+                if strict:
+                    raise GatewayProcessEnumerationError(
+                        "gateway process enumeration command returned an error"
+                    )
                 return []
             current_cmd = ""
             for line in result.stdout.split("\n"):
@@ -481,11 +500,27 @@ def _scan_gateway_pids(
                                 all_profiles or _matches_current_profile(cmdline)
                             ):
                                 _append_unique_pid(pids, pid, exclude_pids)
-                        except (OSError, PermissionError):
+                        except FileNotFoundError:
+                            # A process can exit between listdir() and open().
+                            # That is a normal scan race, not an incomplete
+                            # inventory.
+                            continue
+                        except (OSError, PermissionError) as exc:
+                            if strict:
+                                raise GatewayProcessEnumerationError(
+                                    "gateway process enumeration could not inspect "
+                                    f"/proc/{pid}/cmdline"
+                                ) from exc
                             continue
                     _found_via_proc = True
+                except GatewayProcessEnumerationError:
+                    raise
                 except Exception:
-                    pass
+                    if strict:
+                        logger.debug(
+                            "gateway /proc enumeration failed; trying ps",
+                            exc_info=True,
+                        )
 
             if not _found_via_proc:
                 result = subprocess.run(
@@ -495,6 +530,10 @@ def _scan_gateway_pids(
                     timeout=10,
                 )
                 if result.returncode != 0:
+                    if strict:
+                        raise GatewayProcessEnumerationError(
+                            "gateway process enumeration via ps returned an error"
+                        )
                     return []
                 for line in result.stdout.split("\n"):
                     stripped = line.strip()
@@ -524,7 +563,13 @@ def _scan_gateway_pids(
                         all_profiles or _matches_current_profile(command)
                     ):
                         _append_unique_pid(pids, pid, exclude_pids)
-    except (OSError, subprocess.TimeoutExpired):
+    except GatewayProcessEnumerationError:
+        raise
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if strict:
+            raise GatewayProcessEnumerationError(
+                "gateway process enumeration failed"
+            ) from exc
         return []
 
     # Windows-specific: collapse venv launcher stubs.  A venv-built
@@ -609,6 +654,45 @@ def find_gateway_pids(
         include_restart_managers=include_restart_managers,
     ):
         _append_unique_pid(pids, pid, _exclude)
+    return pids
+
+
+def find_gateway_pids_strict(
+    exclude_pids: set | None = None,
+    all_profiles: bool = True,
+) -> list[int]:
+    """Return gateway PIDs or raise when the process table is unavailable.
+
+    This is the fail-closed inventory for update/config transactions.  The
+    historical :func:`find_gateway_pids` remains best-effort for status views
+    and service UX where an unavailable process utility should not crash the
+    command.  Strict callers must never interpret an enumeration failure as
+    "zero gateways" and begin mutating shared runtime state.
+    """
+    exclude = set(exclude_pids or set())
+    pids: list[int] = []
+    if not all_profiles:
+        try:
+            from gateway.status import get_running_pid
+
+            _append_unique_pid(pids, get_running_pid(), exclude)
+        except Exception as exc:
+            raise GatewayProcessEnumerationError(
+                "current-profile gateway PID could not be inspected"
+            ) from exc
+    try:
+        include_restart_managers = not supports_systemd_services()
+    except Exception as exc:
+        raise GatewayProcessEnumerationError(
+            "gateway service capability could not be inspected"
+        ) from exc
+    for pid in _scan_gateway_pids(
+        exclude,
+        all_profiles=all_profiles,
+        include_restart_managers=include_restart_managers,
+        strict=True,
+    ):
+        _append_unique_pid(pids, pid, exclude)
     return pids
 
 

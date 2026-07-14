@@ -1003,6 +1003,8 @@ def test_named_custom_primary_lifts_nested_model_route_limits(monkeypatch):
                             "max_output_tokens": 4096,
                             "timeout_seconds": 120,
                             "stale_timeout_seconds": 90,
+                            "local_model_max_wait_seconds": 17,
+                            "local_model_lease_ttl_seconds": 600,
                         }
                     },
                 }
@@ -1018,6 +1020,8 @@ def test_named_custom_primary_lifts_nested_model_route_limits(monkeypatch):
     assert resolved["max_output_tokens"] == 4096
     assert resolved["request_timeout_seconds"] == 120
     assert resolved["stale_timeout_seconds"] == 90
+    assert resolved["local_model_max_wait_seconds"] == 17
+    assert resolved["local_model_lease_ttl_seconds"] == 600
 
 
 def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):

@@ -621,6 +621,12 @@ def _lift_route_limits(
     first_event_timeout = _positive_finite_number(
         entry.get("first_event_timeout_seconds")
     )
+    local_model_max_wait = _positive_finite_number(
+        entry.get("local_model_max_wait_seconds")
+    )
+    local_model_lease_ttl = _positive_finite_number(
+        entry.get("local_model_lease_ttl_seconds")
+    )
     if request_timeout is not None:
         result["request_timeout_seconds"] = request_timeout
     if stale_timeout is not None:
@@ -629,6 +635,10 @@ def _lift_route_limits(
         result["total_attempt_timeout_seconds"] = total_attempt_timeout
     if first_event_timeout is not None:
         result["first_event_timeout_seconds"] = first_event_timeout
+    if local_model_max_wait is not None:
+        result["local_model_max_wait_seconds"] = local_model_max_wait
+    if local_model_lease_ttl is not None:
+        result["local_model_lease_ttl_seconds"] = local_model_lease_ttl
 
     models = entry.get("models")
     model_entry = models.get(model, {}) if isinstance(models, dict) and model else {}
@@ -647,6 +657,12 @@ def _lift_route_limits(
     first_event_timeout = _positive_finite_number(
         model_entry.get("first_event_timeout_seconds")
     )
+    local_model_max_wait = _positive_finite_number(
+        model_entry.get("local_model_max_wait_seconds")
+    )
+    local_model_lease_ttl = _positive_finite_number(
+        model_entry.get("local_model_lease_ttl_seconds")
+    )
     if request_timeout is not None:
         result["request_timeout_seconds"] = request_timeout
     if stale_timeout is not None:
@@ -655,6 +671,10 @@ def _lift_route_limits(
         result["total_attempt_timeout_seconds"] = total_attempt_timeout
     if first_event_timeout is not None:
         result["first_event_timeout_seconds"] = first_event_timeout
+    if local_model_max_wait is not None:
+        result["local_model_max_wait_seconds"] = local_model_max_wait
+    if local_model_lease_ttl is not None:
+        result["local_model_lease_ttl_seconds"] = local_model_lease_ttl
 
 
 def _copy_route_limits(source: Mapping[str, Any], result: Dict[str, Any]) -> None:
@@ -664,6 +684,8 @@ def _copy_route_limits(source: Mapping[str, Any], result: Dict[str, Any]) -> Non
         "stale_timeout_seconds",
         "total_attempt_timeout_seconds",
         "first_event_timeout_seconds",
+        "local_model_max_wait_seconds",
+        "local_model_lease_ttl_seconds",
     ):
         if key in source:
             result[key] = source[key]

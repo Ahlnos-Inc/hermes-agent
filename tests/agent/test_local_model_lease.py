@@ -13,6 +13,7 @@ import pytest
 from agent import chat_completion_helpers as helpers
 from agent.local_model_lease import (
     LocalModelLeaseQuarantined,
+    LocalModelLeaseReleasePending,
     LocalModelLeaseReleaseError,
     LocalModelLeaseStateError,
     LocalModelLeaseTimeout,
@@ -308,6 +309,8 @@ def test_release_write_failure_is_explicit_and_retryable(monkeypatch, tmp_path):
     )
     state_path, _ = _state_files(tmp_path)
     original_write = leases._atomic_write_state
+    stop_heartbeat = MagicMock(wraps=lease._stop_heartbeat)
+    monkeypatch.setattr(lease, "_stop_heartbeat", stop_heartbeat)
 
     def fail_write(*_args, **_kwargs):
         raise OSError("injected release write failure")
@@ -316,12 +319,129 @@ def test_release_write_failure_is_explicit_and_retryable(monkeypatch, tmp_path):
     with pytest.raises(LocalModelLeaseReleaseError, match="durably release"):
         lease.release()
     assert lease._released is False
+    # A failed durable clear must leave the heartbeat alive while the janitor
+    # retains the exact owner for retry.
+    assert stop_heartbeat.call_count == 0
     assert json.loads(state_path.read_text())["active"]["token"] == lease._token
 
     monkeypatch.setattr(leases, "_atomic_write_state", original_write)
     lease.release()
     assert lease._released is True
+    assert stop_heartbeat.call_count == 1
     assert json.loads(state_path.read_text())["active"] is None
+
+
+def test_release_janitor_retries_transient_failure_and_clears_exact_owner(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import local_model_lease as leases
+
+    lease = acquire_local_model_capacity(
+        provider="omlx",
+        model="qwen",
+        base_url="http://127.0.0.1:8080/v1",
+        deadline_monotonic=time.monotonic() + 2,
+        cancelled=lambda: False,
+        root=tmp_path,
+    )
+    state_path, _ = _state_files(tmp_path)
+    original_write = leases._atomic_write_state
+    failures = {"remaining": 1}
+
+    def fail_once(*args, **kwargs):
+        if failures["remaining"]:
+            failures["remaining"] -= 1
+            raise OSError("transient release failure")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(leases, "_atomic_write_state", fail_once)
+    with pytest.raises(LocalModelLeaseReleaseError):
+        lease.release()
+    assert lease._release_pending is True
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if json.loads(state_path.read_text())["active"] is None:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("release janitor did not clear the exact owned lease")
+    assert lease._released is True
+    assert lease._release_pending is False
+
+
+def test_expired_failed_release_is_distinct_from_active_owner(monkeypatch, tmp_path):
+    from agent import local_model_lease as leases
+
+    lease = acquire_local_model_capacity(
+        provider="omlx",
+        model="qwen",
+        base_url="http://127.0.0.1:8080/v1",
+        deadline_monotonic=time.monotonic() + 2,
+        cancelled=lambda: False,
+        root=tmp_path,
+    )
+    state_path, _ = _state_files(tmp_path)
+    original_write = leases._atomic_write_state
+    monkeypatch.setattr(
+        leases,
+        "_atomic_write_state",
+        MagicMock(side_effect=OSError("persistent release failure")),
+    )
+    with pytest.raises(LocalModelLeaseReleaseError):
+        lease.release()
+
+    state = json.loads(state_path.read_text())
+    now = time.time()
+    state["active"]["acquired_at"] = now - 3
+    state["active"]["heartbeat_at"] = now - 2
+    state["active"]["expires_at"] = now - 1
+    state["active"]["max_expires_at"] = now + 1
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(LocalModelLeaseReleasePending, match="release is pending"):
+        acquire_local_model_capacity(
+            provider="omlx",
+            model="qwen",
+            base_url="http://127.0.0.1:8080/v1",
+            deadline_monotonic=time.monotonic() + 1,
+            cancelled=lambda: False,
+            root=tmp_path,
+        )
+
+    monkeypatch.setattr(leases, "_atomic_write_state", original_write)
+    lease.release()
+
+
+def test_pre_admission_failure_closes_pinned_directory_fd(monkeypatch, tmp_path):
+    from agent import local_model_lease as leases
+
+    captured = {}
+    original_open = leases._open_pinned_lease_directory
+
+    def capture(*args, **kwargs):
+        path, descriptor = original_open(*args, **kwargs)
+        captured["fd"] = descriptor
+        return path, descriptor
+
+    monkeypatch.setattr(leases, "_open_pinned_lease_directory", capture)
+
+    def fail_birth(_pid):
+        raise LocalModelLeaseStateError("birth lookup failed")
+
+    with pytest.raises(LocalModelLeaseStateError, match="birth lookup"):
+        acquire_local_model_capacity(
+            provider="omlx",
+            model="qwen",
+            base_url="http://127.0.0.1:8080/v1",
+            deadline_monotonic=time.monotonic() + 1,
+            cancelled=lambda: False,
+            root=tmp_path,
+            process_started_at=fail_birth,
+        )
+    if captured.get("fd") is not None:
+        with pytest.raises(OSError):
+            os.fstat(captured["fd"])
 
 
 def test_release_lock_failure_is_explicit_and_retryable(monkeypatch, tmp_path):

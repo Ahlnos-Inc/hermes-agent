@@ -135,6 +135,8 @@ def test_legacy_provider_deadlines_reach_gateway_agent(isolated_home):
             stale_timeout_seconds: 42
             total_attempt_timeout_seconds: 43
             first_event_timeout_seconds: 44
+            local_model_max_wait_seconds: 45
+            local_model_lease_ttl_seconds: 46
         """
     )
     grun = fresh_gateway()
@@ -144,6 +146,8 @@ def test_legacy_provider_deadlines_reach_gateway_agent(isolated_home):
     assert runtime["stale_timeout_seconds"] == 42
     assert runtime["total_attempt_timeout_seconds"] == 43
     assert runtime["first_event_timeout_seconds"] == 44
+    assert runtime["local_model_max_wait_seconds"] == 45
+    assert runtime["local_model_lease_ttl_seconds"] == 46
 
     model = runtime.pop("model")
     agent = AIAgent(
@@ -157,6 +161,8 @@ def test_legacy_provider_deadlines_reach_gateway_agent(isolated_home):
     assert agent._route_stale_timeout_seconds == 42
     assert agent._route_total_attempt_timeout_seconds == 43
     assert agent._route_first_event_timeout_seconds == 44
+    assert agent._route_local_model_max_wait_seconds == 45
+    assert agent._route_local_model_lease_ttl_seconds == 46
 
 
 def test_env_override_beats_everything(isolated_home, monkeypatch):

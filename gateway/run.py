@@ -1833,6 +1833,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "stale_timeout_seconds",
         "total_attempt_timeout_seconds",
         "first_event_timeout_seconds",
+        "local_model_max_wait_seconds",
+        "local_model_lease_ttl_seconds",
     ):
         if runtime.get(timeout_key) is not None:
             resolved[timeout_key] = runtime[timeout_key]
@@ -1905,6 +1907,8 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "stale_timeout_seconds",
                     "total_attempt_timeout_seconds",
                     "first_event_timeout_seconds",
+                    "local_model_max_wait_seconds",
+                    "local_model_lease_ttl_seconds",
                 ):
                     if runtime.get(timeout_key) is not None:
                         resolved[timeout_key] = runtime[timeout_key]
@@ -3714,6 +3718,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "first_event_timeout_seconds": runtime_kwargs.get(
                 "first_event_timeout_seconds"
             ),
+            "local_model_max_wait_seconds": runtime_kwargs.get(
+                "local_model_max_wait_seconds"
+            ),
+            "local_model_lease_ttl_seconds": runtime_kwargs.get(
+                "local_model_lease_ttl_seconds"
+            ),
         }
         route = {
             "model": model,
@@ -3731,6 +3741,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("stale_timeout_seconds"),
                 runtime.get("total_attempt_timeout_seconds"),
                 runtime.get("first_event_timeout_seconds"),
+                runtime.get("local_model_max_wait_seconds"),
+                runtime.get("local_model_lease_ttl_seconds"),
             ),
         }
 
@@ -15029,6 +15041,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("stale_timeout_seconds"),
                 runtime.get("total_attempt_timeout_seconds"),
                 runtime.get("first_event_timeout_seconds"),
+                runtime.get("local_model_max_wait_seconds"),
+                runtime.get("local_model_lease_ttl_seconds"),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.

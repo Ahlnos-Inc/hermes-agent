@@ -30,6 +30,7 @@ import httpx
 import pytest
 
 from agent import chat_completion_helpers as cch
+from agent.request_budgets import ProviderRouteQuarantined
 
 
 class _FakeInterruptError(Exception):
@@ -42,6 +43,10 @@ def _make_agent():
     agent.api_mode = "chat_completions"
     agent._interrupt_requested = False
     agent.verbose_logging = False
+    agent._route_request_timeout_seconds = None
+    agent._route_stale_timeout_seconds = None
+    agent._route_total_attempt_timeout_seconds = None
+    agent._route_first_event_timeout_seconds = None
     # _compute_non_stream_stale_timeout / streaming setup helpers return
     # benign values; the real call path is mocked per-test.
     agent._compute_non_stream_stale_timeout.return_value = 5.0
@@ -79,6 +84,46 @@ def test_non_streaming_cancel_does_not_surface_network_error():
     assert elapsed < 3.0, f"interrupt took {elapsed:.1f}s — should be near-instant"
 
 
+def test_interrupt_returns_before_blocking_transport_abort_finishes():
+    """Quarantine is synchronous, but SDK teardown must not add a 2s wait."""
+    agent = _make_agent()
+    agent.provider = "interrupt-latency-provider"
+    agent.model = "interrupt-latency-model"
+    agent.base_url = "https://interrupt-latency.invalid/v1"
+    worker_release = threading.Event()
+    worker_started = threading.Event()
+    fake_client = MagicMock()
+
+    def blocked_create(**_kwargs):
+        worker_started.set()
+        worker_release.wait(5)
+        raise httpx.RemoteProtocolError("aborted")
+
+    def blocking_abort(*_args, **_kwargs):
+        time.sleep(2)
+        worker_release.set()
+
+    fake_client.chat.completions.create.side_effect = blocked_create
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = blocking_abort
+
+    def interrupt_soon():
+        assert worker_started.wait(1)
+        agent._interrupt_requested = True
+
+    threading.Thread(target=interrupt_soon, daemon=True).start()
+    started = time.monotonic()
+    with pytest.raises(InterruptedError):
+        cch.interruptible_api_call(
+            agent,
+            {"model": agent.model, "messages": []},
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, f"interrupt waited {elapsed:.2f}s for transport teardown"
+    worker_release.set()
+
+
 def test_normal_transient_error_still_raises_when_not_cancelled():
     """Regression guard: a real transport error with NO interrupt must still
     surface to the caller (so the outer retry loop can recover)."""
@@ -96,21 +141,19 @@ def test_normal_transient_error_still_raises_when_not_cancelled():
         cch.interruptible_api_call(agent, {"model": "x", "messages": []})
 
 
-def test_request_cancelled_token_is_request_local():
-    """The cancellation token must be created per call, not shared on the
-    agent — a stale worker from a previous turn must not see the next turn's
-    interrupt flag flip back to False and mistake its own forced error for a
-    network bug. We assert the helper reads agent._interrupt_requested at the
-    force-close site (request-local token set there), by confirming two
-    independent calls don't share cancellation state."""
+def test_prompt_interrupt_quarantines_only_the_exact_route():
+    """A timed-out worker fences its route until its transport has unwound."""
     agent = _make_agent()
 
     # First call: interrupted.
     fake_client_1 = MagicMock()
+    worker_started = threading.Event()
+    worker_release = threading.Event()
 
     def _create_1(**kwargs):
         agent._interrupt_requested = True
-        time.sleep(0.3)
+        worker_started.set()
+        worker_release.wait(5)
         raise httpx.RemoteProtocolError("forced close turn A")
 
     fake_client_1.chat.completions.create.side_effect = _create_1
@@ -120,10 +163,29 @@ def test_request_cancelled_token_is_request_local():
 
     with pytest.raises(InterruptedError):
         cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    assert worker_started.is_set()
 
-    # Second call: NOT interrupted (turn boundary cleared the flag). A genuine
-    # error must still surface — the previous call's cancellation must not leak.
+    # The prompt can return before the worker exits. The matching route must
+    # fail closed during that quarantine window rather than overlap the stale
+    # transport; this is intentionally stronger than merely clearing the
+    # agent-wide interrupt flag.
     agent._interrupt_requested = False
+    with pytest.raises(ProviderRouteQuarantined):
+        cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    worker_release.set()
+
+    # Once the old worker has exited, a genuine error on the next turn still
+    # surfaces normally: quarantine is request/route-local, not sticky state.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            cch.ensure_provider_route_available(agent, {"model": "x", "messages": []})
+            break
+        except ProviderRouteQuarantined:
+            time.sleep(0.02)
+    else:
+        pytest.fail("prompt-interrupted worker did not leave route quarantine")
+
     fake_client_2 = MagicMock()
     fake_client_2.chat.completions.create.side_effect = httpx.RemoteProtocolError(
         "genuine drop turn B"

@@ -31,7 +31,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.timeouts import (
+    get_provider_first_event_timeout,
+    get_provider_local_model_lease_ttl,
+    get_provider_local_model_max_wait,
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    get_provider_total_attempt_timeout,
+)
 from hermes_cli.kanban_runtime_contract import RuntimeObservationError
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
@@ -1180,6 +1187,24 @@ def restore_primary_runtime(agent) -> bool:
         agent._route_first_event_timeout_seconds = rt.get(
             "route_first_event_timeout_seconds"
         )
+        agent._route_local_model_max_wait_seconds = rt.get(
+            "route_local_model_max_wait_seconds"
+        )
+        agent._route_local_model_lease_ttl_seconds = rt.get(
+            "route_local_model_lease_ttl_seconds"
+        )
+        if agent._route_local_model_max_wait_seconds is None:
+            from agent.local_model_lease import DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS
+
+            agent._route_local_model_max_wait_seconds = (
+                DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS
+            )
+        if agent._route_local_model_lease_ttl_seconds is None:
+            from agent.local_model_lease import DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS
+
+            agent._route_local_model_lease_ttl_seconds = (
+                DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS
+            )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1684,10 +1709,39 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     turn-scoped).
     """
     from hermes_cli.providers import determine_api_mode
+    from agent.local_model_lease import (
+        DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
+        DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
+    )
+    from agent.model_metadata import is_local_endpoint
+
+    # Resolve the complete target route policy before touching the live agent.
+    # Every value is target-derived; absent target settings explicitly clear
+    # old route budgets instead of inheriting the primary/fallback route.
+    target_base_url = str(base_url or "")
+    target_api_key = api_key
+    if not target_api_key and target_base_url and is_local_endpoint(target_base_url):
+        target_api_key = "no-key-required"
+    target_request_timeout = get_provider_request_timeout(new_provider, new_model)
+    target_stale_timeout = get_provider_stale_timeout(new_provider, new_model)
+    target_total_timeout = get_provider_total_attempt_timeout(
+        new_provider, new_model
+    )
+    target_first_event_timeout = get_provider_first_event_timeout(
+        new_provider, new_model
+    )
+    target_local_max_wait = (
+        get_provider_local_model_max_wait(new_provider, new_model)
+        or DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS
+    )
+    target_local_lease_ttl = (
+        get_provider_local_model_lease_ttl(new_provider, new_model)
+        or DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS
+    )
 
     # ── Determine api_mode if not provided ──
     if not api_mode:
-        api_mode = determine_api_mode(new_provider, base_url)
+        api_mode = determine_api_mode(new_provider, target_base_url)
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -1697,10 +1751,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     if (
         api_mode == "anthropic_messages"
         and new_provider in {"opencode-zen", "opencode-go"}
-        and isinstance(base_url, str)
-        and base_url
+        and target_base_url
     ):
-        base_url = re.sub(r"/v1/?$", "", base_url)
+        target_base_url = re.sub(r"/v1/?$", "", target_base_url)
 
     old_model = agent.model
     old_provider = agent.provider
@@ -1730,6 +1783,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "provider",
             "base_url",
             "api_mode",
+            "runtime",
             "api_key",
             "client",
             "_anthropic_client",
@@ -1737,6 +1791,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "_route_request_timeout_seconds",
+            "_route_stale_timeout_seconds",
+            "_route_total_attempt_timeout_seconds",
+            "_route_first_event_timeout_seconds",
+            "_route_local_model_max_wait_seconds",
+            "_route_local_model_lease_ttl_seconds",
+            "_use_prompt_caching",
+            "_use_native_cache_layout",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -1756,19 +1818,19 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # ── Swap core runtime fields ──
         agent.model = new_model
         agent.provider = new_provider
-        # Use new base_url when provided; only fall back to current when the
-        # new provider genuinely has no endpoint (e.g. native SDK providers).
-        # Without this guard the old provider's URL (e.g. Ollama's localhost
-        # address) would persist silently after switching to a cloud provider
-        # that returns an empty base_url string.
-        if base_url:
-            agent.base_url = base_url
+        agent.base_url = target_base_url
         agent.api_mode = api_mode
+        agent.runtime = "hermes"
+        agent._route_request_timeout_seconds = target_request_timeout
+        agent._route_stale_timeout_seconds = target_stale_timeout
+        agent._route_total_attempt_timeout_seconds = target_total_timeout
+        agent._route_first_event_timeout_seconds = target_first_event_timeout
+        agent._route_local_model_max_wait_seconds = target_local_max_wait
+        agent._route_local_model_lease_ttl_seconds = target_local_lease_ttl
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-        if api_key:
-            agent.api_key = api_key
+        agent.api_key = target_api_key
 
         # ── Reload credential pool for the new provider (issue #52727) ──
         # Without this, ``recover_with_credential_pool`` sees a
@@ -1807,7 +1869,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # model. Pin chat_completions here so the primary call always goes
             # through MoAClient.chat.completions, matching agent_init.py.
             agent.api_mode = "chat_completions"
-            agent.api_key = api_key or "moa-virtual-provider"
+            agent.api_key = target_api_key or "moa-virtual-provider"
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
             agent.client = MoAClient(agent.model or "default")
@@ -1821,7 +1883,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
             _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+            effective_key = (target_api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (target_api_key or "")
 
             # MiniMax OAuth: swap static string for a per-request callable token
             # provider so the rebuilt client survives 15-min token expiry. See
@@ -1840,7 +1902,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
-            agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
+            agent._anthropic_base_url = target_base_url or None
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
@@ -1849,8 +1911,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.client = None
             agent._client_kwargs = {}
         else:
-            effective_key = api_key or agent.api_key
-            effective_base = base_url or agent.base_url
+            effective_key = target_api_key
+            effective_base = target_base_url
             agent._client_kwargs = {
                 "api_key": effective_key,
                 "base_url": effective_base,
@@ -1873,9 +1935,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 )
             except Exception:
                 logger.debug("custom-provider TLS resolution skipped on switch_model", exc_info=True)
-            _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
-            if _sm_timeout is not None:
-                agent._client_kwargs["timeout"] = _sm_timeout
+            if target_request_timeout is not None:
+                agent._client_kwargs["timeout"] = target_request_timeout
             agent.client = agent._create_openai_client(
                 dict(agent._client_kwargs),
                 reason="switch_model",
@@ -1902,7 +1963,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent._anthropic_prompt_cache_policy(
             provider=new_provider,
             base_url=agent.base_url,
-            api_mode=api_mode,
+            api_mode=agent.api_mode,
             model=new_model,
         )
     )
@@ -1958,6 +2019,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "runtime": getattr(agent, "runtime", "hermes"),
+        "max_tokens": getattr(agent, "max_tokens", None),
+        "route_request_timeout_seconds": agent._route_request_timeout_seconds,
+        "route_stale_timeout_seconds": agent._route_stale_timeout_seconds,
+        "route_total_attempt_timeout_seconds": agent._route_total_attempt_timeout_seconds,
+        "route_first_event_timeout_seconds": agent._route_first_event_timeout_seconds,
+        "route_local_model_max_wait_seconds": agent._route_local_model_max_wait_seconds,
+        "route_local_model_lease_ttl_seconds": agent._route_local_model_lease_ttl_seconds,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
@@ -1971,7 +2039,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "compressor_runtime": getattr(_cc, "runtime", agent.runtime) if _cc else agent.runtime,
         "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
     }
-    if api_mode == "anthropic_messages":
+    if agent.api_mode == "anthropic_messages":
         agent._primary_runtime.update({
             "anthropic_api_key": agent._anthropic_api_key,
             "anthropic_base_url": agent._anthropic_base_url,

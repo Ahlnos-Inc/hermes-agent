@@ -8793,7 +8793,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
-            find_gateway_pids,
+            find_gateway_pids_strict,
             find_profile_gateway_processes,
         )
     except Exception as exc:
@@ -8801,10 +8801,15 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        running_pids = list(dict.fromkeys(find_gateway_pids(all_profiles=True)))
+        running_pids = list(
+            dict.fromkeys(find_gateway_pids_strict(all_profiles=True))
+        )
     except Exception as exc:
-        logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
-        return None
+        # Updating a shared checkout while process discovery is incomplete can
+        # leave an unseen gateway importing a mixed old/new tree. Strict
+        # inventory is deliberately fail-closed for this mutation path.
+        logger.error("Could not discover Windows gateway PIDs before update: %s", exc)
+        raise
     if not running_pids:
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
@@ -8927,7 +8932,7 @@ def _cold_start_windows_gateway_after_update() -> None:
         return
     try:
         from hermes_cli import gateway_windows
-        from hermes_cli.gateway import find_gateway_pids
+        from hermes_cli.gateway import find_gateway_pids_strict
     except Exception as exc:
         logger.debug("Could not load Windows gateway cold-start helpers: %s", exc)
         return
@@ -8936,7 +8941,7 @@ def _cold_start_windows_gateway_after_update() -> None:
     # autostart entry may have already brought a gateway up, or a leftover
     # process may have re-registered. Don't double-start.
     try:
-        if list(find_gateway_pids(all_profiles=True)):
+        if list(find_gateway_pids_strict(all_profiles=True)):
             return
     except Exception as exc:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
@@ -10029,7 +10034,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 is_macos,
                 supports_systemd_services,
                 _ensure_user_systemd_env,
-                find_gateway_pids,
+                find_gateway_pids_strict,
                 find_profile_gateway_processes,
                 launch_detached_profile_gateway_restart,
                 _get_service_pids,
@@ -10535,7 +10540,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
+            manual_pids = find_gateway_pids_strict(
                 exclude_pids=service_pids, all_profiles=True
             )
             profile_processes = {
@@ -10627,7 +10632,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             try:
                 _time.sleep(3.0)
                 _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids(
+                _surviving = find_gateway_pids_strict(
                     exclude_pids=_service_pids_after,
                     all_profiles=True,
                 )

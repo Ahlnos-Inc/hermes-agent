@@ -82,6 +82,28 @@ def get_provider_first_event_timeout(
     return _coerce_timeout(provider_config.get("first_event_timeout_seconds"))
 
 
+def get_provider_local_model_max_wait(
+    provider_id: str, model: str | None = None
+) -> float | None:
+    """Return the typed local-capacity queue wait bound for a route."""
+    return _get_provider_or_model_timeout(
+        provider_id,
+        model,
+        "local_model_max_wait_seconds",
+    )
+
+
+def get_provider_local_model_lease_ttl(
+    provider_id: str, model: str | None = None
+) -> float | None:
+    """Return the typed durable local-capacity lease TTL for a route."""
+    return _get_provider_or_model_timeout(
+        provider_id,
+        model,
+        "local_model_lease_ttl_seconds",
+    )
+
+
 def get_provider_stale_timeout(
     provider_id: str, model: str | None = None
 ) -> float | None:
@@ -122,6 +144,22 @@ def _get_model_config(
     if isinstance(model_config, dict):
         return model_config
     return None
+
+
+def _get_provider_or_model_timeout(
+    provider_id: str,
+    model: str | None,
+    key: str,
+) -> float | None:
+    provider_config = _get_provider_config(provider_id)
+    if provider_config is None:
+        return None
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        value = _coerce_timeout(model_config.get(key))
+        if value is not None:
+            return value
+    return _coerce_timeout(provider_config.get(key))
 
 
 def _get_provider_config(provider_id: str) -> dict[str, object] | None:

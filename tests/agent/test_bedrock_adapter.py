@@ -955,6 +955,23 @@ class TestClientCache:
         assert len(_bedrock_runtime_client_cache) == 0
         assert len(_bedrock_control_client_cache) == 0
 
+    def test_reset_closes_each_cached_client_once(self):
+        from agent.bedrock_adapter import (
+            _bedrock_runtime_client_cache,
+            _bedrock_control_client_cache,
+            reset_client_cache,
+        )
+
+        runtime = MagicMock()
+        control = MagicMock()
+        _bedrock_runtime_client_cache["us-east-1"] = runtime
+        _bedrock_control_client_cache["us-east-1"] = control
+
+        reset_client_cache()
+
+        runtime.close.assert_called_once_with()
+        control.close.assert_called_once_with()
+
     def test_budgeted_runtime_client_bounds_connect_and_read_without_caching(self):
         from agent import bedrock_adapter
 
@@ -962,6 +979,7 @@ class TestClientCache:
             def __init__(self, **kwargs):
                 self.connect_timeout = kwargs["connect_timeout"]
                 self.read_timeout = kwargs["read_timeout"]
+                self.retries = kwargs["retries"]
 
         botocore_mod = ModuleType("botocore")
         config_mod = ModuleType("botocore.config")
@@ -989,6 +1007,7 @@ class TestClientCache:
         assert kwargs["region_name"] == "us-west-2"
         assert kwargs["config"].connect_timeout == 7.25
         assert kwargs["config"].read_timeout == 7.25
+        assert kwargs["config"].retries == {"max_attempts": 0}
         assert "us-west-2" not in bedrock_adapter._bedrock_runtime_client_cache
 
 
@@ -1395,12 +1414,14 @@ class TestInvalidateRuntimeClient:
             reset_client_cache,
         )
         reset_client_cache()
-        _bedrock_runtime_client_cache["us-east-1"] = "dead-client"
+        dead_client = MagicMock()
+        _bedrock_runtime_client_cache["us-east-1"] = dead_client
         _bedrock_runtime_client_cache["us-west-2"] = "live-client"
 
         evicted = invalidate_runtime_client("us-east-1")
 
         assert evicted is True
+        dead_client.close.assert_called_once_with()
         assert "us-east-1" not in _bedrock_runtime_client_cache
         assert _bedrock_runtime_client_cache["us-west-2"] == "live-client"
 
@@ -1483,115 +1504,104 @@ class TestIsStaleConnectionError:
         assert is_stale_connection_error(KeyError("missing")) is False
 
 
-class TestCallConverseInvalidatesOnStaleError:
-    """call_converse / call_converse_stream evict the cached client when the
-    boto3 call raises a stale-connection error — so the next invocation
-    reconnects instead of reusing the dead socket."""
+class TestDirectConverseUsesBoundedRequestClient:
+    """Legacy helpers cannot bypass finite request-scoped socket budgets."""
 
     def test_converse_evicts_client_on_stale_error(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse
         from botocore.exceptions import ConnectionClosedError
 
-        reset_client_cache()
         dead_client = MagicMock()
         dead_client.converse.side_effect = ConnectionClosedError(
             endpoint_url="https://bedrock.example",
         )
-        _bedrock_runtime_client_cache["us-east-1"] = dead_client
-
-        with pytest.raises(ConnectionClosedError):
-            call_converse(
-                region="us-east-1",
-                model="anthropic.claude-3-sonnet-20240229-v1:0",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        assert "us-east-1" not in _bedrock_runtime_client_cache, (
-            "stale client should have been evicted so the retry reconnects"
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=dead_client,
+        ) as get_client:
+            with pytest.raises(ConnectionClosedError):
+                call_converse(
+                    region="us-east-1",
+                    model="anthropic.claude-3-sonnet-20240229-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                    attempt_timeout_seconds=37,
+                )
+        get_client.assert_called_once_with(
+            "us-east-1",
+            attempt_timeout_seconds=37,
         )
+        dead_client.close.assert_called_once()
 
     def test_converse_stream_evicts_client_on_stale_error(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse_stream,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse_stream
         from botocore.exceptions import ConnectionClosedError
 
-        reset_client_cache()
         dead_client = MagicMock()
         dead_client.converse_stream.side_effect = ConnectionClosedError(
             endpoint_url="https://bedrock.example",
         )
-        _bedrock_runtime_client_cache["us-east-1"] = dead_client
-
-        with pytest.raises(ConnectionClosedError):
-            call_converse_stream(
-                region="us-east-1",
-                model="anthropic.claude-3-sonnet-20240229-v1:0",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        assert "us-east-1" not in _bedrock_runtime_client_cache
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=dead_client,
+        ) as get_client:
+            with pytest.raises(ConnectionClosedError):
+                call_converse_stream(
+                    region="us-east-1",
+                    model="anthropic.claude-3-sonnet-20240229-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                    attempt_timeout_seconds=41,
+                )
+        get_client.assert_called_once_with(
+            "us-east-1",
+            attempt_timeout_seconds=41,
+        )
+        dead_client.close.assert_called_once()
 
     def test_converse_does_not_evict_on_non_stale_error(self):
         """Non-stale errors (e.g. ValidationException) leave the client cache alone."""
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse
         from botocore.exceptions import ClientError
 
-        reset_client_cache()
         live_client = MagicMock()
         live_client.converse.side_effect = ClientError(
             error_response={"Error": {"Code": "ValidationException", "Message": "bad"}},
             operation_name="Converse",
         )
-        _bedrock_runtime_client_cache["us-east-1"] = live_client
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=live_client,
+        ):
+            with pytest.raises(ClientError):
+                call_converse(
+                    region="us-east-1",
+                    model="anthropic.claude-3-sonnet-20240229-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        live_client.close.assert_called_once()
 
-        with pytest.raises(ClientError):
-            call_converse(
-                region="us-east-1",
-                model="anthropic.claude-3-sonnet-20240229-v1:0",
-                messages=[{"role": "user", "content": "hi"}],
-            )
+    def test_converse_success_closes_request_scoped_client(self):
+        from agent.bedrock_adapter import call_converse
 
-        assert _bedrock_runtime_client_cache.get("us-east-1") is live_client, (
-            "validation errors do not indicate a dead connection — keep the client"
-        )
-
-    def test_converse_leaves_successful_client_in_cache(self):
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse,
-            reset_client_cache,
-        )
-
-        reset_client_cache()
         live_client = MagicMock()
         live_client.converse.return_value = {
             "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
             "stopReason": "end_turn",
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
         }
-        _bedrock_runtime_client_cache["us-east-1"] = live_client
-
-        call_converse(
-            region="us-east-1",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
-            messages=[{"role": "user", "content": "hi"}],
-        )
-
-        assert _bedrock_runtime_client_cache.get("us-east-1") is live_client
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=live_client,
+        ) as get_client:
+            call_converse(
+                region="us-east-1",
+                model="anthropic.claude-3-sonnet-20240229-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert get_client.call_args.kwargs["attempt_timeout_seconds"] == 900
+        live_client.close.assert_called_once()
 
 
 class TestStreamingAccessDeniedDetection:
@@ -1678,14 +1688,9 @@ class TestCallConverseStreamIamFallback:
 
     def test_falls_back_to_converse_on_streaming_denial(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
-        from agent.bedrock_adapter import (
-            _bedrock_runtime_client_cache,
-            call_converse_stream,
-            reset_client_cache,
-        )
+        from agent.bedrock_adapter import call_converse_stream
         from botocore.exceptions import ClientError
 
-        reset_client_cache()
         client = MagicMock()
         client.converse_stream.side_effect = ClientError(
             error_response={
@@ -1704,18 +1709,23 @@ class TestCallConverseStreamIamFallback:
             "stopReason": "end_turn",
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
         }
-        _bedrock_runtime_client_cache["us-east-1"] = client
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=client,
+        ) as get_client:
+            result = call_converse_stream(
+                region="us-east-1",
+                model="anthropic.claude-3-sonnet-20240229-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+                attempt_timeout_seconds=53,
+            )
 
-        result = call_converse_stream(
-            region="us-east-1",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
-            messages=[{"role": "user", "content": "hi"}],
+        get_client.assert_called_once_with(
+            "us-east-1", attempt_timeout_seconds=53
         )
-
         client.converse.assert_called_once()
         assert result.choices[0].message.content == "hi"
-        # Not a stale connection — client stays cached.
-        assert _bedrock_runtime_client_cache.get("us-east-1") is client
+        client.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

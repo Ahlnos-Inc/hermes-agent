@@ -202,3 +202,102 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+@pytest.mark.parametrize(
+    ("target_url", "target_key", "expected_key"),
+    [
+        ("https://new.example/v1", "new-key", "new-key"),
+        ("http://127.0.0.1:11434/v1", "", "no-key-required"),
+    ],
+)
+def test_switch_replaces_complete_transport_and_timeout_policy(
+    monkeypatch,
+    target_url,
+    target_key,
+    expected_key,
+):
+    from agent import agent_runtime_helpers as helpers
+
+    agent = _make_agent_openrouter()
+    agent.runtime = "claude_agent_sdk"
+    agent._route_request_timeout_seconds = 901
+    agent._route_stale_timeout_seconds = 902
+    agent._route_total_attempt_timeout_seconds = 903
+    agent._route_first_event_timeout_seconds = 904
+    agent._route_local_model_max_wait_seconds = 905
+    agent._route_local_model_lease_ttl_seconds = 906
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock(name="TargetClient")
+
+    monkeypatch.setattr(helpers, "get_provider_request_timeout", lambda *_a: 11)
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *_a: None)
+    monkeypatch.setattr(helpers, "get_provider_total_attempt_timeout", lambda *_a: 33)
+    monkeypatch.setattr(helpers, "get_provider_first_event_timeout", lambda *_a: None)
+    monkeypatch.setattr(helpers, "get_provider_local_model_max_wait", lambda *_a: 55)
+    monkeypatch.setattr(helpers, "get_provider_local_model_lease_ttl", lambda *_a: 66)
+
+    agent.switch_model(
+        new_model="target-model",
+        new_provider="target-provider",
+        api_key=target_key,
+        base_url=target_url,
+        api_mode="chat_completions",
+    )
+
+    assert agent.runtime == "hermes"
+    assert agent.base_url == target_url
+    assert agent.api_key == expected_key
+    assert agent._client_kwargs == {
+        "api_key": expected_key,
+        "base_url": target_url,
+        "timeout": 11,
+    }
+    assert agent._route_request_timeout_seconds == 11
+    assert agent._route_stale_timeout_seconds is None
+    assert agent._route_total_attempt_timeout_seconds == 33
+    assert agent._route_first_event_timeout_seconds is None
+    assert agent._route_local_model_max_wait_seconds == 55
+    assert agent._route_local_model_lease_ttl_seconds == 66
+    assert agent._primary_runtime["route_stale_timeout_seconds"] is None
+    assert agent._primary_runtime["route_first_event_timeout_seconds"] is None
+
+
+def test_failed_switch_rolls_back_route_policy(monkeypatch):
+    from agent import agent_runtime_helpers as helpers
+
+    agent = _make_agent_openrouter()
+    agent.runtime = "hermes"
+    old_policy = (901, 902, 903, 904, 905, 906)
+    (
+        agent._route_request_timeout_seconds,
+        agent._route_stale_timeout_seconds,
+        agent._route_total_attempt_timeout_seconds,
+        agent._route_first_event_timeout_seconds,
+        agent._route_local_model_max_wait_seconds,
+        agent._route_local_model_lease_ttl_seconds,
+    ) = old_policy
+    agent._create_openai_client = MagicMock(side_effect=RuntimeError("build failed"))
+    monkeypatch.setattr(helpers, "get_provider_request_timeout", lambda *_a: 11)
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *_a: 12)
+    monkeypatch.setattr(helpers, "get_provider_total_attempt_timeout", lambda *_a: 13)
+    monkeypatch.setattr(helpers, "get_provider_first_event_timeout", lambda *_a: 14)
+    monkeypatch.setattr(helpers, "get_provider_local_model_max_wait", lambda *_a: 15)
+    monkeypatch.setattr(helpers, "get_provider_local_model_lease_ttl", lambda *_a: 16)
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        agent.switch_model(
+            "target-model",
+            "target-provider",
+            api_key="new-key",
+            base_url="https://new.example/v1",
+            api_mode="chat_completions",
+        )
+
+    assert (
+        agent._route_request_timeout_seconds,
+        agent._route_stale_timeout_seconds,
+        agent._route_total_attempt_timeout_seconds,
+        agent._route_first_event_timeout_seconds,
+        agent._route_local_model_max_wait_seconds,
+        agent._route_local_model_lease_ttl_seconds,
+    ) == old_policy

@@ -60,6 +60,18 @@ _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
 _MIN_BOTO3_VERSION = (1, 34, 59)
+_DEFAULT_DIRECT_CALL_TIMEOUT_SECONDS = 15 * 60.0
+
+
+def _close_client(client: Any) -> None:
+    """Close a cached boto client when its connection pool leaves the cache."""
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.debug("Failed to close an evicted Bedrock client", exc_info=True)
 
 
 def _require_boto3():
@@ -121,6 +133,9 @@ def _get_bedrock_runtime_client(
             config=Config(
                 connect_timeout=timeout,
                 read_timeout=timeout,
+                # The outer request budget owns retries. Botocore's default
+                # retry loop can otherwise outlive the finite request scope.
+                retries={"max_attempts": 0},
             ),
         )
 
@@ -144,8 +159,17 @@ def _get_bedrock_control_client(region: str):
 
 def reset_client_cache():
     """Clear cached boto3 clients. Used in tests and profile switches."""
+    clients = list(_bedrock_runtime_client_cache.values()) + list(
+        _bedrock_control_client_cache.values()
+    )
     _bedrock_runtime_client_cache.clear()
     _bedrock_control_client_cache.clear()
+    seen: set[int] = set()
+    for client in clients:
+        if id(client) in seen:
+            continue
+        seen.add(id(client))
+        _close_client(client)
 
 
 def invalidate_runtime_client(region: str) -> bool:
@@ -160,7 +184,9 @@ def invalidate_runtime_client(region: str) -> bool:
     cached.
     """
     existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
+    client = _bedrock_runtime_client_cache.pop(region, None)
+    if existed and client is not None:
+        _close_client(client)
     return existed
 
 
@@ -1033,12 +1059,17 @@ def call_converse(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    *,
+    attempt_timeout_seconds: float = _DEFAULT_DIRECT_CALL_TIMEOUT_SECONDS,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
     This is the primary entry point for the agent loop when using the Bedrock provider.
     """
-    client = _get_bedrock_runtime_client(region)
+    client = _get_bedrock_runtime_client(
+        region,
+        attempt_timeout_seconds=attempt_timeout_seconds,
+    )
     kwargs = build_converse_kwargs(
         model=model,
         messages=messages,
@@ -1061,6 +1092,13 @@ def call_converse(
             )
             invalidate_runtime_client(region)
         raise
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("failed to close request-scoped Bedrock client", exc_info=True)
     return normalize_converse_response(response)
 
 
@@ -1074,13 +1112,18 @@ def call_converse_stream(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    *,
+    attempt_timeout_seconds: float = _DEFAULT_DIRECT_CALL_TIMEOUT_SECONDS,
 ) -> SimpleNamespace:
     """Call Bedrock ConverseStream API and return an OpenAI-compatible response.
 
     Consumes the full stream and returns the assembled response. For true
     streaming with delta callbacks, use ``iter_converse_stream()`` instead.
     """
-    client = _get_bedrock_runtime_client(region)
+    client = _get_bedrock_runtime_client(
+        region,
+        attempt_timeout_seconds=attempt_timeout_seconds,
+    )
     kwargs = build_converse_kwargs(
         model=model,
         messages=messages,
@@ -1113,6 +1156,13 @@ def call_converse_stream(
             )
             invalidate_runtime_client(region)
         raise
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("failed to close request-scoped Bedrock client", exc_info=True)
     return normalize_converse_stream_events(response)
 
 

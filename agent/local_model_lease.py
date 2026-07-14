@@ -36,12 +36,24 @@ logger = logging.getLogger(__name__)
 _STATE_VERSION = 2
 _LOCK_POLL_SECONDS = 0.025
 _QUEUE_POLL_SECONDS = 0.05
-_DEFAULT_MAX_WAIT_SECONDS = 120.0
-_DEFAULT_LEASE_TTL_SECONDS = 1800.0
+DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS = 120.0
+DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS = 1800.0
 _HEARTBEAT_INTERVAL_SECONDS = 10.0
 _HEARTBEAT_WINDOW_SECONDS = 60.0
 _OWNER_BIRTH_TOLERANCE_SECONDS = 0.01
 _PRIORITY_AGING_SECONDS_PER_POINT = 2.0
+_RELEASE_RETRY_INITIAL_SECONDS = 0.05
+_RELEASE_RETRY_MAX_SECONDS = 2.0
+
+# Strong references are intentional.  A lease whose final durable clear fails
+# must not be garbage-collected while its live PID remains in the state file:
+# doing so wedges the route until process restart.  The janitor retries the
+# exact-owner compare-and-clear with capped exponential backoff.  It never
+# clears by PID alone and therefore cannot delete a successor lease.
+_owned_leases: dict[str, "LocalModelCapacityLease"] = {}
+_owned_leases_lock = threading.Lock()
+_release_janitor_thread: threading.Thread | None = None
+_release_janitor_wakeup = threading.Event()
 
 
 class LocalModelLeaseError(RuntimeError):
@@ -54,6 +66,10 @@ class LocalModelLeaseTimeout(TimeoutError, LocalModelLeaseError):
 
 class LocalModelLeaseQuarantined(LocalModelLeaseTimeout):
     """A prior request exceeded its lease while its owner is still alive."""
+
+
+class LocalModelLeaseReleasePending(LocalModelLeaseQuarantined):
+    """The provider call ended but its exact lease clear is being retried."""
 
 
 class LocalModelLeaseStateError(LocalModelLeaseTimeout):
@@ -113,32 +129,60 @@ def _priority_from_env() -> int:
     return max(-1_000_000_000, min(1_000_000_000, value))
 
 
-def _max_wait_from_env() -> float:
-    raw = os.environ.get(
-        "HERMES_LOCAL_MODEL_LEASE_MAX_WAIT_SECONDS",
-        str(_DEFAULT_MAX_WAIT_SECONDS),
-    )
+def _positive_policy_seconds(raw: object, default: float) -> float:
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return _DEFAULT_MAX_WAIT_SECONDS
-    if not value > 0 or value == float("inf"):
-        return _DEFAULT_MAX_WAIT_SECONDS
+        return default
+    if not value > 0 or not math.isfinite(value):
+        return default
     return value
 
 
-def _lease_ttl_from_env() -> float:
-    raw = os.environ.get(
-        "HERMES_LOCAL_MODEL_LEASE_TTL_SECONDS",
-        str(_DEFAULT_LEASE_TTL_SECONDS),
-    )
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return _DEFAULT_LEASE_TTL_SECONDS
-    if not value > 0 or value == float("inf"):
-        return _DEFAULT_LEASE_TTL_SECONDS
-    return value
+def _release_janitor_loop() -> None:
+    """Retry failed exact-owner releases without admitting overlap."""
+    while True:
+        now = time.monotonic()
+        next_delay = _RELEASE_RETRY_MAX_SECONDS
+        with _owned_leases_lock:
+            pending = [
+                lease
+                for lease in _owned_leases.values()
+                if lease._release_pending and not lease._released
+            ]
+        for lease in pending:
+            if lease._next_release_retry_monotonic > now:
+                next_delay = min(
+                    next_delay,
+                    lease._next_release_retry_monotonic - now,
+                )
+                continue
+            try:
+                lease.release()
+            except LocalModelLeaseError:
+                # release() updates the retry deadline and retains the exact
+                # lease.  Log at debug here; the original caller already got
+                # the explicit release error.
+                logger.debug(
+                    "Local-model lease janitor retry failed token=%s",
+                    lease._token[:8],
+                )
+            next_delay = min(next_delay, lease._release_retry_delay_seconds)
+        _release_janitor_wakeup.wait(max(0.01, next_delay))
+        _release_janitor_wakeup.clear()
+
+
+def _ensure_release_janitor_started() -> None:
+    global _release_janitor_thread
+    with _owned_leases_lock:
+        if _release_janitor_thread is not None and _release_janitor_thread.is_alive():
+            return
+        _release_janitor_thread = threading.Thread(
+            target=_release_janitor_loop,
+            name="local-model-lease-release-janitor",
+            daemon=True,
+        )
+        _release_janitor_thread.start()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -381,10 +425,9 @@ class _StateLock:
                 flags |= os.O_NOFOLLOW
             lock_fd = os.open(self.path.name, flags, 0o600, dir_fd=self.dir_fd)
             self._handle = os.fdopen(lock_fd, "a+b")
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+        # Apply permissions to the descriptor we actually opened.  chmod(path)
+        # can race a parent replacement and mutate an unrelated successor.
+        os.fchmod(self._handle.fileno(), 0o600)
         while True:
             if self.cancelled():
                 self._close()
@@ -449,6 +492,17 @@ class LocalModelCapacityLease:
     _max_expires_at: float
     _dir_fd: int | None = None
     _released: bool = False
+    _release_pending: bool = False
+    _release_retry_delay_seconds: float = field(
+        default=_RELEASE_RETRY_INITIAL_SECONDS,
+        init=False,
+        repr=False,
+    )
+    _next_release_retry_monotonic: float = field(
+        default=0.0,
+        init=False,
+        repr=False,
+    )
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event,
         init=False,
@@ -459,14 +513,35 @@ class LocalModelCapacityLease:
         init=False,
         repr=False,
     )
+    _release_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
+        with _owned_leases_lock:
+            _owned_leases[self._token] = self
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
             name=f"local-model-lease-{self._token[:8]}",
             daemon=True,
         )
         self._heartbeat_thread.start()
+
+    def _retain_for_release_retry(self) -> None:
+        self._release_pending = True
+        self._next_release_retry_monotonic = (
+            time.monotonic() + self._release_retry_delay_seconds
+        )
+        self._release_retry_delay_seconds = min(
+            _RELEASE_RETRY_MAX_SECONDS,
+            self._release_retry_delay_seconds * 2.0,
+        )
+        with _owned_leases_lock:
+            _owned_leases[self._token] = self
+        _ensure_release_janitor_started()
+        _release_janitor_wakeup.set()
 
     def _owns(self, active: object) -> bool:
         return (
@@ -529,44 +604,58 @@ class LocalModelCapacityLease:
 
     def release(self) -> None:
         """Durably clear this exact owner, or raise so the caller can retry."""
-        if self._released:
-            return
-        self._stop_heartbeat()
-        try:
-            with _StateLock(
-                self._lock_path,
-                deadline_monotonic=time.monotonic() + 2.0,
-                cancelled=lambda: False,
-                dir_fd=self._dir_fd,
-            ):
-                state = _read_state(self._state_path, dir_fd=self._dir_fd)
-                active = state.get("active")
-                if self._owns(active):
-                    state["active"] = None
-                    _atomic_write_state(
-                        self._state_path,
-                        state,
-                        dir_fd=self._dir_fd,
-                    )
-                elif isinstance(active, dict) and active.get("token") == self._token:
-                    # Same token with a different owner identity is corrupt,
-                    # not authority to clear a possibly-successor record.
-                    raise LocalModelLeaseStateError(
-                        "local-model lease token owner identity changed"
-                    )
-                # None or a different token means expiry/reclamation already
-                # ended our ownership. Exact compare prevents deleting the
-                # successor that acquired after our lease expired.
-            self._released = True
-            if self._dir_fd is not None:
-                os.close(self._dir_fd)
-                self._dir_fd = None
-        except LocalModelLeaseError:
-            raise
-        except Exception as exc:
-            raise LocalModelLeaseReleaseError(
-                "Failed to durably release local-model capacity lease"
-            ) from exc
+        # The request thread and the janitor can both observe a release
+        # failure. Serialize them so a retry cannot race the successful
+        # release, close the pinned directory twice, or clear a successor.
+        with self._release_lock:
+            if self._released:
+                return
+            try:
+                with _StateLock(
+                    self._lock_path,
+                    deadline_monotonic=time.monotonic() + 2.0,
+                    cancelled=lambda: False,
+                    dir_fd=self._dir_fd,
+                ):
+                    state = _read_state(self._state_path, dir_fd=self._dir_fd)
+                    active = state.get("active")
+                    if self._owns(active):
+                        state["active"] = None
+                        _atomic_write_state(
+                            self._state_path,
+                            state,
+                            dir_fd=self._dir_fd,
+                        )
+                    elif isinstance(active, dict) and active.get("token") == self._token:
+                        # Same token with a different owner identity is corrupt,
+                        # not authority to clear a possibly-successor record.
+                        raise LocalModelLeaseStateError(
+                            "local-model lease token owner identity changed"
+                        )
+                    # None or a different token means expiry/reclamation already
+                    # ended our ownership. Exact compare prevents deleting the
+                    # successor that acquired after our lease expired.
+
+                # Keep renewing until the durable clear above succeeds. A
+                # transient lock/I/O failure must not leave a still-running
+                # request exposed as an expired slot that another process can
+                # reclaim while this owner is still using the model.
+                self._stop_heartbeat()
+                self._released = True
+                self._release_pending = False
+                with _owned_leases_lock:
+                    _owned_leases.pop(self._token, None)
+                if self._dir_fd is not None:
+                    os.close(self._dir_fd)
+                    self._dir_fd = None
+            except LocalModelLeaseError:
+                self._retain_for_release_retry()
+                raise
+            except Exception as exc:
+                self._retain_for_release_retry()
+                raise LocalModelLeaseReleaseError(
+                    "Failed to durably release local-model capacity lease"
+                ) from exc
 
     def __enter__(self) -> "LocalModelCapacityLease":
         return self
@@ -712,6 +801,8 @@ def acquire_local_model_capacity(
     deadline_monotonic: float | None,
     cancelled: Callable[[], bool],
     lease_deadline_monotonic: float | None = None,
+    max_wait_seconds: float = DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
+    lease_ttl_seconds: float = DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
     root: Path | None = None,
     priority: int | None = None,
     pid_alive: Callable[[int], bool] = _pid_alive,
@@ -725,7 +816,10 @@ def acquire_local_model_capacity(
     absolute deadline always wins over the independent queue-wait safety cap.
     """
     now_monotonic = time.monotonic()
-    max_wait_deadline = now_monotonic + _max_wait_from_env()
+    max_wait_deadline = now_monotonic + _positive_policy_seconds(
+        max_wait_seconds,
+        DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS,
+    )
     effective_deadline = (
         min(deadline_monotonic, max_wait_deadline)
         if deadline_monotonic is not None
@@ -743,43 +837,52 @@ def acquire_local_model_capacity(
     )
     state_path = lease_dir / "state.json"
     lock_path = lease_dir / "state.lock"
-    if state_path.is_symlink() or lock_path.is_symlink():
-        raise LocalModelLeaseStateError(
-            "local-model lease state path contains a symbolic link"
-        )
+    try:
+        if state_path.is_symlink() or lock_path.is_symlink():
+            raise LocalModelLeaseStateError(
+                "local-model lease state path contains a symbolic link"
+            )
 
-    token = uuid.uuid4().hex
-    hostname = socket.gethostname()
-    pid = os.getpid()
-    owner_process_started_at = process_started_at(pid)
-    requested_priority = _priority_from_env() if priority is None else int(priority)
-    created_at = time.time_ns()
-    expires_at = time.time() + max(0.0, effective_deadline - now_monotonic)
-    lease_budget_deadline = (
-        lease_deadline_monotonic
-        if lease_deadline_monotonic is not None
-        else deadline_monotonic
-    )
-    lease_deadline = (
-        lease_budget_deadline
-        if lease_budget_deadline is not None
-        else now_monotonic + _lease_ttl_from_env()
-    )
-    max_lease_expires_at = time.time() + max(
-        0.0,
-        lease_deadline - time.monotonic(),
-    )
-    waiter = {
-        "token": token,
-        "pid": pid,
-        "host": hostname,
-        "process_started_at": owner_process_started_at,
-        "priority": requested_priority,
-        "created_at": created_at,
-        "expires_at": expires_at,
-        "task_id": os.environ.get("HERMES_KANBAN_TASK") or None,
-        "run_id": os.environ.get("HERMES_KANBAN_RUN_ID") or None,
-    }
+        token = uuid.uuid4().hex
+        hostname = socket.gethostname()
+        pid = os.getpid()
+        owner_process_started_at = process_started_at(pid)
+        requested_priority = _priority_from_env() if priority is None else int(priority)
+        created_at = time.time_ns()
+        expires_at = time.time() + max(0.0, effective_deadline - now_monotonic)
+        lease_budget_deadline = (
+            lease_deadline_monotonic
+            if lease_deadline_monotonic is not None
+            else deadline_monotonic
+        )
+        ttl_deadline = now_monotonic + _positive_policy_seconds(
+            lease_ttl_seconds,
+            DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS,
+        )
+        lease_deadline = (
+            min(lease_budget_deadline, ttl_deadline)
+            if lease_budget_deadline is not None
+            else ttl_deadline
+        )
+        max_lease_expires_at = time.time() + max(
+            0.0,
+            lease_deadline - time.monotonic(),
+        )
+        waiter = {
+            "token": token,
+            "pid": pid,
+            "host": hostname,
+            "process_started_at": owner_process_started_at,
+            "priority": requested_priority,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "task_id": os.environ.get("HERMES_KANBAN_TASK") or None,
+            "run_id": os.environ.get("HERMES_KANBAN_RUN_ID") or None,
+        }
+    except BaseException:
+        if lease_dir_fd is not None:
+            os.close(lease_dir_fd)
+        raise
     registered = False
     acquired = False
     wait_started = time.monotonic()
@@ -821,6 +924,18 @@ def acquire_local_model_capacity(
                             state_path,
                             state,
                             dir_fd=lease_dir_fd,
+                        )
+                    with _owned_leases_lock:
+                        owned = _owned_leases.get(str(active.get("token") or ""))
+                        release_pending = bool(
+                            owned is not None
+                            and owned._release_pending
+                            and owned._owns(active)
+                        )
+                    if release_pending:
+                        _release_janitor_wakeup.set()
+                        raise LocalModelLeaseReleasePending(
+                            "Local-model capacity release is pending durable retry"
                         )
                     raise LocalModelLeaseQuarantined(
                         "Local-model route is quarantined by an unsettled prior attempt"
@@ -931,10 +1046,13 @@ def acquire_local_model_capacity(
 
 
 __all__ = [
+    "DEFAULT_LOCAL_MODEL_LEASE_TTL_SECONDS",
+    "DEFAULT_LOCAL_MODEL_MAX_WAIT_SECONDS",
     "LocalModelCapacityLease",
     "LocalModelLeaseError",
     "LocalModelLeaseReleaseError",
     "LocalModelLeaseQuarantined",
+    "LocalModelLeaseReleasePending",
     "LocalModelLeaseStateError",
     "LocalModelLeaseTimeout",
     "acquire_local_model_capacity",

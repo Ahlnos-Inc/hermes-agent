@@ -4513,6 +4513,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "total_attempt_timeout_seconds", "first_event_timeout_seconds",
+        "local_model_max_wait_seconds", "local_model_lease_ttl_seconds",
         "discover_models", "extra_body", "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -4621,6 +4622,8 @@ def _normalize_custom_provider_entry(
         "stale_timeout_seconds",
         "total_attempt_timeout_seconds",
         "first_event_timeout_seconds",
+        "local_model_max_wait_seconds",
+        "local_model_lease_ttl_seconds",
     ):
         raw_timeout = entry.get(timeout_key)
         if isinstance(raw_timeout, bool):
@@ -4679,6 +4682,8 @@ def _custom_provider_entry_to_provider_config(
         "stale_timeout_seconds",
         "total_attempt_timeout_seconds",
         "first_event_timeout_seconds",
+        "local_model_max_wait_seconds",
+        "local_model_lease_ttl_seconds",
         "discover_models",
         "extra_body",
         "ssl_ca_cert",
