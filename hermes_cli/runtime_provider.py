@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from urllib.parse import urlparse
@@ -591,7 +592,66 @@ def _lift_max_output_tokens(entry: Dict[str, Any], result: Dict[str, Any]) -> No
             return
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _positive_finite_number(raw: Any) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 and math.isfinite(value) else None
+
+
+def _lift_route_limits(
+    entry: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    model: str | None = None,
+) -> None:
+    """Lift provider defaults, then override them with the selected model."""
+
+    _lift_max_output_tokens(entry, result)
+    request_timeout = _positive_finite_number(
+        entry.get("request_timeout_seconds")
+    )
+    stale_timeout = _positive_finite_number(entry.get("stale_timeout_seconds"))
+    if request_timeout is not None:
+        result["request_timeout_seconds"] = request_timeout
+    if stale_timeout is not None:
+        result["stale_timeout_seconds"] = stale_timeout
+
+    models = entry.get("models")
+    model_entry = models.get(model, {}) if isinstance(models, dict) and model else {}
+    if not isinstance(model_entry, dict):
+        return
+    _lift_max_output_tokens(model_entry, result)
+    request_timeout = _positive_finite_number(
+        model_entry.get("timeout_seconds", model_entry.get("request_timeout_seconds"))
+    )
+    stale_timeout = _positive_finite_number(
+        model_entry.get("stale_timeout_seconds")
+    )
+    if request_timeout is not None:
+        result["request_timeout_seconds"] = request_timeout
+    if stale_timeout is not None:
+        result["stale_timeout_seconds"] = stale_timeout
+
+
+def _copy_route_limits(source: Mapping[str, Any], result: Dict[str, Any]) -> None:
+    for key in (
+        "max_output_tokens",
+        "request_timeout_seconds",
+        "stale_timeout_seconds",
+    ):
+        if key in source:
+            result[key] = source[key]
+
+
+def _get_named_custom_provider(
+    requested_provider: str,
+    *,
+    target_model: str | None = None,
+) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
         return None
@@ -670,7 +730,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                     if api_mode:
                         result["api_mode"] = api_mode
-                    _lift_max_output_tokens(entry, result)
+                    _lift_route_limits(
+                        entry,
+                        result,
+                        model=target_model or result.get("model"),
+                    )
                     return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -692,7 +756,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode
-                        _lift_max_output_tokens(entry, result)
+                        _lift_route_limits(
+                            entry,
+                            result,
+                            model=target_model or result.get("model"),
+                        )
                         return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -742,7 +810,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:
             result["model"] = model_name
-        _lift_max_output_tokens(entry, result)
+        _lift_route_limits(
+            entry,
+            result,
+            model=target_model or result.get("model"),
+        )
         return result
 
     return None
@@ -892,6 +964,7 @@ def _resolve_named_custom_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
@@ -944,7 +1017,11 @@ def _resolve_named_custom_runtime(
             "requested_provider": requested_provider,
         }
 
-    custom_provider = _get_named_custom_provider(requested_provider)
+    custom_provider = (
+        _get_named_custom_provider(requested_provider, target_model=target_model)
+        if target_model
+        else _get_named_custom_provider(requested_provider)
+    )
     if not custom_provider:
         return None
 
@@ -963,8 +1040,7 @@ def _resolve_named_custom_runtime(
         model_name = custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
-        if isinstance(custom_provider.get("max_output_tokens"), int):
-            pool_result["max_output_tokens"] = custom_provider["max_output_tokens"]
+        _copy_route_limits(custom_provider, pool_result)
         request_overrides = _custom_provider_request_overrides(custom_provider)
         if request_overrides:
             pool_result["request_overrides"] = {
@@ -1002,8 +1078,7 @@ def _resolve_named_custom_runtime(
     # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
-    if isinstance(custom_provider.get("max_output_tokens"), int):
-        result["max_output_tokens"] = custom_provider["max_output_tokens"]
+    _copy_route_limits(custom_provider, result)
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides
@@ -1577,6 +1652,7 @@ def _resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider

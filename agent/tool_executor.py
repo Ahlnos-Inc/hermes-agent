@@ -47,6 +47,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.kanban_tools import KanbanTerminalControl
 
 logger = logging.getLogger(__name__)
 
@@ -956,10 +957,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+) -> Optional[KanbanTerminalControl]:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    terminal_control: Optional[KanbanTerminalControl] = None
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -1485,6 +1493,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if (
+            not _execution_blocked
+            and not _is_error_result
+            and isinstance(function_result, KanbanTerminalControl)
+        ):
+            # Capture the control signal before guardrail annotations and
+            # result-storage transforms turn the str subclass into a plain str.
+            terminal_control = function_result
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1591,6 +1607,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # entire batch.  The model sees it on the next API iteration.
         agent._apply_pending_steer_to_tool_results(messages, 1)
 
+        if terminal_control is not None:
+            # The lifecycle mutation has committed. Persist its real result
+            # first (above), then close every remaining tool_call id with a
+            # synthetic result so durable history remains provider-valid. No
+            # later call in this model-issued batch is allowed to mutate state.
+            remaining_calls = assistant_message.tool_calls[i:]
+            for skipped_tc in remaining_calls:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    (
+                        "[Tool execution skipped — "
+                        f"{function_name} committed terminal worker state before "
+                        f"{skipped_name} was started]"
+                    ),
+                    skipped_tc.id,
+                ))
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"terminal-control skipped tool result {skipped_name}",
+                )
+            break
+
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -1630,6 +1670,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+
+    return terminal_control
 
 
 

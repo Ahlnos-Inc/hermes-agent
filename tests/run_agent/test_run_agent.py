@@ -2247,6 +2247,63 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_terminal_control_persists_result_and_skips_later_batch_tools(self, agent):
+        from tools.kanban_tools import KanbanTerminalAction, KanbanTerminalControl
+
+        terminal = KanbanTerminalControl(
+            '{"ok": true, "task_id": "t_worker"}',
+            action=KanbanTerminalAction.COMPLETE,
+        )
+        tc1 = _mock_tool_call(name="kanban_complete", arguments="{}", call_id="c1")
+        tc2 = _mock_tool_call(name="write_file", arguments="{}", call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        persisted = []
+
+        def capture_progress(current_messages, *_args, **_kwargs):
+            persisted.append(json.loads(json.dumps(current_messages)))
+
+        with (
+            patch("run_agent.handle_function_call", return_value=terminal) as mock_hfc,
+            patch.object(
+                agent,
+                "_flush_messages_to_session_db",
+                side_effect=capture_progress,
+            ),
+        ):
+            control = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert control is terminal
+        mock_hfc.assert_called_once()
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert messages[0]["content"] == str(terminal)
+        assert "skipped" in messages[1]["content"].lower()
+        assert "kanban_complete" in messages[1]["content"]
+        assert any(
+            snapshot
+            and snapshot[-1].get("tool_call_id") == "c1"
+            and snapshot[-1].get("content") == str(terminal)
+            for snapshot in persisted
+        )
+
+    def test_unsuccessful_terminal_tool_does_not_skip_later_batch_tools(self, agent):
+        tc1 = _mock_tool_call(name="kanban_complete", arguments="{}", call_id="c1")
+        tc2 = _mock_tool_call(name="write_file", arguments="{}", call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=['{"error":"completion rejected"}', '{"ok":true}'],
+        ) as mock_hfc:
+            control = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert control is None
+        assert mock_hfc.call_count == 2
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert "completion rejected" in messages[0]["content"]
+        assert "skipped" not in messages[1]["content"].lower()
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
@@ -4037,6 +4094,89 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_terminal_control_ends_turn_without_another_model_call(self, agent):
+        from tools.kanban_tools import KanbanTerminalAction, KanbanTerminalControl
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("kanban_complete")
+        terminal = KanbanTerminalControl(
+            '{"ok": true, "task_id": "t_worker"}',
+            action=KanbanTerminalAction.COMPLETE,
+        )
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="kanban_complete",
+                    arguments='{"summary":"done"}',
+                    call_id="terminal-1",
+                )
+            ],
+        )
+
+        def reject_second_model_call(*_args, **_kwargs):
+            if agent.client.chat.completions.create.call_count > 1:
+                pytest.fail("terminal control must prevent a second model API call")
+            return tool_turn
+
+        agent.client.chat.completions.create.side_effect = reject_second_model_call
+        with (
+            patch("run_agent.handle_function_call", return_value=terminal),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the card")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "Kanban task completed."
+        assert result["turn_exit_reason"] == "terminal_tool(kanban_complete:complete)"
+        assert agent.client.chat.completions.create.call_count == 1
+        terminal_message = next(
+            message
+            for message in result["messages"]
+            if message.get("tool_call_id") == "terminal-1"
+        )
+        assert terminal_message["content"] == str(terminal)
+
+    def test_unsuccessful_terminal_tool_continues_to_next_model_call(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("kanban_complete")
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="kanban_complete",
+                    arguments='{"summary":"premature"}',
+                    call_id="terminal-error-1",
+                )
+            ],
+        )
+        final_turn = _mock_response(
+            content="I corrected the completion evidence.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [tool_turn, final_turn]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value='{"error":"completion rejected; retry"}',
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the card")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "I corrected the completion evidence."
+        assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

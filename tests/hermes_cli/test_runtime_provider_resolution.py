@@ -987,6 +987,39 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     assert resolved["source"] == "custom_provider:Local"
 
 
+def test_named_custom_primary_lifts_nested_model_route_limits(monkeypatch):
+    model = "qwen3.6-27b:oq4-mtp"
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "omlx-local": {
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "api_key": "no-key-required",
+                    "default_model": model,
+                    "models": {
+                        model: {
+                            "max_output_tokens": 4096,
+                            "timeout_seconds": 120,
+                            "stale_timeout_seconds": 90,
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="omlx-local",
+        target_model=model,
+    )
+
+    assert resolved["max_output_tokens"] == 4096
+    assert resolved["request_timeout_seconds"] == 120
+    assert resolved["stale_timeout_seconds"] == 90
+
+
 def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     """A request for bare ``provider="custom"`` must resolve a literal
     ``providers.custom`` entry (e.g. a cliproxy endpoint) instead of falling

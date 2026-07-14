@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -1117,9 +1118,87 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+def _positive_route_token_limit(fb: dict) -> int | None:
+    for key in ("max_output_tokens", "max_tokens"):
+        raw = fb.get(key)
+        if isinstance(raw, bool):
+            continue
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0 and math.isfinite(numeric) and numeric.is_integer():
+            return int(numeric)
+    return None
+
+
+def _positive_route_timeout(fb: dict, key: str) -> float | None:
+    raw = fb.get(key)
+    if isinstance(raw, bool):
+        return None
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 and math.isfinite(timeout) else None
+
+
+def _apply_fallback_route_limits(agent, fb: dict) -> None:
+    primary_limit = _positive_route_token_limit(
+        {"max_tokens": (getattr(agent, "_primary_runtime", None) or {}).get("max_tokens")}
+    )
+    output_cap = _positive_route_token_limit(fb)
+    if primary_limit is not None and output_cap is not None:
+        agent.max_tokens = min(primary_limit, output_cap)
+    elif output_cap is not None:
+        agent.max_tokens = output_cap
+    else:
+        agent.max_tokens = primary_limit
+    agent._route_request_timeout_seconds = _positive_route_timeout(
+        fb, "request_timeout_seconds"
+    )
+    agent._route_stale_timeout_seconds = _positive_route_timeout(
+        fb, "stale_timeout_seconds"
+    )
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
+    try:
+        from agent.runtime_circuit import runtime_circuit_status
+
+        circuit = runtime_circuit_status(agent, fb)
+    except Exception as exc:
+        logger.debug(
+            "Fallback circuit preflight failed for %s/%s: %s",
+            fb.get("provider"),
+            fb.get("model"),
+            exc,
+        )
+        circuit = None
+    if circuit is not None:
+        return f"target_circuit_open:{circuit.reason or 'unknown'}"
+
     fb_provider = (fb.get("provider") or "").strip().lower()
+    if fb_provider:
+        try:
+            from agent.credential_pool import load_pool
+
+            pool = load_pool(fb_provider)
+            if pool.has_credentials() and not pool.has_available():
+                return "credential_pool_exhausted"
+            if pool.has_credentials():
+                preflight_pools = getattr(agent, "_fallback_preflight_pools", None)
+                if not isinstance(preflight_pools, dict):
+                    preflight_pools = {}
+                    agent._fallback_preflight_pools = preflight_pools
+                preflight_pools[_fallback_entry_key(fb)] = pool
+        except Exception as exc:
+            logger.debug(
+                "Fallback credential-pool preflight failed for %s: %s",
+                fb_provider,
+                exc,
+            )
     if fb_provider != "nous":
         return None
     try:
@@ -1138,7 +1217,31 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def _record_failed_runtime_circuit(agent, reason: "FailoverReason") -> None:
+    """Persist current-route health before fallback mutates agent identity."""
+    try:
+        from agent.runtime_circuit import open_runtime_circuit
+
+        open_runtime_circuit(
+            agent,
+            reset_at=None,
+            reason=reason,
+            target={
+                "provider": getattr(agent, "provider", ""),
+                "model": getattr(agent, "model", ""),
+                "runtime": getattr(agent, "runtime", "hermes"),
+            },
+        )
+    except Exception as exc:
+        logger.warning("Could not persist failed runtime circuit: %s", exc)
+
+
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    _record_failed_route: bool = True,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -1151,6 +1254,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     mappings.
     """
     from hermes_cli.kanban_runtime_contract import RuntimeObservationError
+
+    if reason is not None and _record_failed_route:
+        _record_failed_runtime_circuit(agent, reason)
 
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
@@ -1187,11 +1293,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _record_failed_route=False)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return try_activate_fallback(
+            agent, reason, _record_failed_route=False
+        )  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1202,7 +1310,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _record_failed_route=False)
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
@@ -1235,7 +1343,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback skip: chain entry %s/%s matches current provider/model",
             fb_provider, fb_model,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _record_failed_route=False)
     if (
         fb_base_url_for_dedup
         and current_base_url
@@ -1247,7 +1355,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback skip: chain entry base_url %s matches current backend",
             fb_base_url_for_dedup,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _record_failed_route=False)
 
     # ── min_effort guard: skip fallback entries that require a higher
     # reasoning effort than the current task's active lane.  Prevents
@@ -1268,7 +1376,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback skip: %s/%s requires min_effort=%s, current=%s",
                 fb_provider, fb_model, min_effort, current_effort,
             )
-            return agent._try_activate_fallback()
+            return try_activate_fallback(agent, reason, _record_failed_route=False)
 
     # Whole-agent runtimes authenticate through their own subscription/login
     # state and therefore must be activatable without resolving an API client.
@@ -1281,6 +1389,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             CODEX_APP_SERVER_RUNTIME,
         )
 
+        preflight_pools = getattr(agent, "_fallback_preflight_pools", {})
+        if isinstance(preflight_pools, dict):
+            preflight_pools.pop(fb_key, None)
         old_model = agent.model
         agent._config_context_length = None
         agent.model = fb_model
@@ -1293,7 +1404,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent.api_mode = "codex_app_server"
         else:  # fail closed for a future runtime until an adapter is registered
             logger.error("Fallback runtime %s is unsupported", fb_runtime)
-            return agent._try_activate_fallback(reason)
+            return try_activate_fallback(agent, reason, _record_failed_route=False)
+        _apply_fallback_route_limits(agent, fb)
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = ""
@@ -1355,7 +1467,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return try_activate_fallback(
+                agent, reason, _record_failed_route=False
+            )  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -1443,7 +1557,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             try:
                 from agent.credential_pool import load_pool
 
-                fallback_pool = load_pool(fb_provider)
+                preflight_pools = getattr(agent, "_fallback_preflight_pools", {})
+                fallback_pool = (
+                    preflight_pools.pop(fb_key, None)
+                    if isinstance(preflight_pools, dict)
+                    else None
+                )
+                if fallback_pool is None:
+                    fallback_pool = load_pool(fb_provider)
                 if fallback_pool and fallback_pool.has_credentials():
                     agent._credential_pool = fallback_pool
                     logger.info(
@@ -1459,7 +1580,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = _positive_route_timeout(fb, "request_timeout_seconds")
+        if _fb_timeout is None:
+            _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -1500,6 +1623,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 # timeout takes effect on the very next fallback request,
                 # not only after a later credential-rotation rebuild.
                 agent._replace_primary_openai_client(reason="fallback_timeout_apply")
+
+        _apply_fallback_route_limits(agent, fb)
 
         # Re-evaluate prompt caching for the new provider/model
         agent._use_prompt_caching, agent._use_native_cache_layout = (
@@ -1571,7 +1696,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return try_activate_fallback(
+            agent, reason, _record_failed_route=False
+        )  # try next in chain
 
 
 
@@ -2050,7 +2177,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = getattr(
+            agent, "_route_request_timeout_seconds", None
+        )
+        if _provider_timeout_cfg is None:
+            _provider_timeout_cfg = get_provider_request_timeout(
+                agent.provider, agent.model
+            )
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
@@ -2855,7 +2988,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _close_request_client_once("stream_request_complete")
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = getattr(agent, "_route_stale_timeout_seconds", None)
+    if _cfg_stale is None:
+        _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:

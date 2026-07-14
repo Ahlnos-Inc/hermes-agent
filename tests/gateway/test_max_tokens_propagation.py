@@ -5,9 +5,8 @@ gateway-spawned agent, so providers without a hardcoded default (OpenRouter
 free models, Ollama Cloud, custom OpenAI-compatible endpoints) truncated long
 generations with `finish_reason="length"`.
 
-Precedence verified here:
-    HERMES_MAX_TOKENS env  >  model.max_tokens  >  per-provider
-    max_output_tokens  >  None
+The global/env request limit and the selected route's output cap are both
+honored; when both exist, the lower limit wins.
 """
 
 import importlib
@@ -95,8 +94,8 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
     assert kw["max_tokens"] == 12000
 
 
-def test_global_max_tokens_beats_per_provider(isolated_home):
-    """The documented global model.max_tokens wins over a provider cap."""
+def test_per_provider_cap_clamps_higher_global_max_tokens(isolated_home):
+    """A route-owned output safety cap cannot be raised by a global setting."""
     write_cfg, fresh_gateway = isolated_home
     write_cfg(
         """
@@ -114,7 +113,7 @@ def test_global_max_tokens_beats_per_provider(isolated_home):
     )
     grun = fresh_gateway()
     kw = grun._resolve_runtime_agent_kwargs()
-    assert kw["max_tokens"] == 16384
+    assert kw["max_tokens"] == 12000
 
 
 def test_env_override_beats_everything(isolated_home, monkeypatch):

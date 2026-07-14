@@ -865,6 +865,15 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class OperatorBlockResult:
+    """Outcome of an operator block that may need to stop an active worker."""
+
+    accepted: bool
+    finalized: bool
+    termination: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -5663,8 +5672,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       broken worker path forever, especially for parentless root tasks.
 
     The cheapest signal is the most recent block-state event for the task.
-    If the most recent one is ``"blocked"`` or ``"gave_up"``, the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    If the most recent one is ``"blocked"``, ``"operator_block_fenced"``, or
+    ``"gave_up"``, the task is sticky and ``recompute_ready`` must *not*
+    auto-promote it.  The operator fence is durable before process
+    termination so a surviving worker can never be joined by a replacement.
 
     Returns ``False`` when there is no such event at all (e.g. direct DB
     manipulation of old rows), preserving the legacy auto-recover path
@@ -5672,11 +5683,14 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'operator_block_fenced', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in {"blocked", "gave_up"}
+    return bool(row) and row["kind"] in {
+        "blocked", "operator_block_fenced", "gave_up",
+    }
 
 
 def _awaiting_manual_promotion(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7238,6 +7252,7 @@ def block_task(
     metadata: Optional[dict] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    require_no_active_run: bool = False,
 ) -> bool:
     """Transition a task to blocked, dependency-wait, or triage.
 
@@ -7251,6 +7266,8 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if expected_run_id is not None and require_no_active_run:
+        raise ValueError("expected_run_id and require_no_active_run are exclusive")
     effective_summary = summary or reason
     with write_txn(conn):
         cur_row = conn.execute(
@@ -7278,7 +7295,10 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'review')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                """ + (
+                    " AND current_run_id IS NULL" if require_no_active_run
+                    else ("" if expected_run_id is None else " AND current_run_id = ?")
+                ),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
             )
@@ -7336,7 +7356,9 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'review')
-                """,
+                """ + (
+                    " AND current_run_id IS NULL" if require_no_active_run else ""
+                ),
                 (target_status, kind, recurrences, task_id),
             )
         else:
@@ -7404,6 +7426,176 @@ def block_task(
     return True
 
 
+def operator_block_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    kind: Optional[str] = None,
+    signal_fn=None,
+) -> OperatorBlockResult:
+    """Fence an active run, stop its worker, then finalize the same run.
+
+    The first transaction makes the task non-routable without releasing its
+    claim or PID.  Worker termination happens after that transaction commits.
+    The second transaction clears the lease and closes only the run that was
+    fenced, and only after the worker is confirmed dead.
+    """
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    effective_summary = summary or reason
+    fenced: Optional[sqlite3.Row] = None
+    with write_txn(conn):
+        row = conn.execute(
+            """SELECT status, current_run_id, worker_pid, claim_lock,
+                      block_kind, block_recurrences
+                 FROM tasks WHERE id = ?""",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return OperatorBlockResult(False, False)
+        if row["status"] == "running" and row["current_run_id"] is not None:
+            cur = conn.execute(
+                """UPDATE tasks SET status = 'blocked'
+                     WHERE id = ? AND status = 'running'
+                       AND current_run_id = ?""",
+                (task_id, int(row["current_run_id"])),
+            )
+            if cur.rowcount != 1:
+                return OperatorBlockResult(False, False)
+            fenced = row
+            _append_event(
+                conn,
+                task_id,
+                "operator_block_fenced",
+                {"reason": reason, "kind": kind},
+                run_id=int(row["current_run_id"]),
+            )
+        elif row["status"] == "blocked" and row["current_run_id"] is not None:
+            pending_fence = conn.execute(
+                """SELECT 1 FROM task_events
+                     WHERE task_id = ? AND run_id = ?
+                       AND kind = 'operator_block_fenced'
+                     LIMIT 1""",
+                (task_id, int(row["current_run_id"])),
+            ).fetchone()
+            if pending_fence is not None:
+                fenced = row
+
+    if fenced is None:
+        accepted = block_task(
+            conn,
+            task_id,
+            reason=reason,
+            summary=summary,
+            metadata=metadata,
+            kind=kind,
+            require_no_active_run=True,
+        )
+        return OperatorBlockResult(accepted, accepted)
+
+    run_id = int(fenced["current_run_id"])
+    pid = fenced["worker_pid"]
+    claim_lock = fenced["claim_lock"]
+    termination = _terminate_reclaimed_worker(
+        pid, claim_lock, signal_fn=signal_fn,
+    )
+    if not termination.get("terminated"):
+        with write_txn(conn):
+            current = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'blocked'",
+                (task_id,),
+            ).fetchone()
+            if current is not None and current["current_run_id"] == run_id:
+                _append_event(
+                    conn,
+                    task_id,
+                    "worker_termination",
+                    termination,
+                    run_id=run_id,
+                )
+        return OperatorBlockResult(True, False, termination)
+
+    prev_kind = fenced["block_kind"]
+    prev_recurrences = int(fenced["block_recurrences"] or 0)
+    if kind == "dependency":
+        recurrences = prev_recurrences
+        target_status = "todo"
+        event_kind = "dependency_wait"
+    else:
+        recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+        target_status = (
+            "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+        )
+        event_kind = (
+            "block_loop_detected"
+            if target_status == "triage"
+            else "blocked"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE tasks
+                  SET status = ?, claim_lock = NULL, claim_expires = NULL,
+                      worker_pid = NULL, current_run_id = NULL,
+                      block_kind = ?, block_recurrences = ?
+                WHERE id = ? AND status = 'blocked'
+                  AND current_run_id = ? AND claim_lock IS ? AND worker_pid IS ?""",
+            (
+                target_status,
+                kind,
+                recurrences,
+                task_id,
+                run_id,
+                claim_lock,
+                pid,
+            ),
+        )
+        if cur.rowcount != 1:
+            return OperatorBlockResult(False, False, termination)
+        conn.execute(
+            """UPDATE task_runs
+                  SET status = 'blocked', outcome = 'blocked', summary = ?,
+                      metadata = ?, ended_at = ?, claim_lock = NULL,
+                      claim_expires = NULL, worker_pid = NULL
+                WHERE id = ? AND task_id = ? AND ended_at IS NULL""",
+            (
+                effective_summary,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                now,
+                run_id,
+                task_id,
+            ),
+        )
+        _append_event(
+            conn, task_id, "worker_termination", termination, run_id=run_id,
+        )
+        payload = {"reason": reason, "kind": kind}
+        if kind != "dependency":
+            payload["recurrences"] = recurrences
+        if event_kind == "block_loop_detected":
+            payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        if kind != "dependency":
+            _record_failure_signature(
+                conn, task_id, effective_summary, run_id=run_id,
+            )
+        blocked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=blocked_task.assignee if blocked_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
+    return OperatorBlockResult(True, True, termination)
+
+
 def defer_task_for_delivery_authorization_retry(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7468,7 +7660,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status, policy_quarantined FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, policy_quarantined, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -7481,6 +7674,18 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+    if cur_status == "blocked" and row["current_run_id"] is not None:
+        operator_fence = conn.execute(
+            """SELECT 1 FROM task_events
+                 WHERE task_id = ? AND run_id = ?
+                   AND kind = 'operator_block_fenced'
+                 LIMIT 1""",
+            (task_id, int(row["current_run_id"])),
+        ).fetchone()
+        if operator_fence is not None:
+            return False, (
+                "worker termination is not confirmed; retry the operator block"
+            )
 
     if not force:
         parents = conn.execute(
@@ -7543,6 +7748,22 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     now = int(time.time())
     with write_txn(conn):
+        operator_fence = conn.execute(
+            """SELECT 1
+                 FROM tasks t
+                 JOIN task_events e
+                   ON e.task_id = t.id AND e.run_id = t.current_run_id
+                WHERE t.id = ? AND t.status = 'blocked'
+                  AND t.current_run_id IS NOT NULL
+                  AND e.kind = 'operator_block_fenced'
+                LIMIT 1""",
+            (task_id,),
+        ).fetchone()
+        if operator_fence is not None:
+            # The worker survived (or could not be safely targeted).  Keep the
+            # exact run fenced until an operator retry confirms it is dead;
+            # exposing ready here could dispatch a duplicate worker.
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),

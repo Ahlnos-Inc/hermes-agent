@@ -707,6 +707,16 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_worker_complete_returns_typed_terminal_control(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({"summary": "finished the worker task"})
+
+    assert isinstance(out, kt.KanbanTerminalControl)
+    assert out.action is kt.KanbanTerminalAction.COMPLETE
+    assert json.loads(out)["ok"] is True
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -884,6 +894,7 @@ def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
     assert json.loads(out).get("error"), "should have errored"
+    assert not isinstance(out, kt.KanbanTerminalControl)
 
 
 def test_complete_rejects_non_dict_metadata(worker_env):
@@ -1121,6 +1132,16 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_worker_block_returns_typed_terminal_control(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({"reason": "need a human decision"})
+
+    assert isinstance(out, kt.KanbanTerminalControl)
+    assert out.action is kt.KanbanTerminalAction.BLOCK
+    assert json.loads(out)["ok"] is True
 
 
 def test_block_rejects_empty_reason(worker_env):
@@ -2913,6 +2934,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
+    assert not isinstance(out, kt.KanbanTerminalControl)
 
 
 # ---------------------------------------------------------------------------

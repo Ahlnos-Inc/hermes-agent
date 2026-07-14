@@ -1020,7 +1020,11 @@ def run_conversation(
             FailoverReason.overloaded,
             FailoverReason.server_error,
         }:
-            reset_at = open_runtime_circuit(agent, reset_at=failure.reset_at)
+            reset_at = open_runtime_circuit(
+                agent,
+                reset_at=failure.reset_at,
+                reason=failure.reason,
+            )
             _emit_runtime_event(agent, "runtime_circuit_open", reset_at=reset_at)
 
         from_provider, from_model, from_runtime = (
@@ -1028,7 +1032,10 @@ def run_conversation(
             agent.model,
             active_runtime,
         )
-        if agent._try_activate_fallback(reason=failure.reason):
+        if agent._try_activate_fallback(
+            reason=failure.reason,
+            _record_failed_route=False,
+        ):
             _emit_runtime_event(
                 agent,
                 "runtime_fallback_activated",
@@ -5125,7 +5132,25 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                terminal_control = agent._execute_tool_calls(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                )
+
+                if terminal_control is not None:
+                    # A worker finalizer committed its lifecycle transition.
+                    # The executor has already persisted the real tool result
+                    # and synthesized results for any later calls in the same
+                    # batch. End the turn now: another model request could only
+                    # perform work after the card/run is already terminal.
+                    final_response = terminal_control.final_response
+                    _turn_exit_reason = (
+                        f"terminal_tool({terminal_control.tool_name}:"
+                        f"{terminal_control.action.value})"
+                    )
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

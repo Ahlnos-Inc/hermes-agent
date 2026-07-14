@@ -1167,6 +1167,13 @@ def restore_primary_runtime(agent) -> bool:
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
         agent.runtime = rt.get("runtime", "hermes")
+        agent.max_tokens = rt.get("max_tokens")
+        agent._route_request_timeout_seconds = rt.get(
+            "route_request_timeout_seconds"
+        )
+        agent._route_stale_timeout_seconds = rt.get(
+            "route_stale_timeout_seconds"
+        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]

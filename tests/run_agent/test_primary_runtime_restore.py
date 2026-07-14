@@ -30,7 +30,12 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
+def _make_agent(
+    fallback_model=None,
+    provider="custom",
+    base_url="https://my-llm.example.com/v1",
+    max_tokens=None,
+):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
@@ -45,6 +50,7 @@ def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            max_tokens=max_tokens,
         )
         agent.client = MagicMock()
         return agent
@@ -145,6 +151,89 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
+
+    def test_fallback_projects_route_output_cap_and_finite_timeouts(self):
+        agent = _make_agent(
+            max_tokens=8192,
+            fallback_model={
+                "provider": "omlx-local",
+                "model": "qwen3.6-27b:oq4-mtp",
+                "max_output_tokens": 4096,
+                "request_timeout_seconds": 120,
+                "stale_timeout_seconds": 90,
+            },
+        )
+        mock_client = _mock_resolve(
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="no-key-required",
+        )
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["max_tokens"] == 4096
+        assert agent._resolved_api_call_timeout() == 120
+        assert agent._resolved_api_call_stale_timeout_base() == (90, False)
+
+    def test_primary_restore_reinstates_output_cap_and_timeout_policy(self):
+        agent = _make_agent(
+            max_tokens=8192,
+            fallback_model={
+                "provider": "omlx-local",
+                "model": "qwen3.6-27b:oq4-mtp",
+                "max_tokens": 4096,
+                "request_timeout_seconds": 120,
+                "stale_timeout_seconds": 90,
+            },
+        )
+        mock_client = _mock_resolve(
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="no-key-required",
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["max_tokens"] == 8192
+        assert agent._resolved_api_call_timeout() != 120
+        assert agent._resolved_api_call_stale_timeout_base()[1] is True
+
+    def test_chained_fallback_without_cap_reprojects_primary_output_limit(self):
+        agent = _make_agent(
+            max_tokens=8192,
+            fallback_model=[
+                {
+                    "provider": "fallback-a",
+                    "model": "model-a",
+                    "max_output_tokens": 4096,
+                },
+                {
+                    "provider": "fallback-b",
+                    "model": "model-b",
+                },
+            ],
+        )
+        first_client = _mock_resolve(base_url="https://a.invalid/v1")
+        second_client = _mock_resolve(base_url="https://b.invalid/v1")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(first_client, None), (second_client, None)],
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.max_tokens == 4096
+            assert agent._try_activate_fallback() is True
+
+        assert agent.max_tokens == 8192
 
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -153,10 +155,68 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-    # Claim first so block() finds it running
-    kc.run_slash(f"claim {tid}")
+    # A non-running card uses the ordinary block/unblock lifecycle. Running
+    # cards are covered separately because operator block must stop the worker
+    # before an unblock is safe.
     assert "Blocked" in kc.run_slash(f"block {tid} 'need decision'")
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
+
+
+def test_run_slash_block_operator_terminates_running_worker(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="operator stop", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert claimed is not None
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    try:
+        with kb.connect() as conn:
+            kb._set_worker_pid(conn, task_id, proc.pid)
+
+        out = kc.run_slash(f"block {task_id} 'operator pause'")
+
+        assert "Blocked" in out
+        assert proc.wait(timeout=2) is not None
+        with kb.connect() as conn:
+            blocked = kb.get_task(conn, task_id)
+            assert blocked is not None
+            assert blocked.status == "blocked"
+            assert blocked.current_run_id is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def test_run_slash_worker_self_block_never_signals_itself(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="self block", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        kb._set_worker_pid(conn, task_id, 99999)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        kb.os, "kill", lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    out = kc.run_slash(f"block {task_id} 'need operator input'")
+
+    assert "Blocked" in out
+    assert signals == []
+    with kb.connect() as conn:
+        blocked = kb.get_task(conn, task_id)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        assert blocked.current_run_id is None
 
 
 def test_run_slash_json_output(kanban_home):

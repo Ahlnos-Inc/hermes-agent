@@ -1215,6 +1215,9 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
+        route_timeout = getattr(self, "_route_request_timeout_seconds", None)
+        if route_timeout is not None:
+            return route_timeout
         cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
@@ -1238,6 +1241,9 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
+        route_timeout = getattr(self, "_route_stale_timeout_seconds", None)
+        if route_timeout is not None:
+            return route_timeout, False
         cfg = get_provider_stale_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg, False
@@ -4789,10 +4795,17 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        _record_failed_route: bool = True,
+    ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(
+            self, reason, _record_failed_route=_record_failed_route
+        )
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.

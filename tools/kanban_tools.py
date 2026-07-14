@@ -33,6 +33,7 @@ import hashlib
 import logging
 import os
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -492,6 +493,66 @@ def heartbeat_current_worker_from_env(*, activity_kind: str = "semantic") -> boo
 
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
+
+
+class KanbanTerminalAction(str, Enum):
+    """Worker lifecycle transitions that end the current agent run."""
+
+    COMPLETE = "complete"
+    BLOCK = "block"
+
+
+class KanbanTerminalControl(str):
+    """Successful worker finalizer result with out-of-band control semantics.
+
+    This is deliberately a ``str`` subclass: existing registry, middleware,
+    observer, callback, and transcript paths continue to receive the exact JSON
+    tool result they received before.  The native tool executor can meanwhile
+    distinguish a committed worker-lifecycle transition without parsing JSON or
+    guessing from a tool name.
+    """
+
+    action: KanbanTerminalAction
+
+    def __new__(
+        cls,
+        content: str,
+        *,
+        action: KanbanTerminalAction,
+    ) -> "KanbanTerminalControl":
+        result = super().__new__(cls, content)
+        result.action = action
+        return result
+
+    @property
+    def final_response(self) -> str:
+        if self.action is KanbanTerminalAction.COMPLETE:
+            return "Kanban task completed."
+        return "Kanban task blocked."
+
+    @property
+    def tool_name(self) -> str:
+        if self.action is KanbanTerminalAction.COMPLETE:
+            return "kanban_complete"
+        return "kanban_block"
+
+
+def _worker_terminal_ok(
+    action: KanbanTerminalAction,
+    *,
+    task_id: str,
+    **fields: Any,
+) -> str:
+    """Return typed terminal control only to the worker that owns ``task_id``.
+
+    Orchestrators may use the same tools to operate on another card.  Their
+    conversation must continue, so those successful calls retain the ordinary
+    string result.
+    """
+    content = _ok(task_id=task_id, **fields)
+    if os.environ.get("HERMES_KANBAN_TASK") == task_id:
+        return KanbanTerminalControl(content, action=action)
+    return content
 
 
 def _append_kanban_route_telemetry(
@@ -1695,7 +1756,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 result=result or "",
                 metadata=metadata or {},
             )
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _worker_terminal_ok(
+                KanbanTerminalAction.COMPLETE,
+                task_id=tid,
+                run_id=run.id if run else None,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -1788,7 +1853,8 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
-            return _ok(
+            return _worker_terminal_ok(
+                KanbanTerminalAction.BLOCK,
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",

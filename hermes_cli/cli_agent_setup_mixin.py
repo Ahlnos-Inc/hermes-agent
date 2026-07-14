@@ -89,6 +89,9 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        resolved_max_output_tokens = runtime.get("max_output_tokens")
+        resolved_request_timeout = runtime.get("request_timeout_seconds")
+        resolved_stale_timeout = runtime.get("stale_timeout_seconds")
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
@@ -134,6 +137,12 @@ class CLIAgentSetupMixin:
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
             or resolved_moa_config != getattr(self, "moa_config", None)
+            or resolved_max_output_tokens
+            != getattr(self, "_route_max_output_tokens", None)
+            or resolved_request_timeout
+            != getattr(self, "_route_request_timeout_seconds", None)
+            or resolved_stale_timeout
+            != getattr(self, "_route_stale_timeout_seconds", None)
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
@@ -142,6 +151,9 @@ class CLIAgentSetupMixin:
         self.acp_args = resolved_acp_args
         self.moa_config = resolved_moa_config
         self._credential_pool = resolved_credential_pool
+        self._route_max_output_tokens = resolved_max_output_tokens
+        self._route_request_timeout_seconds = resolved_request_timeout
+        self._route_stale_timeout_seconds = resolved_stale_timeout
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
@@ -209,6 +221,13 @@ class CLIAgentSetupMixin:
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
+            "max_output_tokens": getattr(self, "_route_max_output_tokens", None),
+            "request_timeout_seconds": getattr(
+                self, "_route_request_timeout_seconds", None
+            ),
+            "stale_timeout_seconds": getattr(
+                self, "_route_stale_timeout_seconds", None
+            ),
         }
         route = {
             "model": self.model,
@@ -381,8 +400,25 @@ class CLIAgentSetupMixin:
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
                 "moa_config": getattr(self, "moa_config", None),
+                "max_output_tokens": getattr(
+                    self, "_route_max_output_tokens", None
+                ),
+                "request_timeout_seconds": getattr(
+                    self, "_route_request_timeout_seconds", None
+                ),
+                "stale_timeout_seconds": getattr(
+                    self, "_route_stale_timeout_seconds", None
+                ),
             }
             effective_model = model_override or self.model
+            route_max_tokens = runtime.get("max_output_tokens")
+            effective_max_tokens = self.max_tokens
+            if route_max_tokens is not None:
+                effective_max_tokens = (
+                    min(effective_max_tokens, route_max_tokens)
+                    if effective_max_tokens is not None
+                    else route_max_tokens
+                )
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -394,7 +430,7 @@ class CLIAgentSetupMixin:
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
                 moa_config=runtime.get("moa_config"),
-                max_tokens=self.max_tokens,
+                max_tokens=effective_max_tokens,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 disabled_toolsets=self.disabled_toolsets,

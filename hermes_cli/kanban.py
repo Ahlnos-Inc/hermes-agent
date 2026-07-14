@@ -2022,13 +2022,29 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            worker_run_id = _worker_run_id_for(tid)
+            is_worker_self_block = os.environ.get("HERMES_KANBAN_TASK") == tid
+            if is_worker_self_block:
+                # A worker blocking its own active run is already unwinding;
+                # never route that path through operator process termination.
+                blocked = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=worker_run_id,
+                )
+                finalized = blocked
+            else:
+                outcome = kb.operator_block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                )
+                blocked = outcome.accepted
+                finalized = outcome.finalized
+            if not blocked:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
@@ -2045,7 +2061,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
                         f"human decision){suffix}"
                     )
                 else:
-                    print(f"Blocked {tid}{suffix}")
+                    pending = (
+                        " (worker termination pending; task remains fenced)"
+                        if not finalized else ""
+                    )
+                    print(f"Blocked {tid}{suffix}{pending}")
     return 0 if not failed else 1
 
 

@@ -338,6 +338,27 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    global_max_tokens = None
+    raw_env_max_tokens = os.getenv("HERMES_MAX_TOKENS")
+    if raw_env_max_tokens:
+        try:
+            global_max_tokens = int(raw_env_max_tokens)
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(model_cfg, dict):
+        configured_max_tokens = model_cfg.get("max_tokens")
+        if isinstance(configured_max_tokens, int) and configured_max_tokens > 0:
+            global_max_tokens = configured_max_tokens
+    route_max_tokens = runtime.get("max_output_tokens")
+    if isinstance(route_max_tokens, int) and route_max_tokens > 0:
+        effective_max_tokens = (
+            min(global_max_tokens, route_max_tokens)
+            if isinstance(global_max_tokens, int) and global_max_tokens > 0
+            else route_max_tokens
+        )
+    else:
+        effective_max_tokens = global_max_tokens
+
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -345,6 +366,7 @@ def _run_agent(
         api_mode=runtime.get("api_mode"),
         runtime=runtime.get("runtime"),
         model=effective_model,
+        max_tokens=effective_max_tokens,
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
         platform="cli",
