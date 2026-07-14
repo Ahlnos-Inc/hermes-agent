@@ -2488,6 +2488,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # A gateway profile may opt out when another explicitly designated
+        # profile owns the shared cron store. Default true preserves the
+        # single-profile behavior of existing installations.
+        "enabled": True,
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or

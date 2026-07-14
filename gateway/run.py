@@ -19507,17 +19507,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import cron_scheduler_enabled, resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
-    )
-    cron_thread.start()
+    cron_provider = None
+    cron_thread = None
+    if cron_scheduler_enabled():
+        cron_provider = resolve_cron_scheduler()
+        cron_thread = threading.Thread(
+            target=cron_provider.start,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
+    else:
+        logger.info("Cron scheduler disabled for this profile")
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -19548,11 +19553,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     
     # Stop cron scheduler + housekeeping cleanly
     cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    cron_thread.join(timeout=5)
+    if cron_provider is not None:
+        try:
+            cron_provider.stop()
+        except Exception as e:
+            logger.debug("Cron provider stop() error: %s", e)
+    if cron_thread is not None:
+        cron_thread.join(timeout=5)
     housekeeping_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).

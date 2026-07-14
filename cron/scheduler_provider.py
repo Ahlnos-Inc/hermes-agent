@@ -24,6 +24,26 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def cron_scheduler_enabled() -> bool:
+    """Return whether this profile is allowed to fire cron jobs.
+
+    The default remains enabled for backward compatibility. Multi-profile
+    installations can designate one scheduler authority by disabling this key
+    everywhere else, without deleting the profiles' historical job stores.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
+        value = cron_config.get("enabled", True) if isinstance(cron_config, dict) else True
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return value is not False
+
+
 class CronScheduler(ABC):
     """Axis-B trigger provider. Decides WHEN a due cron job fires.
 

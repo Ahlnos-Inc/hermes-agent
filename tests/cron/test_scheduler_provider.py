@@ -192,6 +192,33 @@ def test_default_config_cron_provider_is_empty():
     assert DEFAULT_CONFIG["cron"]["provider"] == ""
 
 
+def test_cron_scheduler_is_enabled_by_default():
+    """Existing installations keep their scheduler unless a profile opts out."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["enabled"] is True
+
+
+def test_cron_scheduler_enabled_reads_profile_config(monkeypatch):
+    import hermes_cli.config as cfg
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"cron": {"enabled": False}})
+    assert sp.cron_scheduler_enabled() is False
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"cron": {"enabled": True}})
+    assert sp.cron_scheduler_enabled() is True
+
+
+def test_gateway_starts_cron_only_for_authoritative_profile():
+    from pathlib import Path
+
+    gateway_source = (Path(__file__).resolve().parents[2] / "gateway" / "run.py").read_text()
+
+    assert "cron_scheduler_enabled" in gateway_source
+    assert "Cron scheduler disabled for this profile" in gateway_source
+
+
 def test_discover_cron_schedulers_returns_list():
     """Discovery returns bundled non-default providers.
 
