@@ -1299,6 +1299,53 @@ class TestLaunchdServiceRecovery:
         assert "maintenance stop fence is active" in out
         assert "hermes gateway start" in out
 
+    def test_launchd_disabled_probe_parses_real_launchctl_disabled_token(
+        self, monkeypatch
+    ):
+        label = "ai.hermes.gateway-coder"
+        output = (
+            "disabled services = {\n"
+            '    "com.apple.unrelated" => enabled\n'
+            f'    "{label}" => disabled\n'
+            "}\n"
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(
+                returncode=0, stdout=output, stderr=""
+            ),
+        )
+
+        assert gateway_cli._launchd_label_is_disabled("gui/501", label) is True
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            '"ai.hermes.gateway-coder" => disabled-extra',
+            '"ai.hermes.gateway-coder" => not-disabled',
+            '"ai.hermes.gateway-coder-other" => disabled',
+            '"ai.hermes.gateway-coder" => disabled trailing-junk',
+        ],
+    )
+    def test_launchd_disabled_probe_rejects_suffixes_and_substrings(
+        self, monkeypatch, line
+    ):
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(
+                returncode=0, stdout=f"disabled services = {{\n{line}\n}}\n", stderr=""
+            ),
+        )
+
+        assert (
+            gateway_cli._launchd_label_is_disabled(
+                "gui/501", "ai.hermes.gateway-coder"
+            )
+            is False
+        )
+
     def test_gateway_stop_all_uses_launchd_fence_sweep(self, monkeypatch, capsys):
         calls = []
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
@@ -1476,6 +1523,51 @@ class TestLaunchdServiceRecovery:
             labels[1]: ("user/501",),
         }
 
+    def test_gateway_stop_all_dual_registered_label_fails_before_mutation_or_sweep(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["launchctl", "print-disabled"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
+        )
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes",
+            lambda **kwargs: pytest.fail("ambiguous supervisor must abort before sweep"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+        assert not any(
+            cmd[:2] in (["launchctl", "disable"], ["launchctl", "bootout"])
+            for cmd in calls
+        )
+        assert "both gui/501 and user/501" in capsys.readouterr().out
+
     def test_gateway_stop_all_actual_disable_125_aborts_before_pid_sweep(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -1519,6 +1611,52 @@ class TestLaunchdServiceRecovery:
         assert excinfo.value.code == 1
         assert target in capsys.readouterr().out
         assert not any(cmd[:2] == ["launchctl", "bootout"] for cmd in calls)
+
+    def test_gateway_stop_all_failed_disable_stays_unsafe_when_later_probe_is_absent(
+        self, tmp_path, monkeypatch
+    ):
+        """A post-failure absence cannot retroactively prove a fence succeeded."""
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        target = f"user/501/{label}"
+        disable_failed = False
+
+        def fake_run(cmd, **kwargs):
+            nonlocal disable_failed
+            if cmd[:2] == ["launchctl", "print"]:
+                rc = 0 if cmd[2] == target and not disable_failed else 113
+                return SimpleNamespace(returncode=rc, stdout="", stderr="")
+            if cmd == ["launchctl", "disable", target]:
+                disable_failed = True
+                raise subprocess.CalledProcessError(125, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
+        )
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes",
+            lambda **kwargs: pytest.fail(
+                "an attempted disable failure must keep the sweep unsafe"
+            ),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
 
     def test_gateway_stop_all_launchagents_permission_error_fails_before_sweep(
         self, tmp_path, monkeypatch, capsys
@@ -1610,6 +1748,48 @@ class TestLaunchdServiceRecovery:
         assert path.read_bytes() == original
         assert calls == []
         assert "Refusing cross-profile launchd operation" in capsys.readouterr().out
+
+    def test_gateway_stop_all_symlinked_matching_plist_is_untouched(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        target = tmp_path / "valid-target.plist"
+        _write_launchd_gateway_plist(target, label)
+        link = agents_dir / f"{label}.plist"
+        link.symlink_to(target)
+
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: pytest.fail(
+                "symlink inventory must abort before launchctl"
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes",
+            lambda **kwargs: pytest.fail("symlink inventory must abort before sweep"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+        assert link.is_symlink()
+        assert target.exists()
+        assert "not a regular file" in capsys.readouterr().out
 
     def test_gateway_restart_all_partial_restore_lists_stranded_label_and_is_nonzero(
         self, tmp_path, monkeypatch, capsys

@@ -3692,7 +3692,7 @@ def _launchd_label_is_disabled(domain: str, label: str) -> bool | None:
 
     label_pattern = re.compile(
         rf"^\s*(?:{re.escape(label)}|\"{re.escape(label)}\"|'"
-        rf"{re.escape(label)}')\s*=>\s*true\b",
+        rf"{re.escape(label)}')\s*=>\s*(?:true|disabled)(?:\s*[,;])?\s*$",
         re.IGNORECASE,
     )
     return any(label_pattern.search(line) for line in (result.stdout or "").splitlines())
@@ -3746,7 +3746,7 @@ def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
         if not _LAUNCHD_GATEWAY_PLIST_PATTERN.fullmatch(path.name):
             continue
         try:
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 raise LaunchdInventoryError(
                     f"Refusing cross-profile launchd operation: {path} is not a regular file"
                 )
@@ -4608,6 +4608,11 @@ def launchd_stop_all() -> LaunchdStopAllResult:
     planned: list[tuple[str, Path, LaunchdLabelProbe, tuple[str, ...]]] = []
     for label, plist_path in inventory:
         probe = _probe_launchd_label_domains(label)
+        if len(probe.registered) > 1:
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: {label} is registered "
+                f"in both {probe.registered[0]} and {probe.registered[1]}"
+            )
         if probe.registered:
             restore_domains = probe.registered
         else:
@@ -4642,6 +4647,12 @@ def launchd_stop_all() -> LaunchdStopAllResult:
                 label_failures.append(f"{domain}/{label} (launchd exit {rc})")
 
         if label_failures:
+            # Once a desired-state write was attempted and failed, the fence
+            # transaction is unsafe. A later "not registered" observation can
+            # race with launchd and must not retroactively authorize a global
+            # PID sweep. Domains known to be inapplicable must be excluded
+            # before attempting disable, not excused afterward.
+            sweep_safe = False
             # Re-probe after the failure in case the registration moved between
             # gui/user while fencing. Retry any newly-observed actual domain.
             retry_probe = _probe_launchd_label_domains(label)
@@ -4654,14 +4665,6 @@ def launchd_stop_all() -> LaunchdStopAllResult:
                     changed.append(actual_domain)
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                     pass
-            final_probe = _probe_launchd_label_domains(label)
-            supervised_unfenced = [
-                domain
-                for domain in final_probe.registered
-                if domain not in successful and domain not in final_probe.disabled
-            ]
-            if supervised_unfenced or final_probe.unknown:
-                sweep_safe = False
             failures.extend(label_failures)
 
         fenced.append(
