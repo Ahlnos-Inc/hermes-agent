@@ -41,7 +41,9 @@ def cron_scheduler_enabled() -> bool:
         if config_path.exists():
             try:
                 with config_path.open(encoding="utf-8") as handle:
-                    raw_config = fast_safe_load(handle) or {}
+                    raw_config = fast_safe_load(handle)
+                if raw_config is None:
+                    raw_config = {}
                 if not isinstance(raw_config, dict):
                     raise ValueError("root must be a mapping")
             except Exception as exc:

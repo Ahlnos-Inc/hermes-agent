@@ -253,6 +253,18 @@ def test_cron_scheduler_fails_closed_on_non_mapping_cron_section(tmp_path, monke
     assert sp.cron_scheduler_enabled() is False
 
 
+def test_cron_scheduler_fails_closed_on_falsy_non_mapping_root(tmp_path, monkeypatch):
+    from cron import scheduler_provider as sp
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    for document in ("[]\n", "false\n", "0\n"):
+        (home / "config.yaml").write_text(document)
+        assert sp.cron_scheduler_enabled() is False
+
+
 def test_disabled_resolver_never_loads_or_fires_provider(monkeypatch):
     from cron import scheduler_provider as sp
 
