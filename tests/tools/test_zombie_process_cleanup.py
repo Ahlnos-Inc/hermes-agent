@@ -175,6 +175,40 @@ class TestAgentCloseMethod:
                 "test-close-session-row", "agent_close"
             )
 
+    def test_close_finalizes_session_before_potentially_blocking_resource_cleanup(self):
+        """A bounded SIGTERM close must persist the terminal state immediately."""
+        from unittest.mock import MagicMock, patch
+
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+
+        with patch("run_agent.AIAgent.__init__", return_value=None):
+            from run_agent import AIAgent
+            agent = AIAgent.__new__(AIAgent)
+            agent.session_id = "test-close-before-cleanup"
+            agent._active_children = []
+            agent._active_children_lock = threading.Lock()
+            agent.client = None
+            agent._end_session_on_close = True
+            agent._session_db = MagicMock()
+
+            def block_cleanup(*, task_id):
+                cleanup_started.set()
+                release_cleanup.wait(timeout=5)
+
+            with patch("tools.process_registry.process_registry") as mock_registry:
+                mock_registry.kill_all.side_effect = block_cleanup
+                close_thread = threading.Thread(target=agent.close, daemon=True)
+                close_thread.start()
+                assert cleanup_started.wait(timeout=1)
+                try:
+                    agent._session_db.end_session.assert_called_once_with(
+                        "test-close-before-cleanup", "agent_close"
+                    )
+                finally:
+                    release_cleanup.set()
+                    close_thread.join(timeout=1)
+
     def test_close_skips_session_end_for_forwarded_continuation_agents(self):
         """Helper agents that handed session ownership forward opt out."""
         from unittest.mock import MagicMock, patch

@@ -1135,11 +1135,50 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+def _close_single_query_agent(cli, *, timeout_s: float | None = None) -> bool:
+    """Close a one-shot agent once, optionally waiting only a bounded time."""
+    if getattr(cli, "_single_query_agent_close_started", False):
+        return bool(getattr(cli, "_single_query_agent_close_finished", False))
+    cli._single_query_agent_close_started = True
+    agent = getattr(cli, "agent", None)
+    close = getattr(agent, "close", None)
+    if not callable(close):
+        cli._single_query_agent_close_finished = True
+        return True
+
+    if timeout_s is None:
+        close()
+        cli._single_query_agent_close_finished = True
+        return True
+
+    errors: list[BaseException] = []
+
+    def _close_bounded() -> None:
+        try:
+            close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            cli._single_query_agent_close_finished = True
+
+    close_thread = threading.Thread(
+        target=_close_bounded,
+        name="hermes-single-query-close",
+        daemon=True,
+    )
+    close_thread.start()
+    close_thread.join(max(0.0, timeout_s))
+    return not close_thread.is_alive() and not errors
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
         _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        try:
+            _run_cleanup(notify_session_finalize=False)
+        finally:
+            _close_single_query_agent(cli)
     finally:
         cli._release_active_session()
 
@@ -15792,6 +15831,15 @@ def main(
                     _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
                     _sig_mod.alarm(2)
             except Exception:
+                pass
+            # ``os._exit`` skips both the one-shot ``finally`` block and
+            # atexit. Give the normal agent teardown a short, hard deadline so
+            # its current (possibly compression-rotated) SQLite session is
+            # finalized without letting a wedged resource cleanup keep the
+            # worker PID alive indefinitely.
+            try:
+                _close_single_query_agent(cli, timeout_s=0.25)
+            except BaseException:
                 pass
             try:
                 import logging as _lg

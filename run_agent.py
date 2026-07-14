@@ -3480,26 +3480,39 @@ class AIAgent:
         """
         task_id = getattr(self, "session_id", None) or ""
 
-        # 1. Kill background processes for this task
+        # 1. Persist the terminal session state before any resource cleanup
+        # that may block. This makes bounded SIGTERM teardown reliable while
+        # preserving compression/other terminal reasons because
+        # SessionDB.end_session() is first-reason-wins.
+        try:
+            if getattr(self, "_end_session_on_close", True):
+                session_db = getattr(self, "_session_db", None)
+                session_id = getattr(self, "session_id", None)
+                if session_db and session_id:
+                    session_db.end_session(session_id, "agent_close")
+        except Exception:
+            pass
+
+        # 2. Kill background processes for this task
         try:
             from tools.process_registry import process_registry
             process_registry.kill_all(task_id=task_id)
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
+        # 3. Clean terminal sandbox environments
         try:
             cleanup_vm(task_id)
         except Exception:
             pass
 
-        # 3. Clean browser daemon sessions
+        # 4. Clean browser daemon sessions
         try:
             cleanup_browser(task_id)
         except Exception:
             pass
 
-        # 4. Close active child agents
+        # 5. Close active child agents
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -3520,7 +3533,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3529,7 +3542,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3537,22 +3550,6 @@ class AIAgent:
         # still holds the closed agent (e.g. a draining background task).
         try:
             self._session_messages = []
-        except Exception:
-            pass
-
-        # 7. Finalize the owned SQLite session row unless this agent is only a
-        # temporary helper that deliberately handed session ownership forward
-        # (manual compression helpers that rotate to a continuation session_id,
-        # or background-review forks that share the live parent's session_id and
-        # must leave it open). end_session() is first-reason-wins and no-ops on
-        # an already-ended row, so this never clobbers a 'compression' /
-        # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
-        try:
-            if getattr(self, "_end_session_on_close", True):
-                session_db = getattr(self, "_session_db", None)
-                session_id = getattr(self, "session_id", None)
-                if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
         except Exception:
             pass
 

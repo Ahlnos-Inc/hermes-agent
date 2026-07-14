@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +34,57 @@ def test_finalize_single_query_runs_cleanup_without_reemitting_finalize_before_r
         ("cleanup", {"notify_session_finalize": False}),
         ("release", {}),
     ]
+
+
+def test_finalize_single_query_closes_agent_after_cleanup_before_release(monkeypatch):
+    calls = []
+    fake_agent = SimpleNamespace(close=lambda: calls.append("close"))
+    fake_cli = SimpleNamespace(
+        agent=fake_agent,
+        _release_active_session=lambda: calls.append("release"),
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "_notify_single_query_session_finalize",
+        lambda _cli: calls.append("finalize"),
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **_kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    assert calls == ["finalize", "cleanup", "close", "release"]
+
+
+def test_close_single_query_agent_is_idempotent():
+    calls = []
+    fake_agent = SimpleNamespace(close=lambda: calls.append("close"))
+    fake_cli = SimpleNamespace(agent=fake_agent)
+
+    cli._close_single_query_agent(fake_cli)
+    cli._close_single_query_agent(fake_cli)
+
+    assert calls == ["close"]
+
+
+def test_close_single_query_agent_timeout_is_bounded():
+    release_close = threading.Event()
+    close_started = threading.Event()
+
+    def close():
+        close_started.set()
+        release_close.wait(timeout=5)
+
+    fake_cli = SimpleNamespace(agent=SimpleNamespace(close=close))
+    started_at = time.monotonic()
+    try:
+        closed = cli._close_single_query_agent(fake_cli, timeout_s=0.01)
+    finally:
+        release_close.set()
+
+    assert close_started.is_set()
+    assert closed is False
+    assert time.monotonic() - started_at < 0.5
 
 
 def test_finalize_single_query_releases_session_when_cleanup_fails(monkeypatch):
@@ -268,3 +321,50 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_kanban_sigterm_handler_closes_agent_before_hard_exit(monkeypatch):
+    import signal
+
+    calls = []
+    registered_handlers = {}
+
+    class _HardExit(BaseException):
+        pass
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.agent = SimpleNamespace(
+                session_id="kanban-session",
+                interrupt=lambda reason: calls.append(("interrupt", reason)),
+                close=lambda: calls.append("close"),
+            )
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return False
+
+    def register_handler(signum, handler):
+        registered_handlers[signum] = handler
+
+    def hard_exit(code):
+        calls.append(("hard-exit", code))
+        raise _HardExit()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_sigterm_close")
+    monkeypatch.setenv("HERMES_SIGTERM_GRACE", "0")
+    monkeypatch.setattr(cli, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(signal, "signal", register_handler)
+    monkeypatch.setattr(signal, "alarm", lambda _seconds: None)
+    monkeypatch.setattr(cli.os, "_exit", hard_exit)
+    monkeypatch.setattr("logging.shutdown", lambda: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(query="work task", quiet=True, toolsets="terminal")
+    assert exc_info.value.code == 1
+
+    with pytest.raises(_HardExit):
+        registered_handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    assert calls.count("close") == 1
+    assert calls.index("close") < calls.index(("hard-exit", 0))
