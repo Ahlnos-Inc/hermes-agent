@@ -144,7 +144,11 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import cron_scheduler_enabled, resolve_cron_scheduler
+
+    if not cron_scheduler_enabled():
+        _log.info("Desktop cron scheduler disabled for this profile")
+        return
 
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)

@@ -101,6 +101,19 @@ def test_desktop_ticker_calls_tick_then_stops():
     assert calls[0].get("sync") is False
 
 
+def test_desktop_ticker_does_not_fire_when_profile_cron_is_disabled(monkeypatch):
+    from hermes_cli.web_server import _start_desktop_cron_ticker
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.cron_scheduler_enabled", lambda: False
+    )
+    calls = []
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **kw: calls.append(kw)):
+        _start_desktop_cron_ticker(threading.Event(), interval=0)
+
+    assert calls == []
+
+
 # ── Phase 1: CronScheduler ABC + InProcessCronScheduler ──────────────────────
 
 
@@ -208,6 +221,46 @@ def test_cron_scheduler_enabled_reads_profile_config(monkeypatch):
 
     monkeypatch.setattr(cfg, "load_config", lambda: {"cron": {"enabled": True}})
     assert sp.cron_scheduler_enabled() is True
+
+
+def test_cron_scheduler_integer_zero_is_disabled(monkeypatch):
+    import hermes_cli.config as cfg
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"cron": {"enabled": 0}})
+    assert sp.cron_scheduler_enabled() is False
+
+
+def test_cron_scheduler_fails_closed_on_malformed_profile_config(tmp_path, monkeypatch):
+    from cron import scheduler_provider as sp
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("cron: [unterminated\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert sp.cron_scheduler_enabled() is False
+
+
+def test_disabled_resolver_never_loads_or_fires_provider(monkeypatch):
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(sp, "cron_scheduler_enabled", lambda: False)
+    provider = sp.resolve_cron_scheduler()
+
+    assert provider.name == "disabled"
+    assert provider.fire_due("must-not-run") is False
+
+
+def test_direct_inprocess_provider_does_not_tick_when_disabled(monkeypatch):
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(sp, "cron_scheduler_enabled", lambda: False)
+    calls = []
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **kw: calls.append(kw)):
+        sp.InProcessCronScheduler().start(threading.Event(), interval=0)
+
+    assert calls == []
 
 
 def test_gateway_starts_cron_only_for_authoritative_profile():

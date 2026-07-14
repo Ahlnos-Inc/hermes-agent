@@ -3556,7 +3556,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if not job_id:
             return web.json_response({"error": "missing job_id"}, status=400)
 
-        from cron.scheduler_provider import resolve_cron_scheduler
+        from cron.scheduler_provider import cron_scheduler_enabled, resolve_cron_scheduler
+        if not cron_scheduler_enabled():
+            return web.json_response(
+                {"error": "cron disabled for this profile"}, status=409
+            )
         provider = resolve_cron_scheduler()
 
         loop = asyncio.get_running_loop()

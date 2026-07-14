@@ -20,6 +20,7 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import threading
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -32,16 +33,45 @@ def cron_scheduler_enabled() -> bool:
     everywhere else, without deleting the profiles' historical job stores.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path, load_config
+        from utils import fast_safe_load
 
+        config_path = get_config_path()
+        if config_path.exists():
+            try:
+                with config_path.open(encoding="utf-8") as handle:
+                    raw_config = fast_safe_load(handle) or {}
+                if not isinstance(raw_config, dict):
+                    raise ValueError("root must be a mapping")
+            except Exception as exc:
+                logging.getLogger("cron.scheduler_provider").error(
+                    "Cron scheduler disabled: cannot parse profile config %s: %s",
+                    config_path,
+                    exc,
+                )
+                return False
         config = load_config() or {}
         cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
         value = cron_config.get("enabled", True) if isinstance(cron_config, dict) else True
-    except Exception:
-        return True
+    except Exception as exc:
+        logging.getLogger("cron.scheduler_provider").error(
+            "Cron scheduler disabled: authority config could not be loaded: %s", exc
+        )
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
     if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
-    return value is not False
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    logging.getLogger("cron.scheduler_provider").error(
+        "Cron scheduler disabled: invalid cron.enabled value %r", value
+    )
+    return False
 
 
 class CronScheduler(ABC):
@@ -114,6 +144,9 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
+        if not cron_scheduler_enabled():
+            return False
+
         from cron.jobs import claim_job_for_fire, get_job
         from cron.scheduler import run_one_job
 
@@ -131,6 +164,27 @@ class CronScheduler(ABC):
         return None
 
 
+class DisabledCronScheduler(CronScheduler):
+    """No-op authority boundary for profiles that do not own cron firing."""
+
+    @property
+    def name(self) -> str:
+        return "disabled"
+
+    def start(
+        self,
+        stop_event: threading.Event,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        interval: int = 60,
+    ) -> None:
+        return None
+
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+        return False
+
+
 def resolve_cron_scheduler() -> "CronScheduler":
     """Return the active cron scheduler provider.
 
@@ -142,6 +196,9 @@ def resolve_cron_scheduler() -> "CronScheduler":
     import logging
 
     logger = logging.getLogger("cron.scheduler_provider")
+
+    if not cron_scheduler_enabled():
+        return DisabledCronScheduler()
 
     name = ""
     try:
@@ -189,6 +246,9 @@ class InProcessCronScheduler(CronScheduler):
         from cron.jobs import record_ticker_heartbeat
 
         logger = logging.getLogger("cron.scheduler_provider")
+        if not cron_scheduler_enabled():
+            logger.info("Cron scheduler disabled for this profile")
+            return
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.

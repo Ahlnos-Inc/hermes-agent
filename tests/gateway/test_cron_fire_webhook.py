@@ -128,6 +128,29 @@ async def test_missing_job_id_400(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_disabled_profile_rejects_external_fire(adapter, monkeypatch):
+    """A valid Chronos token cannot bypass the profile's scheduler authority."""
+    spy = _SpyProvider()
+    monkeypatch.setattr("cron.scheduler_provider.cron_scheduler_enabled", lambda: False)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "must-not-run"},
+        )
+        assert resp.status == 409
+        assert (await resp.json())["error"] == "cron disabled for this profile"
+    assert spy.fired == []
+
+
+@pytest.mark.asyncio
 async def test_fire_does_not_require_api_server_key(adapter, monkeypatch):
     """The fire endpoint must NOT gate on API_SERVER_KEY — auth is the NAS-JWT.
     A request with NO API key header but a valid fire token still succeeds."""
