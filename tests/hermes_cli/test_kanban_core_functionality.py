@@ -1244,7 +1244,10 @@ def test_heartbeat_on_running_task(kanban_home):
         events = kb.list_events(conn, tid)
         hb = [e for e in events if e.kind == "heartbeat"]
         assert len(hb) == 1
-        assert hb[0].payload == {"note": "step 3/10"}
+        assert hb[0].payload == {
+            "activity_kind": "semantic",
+            "note": "step 3/10",
+        }
     finally:
         conn.close()
 
@@ -1333,7 +1336,11 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        task = kb.get_task(conn, tid)
+        assert spawned[0].payload == {
+            "pid": 98765,
+            "run_id": task.current_run_id,
+        }
     finally:
         conn.close()
 
@@ -3004,8 +3011,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
-        pid = kb._default_spawn(task, str(workspace))
-        assert pid == 99999
+        receipt = kb._default_spawn(task, str(workspace))
+        assert receipt.pid == 99999
     finally:
         conn.close()
 
@@ -4791,9 +4798,10 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
                 "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (five_hours_ago, five_hours_ago, t),
             )
 
         res = kb.dispatch_once(

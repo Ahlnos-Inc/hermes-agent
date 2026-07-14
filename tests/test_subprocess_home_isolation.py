@@ -500,11 +500,11 @@ class TestKanbanWorkerSpawnHome:
             tenant=None,
         )
 
-        pid = kb._default_spawn(task, str(workspace), board="default")
+        receipt = kb._default_spawn(task, str(workspace), board="default")
 
         env = captured["env"]
         assert isinstance(env, dict)
-        assert pid == 4242
+        assert receipt.pid == 4242
         assert captured["cwd"] == str(workspace)
         assert env["HERMES_HOME"] == str(worker_profile)
         assert env["HOME"] == str(worker_home)

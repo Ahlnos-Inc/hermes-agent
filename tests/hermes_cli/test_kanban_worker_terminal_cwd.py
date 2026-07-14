@@ -33,7 +33,9 @@ def _make_task(kb, *, assignee: str = "w"):
         claim_lock="lock",
         claim_expires=None,
         tenant=None,
-        current_run_id=1,
+        # This unit test calls the low-level spawn helper directly, so it is
+        # intentionally a legacy/manual spawn with no persisted run contract.
+        current_run_id=None,
     )
 
 
