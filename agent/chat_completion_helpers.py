@@ -1150,6 +1150,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    from hermes_cli.kanban_runtime_contract import RuntimeObservationError
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1217,6 +1219,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     )
     current_runtime = str(getattr(agent, "runtime", "hermes") or "hermes")
     current_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/").lower()
+    previous_route = {
+        "provider": current_provider,
+        "model": current_model,
+        "runtime": current_runtime,
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+    }
     fb_base_url_for_dedup = (fb.get("base_url") or "").strip().rstrip("/").lower()
     if (
         fb_provider == current_provider
@@ -1306,6 +1314,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             fb_provider,
             fb_runtime,
+        )
+        from hermes_cli.kanban_runtime_contract import notify_runtime_observer
+
+        notify_runtime_observer(
+            agent,
+            phase="fallback",
+            reason=reason,
+            from_route=previous_route,
         )
         return True
 
@@ -1540,7 +1556,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+        from hermes_cli.kanban_runtime_contract import notify_runtime_observer
+
+        notify_runtime_observer(
+            agent,
+            phase="fallback",
+            reason=reason,
+            from_route=previous_route,
+        )
         return True
+    except RuntimeObservationError:
+        raise
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)

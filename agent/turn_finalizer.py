@@ -155,11 +155,10 @@ def finalize_turn(
                     },
                     "turn_exit_reason": _turn_exit_reason,
                 }
-                _model_provider = (
-                    os.environ.get("HERMES_PROVIDER")
-                    or os.environ.get("HERMES_MODEL_PROVIDER")
-                )
-                _model_name = os.environ.get("HERMES_MODEL")
+                # The live agent is observed truth. HERMES_* values describe
+                # requested launch intent and become stale after fallback.
+                _model_provider = getattr(agent, "provider", None)
+                _model_name = getattr(agent, "model", None)
                 _session_id = os.environ.get("HERMES_SESSION_ID")
                 if _model_provider:
                     _block_metadata["provider"] = _model_provider.strip()

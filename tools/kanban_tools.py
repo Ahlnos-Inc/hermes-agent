@@ -1155,7 +1155,7 @@ def _resolve_model_routing(args: dict[str, Any], explicit_model_override: Any) -
     return model_override, {k: v for k, v in decision.items() if v is not None}
 
 
-def _current_model_used() -> Optional[dict[str, str]]:
+def _legacy_model_used_from_env() -> Optional[dict[str, str]]:
     provider = os.environ.get("HERMES_PROVIDER") or os.environ.get("HERMES_MODEL_PROVIDER")
     model = os.environ.get("HERMES_MODEL")
     effort = os.environ.get("HERMES_REASONING_EFFORT")
@@ -1169,6 +1169,39 @@ def _current_model_used() -> Optional[dict[str, str]]:
         if isinstance(v, str) and v.strip()
     }
     return result or None
+
+
+def _current_model_used(
+    kb: Any = None,
+    conn: Any = None,
+    task_id: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Return observed runtime truth, with env only for legacy runs."""
+    if kb is not None and conn is not None and task_id:
+        task = kb.get_task(conn, task_id)
+        run_id = task.current_run_id if task else None
+        if run_id is not None:
+            observed = kb.latest_runtime_observation(conn, run_id)
+            if observed is not None:
+                result = {
+                    key: str(observed[key]).strip()
+                    for key in ("provider", "model", "reasoning_effort")
+                    if isinstance(observed.get(key), str)
+                    and str(observed[key]).strip()
+                }
+                return result or None
+            if kb.get_run_spec(
+                conn, run_id, task_id=task_id, require_current=True,
+            ) is not None:
+                if os.environ.get("HERMES_KANBAN_TASK") == task_id:
+                    raise ValueError(
+                        f"contracted run {run_id} has no runtime observation"
+                    )
+                # An operator may close a run externally. There is no active
+                # runtime to attest, so leave model_used absent rather than
+                # borrowing the operator process's unrelated environment.
+                return None
+    return _legacy_model_used_from_env()
 
 
 def _normalize_profile(value: Any) -> Optional[str]:
@@ -1467,10 +1500,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
-    model_used = _current_model_used()
-    if model_used:
-        metadata = dict(metadata or {})
-        metadata.setdefault("model_used", model_used)
+    model_used = None
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -1506,6 +1536,11 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"or (2) create continuation tasks with parents=[{tid}] "
                         f"and keep this task alive."
                     )
+
+            model_used = _current_model_used(kb, conn, tid)
+            if model_used:
+                metadata = dict(metadata or {})
+                metadata["model_used"] = model_used
 
             try:
                 ok = kb.complete_task(
@@ -1588,10 +1623,7 @@ def _handle_block(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     # Stamp model/session metadata, mirroring kanban_complete.
-    model_used = _current_model_used()
-    if model_used:
-        metadata = dict(metadata or {})
-        metadata.setdefault("model_used", model_used)
+    model_used = None
     metadata = _stamp_worker_session_metadata(tid, metadata)
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
@@ -1627,6 +1659,10 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        model_used = _current_model_used(kb, conn, tid)
+        if model_used:
+            metadata = dict(metadata or {})
+            metadata["model_used"] = model_used
         try:
             ok = kb.block_task(
                 conn, tid,

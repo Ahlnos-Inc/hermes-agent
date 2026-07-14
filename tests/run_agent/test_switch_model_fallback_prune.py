@@ -20,6 +20,7 @@ def _make_agent(chain):
     agent.base_url = "https://openrouter.ai/api/v1"
     agent.api_key = "or-key"
     agent.api_mode = "chat_completions"
+    agent.runtime = "hermes"
     agent.client = MagicMock()
     agent._client_kwargs = {"api_key": "or-key", "base_url": "https://openrouter.ai/api/v1"}
     agent.context_compressor = None
@@ -76,6 +77,27 @@ def test_switch_with_empty_chain_stays_empty():
 
     assert agent._fallback_chain == []
     assert agent._fallback_model is None
+
+
+def test_switch_attests_new_primary_route():
+    agent = _make_agent([])
+    observed = []
+    agent._runtime_observer = lambda **payload: observed.append(payload)
+
+    _switch_to_anthropic(agent)
+
+    assert observed == [
+        {
+            "phase": "switch",
+            "reason": "explicit_model_switch",
+            "from_route": {
+                "provider": "openrouter",
+                "model": "x-ai/grok-4",
+                "runtime": "hermes",
+                "api_mode": "chat_completions",
+            },
+        }
+    ]
 
 
 def test_switch_initializes_missing_fallback_attrs():

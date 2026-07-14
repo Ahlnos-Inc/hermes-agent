@@ -1456,6 +1456,39 @@ def test_claim_succeeds_once_parents_done(kanban_home):
         claimed = kb.claim_task(conn, child, claimer="host:1")
     assert claimed is not None
     assert claimed.status == "running"
+    assert claimed.claim_lock is not None
+
+
+def test_claim_snapshots_an_immutable_versioned_run_spec(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="routed work",
+            assignee="coder",
+            model_override="gpt-5.6-sol",
+            model_provider_override="openai-codex",
+            model_reasoning_effort="xhigh",
+        )
+
+        assert kb.claim_task(conn, tid) is not None
+        run = kb.latest_run(conn, tid)
+        assert run.run_spec == {
+            "version": 1,
+            "profile": "coder",
+            "requested_route": {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "xhigh",
+            },
+        }
+
+        conn.execute(
+            "UPDATE tasks SET model_override = ?, "
+            "model_provider_override = ?, model_reasoning_effort = ? "
+            "WHERE id = ?",
+            ("claude-opus-4-8", "anthropic", "max", tid),
+        )
+        assert kb.latest_run(conn, tid).run_spec == run.run_spec
 
 
 def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
@@ -3733,7 +3766,41 @@ def test_claim_review_task_transitions_to_running(kanban_home):
         claimed = kb.claim_review_task(conn, t)
     assert claimed is not None
     assert claimed.status == "running"
-    assert claimed.claim_lock is not None
+
+
+def test_review_claim_snapshots_its_own_run_spec(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review routed work",
+            assignee="reviewer",
+            model_override="claude-opus-4-8",
+            model_provider_override="anthropic",
+            model_reasoning_effort="xhigh",
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+
+        assert kb.claim_review_task(conn, tid) is not None
+        assert kb.latest_run(conn, tid).run_spec == {
+            "version": 1,
+            "profile": "reviewer",
+            "requested_route": {
+                "provider": "anthropic",
+                "model": "claude-opus-4-8",
+                "reasoning_effort": "xhigh",
+            },
+        }
+
+
+def test_create_rejects_reasoning_effort_the_cli_cannot_honor(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="model_reasoning_effort"):
+            kb.create_task(
+                conn,
+                title="invalid route",
+                assignee="coder",
+                model_reasoning_effort="max",
+            )
 
 
 def test_claim_review_task_fails_on_non_review(kanban_home):

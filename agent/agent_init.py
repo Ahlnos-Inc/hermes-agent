@@ -452,6 +452,10 @@ def init_agent(
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
+    # Synchronous run-route attestation hook. Kanban worker startup installs
+    # it only after the agent is fully constructed; runtime mutations call it
+    # before another provider request may begin.
+    agent._runtime_observer = None
     agent.tool_gen_callback = tool_gen_callback
 
     # Defence in depth for architecture-gated Kanban turns: prevent partial

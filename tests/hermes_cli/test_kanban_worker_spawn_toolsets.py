@@ -20,7 +20,7 @@ def _make_task(kb, *, assignee: str):
         claim_lock="lock",
         claim_expires=None,
         tenant=None,
-        current_run_id=7,
+        current_run_id=None,
     )
 
 
@@ -168,6 +168,58 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
     assert args.query == "work kanban task t_spawn_tools"
+
+
+def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
+    monkeypatch, tmp_path,
+):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "coder").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="immutable route",
+            assignee="coder",
+            workspace_kind="dir",
+            model_override="gpt-5.6-sol",
+            model_provider_override="openai-codex",
+            model_reasoning_effort="xhigh",
+        )
+        assert kb.claim_task(conn, tid) is not None
+        conn.execute(
+            "UPDATE tasks SET model_override = ?, "
+            "model_provider_override = ?, model_reasoning_effort = ? "
+            "WHERE id = ?",
+            ("claude-opus-4-8", "anthropic", "max", tid),
+        )
+        mutated_task = kb.get_task(conn, tid)
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(mutated_task, str(workspace))
+
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "gpt-5.6-sol"
+    assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "openai-codex"
+    assert captured["cmd"][captured["cmd"].index("--reasoning-effort") + 1] == "xhigh"
+    assert captured["env"]["HERMES_MODEL"] == "gpt-5.6-sol"
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"

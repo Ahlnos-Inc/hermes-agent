@@ -248,6 +248,26 @@ class CLIAgentSetupMixin:
         if self.agent is not None:
             return True
 
+        # Dispatcher workers carry an immutable run route. Validate the real
+        # parsed CLI values before startup hooks, credentials, clients, or an
+        # AIAgent can create provider-side effects.
+        from hermes_cli.kanban_runtime_contract import (
+            RunRouteMismatch,
+            preflight_kanban_cli_route,
+        )
+
+        try:
+            preflight_kanban_cli_route(
+                model=model_override or self.model,
+                provider=self.requested_provider,
+                reasoning_config=self.reasoning_config,
+            )
+        except RunRouteMismatch as exc:
+            ChatConsole().print(
+                f"[bold red]Kanban run route preflight failed: {_escape(str(exc))}[/]"
+            )
+            return False
+
         _prepare_deferred_agent_startup()
         self._install_tool_callbacks()
         self._ensure_tirith_security()
@@ -416,6 +436,22 @@ class CLIAgentSetupMixin:
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
             )
+            # The requested route was checked before construction; now attest
+            # the route the fully initialized agent will actually use. This is
+            # synchronous and fail-closed for contracted Kanban workers.
+            try:
+                from hermes_cli.kanban_runtime_contract import (
+                    attach_kanban_runtime_observer,
+                )
+
+                attach_kanban_runtime_observer(self.agent)
+            except Exception:
+                try:
+                    self.agent.close()
+                except Exception:
+                    pass
+                self.agent = None
+                raise
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

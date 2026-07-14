@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.kanban_runtime_contract import RuntimeObservationError
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -1147,6 +1148,12 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
+    previous_route = {
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "model": str(getattr(agent, "model", "") or ""),
+        "runtime": str(getattr(agent, "runtime", "hermes") or "hermes"),
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+    }
     rt = agent._primary_runtime
     if rt.get("runtime", "hermes") != "hermes":
         from agent.runtime_circuit import runtime_circuit_open_until
@@ -1245,7 +1252,17 @@ def restore_primary_runtime(agent) -> bool:
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
+        from hermes_cli.kanban_runtime_contract import notify_runtime_observer
+
+        notify_runtime_observer(
+            agent,
+            phase="primary",
+            reason="turn_restore",
+            from_route=previous_route,
+        )
         return True
+    except RuntimeObservationError:
+        raise
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
@@ -1674,6 +1691,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    previous_route = {
+        "provider": str(old_provider or ""),
+        "model": str(old_model or ""),
+        "runtime": str(getattr(agent, "runtime", "hermes") or "hermes"),
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+    }
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -1964,6 +1987,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
 
+    from hermes_cli.kanban_runtime_contract import notify_runtime_observer
+
+    notify_runtime_observer(
+        agent,
+        phase="switch",
+        reason="explicit_model_switch",
+        from_route=previous_route,
+    )
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

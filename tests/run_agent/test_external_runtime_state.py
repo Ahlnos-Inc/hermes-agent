@@ -1,6 +1,8 @@
 from unittest.mock import patch
 import time
 
+import pytest
+
 from agent.runtime_circuit import open_runtime_circuit
 from run_agent import AIAgent
 
@@ -71,6 +73,55 @@ def test_external_fallback_activates_without_provider_credentials():
     assert agent.client is None
 
 
+def test_successful_external_fallback_attests_before_returning():
+    agent = _make_agent(
+        runtime="hermes",
+        fallback_model={
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "runtime": "claude_agent_sdk",
+        },
+    )
+    observations = []
+    agent._runtime_observer = lambda **payload: observations.append(payload)
+
+    assert agent._try_activate_fallback() is True
+
+    assert observations == [
+        {
+            "phase": "fallback",
+            "reason": None,
+            "from_route": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "runtime": "hermes",
+                "api_mode": "anthropic_messages",
+            },
+        }
+    ]
+
+
+def test_fallback_observer_failure_is_not_treated_as_another_provider_failure():
+    from hermes_cli.kanban_runtime_contract import RuntimeObservationError
+
+    agent = _make_agent(
+        runtime="hermes",
+        fallback_model={
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "runtime": "claude_agent_sdk",
+        },
+    )
+
+    def fail_observation(**_payload):
+        raise RuntimeObservationError("database unavailable")
+
+    agent._runtime_observer = fail_observation
+
+    with pytest.raises(RuntimeObservationError, match="database unavailable"):
+        agent._try_activate_fallback()
+
+
 def test_restore_primary_restores_agent_loop_runtime():
     agent = _make_agent(
         fallback_model={
@@ -84,6 +135,38 @@ def test_restore_primary_restores_agent_loop_runtime():
 
     assert agent._restore_primary_runtime() is True
     assert agent.runtime == "claude_agent_sdk"
+
+
+def test_restore_primary_attests_route_mutation():
+    agent = _make_agent(
+        fallback_model={
+            "provider": "openai-codex",
+            "model": "gpt-5.4",
+            "runtime": "codex_app_server",
+        }
+    )
+    agent.model = "gpt-5.4"
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_app_server"
+    agent.runtime = "codex_app_server"
+    agent._fallback_activated = True
+    agent._rate_limited_until = 0
+    observed = []
+    agent._runtime_observer = lambda **payload: observed.append(payload)
+
+    assert agent._restore_primary_runtime() is True
+    assert observed == [
+        {
+            "phase": "primary",
+            "reason": "turn_restore",
+            "from_route": {
+                "provider": "openai-codex",
+                "model": "gpt-5.4",
+                "runtime": "codex_app_server",
+                "api_mode": "codex_app_server",
+            },
+        }
+    ]
 
 
 def test_reset_aware_primary_circuit_prevents_early_restore():

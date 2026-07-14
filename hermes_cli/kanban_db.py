@@ -90,6 +90,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -1076,6 +1077,7 @@ class Run:
     last_transport_activity_at: Optional[int]
     last_semantic_progress_at: Optional[int]
     last_durable_progress_at: Optional[int]
+    run_spec: Optional[dict]
     started_at: int
     ended_at: Optional[int]
     outcome: Optional[str]
@@ -1089,6 +1091,14 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        try:
+            run_spec = (
+                json.loads(row["run_spec_json"])
+                if "run_spec_json" in row.keys() and row["run_spec_json"]
+                else None
+            )
+        except Exception:
+            run_spec = None
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1103,6 +1113,7 @@ class Run:
             last_transport_activity_at=row["last_transport_activity_at"],
             last_semantic_progress_at=row["last_semantic_progress_at"],
             last_durable_progress_at=row["last_durable_progress_at"],
+            run_spec=run_spec,
             started_at=int(row["started_at"]),
             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
             outcome=row["outcome"],
@@ -1401,6 +1412,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     last_transport_activity_at INTEGER,
     last_semantic_progress_at INTEGER,
     last_durable_progress_at INTEGER,
+    -- Immutable, versioned, secret-free requested runtime contract for this
+    -- attempt. NULL identifies a legacy/synthetic run.
+    run_spec_json       TEXT,
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
@@ -2433,6 +2447,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "last_durable_progress_at",
                 "last_durable_progress_at INTEGER",
             )
+        if "run_spec_json" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "run_spec_json", "run_spec_json TEXT",
+            )
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2534,6 +2552,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, last_transport_activity_at INTEGER,"
         " last_semantic_progress_at INTEGER, last_durable_progress_at INTEGER,"
+        " run_spec_json TEXT,"
         " started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -3935,6 +3954,15 @@ def create_task(
         model_provider_override = str(model_provider_override).strip() or None
     if model_reasoning_effort is not None:
         model_reasoning_effort = str(model_reasoning_effort).strip().lower() or None
+        supported_efforts = {"none", *VALID_REASONING_EFFORTS}
+        if (
+            model_reasoning_effort is not None
+            and model_reasoning_effort not in supported_efforts
+        ):
+            raise ValueError(
+                "model_reasoning_effort must be one of "
+                + ", ".join(sorted(supported_efforts))
+            )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -4788,6 +4816,49 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _build_run_spec(task_row: Optional[sqlite3.Row]) -> dict:
+    """Build the immutable, secret-free launch contract for one run."""
+    return {
+        "version": 1,
+        "profile": task_row["assignee"] if task_row else None,
+        "requested_route": {
+            "provider": task_row["model_provider_override"] if task_row else None,
+            "model": task_row["model_override"] if task_row else None,
+            "reasoning_effort": task_row["model_reasoning_effort"] if task_row else None,
+        },
+    }
+
+
+def get_run_spec(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    task_id: Optional[str] = None,
+    require_current: bool = False,
+) -> Optional[dict]:
+    """Return a run's requested route, optionally guarded by active ownership."""
+    clauses = ["r.id = ?"]
+    params: list[Any] = [int(run_id)]
+    join = ""
+    if task_id is not None:
+        clauses.append("r.task_id = ?")
+        params.append(task_id)
+    if require_current:
+        join = " JOIN tasks t ON t.id = r.task_id AND t.current_run_id = r.id"
+    row = conn.execute(
+        "SELECT r.run_spec_json FROM task_runs r" + join
+        + " WHERE " + " AND ".join(clauses),
+        params,
+    ).fetchone()
+    if row is None or not row["run_spec_json"]:
+        return None
+    try:
+        value = json.loads(row["run_spec_json"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5155,17 +5226,21 @@ def claim_task(
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_override, model_provider_override, model_reasoning_effort "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_spec_json = json.dumps(
+            _build_run_spec(trow), ensure_ascii=False, sort_keys=True,
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                last_semantic_progress_at, started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                last_semantic_progress_at, run_spec_json, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5175,6 +5250,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                run_spec_json,
                 now,
             ),
         )
@@ -5238,17 +5314,21 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_override, model_provider_override, model_reasoning_effort "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_spec_json = json.dumps(
+            _build_run_spec(trow), ensure_ascii=False, sort_keys=True,
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                last_semantic_progress_at, started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                last_semantic_progress_at, run_spec_json, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5258,6 +5338,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                run_spec_json,
                 now,
             ),
         )
@@ -8015,6 +8096,72 @@ def heartbeat_worker(
     return True
 
 
+_RUNTIME_OBSERVATION_FIELDS = frozenset({
+    "version", "phase", "provider", "model", "reasoning_effort",
+    "runtime", "api_mode", "reason", "from",
+})
+
+
+def record_runtime_observation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    observation: dict,
+) -> bool:
+    """Append the actual active route for the current contracted run."""
+    if not isinstance(observation, dict):
+        raise ValueError("runtime observation must be an object")
+    unknown = set(observation) - _RUNTIME_OBSERVATION_FIELDS
+    if unknown:
+        raise ValueError(
+            f"runtime observation has unsupported fields: {sorted(unknown)}"
+        )
+    if observation.get("version") != 1:
+        raise ValueError("runtime observation version must be 1")
+    if observation.get("phase") not in {"initial", "fallback", "primary", "switch"}:
+        raise ValueError("runtime observation phase is invalid")
+    for key in ("provider", "model", "runtime", "api_mode"):
+        if not isinstance(observation.get(key), str):
+            raise ValueError(f"runtime observation {key} must be a string")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT r.id FROM task_runs r "
+            "JOIN tasks t ON t.id = r.task_id AND t.current_run_id = r.id "
+            "WHERE r.id = ? AND r.task_id = ? AND r.status = 'running' "
+            "AND r.run_spec_json IS NOT NULL",
+            (int(run_id), task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "runtime_observed",
+            observation,
+            run_id=int(run_id),
+        )
+    return True
+
+
+def latest_runtime_observation(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE run_id = ? "
+        "AND kind = 'runtime_observed' ORDER BY id DESC LIMIT 1",
+        (int(run_id),),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        value = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -10079,6 +10226,61 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _spawn_contract(
+    task: Task,
+    *,
+    board: Optional[str],
+) -> tuple[str, dict[str, Optional[str]]]:
+    """Load the active run's immutable launch contract.
+
+    A task without a run spec is a legacy/manual spawn and keeps the old task
+    fields. Once a run carries a contract, mutable task routing is ignored.
+    Missing, stale, or malformed contracted runs fail closed before Popen.
+    """
+    legacy_route = {
+        "provider": task.model_provider_override,
+        "model": task.model_override,
+        "reasoning_effort": task.model_reasoning_effort,
+    }
+    if task.current_run_id is None:
+        return task.assignee or "", legacy_route
+
+    with connect(board=board) as conn:
+        row = conn.execute(
+            "SELECT r.run_spec_json FROM task_runs r "
+            "JOIN tasks t ON t.id = r.task_id AND t.current_run_id = r.id "
+            "WHERE r.id = ? AND r.task_id = ?",
+            (int(task.current_run_id), task.id),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} is no longer current"
+        )
+    raw = row["run_spec_json"]
+    if not raw:
+        return task.assignee or "", legacy_route
+    try:
+        spec = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} has invalid run spec"
+        ) from exc
+    if not isinstance(spec, dict):
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} has unsupported run spec"
+        )
+    route = spec.get("requested_route")
+    if spec.get("version") != 1 or not isinstance(route, dict):
+        raise RuntimeError(
+            f"task {task.id} run {task.current_run_id} has unsupported run spec"
+        )
+    return str(spec.get("profile") or ""), {
+        "provider": route.get("provider"),
+        "model": route.get("model"),
+        "reasoning_effort": route.get("reasoning_effort"),
+    }
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10098,12 +10300,13 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
-    if not task.assignee:
-        raise ValueError(f"task {task.id} has no assignee")
 
     from hermes_cli.profiles import normalize_profile_name
 
-    profile_arg = normalize_profile_name(task.assignee)
+    requested_profile, requested_route = _spawn_contract(task, board=board)
+    profile_arg = normalize_profile_name(requested_profile)
+    if not profile_arg:
+        raise RuntimeError(f"task {task.id} run contract has no profile")
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -10226,16 +10429,19 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        env["HERMES_MODEL"] = task.model_override
-    if task.model_provider_override:
-        cmd.extend(["--provider", task.model_provider_override])
-        env["HERMES_PROVIDER"] = task.model_provider_override
-        env["HERMES_MODEL_PROVIDER"] = task.model_provider_override
-    if task.model_reasoning_effort:
-        cmd.extend(["--reasoning-effort", task.model_reasoning_effort])
-        env["HERMES_REASONING_EFFORT"] = task.model_reasoning_effort
+    requested_model = requested_route.get("model")
+    requested_provider = requested_route.get("provider")
+    requested_effort = requested_route.get("reasoning_effort")
+    if requested_model:
+        cmd.extend(["-m", requested_model])
+        env["HERMES_MODEL"] = requested_model
+    if requested_provider:
+        cmd.extend(["--provider", requested_provider])
+        env["HERMES_PROVIDER"] = requested_provider
+        env["HERMES_MODEL_PROVIDER"] = requested_provider
+    if requested_effort:
+        cmd.extend(["--reasoning-effort", requested_effort])
+        env["HERMES_REASONING_EFFORT"] = requested_effort
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

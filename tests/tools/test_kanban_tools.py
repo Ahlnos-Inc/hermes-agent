@@ -166,10 +166,26 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        kb.record_runtime_observation(
+            conn,
+            tid,
+            claimed.current_run_id,
+            {
+                "version": 1,
+                "phase": "initial",
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "",
+                "runtime": "hermes",
+                "api_mode": "chat_completions",
+            },
+        )
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     return tid
 
 
@@ -592,6 +608,25 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
     assert ok.get("ok") is True
 
 
+def _attest_test_worker(kb, conn, task, monkeypatch) -> None:
+    assert task is not None and task.current_run_id is not None
+    assert kb.record_runtime_observation(
+        conn,
+        task.id,
+        task.current_run_id,
+        {
+            "version": 1,
+            "phase": "initial",
+            "provider": "",
+            "model": "",
+            "reasoning_effort": "",
+            "runtime": "hermes",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""
@@ -615,7 +650,8 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        _attest_test_worker(kb, conn, claimed, monkeypatch)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
@@ -671,7 +707,8 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        _attest_test_worker(kb, conn, claimed, monkeypatch)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
@@ -736,7 +773,8 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        _attest_test_worker(kb, conn, claimed, monkeypatch)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
@@ -957,12 +995,12 @@ def test_typed_activity_advances_distinct_run_clocks(worker_env):
     row = clocks()
     assert row["last_transport_activity_at"] is not None
     assert row["last_semantic_progress_at"] == initial["last_semantic_progress_at"]
-    assert row["last_durable_progress_at"] is None
+    assert row["last_durable_progress_at"] == initial["last_durable_progress_at"]
 
     record("semantic")
     row = clocks()
     assert row["last_semantic_progress_at"] is not None
-    assert row["last_durable_progress_at"] is None
+    assert row["last_durable_progress_at"] == initial["last_durable_progress_at"]
 
     record("durable")
     assert clocks()["last_durable_progress_at"] is not None
@@ -2060,6 +2098,18 @@ def test_complete_stamps_model_used_on_run_and_completed_event(monkeypatch, work
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+        assert kb.record_runtime_observation(conn, worker_env, run_id, {
+            "version": 1,
+            "phase": "switch",
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "runtime": "hermes",
+            "api_mode": "codex_responses",
+        })
+
     comp = json.loads(kt._handle_complete({
         "summary": "done with model metadata",
         "metadata": {"tests_run": 1},
@@ -2085,6 +2135,19 @@ def test_complete_logs_route_completed_telemetry_without_summary(monkeypatch, wo
     monkeypatch.setenv("HERMES_MODEL", "deepseek/deepseek-v4-flash:free")
     monkeypatch.setenv("HERMES_REASONING_EFFORT", "low")
     from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+        assert kb.record_runtime_observation(conn, worker_env, run_id, {
+            "version": 1,
+            "phase": "switch",
+            "provider": "nous",
+            "model": "deepseek/deepseek-v4-flash:free",
+            "reasoning_effort": "low",
+            "runtime": "hermes",
+            "api_mode": "chat_completions",
+        })
 
     comp = json.loads(kt._handle_complete({
         "summary": "secret-ish implementation details should not be logged",
@@ -2377,6 +2440,15 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         kb.claim_task(conn, worker_env)
         run2 = kb.latest_run(conn, worker_env)
         assert run2.id != run1.id
+        assert kb.record_runtime_observation(conn, worker_env, run2.id, {
+            "version": 1,
+            "phase": "initial",
+            "provider": "",
+            "model": "",
+            "reasoning_effort": "",
+            "runtime": "hermes",
+            "api_mode": "chat_completions",
+        })
     finally:
         conn.close()
 

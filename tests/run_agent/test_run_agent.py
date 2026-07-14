@@ -5288,6 +5288,8 @@ class TestRunConversation:
         monkeypatch.setenv("HERMES_PROVIDER", "test-provider")
         monkeypatch.setenv("HERMES_MODEL", "test-model")
         monkeypatch.setenv("HERMES_SESSION_ID", "sess-123")
+        agent.provider = "actual-fallback-provider"
+        agent.model = "actual-fallback-model"
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -5351,6 +5353,8 @@ class TestRunConversation:
         meta = payload["recovery_handoff"]
         assert isinstance(meta, dict)
         assert meta.get("failure_code") == "iteration_budget_exhausted"
+        assert meta.get("provider") == "actual-fallback-provider"
+        assert meta.get("model") == "actual-fallback-model"
         assert isinstance(meta.get("iterations"), dict)
         assert meta["iterations"]["used"] == 2
         assert meta["iterations"]["max"] == 2
