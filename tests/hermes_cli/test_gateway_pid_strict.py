@@ -28,6 +28,33 @@ def test_strict_inventory_raises_when_ps_fails(monkeypatch, force_ps_path):
         gateway.find_gateway_pids_strict(all_profiles=True)
 
 
+def test_strict_ps_failure_does_not_emit_captured_process_data(
+    monkeypatch,
+    force_ps_path,
+    caplog,
+    capsys,
+):
+    marker = "hermes-test-process-environment-marker"
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            2,
+            f"100 HERMES_TOKEN={marker}",
+            f"ps failed near {marker}",
+        ),
+    )
+
+    with pytest.raises(gateway.GatewayProcessEnumerationError):
+        gateway.find_gateway_pids_strict(all_profiles=True)
+
+    captured = capsys.readouterr()
+    assert marker not in caplog.text
+    assert marker not in captured.out
+    assert marker not in captured.err
+
+
 def test_strict_inventory_raises_when_ps_times_out(monkeypatch, force_ps_path):
     def timeout(*_args, **_kwargs):
         raise subprocess.TimeoutExpired("ps", 10)

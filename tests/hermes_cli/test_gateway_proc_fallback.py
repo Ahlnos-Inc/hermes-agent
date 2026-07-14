@@ -7,7 +7,11 @@ See: NousResearch/hermes-agent#7622
 """
 
 import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import hermes_cli.gateway as gateway_mod
 
@@ -148,6 +152,40 @@ class TestProcFallback:
         mock_ps.assert_called_once()
         assert 12345 in pids
 
+    @pytest.mark.parametrize(
+        ("macos", "linux", "output_field"),
+        [
+            (True, False, "command"),
+            (False, True, "args"),
+        ],
+    )
+    def test_ps_fallback_uses_platform_argv_and_parses_gateway(
+        self,
+        monkeypatch,
+        macos,
+        linux,
+        output_field,
+    ):
+        mock_result = MagicMock(
+            returncode=0,
+            stdout=f"12345 {_GATEWAY_CMD}\n99999 {_OTHER_CMD}\n",
+        )
+        monkeypatch.setattr(gateway_mod, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_mod, "is_macos", lambda: macos)
+        monkeypatch.setattr(gateway_mod, "is_linux", lambda: linux)
+        monkeypatch.setattr(gateway_mod.os.path, "isdir", lambda _path: False)
+        monkeypatch.setattr(gateway_mod, "_get_ancestor_pids", lambda: set())
+        mock_ps = MagicMock(return_value=mock_result)
+        monkeypatch.setattr(gateway_mod.subprocess, "run", mock_ps)
+
+        assert gateway_mod._scan_gateway_pids(set(), all_profiles=True) == [12345]
+        mock_ps.assert_called_once_with(
+            ["ps", "-A", "-ww", "-o", f"pid=,{output_field}="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
     def test_proc_permission_error_skips_pid(self):
         def _isdir(path):
             return str(path) == "/proc"
@@ -173,3 +211,54 @@ class TestProcFallback:
         # PermissionError swallowed — empty result, no crash
         assert 12345 not in pids
         mock_ps.assert_not_called()  # /proc dir existed, so ps not called
+
+
+class TestProcessTablePsCommand:
+    """The fallback ps invocation is portable and never requests env data."""
+
+    def test_darwin_uses_bsd_command_field_without_environment(self, monkeypatch):
+        monkeypatch.setattr(gateway_mod, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_mod, "is_linux", lambda: False)
+
+        assert gateway_mod._process_table_ps_command() == [
+            "ps",
+            "-A",
+            "-ww",
+            "-o",
+            "pid=,command=",
+        ]
+
+    def test_linux_uses_gnu_args_field_without_environment(self, monkeypatch):
+        monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_mod, "is_linux", lambda: True)
+
+        assert gateway_mod._process_table_ps_command() == [
+            "ps",
+            "-A",
+            "-ww",
+            "-o",
+            "pid=,args=",
+        ]
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="requires BSD ps")
+    def test_darwin_command_succeeds_and_does_not_emit_environment(self):
+        sentinel = f"hermes-ps-test-sentinel-{os.getpid()}"
+        env = os.environ.copy()
+        env["HERMES_PS_SECRET_SENTINEL"] = sentinel
+
+        result = subprocess.run(
+            gateway_mod._process_table_ps_command(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+
+        assert result.returncode == 0, "BSD ps process-table command failed"
+        assert any(
+            len(line.strip().split(None, 1)) == 2
+            and line.strip().split(None, 1)[0].isdigit()
+            for line in result.stdout.splitlines()
+        ), "BSD ps output did not contain a parseable PID and command"
+        if sentinel in result.stdout:
+            pytest.fail("BSD ps output included inherited environment data")

@@ -326,6 +326,25 @@ def _append_unique_pid(
     pids.append(pid)
 
 
+def _process_table_ps_command() -> list[str]:
+    """Return a full-width, command-only process-table invocation.
+
+    BSD/macOS ``ps`` rejects the old separate ``eww`` operand, while the
+    ``e`` flag on platforms that accept it appends every process environment
+    to stdout.  That is both unnecessary for gateway matching and capable of
+    exposing runtime secrets.  Keep the platform-specific output field
+    explicit and request only argv with unlimited width.
+    """
+    if is_macos():
+        output_field = "command"
+    elif is_linux():
+        output_field = "args"
+    else:
+        # Other BSD-family ps implementations generally use ``command``.
+        output_field = "command"
+    return ["ps", "-A", "-ww", "-o", f"pid=,{output_field}="]
+
+
 def _scan_gateway_pids(
     exclude_pids: set[int],
     all_profiles: bool = False,
@@ -483,7 +502,7 @@ def _scan_gateway_pids(
                     current_cmd = ""
         else:
             # Try /proc first (works in Docker without procps installed),
-            # fall back to ps -A eww.
+            # then use the platform-safe, environment-free ps fallback.
             _found_via_proc = False
             if os.path.isdir("/proc"):
                 try:
@@ -526,7 +545,7 @@ def _scan_gateway_pids(
 
             if not _found_via_proc:
                 result = subprocess.run(
-                    ["ps", "-A", "eww", "-o", "pid=,command="],
+                    _process_table_ps_command(),
                     capture_output=True,
                     text=True,
                     timeout=10,
