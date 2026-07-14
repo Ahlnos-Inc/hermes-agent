@@ -348,6 +348,65 @@ def test_start_all_bootstrap_exit5_race_never_boots_out_newly_registered_label(
     assert sim.jobs[target]["loaded"] is True
 
 
+def test_start_all_rollback_never_boots_out_a_live_bootstrap_registration(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd({})
+    _patch_launchd_sim(monkeypatch, sim)
+    monkeypatch.setattr(
+        gateway_cli,
+        "_launchd_all_start_bootstrapped_target",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="rollback"):
+        gateway_cli.launchd_start_all()
+
+    assert sim.jobs[target]["loaded"] is True
+    assert not any(call[:2] == ["launchctl", "bootout"] for call in sim.calls)
+
+
+def test_stop_all_global_barrier_rejects_enable_race_on_earlier_label(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    _install_two_profiles(agents, root)
+    second = "user/501/ai.hermes.gateway-coder"
+    sim = _FakeLaunchd(
+        dict(
+            [
+                _job("gui/501", "ai.hermes.gateway", pid=101),
+                _job(
+                    "user/501", "ai.hermes.gateway", pid=None, loaded=False
+                ),
+                _job(
+                    "gui/501", "ai.hermes.gateway-coder", pid=None, loaded=False
+                ),
+                _job("user/501", "ai.hermes.gateway-coder", pid=202),
+            ]
+        )
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    real_disable = gateway_cli._launchd_disable
+
+    def disable_with_race(domain, label):
+        real_disable(domain, label)
+        if label == "ai.hermes.gateway" and domain == "gui/501":
+            sim.jobs[second]["disabled"] = False
+
+    monkeypatch.setattr(gateway_cli, "_launchd_disable", disable_with_race)
+
+    result = gateway_cli.launchd_stop_all()
+
+    assert result.sweep_safe is False
+    assert result.failures
+    assert not any(call[:2] == ["launchctl", "bootout"] for call in sim.calls)
+
+
 @pytest.mark.parametrize(
     ("manager_name", "expected_domain"),
     [("Aqua", "gui/501"), ("Background", "user/501")],

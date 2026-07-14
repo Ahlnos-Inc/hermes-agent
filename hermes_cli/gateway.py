@@ -3721,6 +3721,11 @@ class LaunchdFencedGateway:
     fenced_domains: tuple[str, ...]
     restore_domains: tuple[str, ...]
     changed_domains: tuple[str, ...] = ()
+    plist_fingerprint: str = ""
+    plist_stat_identity: tuple[int, ...] = ()
+    hermes_home: Path | None = None
+    preflight_snapshot: "_LaunchdAllStateSnapshot | None" = None
+    post_mutation_snapshot: "_LaunchdAllStateSnapshot | None" = None
 
 
 @dataclass(frozen=True)
@@ -3827,6 +3832,16 @@ class LaunchdAllTarget:
 
 
 @dataclass(frozen=True)
+class _LaunchdAllStateSnapshot:
+    """Observable launchd state retained across one transaction mutation."""
+
+    registered: tuple[str, ...]
+    disabled: tuple[str, ...]
+    pid: int | None
+    start_time: int | None
+
+
+@dataclass(frozen=True)
 class _LaunchdAllPlistIdentity:
     label: str
     path: Path
@@ -3842,6 +3857,71 @@ class _SecureLaunchdPlist:
     raw: bytes
     fingerprint: str
     stat_identity: tuple[int, ...]
+
+
+def _launchd_all_snapshot_from_probe(
+    probe: LaunchdLabelProbe,
+) -> _LaunchdAllStateSnapshot:
+    """Turn one exact probe into the state used by compensation guards."""
+    registration = probe.registered
+    domain = registration[0] if len(registration) == 1 else None
+    pid = probe.pid_for(domain) if domain is not None else None
+    start_time = _launchd_process_start_time(pid) if pid is not None else None
+    return _LaunchdAllStateSnapshot(
+        registered=registration,
+        disabled=tuple(probe.disabled),
+        pid=pid,
+        start_time=start_time,
+    )
+
+
+def _launchd_all_initial_snapshot(
+    target: LaunchdAllTarget,
+) -> _LaunchdAllStateSnapshot:
+    """Return the immutable pre-mutation state for legacy helper callers."""
+    return _LaunchdAllStateSnapshot(
+        registered=target.probe.registered,
+        disabled=tuple(target.probe.disabled),
+        pid=target.pid,
+        start_time=target.start_time,
+    )
+
+
+def _launchd_all_snapshot_matches(
+    expected: _LaunchdAllStateSnapshot,
+    actual: _LaunchdAllStateSnapshot,
+) -> bool:
+    return (
+        actual.registered == expected.registered
+        and set(actual.disabled) == set(expected.disabled)
+        and actual.pid == expected.pid
+        and actual.start_time == expected.start_time
+    )
+
+
+def _launchd_all_capture_snapshot(
+    target: LaunchdAllTarget,
+    *,
+    expected_disabled: set[str] | None = None,
+) -> _LaunchdAllStateSnapshot:
+    """Probe exact state for a transaction snapshot without mutating it."""
+    probe = _probe_launchd_label_domains(target.label)
+    _launchd_all_require_known_probe(target.label, probe)
+    if expected_disabled is not None and set(probe.disabled) != expected_disabled:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: concurrent disabled state changed to "
+            f"{list(probe.disabled)}"
+        )
+    return _launchd_all_snapshot_from_probe(probe)
+
+
+def _launchd_all_capture_label_snapshot(
+    label: str,
+) -> _LaunchdAllStateSnapshot:
+    """Capture one label snapshot for stop-fence compensation."""
+    probe = _probe_launchd_label_domains(label)
+    _launchd_all_require_known_probe(label, probe)
+    return _launchd_all_snapshot_from_probe(probe)
 
 
 def _launchd_process_start_time(pid: int | None) -> int | None:
@@ -4317,24 +4397,50 @@ def _launchd_all_start_bootstrapped_target(
 
 
 def _launchd_all_rollback_bootstrap(
-    target: LaunchdAllTarget, expected_disabled: set[str]
+    target: LaunchdAllTarget,
+    expected_disabled: set[str],
+    post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None,
 ) -> list[str]:
-    """Remove only a registration definitively created by this operation."""
+    """Remove only an unchanged, transaction-created registration with no live PID."""
     failures: list[str] = []
     try:
         _revalidate_launchd_target(target)
         probe = _probe_launchd_label_domains(target.label)
         _launchd_all_require_known_probe(target.label, probe)
-        if len(probe.registered) > 1:
+        expected = post_mutation_snapshot or _launchd_all_initial_snapshot(target)
+        current = _launchd_all_snapshot_from_probe(probe)
+        if not _launchd_all_snapshot_matches(expected, current):
+            failures.append(
+                f"{target.launchctl_target} rollback state diverged from the "
+                "transaction snapshot; no rollback mutation was attempted"
+            )
+        elif len(expected.registered) > 1:
             failures.append(
                 f"{target.launchctl_target} rollback registration conflict"
             )
-        elif set(probe.disabled) != expected_disabled:
+        elif set(expected.disabled) != expected_disabled:
             failures.append(
                 f"{target.launchctl_target} rollback disabled state changed to "
-                f"{list(probe.disabled)}"
+                f"{list(expected.disabled)}"
             )
-        elif probe.registered == (target.domain,):
+        elif expected.registered != (target.domain,):
+            failures.append(
+                f"{target.launchctl_target} rollback refused registration in "
+                f"{expected.registered or 'none'}"
+            )
+        elif target.was_loaded or target.probe.registered:
+            failures.append(
+                f"{target.launchctl_target} rollback registration was not "
+                "created by this bootstrap transaction"
+            )
+        elif expected.pid is not None and _launchd_pid_is_live(
+            expected.pid, expected.start_time
+        ):
+            failures.append(
+                f"{target.launchctl_target} rollback refused a live PID "
+                f"{expected.pid}; no rollback mutation was attempted"
+            )
+        else:
             bootout_error: BaseException | None = None
             try:
                 subprocess.run(
@@ -4347,33 +4453,25 @@ def _launchd_all_rollback_bootstrap(
 
             post = _probe_launchd_label_domains(target.label)
             _launchd_all_require_known_probe(target.label, post)
-            if len(post.registered) > 1:
+            post_snapshot = _launchd_all_snapshot_from_probe(post)
+            expected_post = _LaunchdAllStateSnapshot(
+                registered=(),
+                disabled=expected.disabled,
+                pid=None,
+                start_time=None,
+            )
+            if not _launchd_all_snapshot_matches(expected_post, post_snapshot):
                 failures.append(
-                    f"{target.launchctl_target} rollback registration conflict "
-                    "after bootout"
-                )
-            elif post.registered:
-                failures.append(
-                    f"{target.launchctl_target} rollback bootout left "
-                    f"registration in {post.registered[0]}"
-                )
-            if set(post.disabled) != expected_disabled:
-                failures.append(
-                    f"{target.launchctl_target} rollback disabled state changed to "
-                    f"{list(post.disabled)}"
+                    f"{target.launchctl_target} rollback bootout left state "
+                    f"{post_snapshot.registered or 'present'}"
                 )
             if bootout_error is not None:
                 failures.append(
                     f"{target.launchctl_target} rollback bootout "
                     f"({_launchd_all_failure_detail(bootout_error)})"
                 )
-        elif probe.registered:
-            failures.append(
-                f"{target.launchctl_target} rollback refused registration in "
-                f"{probe.registered[0]}"
-            )
-        # An absent registration is already rolled back. Do not bootout a
-        # registration that launchd no longer reports.
+        # An absent registration is not mutated. A changed/ambiguous/live state
+        # is reported as a partial rollback failure above.
     except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
         failures.append(
             f"{target.launchctl_target} rollback ({_launchd_all_failure_detail(exc)})"
@@ -4385,6 +4483,7 @@ def _launchd_all_restore_changed_fences(
     target: LaunchdAllTarget,
     changed_domains: list[str],
     expected_disabled: set[str],
+    post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None,
 ) -> list[str]:
     """Restore only desired-state bits changed by one start transaction."""
     failures: list[str] = []
@@ -4392,22 +4491,29 @@ def _launchd_all_restore_changed_fences(
         return failures
     try:
         _revalidate_launchd_target(target)
-        probe = _probe_launchd_label_domains(target.label)
-        _launchd_all_require_known_probe(target.label, probe)
-        if len(probe.registered) > 1:
+        expected = post_mutation_snapshot
+        if expected is None:
             failures.append(
-                f"{target.launchctl_target} rollback registration conflict"
+                f"{target.launchctl_target} rollback has no transaction state "
+                "snapshot; no rollback mutation was attempted"
             )
             return failures
-        if set(probe.disabled) != expected_disabled:
+        current = _launchd_all_capture_snapshot(target)
+        if not _launchd_all_snapshot_matches(expected, current):
             failures.append(
-                f"{target.launchctl_target} rollback disabled state changed to "
-                f"{list(probe.disabled)}"
+                f"{target.launchctl_target} rollback state diverged from the "
+                "transaction snapshot; no rollback mutation was attempted"
             )
             return failures
+
+        expected_state = expected
         for domain in reversed(changed_domains):
-            if domain in probe.disabled:
-                continue
+            if domain in expected_state.disabled:
+                failures.append(
+                    f"{domain}/{target.label} rollback state already disabled "
+                    "in the transaction snapshot; no rollback mutation was attempted"
+                )
+                return failures
             try:
                 _launchd_disable(domain, target.label)
             except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
@@ -4415,17 +4521,28 @@ def _launchd_all_restore_changed_fences(
                     f"{domain}/{target.label} rollback "
                     f"({_launchd_all_failure_detail(exc)})"
                 )
-        final = _probe_launchd_label_domains(target.label)
-        _launchd_all_require_known_probe(target.label, final)
-        if len(final.registered) > 1:
-            failures.append(
-                f"{target.launchctl_target} rollback registration conflict after fence restore"
+                return failures
+
+            expected_state = _LaunchdAllStateSnapshot(
+                registered=expected_state.registered,
+                disabled=tuple(
+                    sorted(set(expected_state.disabled) | {domain})
+                ),
+                pid=expected_state.pid,
+                start_time=expected_state.start_time,
             )
-        expected_final_disabled = expected_disabled | set(changed_domains)
-        if set(final.disabled) != expected_final_disabled:
+            current = _launchd_all_capture_snapshot(target)
+            if not _launchd_all_snapshot_matches(expected_state, current):
+                failures.append(
+                    f"{target.launchctl_target} rollback state diverged after "
+                    f"{domain}/{target.label}; no further rollback mutation was attempted"
+                )
+                return failures
+        if set(expected_state.disabled) != expected_disabled | set(changed_domains):
             failures.append(
                 f"{target.launchctl_target} rollback disabled state is "
-                f"{list(final.disabled)}, expected {list(expected_final_disabled)}"
+                f"{list(expected_state.disabled)}, expected "
+                f"{list(expected_disabled | set(changed_domains))}"
             )
     except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
         failures.append(
@@ -4454,12 +4571,17 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
     expected_disabled = set(original_disabled)
     newly_enabled: list[str] = []
     bootstrapped_by_us = False
+    fence_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
+    bootstrap_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
     try:
         for domain in target.probe.disabled:
             _launchd_all_prepare_mutation(target, expected_disabled)
             _launchd_enable(domain, target.label)
             newly_enabled.append(domain)
             expected_disabled.remove(domain)
+            fence_post_mutation_snapshot = _launchd_all_capture_snapshot(
+                target, expected_disabled=expected_disabled
+            )
 
         if target.was_loaded:
             if target.pid is not None:
@@ -4506,6 +4628,9 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
                     target, expected_disabled=expected_disabled, timeout=2.0
                 )
             else:
+                bootstrap_post_mutation_snapshot = _launchd_all_capture_snapshot(
+                    target, expected_disabled=expected_disabled
+                )
                 live = _launchd_all_start_bootstrapped_target(
                     target, expected_disabled
                 )
@@ -4518,11 +4643,16 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
         rollback_failures: list[str] = []
         if bootstrapped_by_us:
             rollback_failures.extend(
-                _launchd_all_rollback_bootstrap(target, expected_disabled)
+                _launchd_all_rollback_bootstrap(
+                    target, expected_disabled, bootstrap_post_mutation_snapshot
+                )
             )
         rollback_failures.extend(
             _launchd_all_restore_changed_fences(
-                target, newly_enabled, expected_disabled
+                target,
+                newly_enabled,
+                expected_disabled,
+                fence_post_mutation_snapshot,
             )
         )
         detail = _launchd_all_failure_detail(exc)
@@ -4609,6 +4739,7 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
         return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
 
     bootstrapped_by_us = False
+    bootstrap_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
     try:
         if not target.was_loaded:
             _launchd_all_prepare_mutation(target, expected_disabled)
@@ -4619,6 +4750,9 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
                     "registration; no kickstart was attempted"
                 )
             bootstrapped_by_us = True
+            bootstrap_post_mutation_snapshot = _launchd_all_capture_snapshot(
+                target, expected_disabled=expected_disabled
+            )
             if not _launchd_all_start_bootstrapped_target(
                 target, expected_disabled
             ):
@@ -4651,7 +4785,9 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
         return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
     except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
         rollback_failures = (
-            _launchd_all_rollback_bootstrap(target, expected_disabled)
+            _launchd_all_rollback_bootstrap(
+                target, expected_disabled, bootstrap_post_mutation_snapshot
+            )
             if bootstrapped_by_us
             else []
         )
@@ -5710,6 +5846,59 @@ def _launchd_stop_target(
     return True
 
 
+def _launchd_all_probe_details(probe: LaunchdLabelProbe) -> str:
+    return "; ".join(
+        probe.unknown_details
+        + probe.disabled_unknown_details
+        + tuple(probe.unknown)
+        + tuple(probe.disabled_unknown)
+    )
+
+
+def _launchd_stop_barrier_is_valid(
+    before: LaunchdLabelProbe,
+    after: LaunchdLabelProbe,
+    domains: tuple[str, ...],
+) -> bool:
+    """Return whether one label still satisfies the immutable stop plan."""
+    return (
+        not after.unknown
+        and not after.disabled_unknown
+        and set(after.disabled) == set(domains)
+        and len(after.registered) <= 1
+        and after.registered == before.registered
+    )
+
+
+def _launchd_stop_barrier_failures(
+    label: str,
+    before: LaunchdLabelProbe,
+    after: LaunchdLabelProbe,
+    domains: tuple[str, ...],
+) -> list[str]:
+    failures: list[str] = []
+    if after.unknown or after.disabled_unknown:
+        failures.append(
+            f"{label} post-fence state is unknown: "
+            f"{_launchd_all_probe_details(after)}"
+        )
+    if set(after.disabled) != set(domains):
+        failures.append(
+            f"{label} post-fence disabled state is {list(after.disabled)}, "
+            f"expected {list(domains)}"
+        )
+    if after.registered != before.registered:
+        failures.append(
+            f"{label} post-fence registration moved from "
+            f"{before.registered or 'none'} to {after.registered or 'none'}"
+        )
+    if len(after.registered) > 1:
+        failures.append(
+            f"{label} post-fence registration conflict in {after.registered}"
+        )
+    return failures
+
+
 def launchd_stop_all() -> LaunchdStopAllResult:
     """Fence every validated Hermes LaunchAgent before a global PID sweep.
 
@@ -5719,19 +5908,22 @@ def launchd_stop_all() -> LaunchdStopAllResult:
     """
     inventory = _installed_launchd_gateway_plists()
     domains = _launchd_candidate_domains()
-    planned: list[tuple[str, Path, LaunchdLabelProbe, tuple[str, ...], tuple[str, ...]]] = []
+    planned: list[dict] = []
     preflight_failures: list[str] = []
+
+    # Immutable preflight: validate every plist identity and every label state
+    # before the first desired-state write for any label.
     for label, plist_path in inventory:
+        try:
+            identity = _read_launchd_all_plist_identity(plist_path)
+        except LaunchdAllOperationError as exc:
+            preflight_failures.append(f"{label}: {exc}")
+            continue
         probe = _probe_launchd_label_domains(label)
         if probe.unknown or probe.disabled_unknown:
-            details = (
-                probe.unknown_details
-                + probe.disabled_unknown_details
-                + tuple(probe.unknown)
-                + tuple(probe.disabled_unknown)
-            )
             preflight_failures.append(
-                f"{label}: could not inspect launchd state ({'; '.join(details)})"
+                f"{label}: could not inspect launchd state "
+                f"({_launchd_all_probe_details(probe)})"
             )
             continue
         if len(probe.registered) > 1:
@@ -5742,15 +5934,26 @@ def launchd_stop_all() -> LaunchdStopAllResult:
             continue
         if probe.disabled:
             # A disabled bit in either candidate domain is intentional state;
-            # restart/restore must preserve that label rather than inventing a
-            # new bootstrap domain.
+            # restore must preserve that label rather than invent a bootstrap
+            # domain for it.
             restore_domains = ()
         elif probe.registered:
             restore_domains = probe.registered
         else:
             restore_domains = (_launchd_validated_manager_domain(),)
-        changed_domains = tuple(domain for domain in domains if domain not in probe.disabled)
-        planned.append((label, plist_path, probe, restore_domains, changed_domains))
+        planned.append(
+            {
+                "label": label,
+                "plist_path": plist_path,
+                "identity": identity,
+                "probe": probe,
+                "preflight_snapshot": _launchd_all_snapshot_from_probe(probe),
+                "restore_domains": restore_domains,
+                "changed_domains": tuple(
+                    domain for domain in domains if domain not in probe.disabled
+                ),
+            }
+        )
 
     if preflight_failures:
         raise LaunchdInventoryError(
@@ -5758,100 +5961,118 @@ def launchd_stop_all() -> LaunchdStopAllResult:
             + "; ".join(preflight_failures)
         )
 
-    fenced: list[LaunchdFencedGateway] = []
-    failures: list[str] = []
-    barrier: dict[str, LaunchdLabelProbe] = {}
+    write_failures: dict[str, list[str]] = {plan["label"]: [] for plan in planned}
 
-    # Every candidate domain receives the stop intent, including a domain that
-    # was already disabled. This closes the concurrent-enable window between
-    # the initial snapshot and the write phase.
-    for label, plist_path, probe, restore_domains, changed_domains in planned:
-        label_errors: list[str] = []
+    # Phase 1: every label/domain receives a disable intent. There are no
+    # post-write probes in this phase, so no label can be booted out early.
+    for plan in planned:
+        label = plan["label"]
         for domain in domains:
             try:
                 _launchd_disable(domain, label)
             except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-                # The exact barrier below decides whether this command error
-                # mattered. In particular, launchctl 3/5/113/125 is not a
-                # standalone success or failure signal.
-                label_errors.append(
+                write_failures[label].append(
                     f"{domain}/{label} disable ({_launchd_all_failure_detail(exc)})"
                 )
 
+    # Phase 2: probe every label only after all writes completed. This is the
+    # global barrier that closes a concurrent-enable race on an earlier label.
+    barrier: dict[str, LaunchdLabelProbe] = {}
+    post_write: dict[str, LaunchdLabelProbe | None] = {}
+    failures: list[str] = []
+    for plan in planned:
+        label = plan["label"]
         try:
-            post_write = _probe_launchd_label_domains(label)
+            after = _probe_launchd_label_domains(label)
         except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-            post_write = None
-            label_errors.append(
+            after = None
+            failures.extend(write_failures[label])
+            failures.append(
                 f"{label} post-fence probe ({_launchd_all_failure_detail(exc)})"
             )
-        if post_write is not None:
-            if post_write.unknown or post_write.disabled_unknown:
-                label_errors.append(
-                    f"{label} post-fence state is unknown: "
-                    + "; ".join(
-                        post_write.unknown_details
-                        + post_write.disabled_unknown_details
-                        + tuple(post_write.unknown)
-                        + tuple(post_write.disabled_unknown)
+        post_write[label] = after
+        if after is not None:
+            valid = _launchd_stop_barrier_is_valid(plan["probe"], after, domains)
+            if valid:
+                barrier[label] = after
+            else:
+                failures.extend(write_failures[label])
+                failures.extend(
+                    _launchd_stop_barrier_failures(
+                        label, plan["probe"], after, domains
                     )
                 )
-            elif set(post_write.disabled) != set(domains):
-                label_errors.append(
-                    f"{label} post-fence disabled state is "
-                    f"{list(post_write.disabled)}, expected {list(domains)}"
-                )
-            if post_write.registered != probe.registered:
-                label_errors.append(
-                    f"{label} post-fence registration moved from "
-                    f"{probe.registered or 'none'} to "
-                    f"{post_write.registered or 'none'}"
-                )
-            if len(post_write.registered) > 1:
-                label_errors.append(
-                    f"{label} post-fence registration conflict in "
-                    f"{post_write.registered}"
-                )
-            elif post_write.registered == probe.registered:
-                barrier[label] = post_write
-        # A command failure whose exact barrier is correct is not retained as
-        # a transaction failure. Otherwise aggregate every state failure.
-        if post_write is None or label_errors and (
-            post_write is None
-            or post_write.unknown
-            or post_write.disabled_unknown
-            or set(post_write.disabled) != set(domains)
-            or len(post_write.registered) > 1
-        ):
-            failures.extend(label_errors)
 
+    fenced: list[LaunchdFencedGateway] = []
+    for plan in planned:
+        label = plan["label"]
+        after = post_write[label]
         fenced.append(
             LaunchdFencedGateway(
                 label=label,
-                plist_path=plist_path,
+                plist_path=plan["plist_path"],
                 fenced_domains=(
-                    tuple(post_write.disabled)
-                    if post_write is not None
-                    else tuple(probe.disabled)
+                    tuple(after.disabled)
+                    if after is not None
+                    else tuple(plan["probe"].disabled)
                 ),
-                restore_domains=restore_domains,
-                changed_domains=changed_domains,
+                restore_domains=plan["restore_domains"],
+                changed_domains=plan["changed_domains"],
+                plist_fingerprint=plan["identity"].fingerprint,
+                plist_stat_identity=plan["identity"].stat_identity,
+                hermes_home=plan["identity"].hermes_home,
+                preflight_snapshot=plan["preflight_snapshot"],
+                post_mutation_snapshot=(
+                    _launchd_all_snapshot_from_probe(after)
+                    if after is not None
+                    else None
+                ),
             )
         )
 
-    # This is an all-label barrier: no exact bootout is allowed until every
-    # installed label has a known, dual-domain fence and at most one register.
+    # No exact bootout is allowed until every installed label has a known,
+    # dual-domain fence and unchanged unambiguous registration.
     if failures or len(barrier) != len(planned):
-        if len(barrier) != len(planned):
-            known_labels = set(barrier)
-            failures.extend(
-                f"{label} has no verified post-fence barrier"
-                for label, *_rest in planned
-                if label not in known_labels and not any(label in failure for failure in failures)
-            )
-        return LaunchdStopAllResult(tuple(fenced), tuple(dict.fromkeys(failures)), False)
+        known_labels = set(barrier)
+        failures.extend(
+            f"{plan['label']} has no verified post-fence barrier"
+            for plan in planned
+            if plan["label"] not in known_labels
+            and not any(plan["label"] in failure for failure in failures)
+        )
+        return LaunchdStopAllResult(
+            tuple(fenced), tuple(dict.fromkeys(failures)), False
+        )
 
-    for label, _plist_path, _probe, _restore_domains, _changed_domains in planned:
+    # Re-attest every exact plist after the global desired-state barrier and
+    # immediately before bootout. A replacement must not be allowed to turn a
+    # validated Hermes label into a foreign-label mutation.
+    for plan in planned:
+        label = plan["label"]
+        try:
+            identity = _read_launchd_all_plist_identity(plan["plist_path"])
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            failures.append(
+                f"{label} plist changed before bootout "
+                f"({_launchd_all_failure_detail(exc)})"
+            )
+            continue
+        expected_identity = plan["identity"]
+        if (
+            identity.label != expected_identity.label
+            or identity.fingerprint != expected_identity.fingerprint
+            or identity.stat_identity != expected_identity.stat_identity
+            or identity.hermes_home != expected_identity.hermes_home
+        ):
+            failures.append(f"{label} plist changed before bootout")
+    if failures:
+        return LaunchdStopAllResult(
+            tuple(fenced), tuple(dict.fromkeys(failures)), False
+        )
+
+    # Phase 3: bootout all registrations only after the global barrier.
+    for plan in planned:
+        label = plan["label"]
         for domain in barrier[label].registered:
             try:
                 subprocess.run(
@@ -5860,24 +6081,19 @@ def launchd_stop_all() -> LaunchdStopAllResult:
                     timeout=90,
                 )
             except _LAUNCHD_ALL_OPERATIONAL_ERRORS:
-                # The final exact registration probe decides whether this
-                # nonzero result was benign (already absent) or unsafe.
+                # The final exact probe decides whether a nonzero result was
+                # benign (already absent) or left an unsafe registration.
                 pass
 
-    # A post-bootout nonzero is benign if the exact registration is absent;
-    # unknown state or a surviving registration remains unsafe.
+    # Phase 4: post-verify every label after all bootouts.
     final_failures: list[str] = []
-    for label, *_rest in planned:
+    for plan in planned:
+        label = plan["label"]
         probe = _probe_launchd_label_domains(label)
         if probe.unknown or probe.disabled_unknown:
             final_failures.append(
                 f"{label} post-bootout state is unknown: "
-                + "; ".join(
-                    probe.unknown_details
-                    + probe.disabled_unknown_details
-                    + tuple(probe.unknown)
-                    + tuple(probe.disabled_unknown)
-                )
+                f"{_launchd_all_probe_details(probe)}"
             )
             continue
         if set(probe.disabled) != set(domains):
@@ -5896,6 +6112,24 @@ def launchd_stop_all() -> LaunchdStopAllResult:
             tuple(fenced), tuple(dict.fromkeys(failures)), False
         )
     return LaunchdStopAllResult(tuple(fenced), (), True)
+
+
+def _launchd_all_revalidate_fenced_plist(target: LaunchdFencedGateway) -> None:
+    """Re-attest the exact plist identity retained by a stop transaction."""
+    if not target.plist_fingerprint or not target.plist_stat_identity:
+        raise LaunchdAllOperationError(
+            f"{target.label}: restore plist has no retained secure identity"
+        )
+    identity = _read_launchd_all_plist_identity(target.plist_path)
+    if (
+        identity.label != target.label
+        or identity.fingerprint != target.plist_fingerprint
+        or identity.stat_identity != target.plist_stat_identity
+        or identity.hermes_home != target.hermes_home
+    ):
+        raise LaunchdAllOperationError(
+            f"{target.label}: restore plist identity changed before bootstrap"
+        )
 
 
 def launchd_restore_all(
@@ -5949,6 +6183,14 @@ def launchd_restore_all(
             )
             continue
 
+        remaining_owned = set(target.changed_domains) & set(probe.disabled)
+        if remaining_owned:
+            failures.append(
+                f"{target.label} restore left transaction-owned domains disabled: "
+                f"{sorted(remaining_owned)}"
+            )
+            continue
+
         if probe.registered:
             if any(domain not in target.restore_domains for domain in probe.registered):
                 failures.append(
@@ -5960,6 +6202,10 @@ def launchd_restore_all(
 
         for domain in target.restore_domains:
             try:
+                # The service is currently absent, so this is the last safe
+                # point to verify that the exact file retained by stop-all is
+                # still the same secure profile plist.
+                _launchd_all_revalidate_fenced_plist(target)
                 _launchctl_bootstrap(
                     domain, target.plist_path, target.label, timeout=30
                 )
@@ -5968,10 +6214,10 @@ def launchd_restore_all(
                     check=True,
                     timeout=30,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                rc = getattr(exc, "returncode", "unavailable")
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
                 label_errors.append(
-                    f"{domain}/{target.label} restore (launchd exit {rc})"
+                    f"{domain}/{target.label} restore "
+                    f"({_launchd_all_failure_detail(exc)})"
                 )
         if label_errors:
             failures.extend(label_errors)
@@ -5985,12 +6231,22 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
     failures: list[str] = []
     for target in result.fenced:
         try:
-            probe = _probe_launchd_label_domains(target.label)
-            _launchd_all_require_known_probe(target.label, probe)
-            if len(probe.registered) > 1:
+            current = _launchd_all_capture_label_snapshot(target.label)
+            expected = target.post_mutation_snapshot
+            if expected is None:
+                # Preserve compatibility with callers constructing the old
+                # five-field result shape. Real stop-all results always carry
+                # this snapshot and therefore take the strict path below.
+                expected = current
+            if not _launchd_all_snapshot_matches(expected, current):
+                raise LaunchdAllOperationError(
+                    f"{target.label} fence release state diverged from the "
+                    "transaction snapshot; no release mutation was attempted"
+                )
+            if len(current.registered) > 1:
                 raise LaunchdAllOperationError(
                     f"{target.label} fence release registration conflict in "
-                    f"{probe.registered}"
+                    f"{current.registered}"
                 )
         except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
             failures.append(
@@ -5998,8 +6254,10 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
                 f"({_launchd_all_failure_detail(exc)})"
             )
             continue
+
+        expected_state = expected
         for domain in target.changed_domains:
-            if domain not in probe.disabled:
+            if domain not in expected_state.disabled:
                 continue
             try:
                 _launchd_enable(domain, target.label)
@@ -6008,6 +6266,36 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
                     f"{domain}/{target.label} enable "
                     f"({_launchd_all_failure_detail(exc)})"
                 )
+                continue
+            expected_state = _LaunchdAllStateSnapshot(
+                registered=expected_state.registered,
+                disabled=tuple(sorted(set(expected_state.disabled) - {domain})),
+                pid=expected_state.pid,
+                start_time=expected_state.start_time,
+            )
+
+        # A zero exit from launchctl enable is not proof that every desired
+        # state bit changed. One post-enable probe is authoritative for the
+        # complete release phase.
+        try:
+            current = _launchd_all_capture_label_snapshot(target.label)
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            failures.append(
+                f"{target.label} fence release post-enable probe "
+                f"({_launchd_all_failure_detail(exc)})"
+            )
+            continue
+        if not _launchd_all_snapshot_matches(expected_state, current):
+            failures.append(
+                f"{target.label} fence release state diverged after enables; "
+                "no further release mutation was attempted"
+            )
+        remaining_owned = set(target.changed_domains) & set(current.disabled)
+        if remaining_owned:
+            failures.append(
+                f"{target.label} fence release left transaction-owned domains "
+                f"disabled: {sorted(remaining_owned)}"
+            )
     return failures
 
 

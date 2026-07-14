@@ -2110,6 +2110,89 @@ class TestLaunchdServiceRecovery:
         assert release_failures == []
         assert calls == []
 
+    def test_launchd_release_all_fences_post_verifies_zero_exit_enable(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway-coder.plist"
+        _write_launchd_gateway_plist(plist_path, "ai.hermes.gateway-coder")
+        target = gateway_cli.LaunchdFencedGateway(
+            "ai.hermes.gateway-coder",
+            plist_path,
+            ("gui/501", "user/501"),
+            (),
+            ("gui/501",),
+            post_mutation_snapshot=gateway_cli._LaunchdAllStateSnapshot(
+                registered=(),
+                disabled=("gui/501",),
+                pid=None,
+                start_time=None,
+            ),
+        )
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_launchd_label_domains",
+            lambda _label: _label_probe(disabled=("gui/501",)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_enable",
+            lambda domain, label: calls.append(["enable", domain, label]),
+        )
+
+        failures = gateway_cli.launchd_release_all_fences(
+            gateway_cli.LaunchdStopAllResult((target,), (), False)
+        )
+
+        assert calls == [["enable", "gui/501", "ai.hermes.gateway-coder"]]
+        assert any("disabled" in failure for failure in failures)
+
+    def test_launchd_restore_replaced_plist_aborts_before_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway-coder.plist"
+        _write_launchd_gateway_plist(plist_path, "ai.hermes.gateway-coder")
+        identity = gateway_cli._read_launchd_all_plist_identity(plist_path)
+        target = gateway_cli.LaunchdFencedGateway(
+            "ai.hermes.gateway-coder",
+            plist_path,
+            ("gui/501", "user/501"),
+            ("gui/501",),
+            (),
+            plist_fingerprint=identity.fingerprint,
+            plist_stat_identity=identity.stat_identity,
+            hermes_home=identity.hermes_home,
+        )
+        probe_calls = 0
+        bootstrap_calls = []
+
+        def probe(_label):
+            nonlocal probe_calls
+            probe_calls += 1
+            if probe_calls == 2:
+                replacement = plist_path.with_name("replacement.plist")
+                _write_launchd_gateway_plist(replacement, "ai.hermes.gateway-coder")
+                document = plistlib.loads(replacement.read_bytes())
+                document["Comment"] = "replaced during restore"
+                replacement.write_bytes(plistlib.dumps(document))
+                os.replace(replacement, plist_path)
+            return _label_probe(absent=("gui/501", "user/501"))
+
+        monkeypatch.setattr(gateway_cli, "_probe_launchd_label_domains", probe)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchctl_bootstrap",
+            lambda *args, **kwargs: bootstrap_calls.append(args),
+        )
+
+        restored, failures = gateway_cli.launchd_restore_all(
+            gateway_cli.LaunchdStopAllResult((target,), (), True)
+        )
+
+        assert restored == 0
+        assert failures
+        assert bootstrap_calls == []
+
     def test_gateway_stop_all_launchagents_permission_error_fails_before_sweep(
         self, tmp_path, monkeypatch, capsys
     ):
