@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -49,6 +50,38 @@ def _owned_receipt(pid: int) -> kb.SpawnReceipt:
         process_group_id=pid,
         session_id=pid,
     )
+
+
+def _wait_for_attested_process(process, expected: dict[str, str], psutil):
+    """Wait until a real child exposes its inherited worker identity."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            if all(process.environ().get(key) == value for key, value in expected.items()):
+                return float(process.create_time())
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            break
+        time.sleep(0.01)
+    raise AssertionError(f"worker did not expose expected environment: {expected!r}")
+
+
+def _kill_test_process_group(process, pgid: int) -> None:
+    """Best-effort cleanup for a subprocess group created by a test."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        process.wait(timeout=2)
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +423,127 @@ def test_claim_once_wins_second_loses(kanban_home):
         assert second is None
 
 
+_WORKER_IDENTITY_CASES = (
+    ("worker_pid", 424242),
+    ("worker_started_at", 1234.5),
+    ("worker_pgid", 424242),
+    ("worker_sid", 424242),
+)
+
+
+@pytest.mark.parametrize(
+    ("identity_scope", "identity_column", "identity_value"),
+    [
+        (scope, column, value)
+        for scope in ("task", "run")
+        for column, value in _WORKER_IDENTITY_CASES
+    ],
+)
+def test_claim_task_rejects_identity_bearing_ready_rows(
+    kanban_home, identity_scope, identity_column, identity_value,
+):
+    """A ready row with any persisted worker identity is not claimable."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="identity-bearing ready row")
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        if identity_scope == "task":
+            conn.execute(
+                f"UPDATE tasks SET {identity_column} = ? WHERE id = ?",
+                (identity_value, task_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE task_runs SET {identity_column} = ? WHERE id = ?",
+                (identity_value, run_id),
+            )
+        conn.commit()
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+        assert kb.claim_task(conn, task_id, claimer="host:replacement") is None
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == run_count
+        event = kb.list_events(conn, task_id)[-1]
+        assert event.kind == "claim_rejected"
+        assert event.payload == {"reason": "worker_identity_present"}
+
+
+@pytest.mark.parametrize("identity_column, identity_value", _WORKER_IDENTITY_CASES)
+def test_claim_review_task_rejects_identity_bearing_rows(
+    kanban_home, identity_column, identity_value,
+):
+    """Review dispatch must not replace a row carrying worker identity."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="identity-bearing review row")
+        conn.execute(
+            f"UPDATE tasks SET status = 'review', {identity_column} = ? WHERE id = ?",
+            (identity_value, task_id),
+        )
+        conn.commit()
+
+        assert kb.claim_review_task(conn, task_id, claimer="host:reviewer") is None
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == 0
+        event = kb.list_events(conn, task_id)[-1]
+        assert event.kind == "claim_rejected"
+        assert event.payload == {"reason": "worker_identity_present"}
+
+
+@pytest.mark.parametrize(
+    ("identity_scope", "identity_column", "identity_value"),
+    [
+        (scope, column, value)
+        for scope in ("task", "run")
+        for column, value in _WORKER_IDENTITY_CASES
+    ],
+)
+def test_unblock_task_rejects_identity_bearing_rows(
+    kanban_home, identity_scope, identity_column, identity_value,
+):
+    """Unblock must keep an identity-bearing blocked attempt fenced."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="identity-bearing blocked row")
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+        if identity_scope == "task":
+            conn.execute(
+                f"UPDATE tasks SET {identity_column} = ? WHERE id = ?",
+                (identity_value, task_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE task_runs SET {identity_column} = ? WHERE id = ?",
+                (identity_value, run_id),
+            )
+        conn.commit()
+
+        assert kb.unblock_task(conn, task_id) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.current_run_id == run_id
+        assert conn.execute(
+            "SELECT status FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0] == "running"
+
+
 def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
     with kb.connect() as conn:
@@ -720,6 +874,181 @@ def test_stale_claim_released_when_worker_not_host_local(
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="process-group reclaim uses POSIX sessions and signals",
+)
+@pytest.mark.live_system_guard_bypass
+def test_dispatch_once_reclaims_leader_dead_attested_descendant_group(
+    kanban_home, request,
+):
+    """A dead worker leader cannot leave an attested descendant running."""
+    psutil = pytest.importorskip("psutil")
+    child_pid_file = kanban_home / "descendant.pid"
+    leader = None
+    pgid = None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="leader-dead descendant")
+        host = kb._claimer_id().split(":", 1)[0]
+        claim_lock = f"{host}:orphan-group"
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        env = {
+            **os.environ,
+            "HERMES_KANBAN_TASK": task_id,
+            "HERMES_KANBAN_RUN_ID": str(run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": claim_lock,
+        }
+        leader_code = """
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+marker = pathlib.Path(sys.argv[1])
+child_code = (
+    "import os, pathlib, sys, time; "
+    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+    "time.sleep(60)"
+)
+subprocess.Popen(
+    [sys.executable, "-c", child_code, str(marker)],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+deadline = time.monotonic() + 5
+while not marker.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+os._exit(17)
+"""
+        leader = subprocess.Popen(
+            [sys.executable, "-c", leader_code, str(child_pid_file)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        pgid = os.getpgid(leader.pid)
+        request.addfinalizer(lambda: _kill_test_process_group(leader, pgid))
+        sid = os.getsid(leader.pid)
+        started_at = float(psutil.Process(leader.pid).create_time())
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            leader.pid,
+            worker_started_at=started_at,
+            worker_pgid=pgid,
+            worker_sid=sid,
+        )
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - kb._resolve_crash_grace_seconds() - 1, task_id),
+        )
+        conn.commit()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if child_pid_file.exists():
+                try:
+                    if psutil.Process(leader.pid).status() == psutil.STATUS_ZOMBIE:
+                        break
+                except psutil.NoSuchProcess:
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("worker leader did not become a zombie with its child alive")
+
+        result = kb.dispatch_once(conn)
+
+        task = kb.get_task(conn, task_id)
+        assert result.crashed == [task_id]
+        assert task is not None
+        assert task.status == "ready"
+        assert task.worker_pid is None
+        assert kb._classify_worker_exit(leader.pid) == ("nonzero_exit", 17)
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.outcome == "crashed"
+        crash_event = [e for e in kb.list_events(conn, task_id) if e.kind == "crashed"][-1]
+        assert crash_event.payload["exit_code"] == 17
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and kb._process_group_alive(pgid):
+            time.sleep(0.01)
+        assert not kb._process_group_alive(pgid), "attested descendant survived reclaim"
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="process-group attestation uses POSIX sessions",
+)
+def test_reclaim_refuses_dispatcher_own_process_group():
+    """A malformed row can never make reclaim inspect the dispatcher's PGID."""
+    host = kb._claimer_id().split(":", 1)[0]
+    assert kb._attest_reclaim_process_group(
+        os.getpgrp(), os.getsid(0), f"{host}:malformed"
+    ) is False
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="PID/PGID identity attestation uses POSIX sessions",
+)
+@pytest.mark.parametrize("mismatch", ["claim_lock", "task", "run_id", "birth"])
+def test_reclaim_attestation_sends_no_signal_on_identity_mismatch(mismatch):
+    """PID reuse or any exact-env mismatch must fail closed before signaling."""
+    psutil = pytest.importorskip("psutil")
+    task_id = "t_attested"
+    run_id = 91
+    host = kb._claimer_id().split(":", 1)[0]
+    claim_lock = f"{host}:attested"
+    expected_env = {
+        "HERMES_KANBAN_TASK": task_id,
+        "HERMES_KANBAN_RUN_ID": str(run_id),
+        "HERMES_KANBAN_CLAIM_LOCK": claim_lock,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, **expected_env},
+        start_new_session=True,
+    )
+    pgid = os.getpgid(process.pid)
+    sid = os.getsid(process.pid)
+    try:
+        process_view = psutil.Process(process.pid)
+        started_at = _wait_for_attested_process(process_view, expected_env, psutil)
+        signals = []
+        observed_lock = claim_lock if mismatch != "claim_lock" else f"{host}:wrong"
+        observed_task = task_id if mismatch != "task" else "t_other"
+        observed_run = run_id if mismatch != "run_id" else 92
+        observed_started_at = started_at if mismatch != "birth" else started_at + 60
+
+        info = kb._terminate_reclaimed_worker(
+            process.pid,
+            observed_lock,
+            worker_started_at=observed_started_at,
+            worker_pgid=pgid,
+            worker_sid=sid,
+            task_id=observed_task,
+            run_id=observed_run,
+            signal_fn=lambda target, sig: signals.append((target, sig)),
+        )
+
+        assert signals == []
+        assert info["termination_attempted"] is False
+        assert info["identity_verified"] is False
+        assert info["identity_mismatch"] or info["identity_unverifiable"]
+    finally:
+        _kill_test_process_group(process, pgid)
 
 
 def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch):
@@ -4989,61 +5318,48 @@ def test_reap_worker_zombies_handles_waitpid_os_error():
     assert result == []
 
 
-def test_zombie_reaper_runs_despite_board_connect_failure():
-    """reap_worker_zombies runs even when a board tick raises an error."""
-    from unittest.mock import patch
+def test_dispatch_once_reaps_before_board_failure(kanban_home, monkeypatch):
+    """The real dispatch path reaps before the first board operation."""
+    order: list[str] = []
 
-    call_count = [0]
+    def fake_reaper():
+        order.append("reap")
+        return [12345]
 
-    def fake_waitpid(pid, flags):
-        call_count[0] += 1
-        if call_count[0] <= 2:
-            return [12345, 67890][call_count[0] - 1], 0
-        return 0, 0
+    def failed_board_tick(_conn):
+        assert order == ["reap"]
+        order.append("board")
+        raise sqlite3.OperationalError("disk I/O error")
 
-    with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
-        with patch("hermes_cli.kanban_db._record_worker_exit"):
-            # Simulate a board tick failure before reaping
-            try:
-                raise sqlite3.OperationalError("disk I/O error")
-            except sqlite3.OperationalError:
-                pass
+    monkeypatch.setattr(kb, "reap_worker_zombies", fake_reaper)
+    monkeypatch.setattr(kb, "release_stale_claims", failed_board_tick)
 
-            # Reaper still runs independently
-            pids = kb.reap_worker_zombies()
+    with kb.connect() as conn, pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        kb.dispatch_once(conn)
 
-    assert pids == [12345, 67890]
+    assert order == ["reap", "board"]
 
 
-def test_zombie_reaper_survives_all_boards_failing():
-    """reap_worker_zombies runs each tick regardless of board tick failures."""
-    from unittest.mock import patch
+def test_dispatch_once_reaps_on_each_failed_tick(kanban_home, monkeypatch):
+    """Every failed board tick still gets the next tick's cleanup pass."""
+    reaped_ticks: list[int] = []
 
-    total_reaped = 0
+    def failed_board_tick(_conn):
+        raise sqlite3.OperationalError("board unavailable")
 
-    def make_fake_waitpid(zombie_pids):
-        call_count = [0]
+    monkeypatch.setattr(
+        kb,
+        "reap_worker_zombies",
+        lambda: reaped_ticks.append(len(reaped_ticks) + 1) or [],
+    )
+    monkeypatch.setattr(kb, "release_stale_claims", failed_board_tick)
 
-        def fake_waitpid(pid, flags):
-            if call_count[0] < len(zombie_pids):
-                p = zombie_pids[call_count[0]]
-                call_count[0] += 1
-                return p, 0
-            return 0, 0
+    with kb.connect() as conn:
+        for _ in range(5):
+            with pytest.raises(sqlite3.OperationalError, match="board unavailable"):
+                kb.dispatch_once(conn)
 
-        return fake_waitpid
-
-    # 5 ticks, 2 zombies per tick = 10 total
-    for tick in range(5):
-        pids = [tick * 100 + 1, tick * 100 + 2]
-        with patch(
-            "hermes_cli.kanban_db.os.waitpid", side_effect=make_fake_waitpid(pids)
-        ):
-            with patch("hermes_cli.kanban_db._record_worker_exit"):
-                pids = kb.reap_worker_zombies()
-        total_reaped += len(pids)
-
-    assert total_reaped == 10
+    assert reaped_ticks == [1, 2, 3, 4, 5]
 
 
 def test_dispatch_once_still_reaps_via_extracted_fn(kanban_home):
