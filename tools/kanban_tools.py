@@ -408,24 +408,23 @@ def _goal_judge_available() -> bool:
 # Constraints:
 #   - Best-effort: never raise. The agent loop must not care if the bridge
 #     fails (board missing, DB locked, etc.).
-#   - Rate-limited to one DB write per 60s per-process; runtime activity
-#     can tick on every chunk/tool result and we don't need that resolution.
+#   - Rate-limited to one DB write per 60s per task/run/activity kind; a
+#     transport tick must never suppress the first semantic or durable signal.
 #   - No-op outside dispatcher-spawned worker context (no ``HERMES_KANBAN_TASK``).
 #   - No durable note on these auto-heartbeats; that's reserved for the
 #     explicit tool which carries a model-supplied note.
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
-_auto_heartbeat_last_attempt: float = 0.0
+_auto_heartbeat_last_attempt: dict[tuple[str, str, str], float] | float = {}
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def heartbeat_current_worker_from_env(*, activity_kind: str = "semantic") -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    Returns True only after the typed heartbeat was persisted; False if the
+    call was skipped, rejected as stale, or failed. The boolean is
+    informational — agent-loop callers should not branch on it.
 
     Identity comes from:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
@@ -435,9 +434,8 @@ def heartbeat_current_worker_from_env() -> bool:
         falls back to the default ``_claimer_id()`` for locally-driven
         workers that never went through the dispatcher path
 
-    Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
-    timestamp (monotonic clock); not thread-safe in the strict sense, but
-    the worst case is one extra DB write per race, which is harmless.
+    Rate-limited by task, run, and activity kind. The clock advances only
+    after a successful DB write so a transient lock/error is retryable.
     """
     global _auto_heartbeat_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
@@ -445,9 +443,14 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     import time as _time
     now = _time.monotonic()
-    if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+    rate_key = (tid, run_id_raw, activity_kind)
+    if not isinstance(_auto_heartbeat_last_attempt, dict):
+        # Compatibility with callers/tests that reset the old scalar latch.
+        _auto_heartbeat_last_attempt = {}
+    last_attempt = _auto_heartbeat_last_attempt.get(rate_key, 0.0)
+    if (now - last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
-    _auto_heartbeat_last_attempt = now
     try:
         kb, conn = _connect()
         try:
@@ -456,21 +459,30 @@ def heartbeat_current_worker_from_env() -> bool:
                 kb.heartbeat_claim(conn, tid, claimer=claim_lock)
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
             run_id: Optional[int]
             try:
                 run_id = int(run_id_raw) if run_id_raw else None
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                persisted = kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=None,
+                    expected_run_id=run_id,
+                    activity_kind=activity_kind,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+                persisted = False
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+        if not persisted:
+            return False
+        _auto_heartbeat_last_attempt[rate_key] = now
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)

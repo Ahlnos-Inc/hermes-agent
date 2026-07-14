@@ -899,6 +899,85 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+def test_process_keepalive_does_not_advance_semantic_progress(worker_env):
+    """A live wrapper waiting on a provider is not evidence of task progress."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        initial_semantic = conn.execute(
+            "SELECT last_semantic_progress_at FROM task_runs WHERE id = "
+            "(SELECT current_run_id FROM tasks WHERE id = ?)",
+            (worker_env,),
+        ).fetchone()["last_semantic_progress_at"]
+    finally:
+        conn.close()
+
+    kt._auto_heartbeat_last_attempt = 0.0
+    assert kt.heartbeat_current_worker_from_env(activity_kind="process") is True
+
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT last_heartbeat_at, last_semantic_progress_at "
+            "FROM task_runs WHERE id = "
+            "(SELECT current_run_id FROM tasks WHERE id = ?)",
+            (worker_env,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row["last_heartbeat_at"] is not None
+    assert row["last_semantic_progress_at"] == initial_semantic
+
+
+def test_typed_activity_advances_distinct_run_clocks(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def record(kind):
+        assert kt.heartbeat_current_worker_from_env(activity_kind=kind) is True
+
+    def clocks():
+        conn = kb.connect()
+        try:
+            return conn.execute(
+                "SELECT last_transport_activity_at, last_semantic_progress_at, "
+                "last_durable_progress_at FROM task_runs WHERE id = "
+                "(SELECT current_run_id FROM tasks WHERE id = ?)",
+                (worker_env,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    kt._auto_heartbeat_last_attempt = 0.0
+    initial = clocks()
+    record("transport")
+    row = clocks()
+    assert row["last_transport_activity_at"] is not None
+    assert row["last_semantic_progress_at"] == initial["last_semantic_progress_at"]
+    assert row["last_durable_progress_at"] is None
+
+    record("semantic")
+    row = clocks()
+    assert row["last_semantic_progress_at"] is not None
+    assert row["last_durable_progress_at"] is None
+
+    record("durable")
+    assert clocks()["last_durable_progress_at"] is not None
+    conn = kb.connect()
+    try:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'heartbeat' ORDER BY id DESC LIMIT 1",
+            (worker_env,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert json.loads(event["payload"])["activity_kind"] == "durable"
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
@@ -1625,6 +1704,11 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_rou
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
     monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    # Earlier tests may bind a process-local session ContextVar.  This case
+    # models an unattached front-door invocation whose authority comes from
+    # its environment, so restore the unbound resolution state explicitly.
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
     args = {
         "title": "Design the workflow", "assignee": "architect",
         "session_id": "forged-model-session",

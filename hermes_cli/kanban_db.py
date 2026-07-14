@@ -195,14 +195,13 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
-# If a worker's PID is still alive but its ``last_heartbeat_at`` is
+# If a worker's PID is still alive but its semantic-progress clock is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
 # This catches the logic-loop case where the process is technically
-# running but not making observable progress.  ``_touch_activity``
-# bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
-# so any genuinely active worker keeps its heartbeat fresh as a side
-# effect of normal API traffic.
+# running but not making observable progress. Process keepalives and transport
+# traffic deliberately do not advance this clock; model output, tool-call
+# generation, and explicit durable checkpoints do.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 
 # Grace added to a claim when a reclaim is deferred because the previous
@@ -1074,6 +1073,9 @@ class Run:
     worker_pid: Optional[int]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
+    last_transport_activity_at: Optional[int]
+    last_semantic_progress_at: Optional[int]
+    last_durable_progress_at: Optional[int]
     started_at: int
     ended_at: Optional[int]
     outcome: Optional[str]
@@ -1098,6 +1100,9 @@ class Run:
             worker_pid=row["worker_pid"],
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
+            last_transport_activity_at=row["last_transport_activity_at"],
+            last_semantic_progress_at=row["last_semantic_progress_at"],
+            last_durable_progress_at=row["last_durable_progress_at"],
             started_at=int(row["started_at"]),
             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
             outcome=row["outcome"],
@@ -1393,6 +1398,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     worker_pid          INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
+    last_transport_activity_at INTEGER,
+    last_semantic_progress_at INTEGER,
+    last_durable_progress_at INTEGER,
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
@@ -2401,6 +2409,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "last_transport_activity_at" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "last_transport_activity_at",
+                "last_transport_activity_at INTEGER",
+            )
+        if "last_semantic_progress_at" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "last_semantic_progress_at",
+                "last_semantic_progress_at INTEGER",
+            )
+        if "last_durable_progress_at" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "last_durable_progress_at",
+                "last_durable_progress_at INTEGER",
+            )
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2500,7 +2532,9 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
-        " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
+        " last_heartbeat_at INTEGER, last_transport_activity_at INTEGER,"
+        " last_semantic_progress_at INTEGER, last_durable_progress_at INTEGER,"
+        " started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
         (
@@ -5130,8 +5164,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_semantic_progress_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5140,6 +5174,7 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                now,
                 now,
             ),
         )
@@ -5212,8 +5247,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_semantic_progress_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5222,6 +5257,7 @@ def claim_review_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                now,
                 now,
             ),
         )
@@ -5286,16 +5322,15 @@ def release_stale_claims(
     though the subprocess is healthy.
 
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
-    ``last_heartbeat_at`` is stale by more than
+    semantic-progress clock is stale by more than
     ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has
     been making no observable progress and we reclaim anyway — even if
     ``_pid_alive`` is still true. This catches the wedged-in-a-logic-loop
     case where the process is technically running but accomplishing
-    nothing. ``_touch_activity`` (run_agent.py) bridges chunk-level
-    liveness into ``last_heartbeat_at`` via #31752, so any genuinely
-    active worker keeps its heartbeat fresh as a side effect of normal
-    API traffic. ``enforce_max_runtime`` and ``detect_crashed_workers``
-    remain the upper bounds for genuinely wedged or dead workers.
+    nothing. Process and transport activity remain observable but cannot hide
+    a semantically stalled run. ``enforce_max_runtime`` and
+    ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
+    dead workers.
 
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
@@ -5304,20 +5339,23 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "       t.last_heartbeat_at, r.last_semantic_progress_at, "
+        "       COALESCE(r.last_semantic_progress_at, "
+        "                t.last_heartbeat_at) AS progress_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
-        hb = row["last_heartbeat_at"]
-        # Heartbeat staleness backstop: if we have a heartbeat at all
-        # and it's older than the max-stale threshold, the worker is
-        # not making observable progress.  Reclaim instead of extending,
-        # even if the PID is still alive (it's likely in a logic loop).
+        hb = row["progress_at"]
+        # Semantic-progress staleness is the backstop for live wrappers.
+        # Legacy runs have no typed activity clock and fall back to the old
+        # task heartbeat until they are retried under the new protocol.
         heartbeat_stale = (
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
@@ -7910,13 +7948,14 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    activity_kind: str = "semantic",
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Record a typed activity event and touch the run's matching clock.
 
-    Called by long-running workers as a liveness signal orthogonal to
-    the PID check. A worker that forks a long-lived child (train loop,
-    video encode, web crawl) can have its Python still alive while the
-    actual work process is stuck; periodic heartbeats catch that.
+    ``process`` means only the wrapper is alive, ``transport`` means provider
+    bytes/events arrived, ``semantic`` means useful workflow output occurred,
+    and ``durable`` means recoverable state was persisted.  The legacy task
+    heartbeat remains a compatibility projection of every kind.
 
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
@@ -7943,14 +7982,35 @@ def heartbeat_worker(
             else _current_run_id(conn, task_id)
         )
         if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
-            )
+            if activity_kind == "transport":
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ?, "
+                    "last_transport_activity_at = ? WHERE id = ?",
+                    (now, now, run_id),
+                )
+            elif activity_kind == "semantic":
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ?, "
+                    "last_semantic_progress_at = ? WHERE id = ?",
+                    (now, now, run_id),
+                )
+            elif activity_kind == "durable":
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ?, "
+                    "last_semantic_progress_at = ?, "
+                    "last_durable_progress_at = ? WHERE id = ?",
+                    (now, now, now, run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                    (now, run_id),
+                )
+        payload: dict[str, Any] = {"activity_kind": activity_kind}
+        if note:
+            payload["note"] = note
         _append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
+            conn, task_id, "heartbeat", payload, run_id=run_id,
         )
     return True
 
@@ -8069,8 +8129,8 @@ def enforce_max_runtime(
     return timed_out
 
 
-# Heartbeat staleness heartbeat gap — if a running task hasn't sent a
-# heartbeat in this many seconds it's considered inactive regardless of
+# Semantic-progress gap — if a running task has not produced meaningful work
+# in this many seconds it is considered inactive regardless of
 # the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
 # to match the original spec (">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
@@ -8082,7 +8142,7 @@ def detect_stale_running(
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
+    """Reclaim ``running`` tasks that show no semantic progress within the
     staleness window.
 
     A task is considered stale when BOTH of these hold:
@@ -8090,9 +8150,11 @@ def detect_stale_running(
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
-    2. Its ``last_heartbeat_at`` is older than
+    2. Its active run's ``last_semantic_progress_at`` is older than
        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
 
+    On reclaim the task is reset to ``ready``, the run is closed with
+    Legacy runs without typed clocks fall back to ``tasks.last_heartbeat_at``.
     On reclaim the task is reset to ``ready``, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
     terminated.
@@ -8114,6 +8176,9 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       r.last_semantic_progress_at, "
+        "       COALESCE(r.last_semantic_progress_at, "
+        "                t.last_heartbeat_at) AS progress_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8129,7 +8194,7 @@ def detect_stale_running(
         if elapsed < stale_timeout_seconds:
             continue  # not old enough to check
 
-        last_hb = row["last_heartbeat_at"]
+        last_hb = row["progress_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
@@ -10042,6 +10107,10 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # Workers are always headless.  A gateway launched from a TUI session or
+    # a profile defaulting to TUI must not turn a quiet one-shot worker into an
+    # interactive process that exits without running the task.
+    env.pop("HERMES_TUI", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -10146,6 +10215,7 @@ def _default_spawn(
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
+        "--cli",
     ]
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI

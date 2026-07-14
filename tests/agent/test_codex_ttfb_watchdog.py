@@ -102,6 +102,49 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+def test_waiting_for_first_event_is_process_liveness_not_progress(tmp_path, monkeypatch):
+    """A zero-byte wait may keep the wrapper alive but must not claim progress."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+
+    activity: list[tuple[str, str]] = []
+
+    def capture_process_activity(desc):
+        activity.append((desc, "process"))
+
+    monkeypatch.setattr(agent, "_touch_activity", capture_process_activity)
+    monkeypatch.setattr(
+        agent,
+        "_record_semantic_progress",
+        lambda desc: activity.append((desc, "semantic")),
+    )
+
+    stop = {"flag": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    finally:
+        stop["flag"] = True
+
+    waiting = [kind for desc, kind in activity if desc.startswith("waiting for non-streaming")]
+    assert waiting == ["process"]
+
+
 def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     """With no env var set, the no-byte TTFB default is generous (120s), so a
     request whose first stream event is merely slow (~2s of backend admission /
@@ -351,10 +394,13 @@ def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
-def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypatch):
-    """Large Codex inputs can legitimately take longer than the small-request
-    first-byte cutoff before the first SSE frame. Preserve the full input and
-    wait instead of killing/retrying at TTFB."""
+def test_large_codex_request_keeps_bounded_ttfb_reconnect(tmp_path, monkeypatch):
+    """Request size must never disable the no-first-event deadline.
+
+    A large request may use a larger configured deadline, but a provider that
+    accepts the connection and emits no events must still be reconnected
+    before the much longer whole-attempt stale timeout.
+    """
     from agent import chat_completion_helpers as h
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
@@ -370,20 +416,24 @@ def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypat
         agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
     )
 
-    sentinel = SimpleNamespace(ok=True)
+    stop = {"flag": False}
 
-    def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        # No event marker for 2s: this would trip the 1s TTFB watchdog on a
-        # small request, but should be allowed for a large request.
-        time.sleep(2.0)
-        return sentinel
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
 
-    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
 
     large_input = "x" * 120_000  # ~30k estimated tokens, above large-request gate.
-    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
-    assert resp is sentinel
-    assert "codex_ttfb_kill" not in closes
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
+        assert "TTFB threshold: 1s" in str(excinfo.value)
+        assert "codex_ttfb_kill" in closes
+    finally:
+        stop["flag"] = True
 
 
 def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):

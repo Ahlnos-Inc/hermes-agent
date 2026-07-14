@@ -3051,27 +3051,42 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(self, desc: str) -> None:
-        """Update the last-activity timestamp and description (thread-safe).
-
-        Also bridges to the kanban board's heartbeat fields when this
-        process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
-        so the dispatcher watchdog doesn't reclaim an actively-running
-        worker as stale (#31752). Bridge is rate-limited (60s) and
-        best-effort — it never raises into the agent loop.
-        """
-        self._last_activity_ts = time.time()
+    def _record_activity(self, desc: str, *, activity_kind: str) -> None:
+        """Record one typed activity signal and bridge it to the active run."""
+        now = time.time()
+        self._last_activity_ts = now
         self._last_activity_desc = desc
+        if activity_kind == "transport":
+            self._last_transport_activity_ts = now
+        elif activity_kind == "semantic":
+            self._last_semantic_progress_ts = now
+        elif activity_kind == "durable":
+            self._last_semantic_progress_ts = now
+            self._last_durable_progress_ts = now
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(activity_kind=activity_kind)
             except Exception:
-                # Never let the bridge break the agent loop.  The function
-                # already swallows exceptions internally; this outer guard
-                # covers import-time failures (kanban_tools unavailable,
-                # etc.) on niche deployment surfaces.
                 pass
+
+    def _touch_activity(self, desc: str) -> None:
+        """Record process/UI liveness without claiming useful progress.
+
+        This compatibility method is intentionally process-only. Callers that
+        observe provider bytes, useful computation, or a persisted checkpoint
+        must use the explicit typed methods below.
+        """
+        self._record_activity(desc, activity_kind="process")
+
+    def _record_transport_activity(self, desc: str) -> None:
+        self._record_activity(desc, activity_kind="transport")
+
+    def _record_semantic_progress(self, desc: str) -> None:
+        self._record_activity(desc, activity_kind="semantic")
+
+    def _record_durable_progress(self, desc: str) -> None:
+        self._record_activity(desc, activity_kind="durable")
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3280,6 +3295,9 @@ class AIAgent:
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
+            "last_transport_activity_ts": self._last_transport_activity_ts,
+            "last_semantic_progress_ts": self._last_semantic_progress_ts,
+            "last_durable_progress_ts": self._last_durable_progress_ts,
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
@@ -4665,6 +4683,7 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        self._record_semantic_progress("provider text delta")
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -4678,6 +4697,8 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if text:
+            self._record_semantic_progress("provider reasoning delta")
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -4693,6 +4714,7 @@ class AIAgent:
         or status line so the user isn't staring at a frozen screen while a
         large tool payload (e.g. a 45 KB write_file) is being generated.
         """
+        self._record_semantic_progress("provider tool generation")
         cb = self.tool_gen_callback
         if cb is not None:
             try:

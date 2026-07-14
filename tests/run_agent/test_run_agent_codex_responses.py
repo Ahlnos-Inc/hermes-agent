@@ -584,6 +584,8 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     returns whatever it collected — no retry, no separate fallback path.
     """
     agent = _build_agent(monkeypatch)
+    transport_activity: list[str] = []
+    agent._record_transport_activity = transport_activity.append
     output_item = SimpleNamespace(
         type="message",
         status="completed",
@@ -608,6 +610,10 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert calls["create"] == 1
     assert response.status == "completed"
     assert response.output == [output_item]
+    assert transport_activity == [
+        "receiving stream response",
+        "receiving stream response",
+    ]
 
 
 def test_run_codex_stream_surfaces_failed_status_in_final_response(monkeypatch):

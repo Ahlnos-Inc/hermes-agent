@@ -498,6 +498,44 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+def test_process_heartbeat_cannot_hide_stale_semantic_progress(
+    kanban_home, monkeypatch,
+):
+    """A live wrapper is not proof that its workflow is making progress."""
+    import hermes_cli.kanban_db as _kb
+
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="wedged", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (now - 60, now, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ?, "
+            "last_semantic_progress_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (now - 7200, now, now - 7200, t),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(
+            _kb, "_terminate_reclaimed_worker",
+            lambda *a, **k: {
+                "termination_attempted": True,
+                "host_local": True,
+                "terminated": True,
+            },
+        )
+
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, t).status == "ready"
+
+
 def test_stale_claim_with_live_pid_uses_env_ttl_override(
     kanban_home, monkeypatch,
 ):
@@ -551,6 +589,11 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
             "WHERE id = ?",
             (old_expires, int(time.time()) - 7200, t),
         )
+        conn.execute(
+            "UPDATE task_runs SET last_semantic_progress_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (int(time.time()) - 7200, t),
+        )
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         monkeypatch.setattr(
             _kb, "_terminate_reclaimed_worker",
@@ -598,6 +641,11 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
             "WHERE id = ?",
             (int(time.time()) - 60, int(time.time()) - 7200, t),
         )
+        conn.execute(
+            "UPDATE task_runs SET last_semantic_progress_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (int(time.time()) - 7200, t),
+        )
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         monkeypatch.setattr(
             _kb, "_terminate_reclaimed_worker",
@@ -632,6 +680,11 @@ def test_stale_claim_released_when_worker_not_host_local(
             "WHERE id = ?",
             (int(time.time()) - 60, int(time.time()) - 7200, t),
         )
+        conn.execute(
+            "UPDATE task_runs SET last_semantic_progress_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (int(time.time()) - 7200, t),
+        )
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         monkeypatch.setattr(
             _kb, "_terminate_reclaimed_worker",
@@ -663,7 +716,8 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
                 (five_hours_ago, t),
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )
@@ -3857,7 +3911,8 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
                 "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )
@@ -3891,9 +3946,10 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
                 (five_hours_ago, heartbeat_2h_ago, t),
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (five_hours_ago, heartbeat_2h_ago, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -3924,7 +3980,8 @@ def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch)
                 (five_hours_ago, heartbeat_now, t),
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )
@@ -3935,6 +3992,39 @@ def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch)
         )
         assert stale == [], "Task with recent heartbeat should not be reclaimed"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stale_uses_semantic_clock_not_process_heartbeat(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="alive-wrapper-wedged-work", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (now - 5 * 3600, now, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ?, "
+                "last_semantic_progress_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (now - 5 * 3600, now, now - 2 * 3600, t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda _p, _s: None,
+        )
+
+        assert stale == [t]
+        assert kb.get_task(conn, t).status == "ready"
 
 
 def test_detect_stale_skips_recently_started_task(kanban_home, monkeypatch):
@@ -4046,7 +4136,8 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
                 "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, "
+                "last_semantic_progress_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )

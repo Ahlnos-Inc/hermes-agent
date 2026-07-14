@@ -307,8 +307,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # main retry loop can reconnect promptly. Large subscription-backed Codex
     # requests can legitimately spend tens of seconds in backend admission /
     # prompt prefill before the first SSE event, so the no-byte TTFB watchdog
-    # is disabled for large chatgpt.com/backend-api/codex requests. A second
-    # failure mode emits an opening SSE frame and then stalls forever in SSL
+    # uses a generous bounded deadline. Request size must never disable that
+    # deadline entirely: the backend can accept an arbitrarily large request
+    # and still wedge before emitting its first event. A second failure mode
+    # emits an opening SSE frame and then stalls forever in SSL
     # read; for that we watch the gap since the last Codex stream event. This
     # matches Codex CLI's stream_idle_timeout model: any valid SSE event is
     # activity. Operators can tune via HERMES_CODEX_TTFB_TIMEOUT_SECONDS and
@@ -345,34 +347,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     elif _openai_codex_backend:
-        _ttfb_disable_above = _env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 25_000.0)
-        _ttfb_strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        if (
-            not _ttfb_strict
-            and _ttfb_disable_above > 0
-            and _est_tokens_for_codex_watchdog >= _ttfb_disable_above
-        ):
-            _ttfb_enabled = False
+        _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+        if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
             logger.info(
-                "Disabling openai-codex no-byte TTFB watchdog for large request "
-                "(context=~%s tokens >= %.0f). Waiting for backend response instead. "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
+                "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                _ttfb_timeout,
+                _ttfb_cap,
                 f"{_est_tokens_for_codex_watchdog:,}",
-                _ttfb_disable_above,
             )
-        else:
-            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
-            if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
-                logger.info(
-                    "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
-                    "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
-                    _ttfb_timeout,
-                    _ttfb_cap,
-                    f"{_est_tokens_for_codex_watchdog:,}",
-                )
-                _ttfb_timeout = _ttfb_cap
+            _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
     _codex_idle_timeout = _env_float(
@@ -2178,7 +2162,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         usage_obj = None
         for chunk in stream:
             last_chunk_time["t"] = time.time()
-            agent._touch_activity("receiving stream response")
+            agent._record_transport_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -2488,7 +2472,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # actively arriving (the chat_completions path
                 # already does this at the top of its chunk loop).
                 last_chunk_time["t"] = time.time()
-                agent._touch_activity("receiving stream response")
+                agent._record_transport_activity("receiving stream response")
 
                 # Update per-attempt diagnostic counters (best-effort).
                 try:

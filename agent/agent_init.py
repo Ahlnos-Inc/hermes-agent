@@ -588,6 +588,9 @@ def init_agent(
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
     agent._last_activity_desc: str = "initializing"
+    agent._last_transport_activity_ts: float | None = None
+    agent._last_semantic_progress_ts: float | None = None
+    agent._last_durable_progress_ts: float | None = None
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
