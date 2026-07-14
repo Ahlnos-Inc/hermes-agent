@@ -55,7 +55,52 @@ def test_preflight_accepts_canonical_provider_prefixed_model(
         reasoning_config={"effort": "xhigh"},
     )
 
-    assert spec["version"] == 1
+    assert spec["version"] == 2
+
+
+def test_preflight_rejects_clobbered_task_toolsets(monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_runtime_contract import (
+        RunRouteMismatch,
+        preflight_kanban_cli_route,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="scoped tools",
+            assignee="verifier",
+            toolsets=["terminal", "file"],
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+
+    with pytest.raises(RunRouteMismatch, match="requested toolsets"):
+        preflight_kanban_cli_route(
+            model="anything",
+            provider="anything",
+            reasoning_config=None,
+            toolsets=["browser", "web"],
+        )
+
+
+def test_claim_rejects_corrupt_empty_task_toolsets():
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="corrupt empty tools",
+            assignee="verifier",
+        )
+        conn.execute("UPDATE tasks SET toolsets = '[]' WHERE id = ?", (task_id,))
+
+        with pytest.raises(ValueError, match="unsupported values"):
+            kb.claim_task(conn, task_id)
+
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
 def test_cli_preflight_runs_before_deferred_startup_or_agent_construction(monkeypatch):

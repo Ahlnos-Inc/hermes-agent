@@ -67,14 +67,32 @@ def preflight_kanban_cli_route(
     model: Any,
     provider: Any,
     reasoning_config: Any,
+    toolsets: Any = None,
 ) -> Optional[dict]:
     """Fail before agent/provider construction when parser/config drifted."""
     spec = load_active_run_spec()
     if spec is None:
         return None  # legacy or non-Kanban process
     requested = spec.get("requested_route")
-    if spec.get("version") != 1 or not isinstance(requested, dict):
+    version = spec.get("version")
+    if version not in {1, 2} or not isinstance(requested, dict):
         raise RunRouteMismatch("active run has an unsupported route contract")
+
+    if version == 2 and spec.get("toolsets") is not None:
+        expected_toolsets = spec.get("toolsets")
+        if not isinstance(expected_toolsets, list) or any(
+            not isinstance(value, str) for value in expected_toolsets
+        ):
+            raise RunRouteMismatch("active run has invalid toolset contract")
+        actual_toolsets = (
+            [str(value).strip().casefold() for value in toolsets]
+            if isinstance(toolsets, (list, tuple))
+            else []
+        )
+        if actual_toolsets != [value.casefold() for value in expected_toolsets]:
+            raise RunRouteMismatch(
+                f"requested toolsets {expected_toolsets!r}, parsed {actual_toolsets!r}"
+            )
 
     expected_provider = requested.get("provider")
     if expected_provider and _canonical_provider(provider) != _canonical_provider(

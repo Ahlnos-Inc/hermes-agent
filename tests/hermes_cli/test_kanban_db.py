@@ -1473,13 +1473,14 @@ def test_claim_snapshots_an_immutable_versioned_run_spec(kanban_home):
         assert kb.claim_task(conn, tid) is not None
         run = kb.latest_run(conn, tid)
         assert run.run_spec == {
-            "version": 1,
+            "version": 2,
             "profile": "coder",
             "requested_route": {
                 "provider": "openai-codex",
                 "model": "gpt-5.6-sol",
                 "reasoning_effort": "xhigh",
             },
+            "toolsets": None,
             "delivery_policy": {
                 "version": 1,
                 "disposition": "none",
@@ -1813,6 +1814,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
 
     def fake_spawn(task, workspace):
         spawns.append((task.id, task.assignee, workspace))
+        return 20_000 + len(spawns)
 
     with kb.connect() as conn:
         p = kb.create_task(conn, title="p", assignee="alice")
@@ -1854,6 +1856,7 @@ def test_dispatch_max_spawn_counts_existing_running_tasks(
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
+        return 21_000 + len(spawns)
 
     with kb.connect() as conn:
         running_a = kb.create_task(conn, title="running-a", assignee="alice")
@@ -1877,6 +1880,7 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
+        return 21_500 + len(spawns)
 
     with kb.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
@@ -2330,7 +2334,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
 
     def fake_spawn(task, workspace, board=None):
         spawns.append((task.id, workspace))
-        return None
+        return 22_000 + len(spawns)
 
     with kb.connect(board="worktree-board") as conn:
         tid = kb.create_task(
@@ -2369,7 +2373,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
 
     def fake_spawn(task, workspace, board=None):
         spawns.append((task.id, workspace))
-        return None
+        return 23_000 + len(spawns)
 
     with kb.connect(board="worktree-rerun-board") as conn:
         tid = kb.create_task(
@@ -3710,6 +3714,7 @@ def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
+        return 24_000 + len(spawns)
 
     with kb.connect() as conn:
         # Two running tasks.
@@ -3731,6 +3736,7 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
+        return 24_500 + len(spawns)
 
     with kb.connect() as conn:
         # One running task.
@@ -3792,13 +3798,14 @@ def test_review_claim_snapshots_its_own_run_spec(kanban_home):
 
         assert kb.claim_review_task(conn, tid) is not None
         assert kb.latest_run(conn, tid).run_spec == {
-            "version": 1,
+            "version": 2,
             "profile": "reviewer",
             "requested_route": {
                 "provider": "anthropic",
                 "model": "claude-opus-4-8",
                 "reasoning_effort": "xhigh",
             },
+            "toolsets": None,
             "delivery_policy": {
                 "version": 1,
                 "disposition": "none",

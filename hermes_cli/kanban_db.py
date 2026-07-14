@@ -88,7 +88,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -920,6 +920,9 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    # Task-scoped runtime capability list. None preserves the assignee
+    # profile; non-empty lists are exact overrides plus lifecycle tools.
+    toolsets: Optional[list] = None
     model_override: Optional[str] = None
     model_provider_override: Optional[str] = None
     model_reasoning_effort: Optional[str] = None
@@ -977,6 +980,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        toolsets_value: Optional[list] = None
+        if "toolsets" in keys and row["toolsets"] is not None:
+            try:
+                parsed = json.loads(row["toolsets"])
+                if isinstance(parsed, list):
+                    toolsets_value = [str(value) for value in parsed if value]
+            except Exception:
+                toolsets_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1027,6 +1038,7 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            toolsets=toolsets_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             model_provider_override=(
                 row["model_provider_override"]
@@ -1342,6 +1354,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Task-scoped CLI capabilities. NULL = profile fallback; non-empty JSON
+    -- list = exact toolset override plus mandatory lifecycle tools.
+    toolsets             TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -2309,6 +2324,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
+    if "toolsets" not in cols:
+        _add_column_if_missing(conn, "tasks", "toolsets", "toolsets TEXT")
 
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
@@ -3791,7 +3808,7 @@ def compile_workflow_graph(
 
     allowed_step_fields = {
         "key", "title", "body", "assignee", "parents", "role", "terminal",
-        "initial_status", "result", "skills", "max_runtime_seconds", "priority",
+        "initial_status", "result", "skills", "toolsets", "max_runtime_seconds", "priority",
         "model_override", "model_provider_override", "model_reasoning_effort",
     }
     terminal_roles = {"finalizer", "synthesizer", "reporter"}
@@ -3815,6 +3832,7 @@ def compile_workflow_graph(
         initial_status = raw.get("initial_status")
         result = raw.get("result")
         raw_skills = raw.get("skills")
+        raw_toolsets = raw.get("toolsets")
         max_runtime_seconds = raw.get("max_runtime_seconds")
         step_priority = raw.get("priority", priority)
         model_override = str(raw.get("model_override") or "").strip() or None
@@ -3867,6 +3885,28 @@ def compile_workflow_graph(
         skill_validation_error = _forced_skill_validation_error(assignee, skills)
         if skill_validation_error:
             raise WorkflowGraphError(skill_validation_error)
+        if raw_toolsets is not None and not isinstance(raw_toolsets, list):
+            raise WorkflowGraphError(f"steps[{index}].toolsets must be a list")
+        toolsets: Optional[list[str]] = None
+        if raw_toolsets is not None:
+            toolsets = []
+            unknown_toolsets: list[str] = []
+            for raw_toolset in raw_toolsets:
+                name = str(raw_toolset or "").strip().casefold()
+                if not name:
+                    continue
+                if name not in KNOWN_TOOLSET_NAMES:
+                    unknown_toolsets.append(name)
+                elif name not in toolsets:
+                    toolsets.append(name)
+            if unknown_toolsets:
+                raise WorkflowGraphError(
+                    f"steps[{index}] has unknown toolsets: {sorted(unknown_toolsets)}"
+                )
+            if not toolsets:
+                raise WorkflowGraphError(
+                    f"steps[{index}].toolsets must contain at least one toolset"
+                )
         if max_runtime_seconds is not None:
             try:
                 max_runtime_seconds = int(max_runtime_seconds)
@@ -3906,6 +3946,7 @@ def compile_workflow_graph(
                 "initial_status": initial_status,
                 "result": result,
                 "skills": skills,
+                "toolsets": toolsets,
                 "max_runtime_seconds": max_runtime_seconds,
                 "priority": step_priority,
                 "model_override": model_override,
@@ -4090,10 +4131,10 @@ def compile_workflow_graph(
                     id, title, body, assignee, status, priority, created_by,
                     created_at, workspace_kind, workspace_path, tenant,
                     session_id, workflow_key, current_step_key, result,
-                    completed_at, skills, model_override,
+                    completed_at, skills, toolsets, model_override,
                     model_provider_override, model_reasoning_effort,
                     max_runtime_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_ids[step["key"]],
                     step["title"],
@@ -4112,6 +4153,11 @@ def compile_workflow_graph(
                     step["result"],
                     now if task_status == "done" else None,
                     json.dumps(step["skills"]) if step["skills"] else None,
+                    (
+                        json.dumps(step["toolsets"])
+                        if step["toolsets"] is not None
+                        else None
+                    ),
                     step["model_override"],
                     step["model_provider_override"],
                     step["model_reasoning_effort"],
@@ -4525,6 +4571,7 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    toolsets: Optional[Iterable[str]] = None,
     model_override: Optional[str] = None,
     model_provider_override: Optional[str] = None,
     model_reasoning_effort: Optional[str] = None,
@@ -4562,6 +4609,11 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``toolsets`` optionally narrows runtime capabilities for this task. None
+    preserves the assignee profile's configured CLI surface; a non-empty list
+    is snapshotted into the immutable run contract. Mandatory Kanban lifecycle
+    tools are appended by the worker boundary.
 
     ``model_override`` optionally pins the dispatched worker to a model
     different from the assignee profile default. Blank strings are
@@ -4698,6 +4750,30 @@ def create_task(
             )
         skills_list = cleaned
 
+    toolsets_list: Optional[list[str]] = None
+    if toolsets is not None:
+        cleaned_toolsets: list[str] = []
+        seen_toolsets: set[str] = set()
+        unknown_toolsets: list[str] = []
+        for raw_toolset in toolsets:
+            name = str(raw_toolset or "").strip()
+            if not name:
+                continue
+            normalized = name.casefold()
+            if normalized not in KNOWN_TOOLSET_NAMES:
+                unknown_toolsets.append(name)
+                continue
+            if normalized not in seen_toolsets:
+                seen_toolsets.add(normalized)
+                cleaned_toolsets.append(normalized)
+        if unknown_toolsets:
+            raise ValueError(
+                "unknown task toolset(s): " + ", ".join(sorted(unknown_toolsets))
+            )
+        if not cleaned_toolsets:
+            raise ValueError("task toolsets must contain at least one toolset")
+        toolsets_list = cleaned_toolsets
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -4824,10 +4900,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, model_override, model_provider_override,
+                        skills, toolsets, model_override, model_provider_override,
                         model_reasoning_effort, max_retries, goal_mode, goal_max_turns,
                         session_id, workflow_key, workflow_template_id, current_step_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4846,6 +4922,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(toolsets_list) if toolsets_list is not None else None,
                         model_override,
                         model_provider_override,
                         model_reasoning_effort,
@@ -4874,6 +4951,9 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "toolsets": (
+                            list(toolsets_list) if toolsets_list is not None else None
+                        ),
                         "model_override": model_override,
                         "model_provider_override": model_provider_override,
                         "model_reasoning_effort": model_reasoning_effort,
@@ -5558,14 +5638,28 @@ def _build_run_spec(
     architecture_gate: Optional[ArchitectureGate] = None,
 ) -> dict:
     """Build the immutable, secret-free launch contract for one run."""
+    toolsets: Optional[list[str]] = None
+    if task_row is not None and "toolsets" in task_row.keys() and task_row["toolsets"] is not None:
+        try:
+            parsed_toolsets = json.loads(task_row["toolsets"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("task toolsets are not valid JSON") from exc
+        if not isinstance(parsed_toolsets, list) or not parsed_toolsets or any(
+            not isinstance(value, str)
+            or value.casefold() not in KNOWN_TOOLSET_NAMES
+            for value in parsed_toolsets
+        ):
+            raise ValueError("task toolsets contain unsupported values")
+        toolsets = [value.casefold() for value in parsed_toolsets]
     return {
-        "version": 1,
+        "version": 2,
         "profile": task_row["assignee"] if task_row else None,
         "requested_route": {
             "provider": task_row["model_provider_override"] if task_row else None,
             "model": task_row["model_override"] if task_row else None,
             "reasoning_effort": task_row["model_reasoning_effort"] if task_row else None,
         },
+        "toolsets": toolsets,
         "delivery_policy": _delivery_policy_snapshot(architecture_gate),
     }
 
@@ -5976,7 +6070,7 @@ def claim_task(
         # its assignee / step / runtime cap.
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key, "
-            "model_override, model_provider_override, model_reasoning_effort "
+            "model_override, model_provider_override, model_reasoning_effort, toolsets "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6099,7 +6193,7 @@ def claim_review_task(
             return None
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key, "
-            "model_override, model_provider_override, model_reasoning_effort "
+            "model_override, model_provider_override, model_reasoning_effort, toolsets "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6206,7 +6300,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "SELECT t.id, t.current_run_id, t.claim_lock, t.worker_pid, t.claim_expires, "
         "       t.last_heartbeat_at, r.last_semantic_progress_at, "
         "       COALESCE(r.last_semantic_progress_at, "
         "                t.last_heartbeat_at) AS progress_at "
@@ -6219,6 +6313,12 @@ def release_stale_claims(
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
+        if host_local and row["worker_pid"] is None:
+            _log_orphan_worker_canary(
+                task_id=row["id"],
+                run_id=row["current_run_id"],
+                claim_lock=row["claim_lock"],
+            )
         hb = row["progress_at"]
         # Semantic-progress staleness is the backstop for live wrappers.
         # Legacy runs have no typed activity clock and fall back to the old
@@ -6343,7 +6443,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -6352,6 +6452,17 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if (
+        row["worker_pid"] is None
+        and isinstance(prev_lock, str)
+        and prev_lock.startswith(host_prefix)
+    ):
+        _log_orphan_worker_canary(
+            task_id=task_id,
+            run_id=row["current_run_id"],
+            claim_lock=prev_lock,
+        )
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
@@ -8802,6 +8913,20 @@ def _resolve_delivery_authorization_cooldown_seconds() -> int:
 
 
 @dataclass
+class SpawnReceipt:
+    """A started worker that remains gated until its run is durably attached.
+
+    ``release`` lets the child proceed only after the dispatcher has stored
+    and read back the exact task/run/claim/PID tuple. ``abort`` must terminate
+    the process group when attach or gate release fails.
+    """
+
+    pid: int
+    release: Callable[[], None] = field(repr=False)
+    abort: Callable[[], None] = field(repr=False)
+
+
+@dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
@@ -9172,6 +9297,69 @@ def _pid_alive(pid: Optional[int]) -> bool:
             # If the secondary probe fails, keep the kill(0) answer.
             pass
     return True
+
+
+def _scan_exact_kanban_workers(
+    task_id: str,
+    run_id: Optional[int],
+    claim_lock: Optional[str],
+) -> list[int]:
+    """Observe workers whose inherited run identity exactly matches a claim.
+
+    This is deliberately detection-only.  It closes the observability gap for
+    legacy/malformed runs where ``worker_pid`` was never durably attached, but
+    it does not make a process-kill decision from a process-table scan.  The
+    attach-or-die spawn gate is the enforcement mechanism for new workers.
+    """
+    if run_id is None or not claim_lock:
+        return []
+    expected = {
+        "HERMES_KANBAN_TASK": str(task_id),
+        "HERMES_KANBAN_RUN_ID": str(int(run_id)),
+        "HERMES_KANBAN_CLAIM_LOCK": str(claim_lock),
+    }
+    matches: list[int] = []
+    try:
+        import psutil  # type: ignore
+
+        for process in psutil.process_iter(["pid"]):
+            try:
+                pid = int(process.info["pid"])
+                if pid == os.getpid():
+                    continue
+                environ = process.environ()
+            except (KeyError, TypeError, ValueError):
+                continue
+            except Exception:
+                # AccessDenied/NoSuchProcess/ZombieProcess and partially
+                # supported platforms are normal for a best-effort canary.
+                continue
+            if all(environ.get(key) == value for key, value in expected.items()):
+                matches.append(pid)
+    except Exception:
+        return []
+    return sorted(set(matches))
+
+
+def _log_orphan_worker_canary(
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    claim_lock: Optional[str],
+) -> list[int]:
+    """Emit a secret-free warning for exact workers missing DB PID ownership."""
+    matches = _scan_exact_kanban_workers(task_id, run_id, claim_lock)
+    if matches:
+        lock_digest = hashlib.sha256(str(claim_lock).encode("utf-8")).hexdigest()[:12]
+        _log.warning(
+            "orphan_worker_canary action=observe_only task_id=%s run_id=%s "
+            "claim_lock_sha256=%s worker_pids=%s",
+            task_id,
+            run_id,
+            lock_digest,
+            matches,
+        )
+    return matches
 
 
 def _terminate_reclaimed_worker(
@@ -10413,25 +10601,181 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
+) -> None:
+    """Atomically attach ``pid`` to the exact active task run.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    The historical implementation performed two unguarded updates and then
+    reported success even if the task had been reclaimed between spawn and
+    persistence. This compare-and-swap refuses stale ownership, updates the
+    task and run together, and reads the tuple back before emitting the
+    ``spawned`` event. Optional identifiers preserve the helper's public test
+    surface while still deriving and enforcing the active tuple.
     """
+    worker_pid = int(pid)
+    if worker_pid <= 0:
+        raise RuntimeError(f"worker PID must be positive, got {worker_pid}")
+
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        active = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if active is None or active["status"] != "running":
+            raise RuntimeError(f"task {task_id} is no longer running")
+        active_run_id = (
+            int(active["current_run_id"])
+            if active["current_run_id"] is not None
+            else None
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        active_lock = active["claim_lock"]
+        expected_run_id = int(run_id) if run_id is not None else active_run_id
+        expected_lock = claim_lock if claim_lock is not None else active_lock
+        if active_run_id is None or expected_run_id != active_run_id:
+            raise RuntimeError(f"task {task_id} active run changed before PID attach")
+        if not expected_lock or expected_lock != active_lock:
+            raise RuntimeError(f"task {task_id} claim changed before PID attach")
+
+        task_update = conn.execute(
+            """
+            UPDATE tasks
+               SET worker_pid = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+               AND claim_lock = ?
+               AND (worker_pid IS NULL OR worker_pid = ?)
+            """,
+            (worker_pid, task_id, expected_run_id, expected_lock, worker_pid),
+        )
+        run_update = conn.execute(
+            """
+            UPDATE task_runs
+               SET worker_pid = ?
+             WHERE id = ?
+               AND task_id = ?
+               AND status = 'running'
+               AND ended_at IS NULL
+               AND claim_lock = ?
+               AND (worker_pid IS NULL OR worker_pid = ?)
+            """,
+            (worker_pid, expected_run_id, task_id, expected_lock, worker_pid),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise RuntimeError(f"task {task_id} lost ownership before PID attach")
+
+        attached = conn.execute(
+            """
+            SELECT t.worker_pid AS task_pid, r.worker_pid AS run_pid
+              FROM tasks t
+              JOIN task_runs r ON r.id = t.current_run_id
+             WHERE t.id = ? AND t.status = 'running'
+               AND t.current_run_id = ? AND t.claim_lock = ?
+               AND r.task_id = t.id AND r.status = 'running'
+               AND r.ended_at IS NULL AND r.claim_lock = ?
+            """,
+            (task_id, expected_run_id, expected_lock, expected_lock),
+        ).fetchone()
+        if (
+            attached is None
+            or attached["task_pid"] != worker_pid
+            or attached["run_pid"] != worker_pid
+        ):
+            raise RuntimeError(f"task {task_id} PID attach readback failed")
+        _append_event(
+            conn,
+            task_id,
+            "spawned",
+            {"pid": worker_pid, "run_id": expected_run_id},
+            run_id=expected_run_id,
+        )
+
+
+def _abort_spawned_pid(pid: int) -> None:
+    """Best-effort termination for a legacy integer-only spawn receipt."""
+    import signal
+
+    worker_pid = int(pid)
+    if worker_pid <= 1 or worker_pid == os.getpid():
+        _log.error("refusing unsafe abort for worker pid=%s", worker_pid)
+        return
+    try:
+        if not _IS_WINDOWS and os.getpgid(worker_pid) == worker_pid:
+            os.killpg(worker_pid, signal.SIGTERM)
+        else:
+            os.kill(worker_pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+
+
+def _coerce_spawn_receipt(value: Any) -> SpawnReceipt:
+    """Validate a spawn result, accepting positive integer legacy hooks."""
+    if isinstance(value, SpawnReceipt):
+        receipt = value
+    elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        receipt = SpawnReceipt(
+            pid=int(value),
+            release=lambda: None,
+            abort=lambda: _abort_spawned_pid(int(value)),
+        )
+    else:
+        raise RuntimeError("spawn function returned no valid worker receipt")
+    if receipt.pid <= 0:
+        raise RuntimeError("spawn function returned a non-positive worker PID")
+    return receipt
+
+
+def _spawn_and_attach_worker(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    spawn_fn: Callable[..., Any],
+    *,
+    board: Optional[str],
+) -> int:
+    """Start a worker, durably attach its exact run, then open its gate."""
+    import inspect
+
+    receipt: Optional[SpawnReceipt] = None
+    try:
+        try:
+            sig = inspect.signature(spawn_fn)
+            if "board" in sig.parameters:
+                raw_receipt = spawn_fn(task, workspace, board=board)
+            else:
+                raw_receipt = spawn_fn(task, workspace)
+        except (TypeError, ValueError):
+            raw_receipt = spawn_fn(task, workspace)
+        receipt = _coerce_spawn_receipt(raw_receipt)
+        if task.current_run_id is None or not task.claim_lock:
+            raise RuntimeError(f"task {task.id} has no active run ownership")
+        _set_worker_pid(
+            conn,
+            task.id,
+            receipt.pid,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+        )
+        receipt.release()
+        return receipt.pid
+    except Exception:
+        if receipt is not None:
+            try:
+                receipt.abort()
+            except Exception:
+                _log.warning(
+                    "failed to abort unattached worker pid=%s task=%s",
+                    receipt.pid,
+                    task.id,
+                    exc_info=True,
+                )
+        raise
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10727,8 +11071,9 @@ def _dispatch_once_locked(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
-         ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
-         return value (if any) is recorded as ``worker_pid`` so subsequent
+         ``spawn_fn(task, workspace_path, board) -> SpawnReceipt``. Positive
+         integer receipts remain supported for legacy hooks. The exact PID is
+         recorded on both task and run before a gated worker is released, so subsequent
          ticks can detect crashes before the TTL expires.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
@@ -11084,20 +11429,13 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            _spawn_and_attach_worker(
+                conn,
+                claimed,
+                str(workspace),
+                _spawn,
+                board=board,
+            )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -11232,17 +11570,13 @@ def _dispatch_once_locked(
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            _spawn_and_attach_worker(
+                conn,
+                claimed,
+                str(workspace),
+                _spawn,
+                board=board,
+            )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -11558,7 +11892,7 @@ def _spawn_contract(
     task: Task,
     *,
     board: Optional[str],
-) -> tuple[str, dict[str, Optional[str]], dict[str, Any]]:
+) -> tuple[str, dict[str, Optional[str]], dict[str, Any], Optional[list[str]]]:
     """Load the active run's immutable launch contract.
 
     A task without a run spec is a legacy/manual spawn and keeps the old task
@@ -11571,7 +11905,12 @@ def _spawn_contract(
         "reasoning_effort": task.model_reasoning_effort,
     }
     if task.current_run_id is None:
-        return task.assignee or "", legacy_route, _delivery_policy_snapshot(None)
+        return (
+            task.assignee or "",
+            legacy_route,
+            _delivery_policy_snapshot(None),
+            task.toolsets,
+        )
 
     with connect(board=board) as conn:
         row = conn.execute(
@@ -11600,10 +11939,24 @@ def _spawn_contract(
             f"task {task.id} run {task.current_run_id} has unsupported run spec"
         )
     route = spec.get("requested_route")
-    if spec.get("version") != 1 or not isinstance(route, dict):
+    version = spec.get("version")
+    if version not in {1, 2} or not isinstance(route, dict):
         raise RuntimeError(
             f"task {task.id} run {task.current_run_id} has unsupported run spec"
         )
+    run_toolsets: Optional[list[str]] = None
+    if version == 2:
+        raw_toolsets = spec.get("toolsets")
+        if raw_toolsets is not None:
+            if not isinstance(raw_toolsets, list) or not raw_toolsets or any(
+                not isinstance(value, str)
+                or value.casefold() not in KNOWN_TOOLSET_NAMES
+                for value in raw_toolsets
+            ):
+                raise RuntimeError(
+                    f"task {task.id} run {task.current_run_id} has invalid toolsets"
+                )
+            run_toolsets = [value.casefold() for value in raw_toolsets]
     try:
         delivery_policy = validate_delivery_policy_snapshot(
             spec.get("delivery_policy")
@@ -11620,6 +11973,7 @@ def _spawn_contract(
             "reasoning_effort": route.get("reasoning_effort"),
         },
         delivery_policy,
+        run_toolsets,
     )
 
 
@@ -11628,11 +11982,12 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+) -> SpawnReceipt:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
+    Returns a gated receipt. The child cannot begin command dispatch until
+    the dispatcher durably attaches its PID to the exact run and releases the
+    gate. The child's completion is still observed
     via the ``complete`` / ``block`` transitions the worker writes itself;
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
@@ -11645,7 +12000,12 @@ def _default_spawn(
 
     from hermes_cli.profiles import normalize_profile_name
 
-    requested_profile, requested_route, delivery_policy = _spawn_contract(
+    (
+        requested_profile,
+        requested_route,
+        delivery_policy,
+        run_toolsets,
+    ) = _spawn_contract(
         task, board=board,
     )
     profile_arg = normalize_profile_name(requested_profile)
@@ -11695,6 +12055,10 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # Propagate the dispatcher's durable task priority to the point-of-use
+    # local-model capacity arbiter. Provider fallback is model-blind at claim
+    # time, so admission happens immediately before a concrete local call.
+    env["HERMES_KANBAN_PRIORITY"] = str(int(task.priority))
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
@@ -11795,8 +12159,12 @@ def _default_spawn(
     if requested_effort:
         cmd.extend(["--reasoning-effort", requested_effort])
         env["HERMES_REASONING_EFFORT"] = requested_effort
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
+    worker_toolsets = (
+        run_toolsets
+        if run_toolsets is not None
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
+    if worker_toolsets is not None:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
@@ -11811,6 +12179,21 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    # Cross-platform two-phase start gate. The child polls for an unguessable
+    # token and then attests the task/run/claim/PID tuple directly from the
+    # pinned DB before it can parse or execute the chat command. If the parent
+    # dies or attach fails, no token appears and the child exits on timeout.
+    gate_dir = log_dir / ".start-gates"
+    gate_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    gate_token = secrets.token_urlsafe(32)
+    gate_name = hashlib.sha256(
+        f"{task.id}:{task.current_run_id}:{gate_token}".encode("utf-8")
+    ).hexdigest()
+    gate_path = gate_dir / gate_name
+    env["HERMES_KANBAN_START_GATE_PATH"] = str(gate_path)
+    env["HERMES_KANBAN_START_GATE_TOKEN"] = gate_token
+    env["HERMES_KANBAN_START_GATE_TIMEOUT_SECONDS"] = "30"
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
@@ -11831,12 +12214,52 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
-    return proc.pid
+    except Exception:
+        log_f.close()
+        raise
+    # Popen duplicates the descriptor into the child, so the parent can close
+    # its copy immediately without interrupting worker logging.
+    log_f.close()
+
+    def _release() -> None:
+        fd = os.open(
+            gate_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.write(fd, gate_token.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _abort() -> None:
+        try:
+            gate_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if proc.poll() is not None:
+                return
+            if not _IS_WINDOWS and os.getpgid(proc.pid) == proc.pid:
+                import signal
+
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                if not _IS_WINDOWS and os.getpgid(proc.pid) == proc.pid:
+                    import signal
+
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+    return SpawnReceipt(pid=int(proc.pid), release=_release, abort=_abort)
 
 
 # ---------------------------------------------------------------------------

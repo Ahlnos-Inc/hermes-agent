@@ -12407,6 +12407,13 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # Dispatcher-launched workers begin behind a two-phase gate. Enforce it
+    # before recovery, profile loading, plugin discovery, model setup, or any
+    # other command work so an unattached process cannot consume resources.
+    from hermes_cli.kanban_start_gate import enforce_or_exit
+
+    enforce_or_exit()
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

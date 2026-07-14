@@ -2377,6 +2377,13 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    toolsets = args.get("toolsets")
+    if isinstance(toolsets, str):
+        toolsets = [toolsets]
+    if toolsets is not None and not isinstance(toolsets, (list, tuple)):
+        return tool_error(
+            f"toolsets must be a list of capability names, got {type(toolsets).__name__}"
+        )
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -2430,6 +2437,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                toolsets=toolsets,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -3163,6 +3171,17 @@ KANBAN_CREATE_SCHEMA = {
                     "assignee's profile."
                 ),
             },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional non-empty task-scoped runtime capabilities, "
+                    "for example ['terminal', 'file'] for an implementation "
+                    "worker or ['web'] for public research. When supplied, "
+                    "these replace the assignee profile's broad CLI toolsets; "
+                    "Kanban lifecycle tools remain mandatory."
+                ),
+            },
             "model_override": {
                 "type": "string",
                 "description": (
@@ -3300,6 +3319,15 @@ KANBAN_COMPILE_WORKFLOW_SCHEMA = {
                         "skills": {
                             "type": "array",
                             "items": {"type": "string"},
+                        },
+                        "toolsets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"},
+                            "description": (
+                                "Exact task-scoped runtime capabilities; "
+                                "Kanban lifecycle tools are appended."
+                            ),
                         },
                         "max_runtime_seconds": {"type": "integer"},
                         "priority": {"type": "integer"},

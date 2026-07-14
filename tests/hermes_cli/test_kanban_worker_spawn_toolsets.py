@@ -79,11 +79,12 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    receipt = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
-    assert pid == 4242
+    assert receipt.pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_KANBAN_PRIORITY"] == "0"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
@@ -190,13 +191,20 @@ def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
             model_override="gpt-5.6-sol",
             model_provider_override="openai-codex",
             model_reasoning_effort="xhigh",
+            toolsets=["terminal", "file"],
         )
         assert kb.claim_task(conn, tid) is not None
         conn.execute(
             "UPDATE tasks SET model_override = ?, "
-            "model_provider_override = ?, model_reasoning_effort = ? "
+            "model_provider_override = ?, model_reasoning_effort = ?, toolsets = ? "
             "WHERE id = ?",
-            ("claude-opus-4-8", "anthropic", "max", tid),
+            (
+                "claude-opus-4-8",
+                "anthropic",
+                "max",
+                json.dumps(["web", "browser"]),
+                tid,
+            ),
         )
         mutated_task = kb.get_task(conn, tid)
 
@@ -221,6 +229,10 @@ def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
     assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "openai-codex"
     assert captured["cmd"][captured["cmd"].index("--reasoning-effort") + 1] == "xhigh"
     assert captured["env"]["HERMES_MODEL"] == "gpt-5.6-sol"
+    pinned_toolsets = captured["cmd"][
+        captured["cmd"].index("--toolsets") + 1
+    ].split(",")
+    assert pinned_toolsets == ["terminal", "file"]
     assert json.loads(captured["env"]["HERMES_KANBAN_DELIVERY_POLICY"]) == {
         "version": 1,
         "disposition": "none",
