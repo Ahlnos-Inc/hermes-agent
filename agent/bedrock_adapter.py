@@ -779,6 +779,7 @@ def stream_converse_with_callbacks(
     on_text_delta=None,
     on_tool_start=None,
     on_reasoning_delta=None,
+    on_event=None,
     on_interrupt_check=None,
 ) -> SimpleNamespace:
     """Process a Bedrock ConverseStream event stream with real-time callbacks.
@@ -797,6 +798,9 @@ def stream_converse_with_callbacks(
         on_reasoning_delta: Called with reasoning/thinking text chunks.
             Bedrock surfaces thinking via ``reasoning`` content block deltas
             on supported models (Claude 4.6+).
+        on_event: Called once for every provider event before it is decoded.
+            Used by absolute first-event deadlines; it must not inspect or
+            retain provider payloads.
         on_interrupt_check: Called on each event. Should return True if the
             agent has been interrupted and streaming should stop.
 
@@ -814,6 +818,8 @@ def stream_converse_with_callbacks(
     usage_data: Dict[str, int] = {}
 
     for event in event_stream.get("stream", []):
+        if on_event:
+            on_event()
         # Check for interrupt
         if on_interrupt_check and on_interrupt_check():
             break

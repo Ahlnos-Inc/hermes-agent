@@ -11,6 +11,7 @@ from typing import Any
 from agent.claude_agent_runtime import ClaudeProjection, project_claude_messages
 from agent.claude_sdk_mcp import build_hermes_sdk_mcp_server
 from agent.claude_process_scope import WorkerProcessBroker
+from agent.request_budgets import AttemptDeadlineExceeded
 from agent.claude_subscription_env import build_claude_subscription_env
 from agent.claude_tool_guard import create_workspace_pre_tool_hook
 from agent.claude_workspace_terminal import (
@@ -231,6 +232,8 @@ class ClaudeAgentSdkSession:
         tool_progress_callback: Callable[..., Any] | None = None,
         resources: Iterable[Any] = (),
         initial_session_id: str | None = None,
+        total_attempt_timeout_seconds: float | None = None,
+        first_event_timeout_seconds: float | None = None,
     ) -> None:
         self._sdk = sdk
         self._options_factory = options_factory
@@ -238,6 +241,8 @@ class ClaudeAgentSdkSession:
         self._stream_delta_callback = stream_delta_callback
         self._tool_progress_callback = tool_progress_callback
         self._resources = list(resources)
+        self._total_attempt_timeout_seconds = total_attempt_timeout_seconds
+        self._first_event_timeout_seconds = first_event_timeout_seconds
 
     def close(self) -> None:
         for resource in self._resources:
@@ -262,45 +267,93 @@ class ClaudeAgentSdkSession:
         options = self._options_factory(self.session_id)
         events: list[Any] = []
         started_tools: set[str] = set()
-        async with sdk.ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            async for event in client.receive_response():
-                events.append(event)
-                if type(event).__name__ == "RateLimitEvent":
-                    immediate = project_claude_messages([event]).failure
-                    if immediate is not None and immediate.reason.value == "billing":
-                        await client.interrupt()
-                        break
-                if type(event).__name__ == "StreamEvent":
-                    raw = getattr(event, "event", None)
-                    event_type = raw.get("type") if isinstance(raw, Mapping) else getattr(raw, "type", None)
-                    delta = raw.get("delta") if isinstance(raw, Mapping) else getattr(raw, "delta", None)
-                    delta_type = delta.get("type") if isinstance(delta, Mapping) else getattr(delta, "type", None)
-                    text = delta.get("text") if isinstance(delta, Mapping) else getattr(delta, "text", None)
-                    if (
-                        event_type == "content_block_delta"
-                        and delta_type == "text_delta"
-                        and text
-                        and self._stream_delta_callback is not None
-                    ):
-                        self._stream_delta_callback(str(text))
-                if type(event).__name__ == "AssistantMessage" and self._tool_progress_callback:
-                    for block in getattr(event, "content", None) or []:
-                        if type(block).__name__ != "ToolUseBlock":
-                            continue
-                        call_id = str(getattr(block, "id", "") or "")
-                        if call_id in started_tools:
-                            continue
-                        started_tools.add(call_id)
-                        name = str(getattr(block, "name", "") or "")
-                        if name.startswith("mcp__hermes__"):
-                            name = name[len("mcp__hermes__") :]
-                        args = getattr(block, "input", None)
-                        if not isinstance(args, dict):
-                            args = {"input": args}
-                        self._tool_progress_callback(
-                            "tool.started", name, str(args)[:500], args
-                        )
+        started = asyncio.get_running_loop().time()
+        try:
+            async with asyncio.timeout(self._total_attempt_timeout_seconds):
+                async with sdk.ClaudeSDKClient(options=options) as client:
+                    await client.query(prompt)
+                    response_iter = client.receive_response().__aiter__()
+                    first_event = True
+                    while True:
+                        wait_seconds: float | None = None
+                        if first_event and self._first_event_timeout_seconds is not None:
+                            wait_seconds = (
+                                self._first_event_timeout_seconds
+                                - (asyncio.get_running_loop().time() - started)
+                            )
+                            if wait_seconds <= 0:
+                                try:
+                                    await asyncio.wait_for(client.interrupt(), timeout=2.0)
+                                except Exception:
+                                    pass
+                                raise AttemptDeadlineExceeded(
+                                    "Claude SDK produced no event before first-event "
+                                    f"deadline ({self._first_event_timeout_seconds:.1f}s)"
+                                )
+                        try:
+                            if wait_seconds is None:
+                                event = await anext(response_iter)
+                            else:
+                                event = await asyncio.wait_for(
+                                    anext(response_iter), timeout=wait_seconds
+                                )
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError:
+                            try:
+                                await asyncio.wait_for(client.interrupt(), timeout=2.0)
+                            except Exception:
+                                pass
+                            raise AttemptDeadlineExceeded(
+                                "Claude SDK produced no event before first-event "
+                                f"deadline ({self._first_event_timeout_seconds:.1f}s)"
+                            ) from None
+                        first_event = False
+                        events.append(event)
+                        if type(event).__name__ == "RateLimitEvent":
+                            immediate = project_claude_messages([event]).failure
+                            if immediate is not None and immediate.reason.value == "billing":
+                                await client.interrupt()
+                                break
+                        if type(event).__name__ == "StreamEvent":
+                            raw = getattr(event, "event", None)
+                            event_type = raw.get("type") if isinstance(raw, Mapping) else getattr(raw, "type", None)
+                            delta = raw.get("delta") if isinstance(raw, Mapping) else getattr(raw, "delta", None)
+                            delta_type = delta.get("type") if isinstance(delta, Mapping) else getattr(delta, "type", None)
+                            text = delta.get("text") if isinstance(delta, Mapping) else getattr(delta, "text", None)
+                            if (
+                                event_type == "content_block_delta"
+                                and delta_type == "text_delta"
+                                and text
+                                and self._stream_delta_callback is not None
+                            ):
+                                self._stream_delta_callback(str(text))
+                        if type(event).__name__ == "AssistantMessage" and self._tool_progress_callback:
+                            for block in getattr(event, "content", None) or []:
+                                if type(block).__name__ != "ToolUseBlock":
+                                    continue
+                                call_id = str(getattr(block, "id", "") or "")
+                                if call_id in started_tools:
+                                    continue
+                                started_tools.add(call_id)
+                                name = str(getattr(block, "name", "") or "")
+                                if name.startswith("mcp__hermes__"):
+                                    name = name[len("mcp__hermes__") :]
+                                args = getattr(block, "input", None)
+                                if not isinstance(args, dict):
+                                    args = {"input": args}
+                                self._tool_progress_callback(
+                                    "tool.started", name, str(args)[:500], args
+                                )
+        except AttemptDeadlineExceeded:
+            raise
+        except TimeoutError:
+            if self._total_attempt_timeout_seconds is None:
+                raise
+            raise AttemptDeadlineExceeded(
+                "Claude SDK attempt exceeded total deadline "
+                f"({self._total_attempt_timeout_seconds:.1f}s)"
+            ) from None
         return project_claude_messages(events)
 
 

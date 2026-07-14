@@ -30,11 +30,18 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.local_model_lease import (
+    LocalModelCapacityLease,
+    LocalModelLeaseError,
+    LocalModelLeaseTimeout,
+    acquire_local_model_capacity,
+)
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
+from agent.request_budgets import AttemptDeadlineExceeded, resolve_attempt_budgets
 from agent.transports.chat_completions import _normalize_developer_role
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -154,6 +161,62 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _local_model_attempt_deadline(
+    attempt_started_monotonic: float,
+    attempt_budgets,
+) -> float | None:
+    """Return the first absolute deadline that applies before first event."""
+    limits = [
+        float(value)
+        for value in (
+            attempt_budgets.total_seconds,
+            attempt_budgets.first_event_seconds,
+        )
+        if value is not None
+    ]
+    if not limits:
+        return None
+    return attempt_started_monotonic + min(limits)
+
+
+def _acquire_local_model_lease_for_attempt(
+    agent,
+    api_kwargs: dict,
+    *,
+    attempt_started_monotonic: float,
+    attempt_budgets,
+    cancelled,
+) -> LocalModelCapacityLease | None:
+    """Arbitrate only concrete local routes, after provider selection.
+
+    This helper intentionally lives at the provider-call boundary rather than
+    in the dispatcher: fallback can change the provider/model after a task has
+    already been claimed. Cloud routes and the external Claude Agent SDK never
+    enter this code path.
+    """
+    base_url = getattr(agent, "base_url", None)
+    if not isinstance(base_url, str) or not base_url or not is_local_endpoint(base_url):
+        return None
+    deadline = _local_model_attempt_deadline(
+        attempt_started_monotonic,
+        attempt_budgets,
+    )
+    try:
+        return acquire_local_model_capacity(
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(api_kwargs.get("model") or getattr(agent, "model", "") or ""),
+            base_url=base_url,
+            deadline_monotonic=deadline,
+            cancelled=cancelled,
+        )
+    except LocalModelLeaseTimeout as exc:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AttemptDeadlineExceeded(
+                "Local-model capacity was not available before provider-attempt deadline"
+            ) from exc
+        raise
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -169,6 +232,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     result = {"response": None, "error": None}
+    _attempt_budgets = resolve_attempt_budgets(agent)
+    _attempt_started_monotonic = time.monotonic()
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
     # Request-local cancellation flag. Distinct from agent._interrupt_requested
@@ -223,7 +288,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
+        local_model_lease = None
         try:
+            local_model_lease = _acquire_local_model_lease_for_attempt(
+                agent,
+                api_kwargs,
+                attempt_started_monotonic=_attempt_started_monotonic,
+                attempt_budgets=_attempt_budgets,
+                cancelled=lambda: bool(
+                    _request_cancelled["value"] or agent._interrupt_requested
+                ),
+            )
             if agent.api_mode == "codex_responses":
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
@@ -289,6 +364,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             result["error"] = e
         finally:
             _close_request_client_once("request_complete")
+            if local_model_lease is not None:
+                local_model_lease.release()
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -382,6 +459,43 @@ def interruptible_api_call(agent, api_kwargs: dict):
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
+
+        _attempt_elapsed = time.monotonic() - _attempt_started_monotonic
+        _deadline_seconds = _attempt_budgets.total_seconds
+        _deadline_label = "total"
+        if (
+            _attempt_budgets.first_event_seconds is not None
+            and (
+                _deadline_seconds is None
+                or _attempt_budgets.first_event_seconds < _deadline_seconds
+            )
+        ):
+            _deadline_seconds = _attempt_budgets.first_event_seconds
+            _deadline_label = "first-event"
+        if _deadline_seconds is not None and _attempt_elapsed >= _deadline_seconds:
+            _request_cancelled["value"] = True
+            message = (
+                f"Non-streaming provider attempt exceeded {_deadline_label} "
+                f"deadline ({_deadline_seconds:.1f}s)"
+            )
+            logger.warning(
+                "%s provider=%s model=%s elapsed=%.1fs",
+                message,
+                getattr(agent, "provider", None),
+                api_kwargs.get("model", "unknown"),
+                _attempt_elapsed,
+            )
+            try:
+                if agent.api_mode == "anthropic_messages":
+                    agent._anthropic_client.close()
+                    agent._rebuild_anthropic_client()
+                else:
+                    _close_request_client_once("absolute_attempt_deadline")
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            result["error"] = AttemptDeadlineExceeded(message)
+            break
 
         # Touch activity every ~30s so the gateway's inactivity
         # monitor knows we're alive while waiting for the response.
@@ -1159,6 +1273,12 @@ def _apply_fallback_route_limits(agent, fb: dict) -> None:
     )
     agent._route_stale_timeout_seconds = _positive_route_timeout(
         fb, "stale_timeout_seconds"
+    )
+    agent._route_total_attempt_timeout_seconds = _positive_route_timeout(
+        fb, "total_attempt_timeout_seconds"
+    )
+    agent._route_first_event_timeout_seconds = _positive_route_timeout(
+        fb, "first_event_timeout_seconds"
     )
 
 
@@ -2019,6 +2139,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    _attempt_budgets = resolve_attempt_budgets(agent)
+    _attempt_started_monotonic = time.monotonic()
+    _first_provider_event = {"seen": False}
+
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
         # in _interruptible_api_call already calls it; we just need to
@@ -2036,6 +2160,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         result = {"response": None, "error": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
+        bedrock_client_holder = {"client": None}
 
         def _fire_first():
             if not first_delta_fired["done"] and on_first_delta:
@@ -2058,6 +2183,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
                 client = _get_bedrock_runtime_client(region)
+                bedrock_client_holder["client"] = client
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
                 except Exception as _bedrock_exc:
@@ -2108,6 +2234,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_text_delta=_on_text if agent._has_stream_consumers() else None,
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
+                    on_event=lambda: _first_provider_event.__setitem__("seen", True),
                     on_interrupt_check=lambda: agent._interrupt_requested,
                 )
             except Exception as e:
@@ -2119,6 +2246,35 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             t.join(timeout=0.3)
             if agent._interrupt_requested:
                 raise InterruptedError("Agent interrupted during Bedrock API call")
+            elapsed = time.monotonic() - _attempt_started_monotonic
+            deadline_message = None
+            if (
+                _attempt_budgets.total_seconds is not None
+                and elapsed >= _attempt_budgets.total_seconds
+            ):
+                deadline_message = (
+                    "Bedrock provider attempt exceeded total deadline "
+                    f"({_attempt_budgets.total_seconds:.1f}s)"
+                )
+            elif (
+                _attempt_budgets.first_event_seconds is not None
+                and not _first_provider_event["seen"]
+                and elapsed >= _attempt_budgets.first_event_seconds
+            ):
+                deadline_message = (
+                    "Bedrock provider produced no event before deadline "
+                    f"({_attempt_budgets.first_event_seconds:.1f}s)"
+                )
+            if deadline_message is not None:
+                client = bedrock_client_holder.get("client")
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                t.join(timeout=2.0)
+                raise AttemptDeadlineExceeded(deadline_message)
         if result["error"] is not None:
             raise result["error"]
         return result["response"]
@@ -2286,6 +2442,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # with ``'types.SimpleNamespace' object is not iterable`` (#11732).
         response_choices = getattr(stream, "choices", None)
         if isinstance(response_choices, list) and response_choices:
+            _first_provider_event["seen"] = True
             logger.info(
                 "Streaming request returned a final response object instead of "
                 "an iterator; switching %s/%s to non-streaming for this session.",
@@ -2336,6 +2493,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         for chunk in stream:
+            _first_provider_event["seen"] = True
             last_chunk_time["t"] = time.time()
             agent._record_transport_activity("receiving stream response")
 
@@ -2640,6 +2798,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
             for event in stream:
+                _first_provider_event["seen"] = True
                 # Update stale-stream timer on every event so the
                 # outer poll loop knows data is flowing.  Without
                 # this, the detector kills healthy long-running
@@ -2706,8 +2865,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
 
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        local_model_lease = None
 
         try:
+            local_model_lease = _acquire_local_model_lease_for_attempt(
+                agent,
+                api_kwargs,
+                attempt_started_monotonic=_attempt_started_monotonic,
+                attempt_budgets=_attempt_budgets,
+                cancelled=lambda: bool(
+                    _request_cancelled["value"] or agent._interrupt_requested
+                ),
+            )
             for _stream_attempt in range(_max_stream_retries + 1):
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -3000,8 +3169,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # channel so callers never miss a fast pre-retry interrupt.
             result["error"] = e
             return
+        except (AttemptDeadlineExceeded, LocalModelLeaseError) as e:
+            # Capacity admission happens outside the transport retry loop.
+            # Surface a bounded/fail-closed queue error through the same result
+            # channel instead of letting the daemon worker die silently.
+            result["error"] = e
+            return
         finally:
             _close_request_client_once("stream_request_complete")
+            if local_model_lease is not None:
+                local_model_lease.release()
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = getattr(agent, "_route_stale_timeout_seconds", None)
@@ -3015,8 +3192,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
     if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
-        _stream_stale_timeout = float("inf")
-        logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
+        if _attempt_budgets.total_seconds is not None:
+            _stream_stale_timeout = min(
+                _stream_stale_timeout_base,
+                _attempt_budgets.total_seconds,
+            )
+            logger.debug(
+                "Local provider detected (%s) — explicit attempt budget keeps "
+                "idle protection at %.0fs",
+                agent.base_url,
+                _stream_stale_timeout,
+            )
+        else:
+            _stream_stale_timeout = float("inf")
+            logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
         # Scale the stale timeout for large contexts: slow models (like Opus)
         # can legitimately think for minutes before producing the first token
@@ -3048,6 +3237,49 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
         t.join(timeout=0.3)
+
+        _attempt_elapsed = time.monotonic() - _attempt_started_monotonic
+        _deadline_message = None
+        _deadline_reason = None
+        if (
+            _attempt_budgets.total_seconds is not None
+            and _attempt_elapsed >= _attempt_budgets.total_seconds
+        ):
+            _deadline_reason = "total_attempt_deadline"
+            _deadline_message = (
+                "Streaming provider attempt exceeded total deadline "
+                f"({_attempt_budgets.total_seconds:.1f}s)"
+            )
+        elif (
+            _attempt_budgets.first_event_seconds is not None
+            and not _first_provider_event["seen"]
+            and _attempt_elapsed >= _attempt_budgets.first_event_seconds
+        ):
+            _deadline_reason = "first_event_deadline"
+            _deadline_message = (
+                "Streaming provider produced no event before deadline "
+                f"({_attempt_budgets.first_event_seconds:.1f}s)"
+            )
+        if _deadline_message is not None:
+            _request_cancelled["value"] = True
+            logger.warning(
+                "%s provider=%s model=%s elapsed=%.1fs",
+                _deadline_message,
+                getattr(agent, "provider", None),
+                api_kwargs.get("model", "unknown"),
+                _attempt_elapsed,
+            )
+            try:
+                if agent.api_mode == "anthropic_messages":
+                    agent._anthropic_client.close()
+                    agent._rebuild_anthropic_client()
+                else:
+                    _close_request_client_once(str(_deadline_reason))
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            result["error"] = AttemptDeadlineExceeded(_deadline_message)
+            break
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting

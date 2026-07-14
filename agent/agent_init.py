@@ -552,6 +552,8 @@ def init_agent(
     # undo fallback-specific timeout policy without rebuilding configuration.
     agent._route_request_timeout_seconds = None
     agent._route_stale_timeout_seconds = None
+    agent._route_total_attempt_timeout_seconds = None
+    agent._route_first_event_timeout_seconds = None
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
@@ -1969,6 +1971,8 @@ def init_agent(
         "max_tokens": agent.max_tokens,
         "route_request_timeout_seconds": agent._route_request_timeout_seconds,
         "route_stale_timeout_seconds": agent._route_stale_timeout_seconds,
+        "route_total_attempt_timeout_seconds": agent._route_total_attempt_timeout_seconds,
+        "route_first_event_timeout_seconds": agent._route_first_event_timeout_seconds,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

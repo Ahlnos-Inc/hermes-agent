@@ -92,6 +92,8 @@ class CLIAgentSetupMixin:
         resolved_max_output_tokens = runtime.get("max_output_tokens")
         resolved_request_timeout = runtime.get("request_timeout_seconds")
         resolved_stale_timeout = runtime.get("stale_timeout_seconds")
+        resolved_total_attempt_timeout = runtime.get("total_attempt_timeout_seconds")
+        resolved_first_event_timeout = runtime.get("first_event_timeout_seconds")
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
@@ -143,6 +145,10 @@ class CLIAgentSetupMixin:
             != getattr(self, "_route_request_timeout_seconds", None)
             or resolved_stale_timeout
             != getattr(self, "_route_stale_timeout_seconds", None)
+            or resolved_total_attempt_timeout
+            != getattr(self, "_route_total_attempt_timeout_seconds", None)
+            or resolved_first_event_timeout
+            != getattr(self, "_route_first_event_timeout_seconds", None)
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
@@ -154,6 +160,8 @@ class CLIAgentSetupMixin:
         self._route_max_output_tokens = resolved_max_output_tokens
         self._route_request_timeout_seconds = resolved_request_timeout
         self._route_stale_timeout_seconds = resolved_stale_timeout
+        self._route_total_attempt_timeout_seconds = resolved_total_attempt_timeout
+        self._route_first_event_timeout_seconds = resolved_first_event_timeout
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
@@ -228,6 +236,12 @@ class CLIAgentSetupMixin:
             "stale_timeout_seconds": getattr(
                 self, "_route_stale_timeout_seconds", None
             ),
+            "total_attempt_timeout_seconds": getattr(
+                self, "_route_total_attempt_timeout_seconds", None
+            ),
+            "first_event_timeout_seconds": getattr(
+                self, "_route_first_event_timeout_seconds", None
+            ),
         }
         route = {
             "model": self.model,
@@ -280,6 +294,7 @@ class CLIAgentSetupMixin:
                 model=model_override or self.model,
                 provider=self.requested_provider,
                 reasoning_config=self.reasoning_config,
+                toolsets=getattr(self, "enabled_toolsets", None),
             )
         except RunRouteMismatch as exc:
             ChatConsole().print(
@@ -409,6 +424,12 @@ class CLIAgentSetupMixin:
                 "stale_timeout_seconds": getattr(
                     self, "_route_stale_timeout_seconds", None
                 ),
+                "total_attempt_timeout_seconds": getattr(
+                    self, "_route_total_attempt_timeout_seconds", None
+                ),
+                "first_event_timeout_seconds": getattr(
+                    self, "_route_first_event_timeout_seconds", None
+                ),
             }
             effective_model = model_override or self.model
             route_max_tokens = runtime.get("max_output_tokens")
@@ -472,6 +493,23 @@ class CLIAgentSetupMixin:
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
             )
+            # Project the resolved route budgets onto the concrete agent and
+            # its primary-runtime snapshot. These limits are control-plane
+            # policy, not provider credentials, and must survive turn restores.
+            for field, runtime_key in (
+                ("_route_request_timeout_seconds", "request_timeout_seconds"),
+                ("_route_stale_timeout_seconds", "stale_timeout_seconds"),
+                (
+                    "_route_total_attempt_timeout_seconds",
+                    "total_attempt_timeout_seconds",
+                ),
+                ("_route_first_event_timeout_seconds", "first_event_timeout_seconds"),
+            ):
+                value = runtime.get(runtime_key)
+                setattr(self.agent, field, value)
+                primary_key = field.removeprefix("_")
+                if isinstance(getattr(self.agent, "_primary_runtime", None), dict):
+                    self.agent._primary_runtime[primary_key] = value
             # The requested route was checked before construction; now attest
             # the route the fully initialized agent will actually use. This is
             # synchronous and fail-closed for contracted Kanban workers.

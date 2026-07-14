@@ -615,10 +615,20 @@ def _lift_route_limits(
         entry.get("request_timeout_seconds")
     )
     stale_timeout = _positive_finite_number(entry.get("stale_timeout_seconds"))
+    total_attempt_timeout = _positive_finite_number(
+        entry.get("total_attempt_timeout_seconds")
+    )
+    first_event_timeout = _positive_finite_number(
+        entry.get("first_event_timeout_seconds")
+    )
     if request_timeout is not None:
         result["request_timeout_seconds"] = request_timeout
     if stale_timeout is not None:
         result["stale_timeout_seconds"] = stale_timeout
+    if total_attempt_timeout is not None:
+        result["total_attempt_timeout_seconds"] = total_attempt_timeout
+    if first_event_timeout is not None:
+        result["first_event_timeout_seconds"] = first_event_timeout
 
     models = entry.get("models")
     model_entry = models.get(model, {}) if isinstance(models, dict) and model else {}
@@ -631,10 +641,20 @@ def _lift_route_limits(
     stale_timeout = _positive_finite_number(
         model_entry.get("stale_timeout_seconds")
     )
+    total_attempt_timeout = _positive_finite_number(
+        model_entry.get("total_attempt_timeout_seconds")
+    )
+    first_event_timeout = _positive_finite_number(
+        model_entry.get("first_event_timeout_seconds")
+    )
     if request_timeout is not None:
         result["request_timeout_seconds"] = request_timeout
     if stale_timeout is not None:
         result["stale_timeout_seconds"] = stale_timeout
+    if total_attempt_timeout is not None:
+        result["total_attempt_timeout_seconds"] = total_attempt_timeout
+    if first_event_timeout is not None:
+        result["first_event_timeout_seconds"] = first_event_timeout
 
 
 def _copy_route_limits(source: Mapping[str, Any], result: Dict[str, Any]) -> None:
@@ -642,6 +662,8 @@ def _copy_route_limits(source: Mapping[str, Any], result: Dict[str, Any]) -> Non
         "max_output_tokens",
         "request_timeout_seconds",
         "stale_timeout_seconds",
+        "total_attempt_timeout_seconds",
+        "first_event_timeout_seconds",
     ):
         if key in source:
             result[key] = source[key]

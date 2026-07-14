@@ -624,3 +624,87 @@ def test_session_interrupts_immediately_when_overage_event_arrives():
     assert projection.failure.reason.value == "billing"
     assert FakeClient.interrupted is True
     assert consumed_after_overage == []
+
+
+def test_session_enforces_first_event_deadline():
+    from agent.request_budgets import AttemptDeadlineExceeded
+
+    class FakeClient:
+        interrupted = False
+
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def query(self, prompt):
+            pass
+
+        async def interrupt(self):
+            type(self).interrupted = True
+
+        async def receive_response(self):
+            await asyncio.sleep(1.0)
+            if False:
+                yield None
+
+    FakeSdk.ClaudeSDKClient = FakeClient
+    session = ClaudeAgentSdkSession(
+        sdk=FakeSdk,
+        options_factory=lambda resume: FakeOptions(resume=resume),
+        total_attempt_timeout_seconds=1.0,
+        first_event_timeout_seconds=0.05,
+    )
+
+    with pytest.raises(AttemptDeadlineExceeded, match="no event"):
+        session.run_turn("must not hang")
+
+    assert FakeClient.interrupted is True
+
+
+def test_session_enforces_total_deadline_despite_continuous_events():
+    from dataclasses import dataclass
+
+    from agent.request_budgets import AttemptDeadlineExceeded
+
+    @dataclass
+    class StreamEvent:
+        event: dict
+
+    class FakeClient:
+        exited = False
+
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            type(self).exited = True
+            return False
+
+        async def query(self, prompt):
+            pass
+
+        async def receive_response(self):
+            while True:
+                await asyncio.sleep(0.01)
+                yield StreamEvent({"type": "ping"})
+
+    FakeSdk.ClaudeSDKClient = FakeClient
+    session = ClaudeAgentSdkSession(
+        sdk=FakeSdk,
+        options_factory=lambda resume: FakeOptions(resume=resume),
+        total_attempt_timeout_seconds=0.06,
+        first_event_timeout_seconds=0.04,
+    )
+
+    with pytest.raises(AttemptDeadlineExceeded, match="total deadline"):
+        session.run_turn("continuous pings cannot extend the deadline")
+
+    assert FakeClient.exited is True

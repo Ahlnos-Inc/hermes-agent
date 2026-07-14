@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -12,6 +13,29 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+
+logger = logging.getLogger(__name__)
+
+
+class ClaudeAttestationError(RuntimeError):
+    """Secret-free typed failure from the exact-environment auth probe."""
+
+    permanent = False
+
+    def __init__(self, message: str, *, diagnostic: Mapping[str, object]):
+        super().__init__(message)
+        self.diagnostic = dict(diagnostic)
+
+
+class ClaudeAttestationTransientError(ClaudeAttestationError):
+    """The auth probe did not produce an authoritative subscription state."""
+
+
+class ClaudeAttestationRejectedError(ClaudeAttestationError):
+    """The probe authoritatively reported a non-Max/non-first-party login."""
+
+    permanent = True
 
 
 @dataclass(frozen=True)
@@ -102,6 +126,8 @@ def attest_claude_max_auth(
     cli_wrapper: str | Path,
     *,
     cache_ttl_seconds: float = 60,
+    max_attempts: int = 2,
+    retry_delay_seconds: float = 0.15,
 ) -> ClaudeMaxAttestation:
     """Require same-binary, same-environment first-party Max authentication."""
 
@@ -112,30 +138,115 @@ def attest_claude_max_auth(
         cached = _ATTESTATION_CACHE.get(key)
         if cached and now - cached.checked_at < cache_ttl_seconds:
             return cached
-    try:
-        result = subprocess.run(
-            [str(wrapper), "auth", "status"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        payload = json.loads(result.stdout) if result.returncode == 0 else {}
-    except Exception as exc:
-        invalidate_claude_auth_attestation(wrapper)
-        raise RuntimeError(f"Claude Max attestation failed: {exc}") from exc
     required = {
         "loggedIn": True,
         "authMethod": "claude.ai",
         "apiProvider": "firstParty",
         "subscriptionType": "max",
     }
-    if any(payload.get(field) != expected for field, expected in required.items()):
+    attempts = max(int(max_attempts), 1)
+    payload: dict[str, object] | None = None
+    last_transient: ClaudeAttestationTransientError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                [str(wrapper), "auth", "status"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_transient = ClaudeAttestationTransientError(
+                "Claude Max attestation probe timed out",
+                diagnostic={"stage": "auth_status", "kind": "timeout", "attempt": attempt},
+            )
+        except OSError as exc:
+            last_transient = ClaudeAttestationTransientError(
+                "Claude Max attestation probe could not start",
+                diagnostic={
+                    "stage": "auth_status",
+                    "kind": "spawn_error",
+                    "errno": getattr(exc, "errno", None),
+                    "attempt": attempt,
+                },
+            )
+        else:
+            stderr_hash = hashlib.sha256((result.stderr or "").encode()).hexdigest()[:16]
+            stdout_hash = hashlib.sha256((result.stdout or "").encode()).hexdigest()[:16]
+            if result.returncode != 0:
+                last_transient = ClaudeAttestationTransientError(
+                    "Claude Max attestation probe returned non-zero",
+                    diagnostic={
+                        "stage": "auth_status",
+                        "kind": "nonzero_exit",
+                        "returncode": int(result.returncode),
+                        "stderr_sha256": stderr_hash,
+                        "attempt": attempt,
+                    },
+                )
+            else:
+                try:
+                    raw_payload = json.loads(result.stdout)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    last_transient = ClaudeAttestationTransientError(
+                        "Claude Max attestation probe returned invalid JSON",
+                        diagnostic={
+                            "stage": "auth_status",
+                            "kind": "invalid_json",
+                            "stdout_sha256": stdout_hash,
+                            "attempt": attempt,
+                        },
+                    )
+                else:
+                    if not isinstance(raw_payload, dict):
+                        last_transient = ClaudeAttestationTransientError(
+                            "Claude Max attestation probe returned a non-object payload",
+                            diagnostic={
+                                "stage": "auth_status",
+                                "kind": "invalid_shape",
+                                "attempt": attempt,
+                            },
+                        )
+                    else:
+                        missing = sorted(field for field in required if field not in raw_payload)
+                        if missing:
+                            last_transient = ClaudeAttestationTransientError(
+                                "Claude Max attestation probe omitted required fields",
+                                diagnostic={
+                                    "stage": "auth_status",
+                                    "kind": "missing_fields",
+                                    "fields": missing,
+                                    "attempt": attempt,
+                                },
+                            )
+                        else:
+                            mismatched = sorted(
+                                field
+                                for field, expected in required.items()
+                                if raw_payload.get(field) != expected
+                            )
+                            if mismatched:
+                                invalidate_claude_auth_attestation(wrapper)
+                                raise ClaudeAttestationRejectedError(
+                                    "Claude Max attestation rejected the exact-environment login",
+                                    diagnostic={
+                                        "stage": "auth_status",
+                                        "kind": "subscription_mismatch",
+                                        "fields": mismatched,
+                                        "attempt": attempt,
+                                    },
+                                )
+                            payload = raw_payload
+                            break
+        if attempt < attempts:
+            time.sleep(max(float(retry_delay_seconds), 0.0))
+
+    if payload is None:
         invalidate_claude_auth_attestation(wrapper)
-        raise RuntimeError(
-            "Claude Max attestation failed: exact-environment CLI is not "
-            "logged into a first-party Max subscription"
-        )
+        assert last_transient is not None
+        logger.warning("Claude Max attestation transient failure: %s", last_transient.diagnostic)
+        raise last_transient
     attestation = ClaudeMaxAttestation(
         auth_method="claude.ai",
         api_provider="firstParty",
@@ -155,6 +266,9 @@ def attest_claude_max_auth(
 
 
 __all__ = [
+    "ClaudeAttestationError",
+    "ClaudeAttestationRejectedError",
+    "ClaudeAttestationTransientError",
     "ClaudeMaxAttestation",
     "attest_claude_max_auth",
     "create_exact_env_cli_wrapper",

@@ -15,6 +15,10 @@ from agent.external_runtime import (
     run_claude_agent_sdk_attempt,
 )
 from agent.claude_agent_runtime import ClaudeProjection, RuntimeFailure
+from agent.claude_cli_boundary import (
+    ClaudeAttestationRejectedError,
+    ClaudeAttestationTransientError,
+)
 from agent.error_classifier import FailoverReason
 
 
@@ -44,6 +48,43 @@ def test_missing_lazy_sdk_becomes_replay_safe_failure(monkeypatch, tmp_path):
     assert projection.failure is not None
     assert projection.failure.replay_safe is True
     assert "SDK is not installed" in projection.failure.message
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            ClaudeAttestationTransientError(
+                "probe unavailable", diagnostic={"kind": "timeout"}
+            ),
+            FailoverReason.unknown,
+        ),
+        (
+            ClaudeAttestationRejectedError(
+                "wrong subscription", diagnostic={"kind": "subscription_mismatch"}
+            ),
+            FailoverReason.auth_permanent,
+        ),
+    ],
+)
+def test_preflight_uses_typed_attestation_classification(
+    monkeypatch, tmp_path, error, expected
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-472")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(external_runtime.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(external_runtime, "load_claude_agent_sdk", lambda: SimpleNamespace(__file__=__file__))
+    monkeypatch.setattr(external_runtime, "get_host_user_home", lambda: tmp_path)
+    monkeypatch.setattr(external_runtime, "build_claude_subscription_env", lambda *a, **k: {})
+    monkeypatch.setattr(external_runtime, "create_exact_env_cli_wrapper", lambda *a, **k: tmp_path / "wrapper")
+    monkeypatch.setattr(external_runtime, "attest_claude_max_auth", lambda *a, **k: (_ for _ in ()).throw(error))
+
+    failure = prepare_claude_agent_sdk_runtime(
+        SimpleNamespace(provider="anthropic", model="claude-haiku")
+    )
+
+    assert failure is not None
+    assert failure.reason is expected
 
 
 def test_external_runtime_uses_active_profile_capability_policy(

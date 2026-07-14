@@ -3,8 +3,10 @@ from __future__ import annotations
 import textwrap
 
 from hermes_cli.timeouts import (
+    get_provider_first_event_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
+    get_provider_total_attempt_timeout,
 )
 
 
@@ -41,6 +43,30 @@ def test_provider_timeout_used_when_no_model_override(monkeypatch, tmp_path):
     )
 
     assert get_provider_request_timeout("ollama-local", "qwen3:32b") == 300.0
+    assert get_provider_total_attempt_timeout("ollama-local", "qwen3:32b") == 300.0
+
+
+def test_explicit_attempt_budgets_override_legacy_request_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ollama-local:
+            request_timeout_seconds: 900
+            total_attempt_timeout_seconds: 240
+            first_event_timeout_seconds: 90
+            models:
+              qwen3:32b:
+                total_attempt_timeout_seconds: 180
+                first_event_timeout_seconds: 60
+        """,
+    )
+
+    assert get_provider_total_attempt_timeout("ollama-local", "qwen3:32b") == 180.0
+    assert get_provider_first_event_timeout("ollama-local", "qwen3:32b") == 60.0
+    assert get_provider_total_attempt_timeout("ollama-local", "other") == 240.0
+    assert get_provider_first_event_timeout("ollama-local", "other") == 90.0
 
 
 def test_model_stale_timeout_override_wins(monkeypatch, tmp_path):

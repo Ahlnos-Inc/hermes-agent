@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from agent.claude_cli_boundary import (
+    ClaudeAttestationError,
+    ClaudeAttestationRejectedError,
     attest_claude_max_auth,
     create_exact_env_cli_wrapper,
     invalidate_claude_auth_attestation,
@@ -24,6 +26,7 @@ from agent.claude_sdk_session import (
     load_claude_agent_sdk,
 )
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.request_budgets import resolve_attempt_budgets
 from agent.claude_subscription_env import build_claude_subscription_env
 from agent.claude_workspace_terminal import build_workspace_seatbelt_profile
 from agent.claude_workspace_files import WorkspaceFileBroker
@@ -230,17 +233,32 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
         )
         attestation = attest_claude_max_auth(cli_wrapper)
     except Exception as exc:
+        if isinstance(exc, ClaudeAttestationError):
+            _runtime_events_logger.warning(
+                "claude_auth_attestation_failure %s",
+                json.dumps(
+                    {
+                        **exc.diagnostic,
+                        "permanent": bool(exc.permanent),
+                        "kanban_worker": bool(kanban_task_id),
+                        "host_home_resolved": bool(locals().get("host_home")),
+                        "wrapper_created": bool(locals().get("cli_wrapper")),
+                    },
+                    sort_keys=True,
+                ),
+            )
+            return RuntimeFailure(
+                FailoverReason.auth_permanent
+                if isinstance(exc, ClaudeAttestationRejectedError)
+                else FailoverReason.unknown,
+                str(exc),
+            )
         classified = classify_api_error(
             exc,
             provider=str(getattr(agent, "provider", "") or ""),
             model=str(getattr(agent, "model", "") or ""),
         )
-        reason = (
-            FailoverReason.auth_permanent
-            if isinstance(exc, RuntimeError) and "attestation" in str(exc).lower()
-            else classified.reason
-        )
-        return RuntimeFailure(reason, classified.message or str(exc))
+        return RuntimeFailure(classified.reason, classified.message or str(exc))
     agent._claude_max_attestation = attestation
     agent._claude_cli_wrapper = str(cli_wrapper)
     agent._claude_runtime_context = {
@@ -317,6 +335,7 @@ def run_claude_agent_sdk_attempt(
                 ),
             )
 
+        attempt_budgets = resolve_attempt_budgets(agent)
         sessions[key] = ClaudeAgentSdkSession(
             sdk=sdk,
             options_factory=_options,
@@ -327,6 +346,8 @@ def run_claude_agent_sdk_attempt(
                 getattr(agent, "_claude_resume_session_id", None)
                 or _load_persisted_claude_session_id(agent)
             ),
+            total_attempt_timeout_seconds=attempt_budgets.total_seconds,
+            first_event_timeout_seconds=attempt_budgets.first_event_seconds,
         )
 
     def _clear_auth_state() -> None:

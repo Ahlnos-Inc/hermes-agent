@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
+
 
 def _coerce_timeout(raw: object) -> float | None:
     try:
         timeout = float(raw)
     except (TypeError, ValueError):
         return None
-    if timeout <= 0:
+    if timeout <= 0 or not math.isfinite(timeout):
         return None
     return timeout
 
@@ -38,6 +40,46 @@ def get_provider_request_timeout(
             return timeout
 
     return _coerce_timeout(provider_config.get("request_timeout_seconds"))
+
+
+def get_provider_total_attempt_timeout(
+    provider_id: str, model: str | None = None
+) -> float | None:
+    """Return the absolute attempt budget, aliasing legacy request timeout."""
+    provider_config = _get_provider_config(provider_id)
+    if provider_config is None:
+        return None
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        timeout = _coerce_timeout(model_config.get("total_attempt_timeout_seconds"))
+        if timeout is not None:
+            return timeout
+        timeout = _coerce_timeout(
+            model_config.get(
+                "timeout_seconds", model_config.get("request_timeout_seconds")
+            )
+        )
+        if timeout is not None:
+            return timeout
+    timeout = _coerce_timeout(provider_config.get("total_attempt_timeout_seconds"))
+    if timeout is not None:
+        return timeout
+    return _coerce_timeout(provider_config.get("request_timeout_seconds"))
+
+
+def get_provider_first_event_timeout(
+    provider_id: str, model: str | None = None
+) -> float | None:
+    """Return an explicit time-to-first-provider-event budget."""
+    provider_config = _get_provider_config(provider_id)
+    if provider_config is None:
+        return None
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        timeout = _coerce_timeout(model_config.get("first_event_timeout_seconds"))
+        if timeout is not None:
+            return timeout
+    return _coerce_timeout(provider_config.get("first_event_timeout_seconds"))
 
 
 def get_provider_stale_timeout(
@@ -80,3 +122,19 @@ def _get_model_config(
     if isinstance(model_config, dict):
         return model_config
     return None
+
+
+def _get_provider_config(provider_id: str) -> dict[str, object] | None:
+    if not provider_id:
+        return None
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return None
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    provider_config = (
+        providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    )
+    return provider_config if isinstance(provider_config, dict) else None

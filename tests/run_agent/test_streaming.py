@@ -467,7 +467,7 @@ class TestStreamingCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._record_transport_activity = lambda desc: touch_calls.append(desc)
 
         agent._interruptible_streaming_api_call({})
 
@@ -959,7 +959,7 @@ class TestCodexStreamCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._record_transport_activity = lambda desc: touch_calls.append(desc)
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
@@ -1037,7 +1037,7 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._record_transport_activity = lambda desc: touch_calls.append(desc)
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
@@ -1091,7 +1091,7 @@ class TestAnthropicStreamCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._record_transport_activity = lambda desc: touch_calls.append(desc)
 
         events = [
             SimpleNamespace(

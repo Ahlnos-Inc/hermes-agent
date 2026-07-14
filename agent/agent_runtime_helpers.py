@@ -1174,6 +1174,12 @@ def restore_primary_runtime(agent) -> bool:
         agent._route_stale_timeout_seconds = rt.get(
             "route_stale_timeout_seconds"
         )
+        agent._route_total_attempt_timeout_seconds = rt.get(
+            "route_total_attempt_timeout_seconds"
+        )
+        agent._route_first_event_timeout_seconds = rt.get(
+            "route_first_event_timeout_seconds"
+        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]

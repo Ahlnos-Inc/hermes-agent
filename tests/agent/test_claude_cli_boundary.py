@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from agent.claude_cli_boundary import (
+    ClaudeAttestationRejectedError,
+    ClaudeAttestationTransientError,
     attest_claude_max_auth,
     create_exact_env_cli_wrapper,
 )
@@ -164,5 +166,59 @@ def test_auth_attestation_fails_closed_for_non_max_routes(tmp_path, override):
         tmp_path / "bad-wrapper",
     )
 
-    with pytest.raises(RuntimeError, match="Claude Max attestation failed"):
+    with pytest.raises(ClaudeAttestationRejectedError, match="attestation rejected"):
         attest_claude_max_auth(wrapper, cache_ttl_seconds=0)
+
+
+def test_auth_attestation_retries_transient_nonzero_then_succeeds(monkeypatch, tmp_path):
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    good = {
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "subscriptionType": "max",
+    }
+    calls = iter(
+        [
+            subprocess.CompletedProcess([], 75, "", "transient detail"),
+            subprocess.CompletedProcess([], 0, json.dumps(good), ""),
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(calls))
+
+    result = attest_claude_max_auth(
+        wrapper,
+        cache_ttl_seconds=0,
+        max_attempts=2,
+        retry_delay_seconds=0,
+    )
+
+    assert result.included_usage is True
+
+
+@pytest.mark.parametrize("payload", ["not-json", "{}", "[]"])
+def test_auth_attestation_inconclusive_payload_is_transient(monkeypatch, tmp_path, payload):
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, payload, ""),
+    )
+
+    with pytest.raises(ClaudeAttestationTransientError) as raised:
+        attest_claude_max_auth(
+            wrapper,
+            cache_ttl_seconds=0,
+            max_attempts=1,
+            retry_delay_seconds=0,
+        )
+
+    assert raised.value.diagnostic["kind"] in {
+        "invalid_json",
+        "missing_fields",
+        "invalid_shape",
+    }
