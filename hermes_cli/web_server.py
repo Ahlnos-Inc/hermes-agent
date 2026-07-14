@@ -8872,10 +8872,15 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     with _CRON_PROFILE_LOCK:
         from cron import jobs as cron_jobs
         from cron.scheduler_provider import resolve_cron_scheduler
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
         old_output_dir = cron_jobs.OUTPUT_DIR
+        token = set_hermes_home_override(str(home))
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
@@ -8886,6 +8891,7 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
             cron_jobs.OUTPUT_DIR = old_output_dir
+            reset_hermes_home_override(token)
 
 
 @app.post("/api/cron/fire")

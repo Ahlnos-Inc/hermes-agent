@@ -37,6 +37,7 @@ def cron_scheduler_enabled() -> bool:
         from utils import fast_safe_load
 
         config_path = get_config_path()
+        raw_config = None
         if config_path.exists():
             try:
                 with config_path.open(encoding="utf-8") as handle:
@@ -48,6 +49,13 @@ def cron_scheduler_enabled() -> bool:
                     "Cron scheduler disabled: cannot parse profile config %s: %s",
                     config_path,
                     exc,
+                )
+                return False
+            raw_cron = raw_config.get("cron")
+            if "cron" in raw_config and not isinstance(raw_cron, dict):
+                logging.getLogger("cron.scheduler_provider").error(
+                    "Cron scheduler disabled: cron section in %s must be a mapping",
+                    config_path,
                 )
                 return False
         config = load_config() or {}

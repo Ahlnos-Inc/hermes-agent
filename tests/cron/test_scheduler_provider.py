@@ -242,6 +242,17 @@ def test_cron_scheduler_fails_closed_on_malformed_profile_config(tmp_path, monke
     assert sp.cron_scheduler_enabled() is False
 
 
+def test_cron_scheduler_fails_closed_on_non_mapping_cron_section(tmp_path, monkeypatch):
+    from cron import scheduler_provider as sp
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("cron: []\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert sp.cron_scheduler_enabled() is False
+
+
 def test_disabled_resolver_never_loads_or_fires_provider(monkeypatch):
     from cron import scheduler_provider as sp
 

@@ -140,3 +140,26 @@ def test_valid_token_accepts_and_fires(monkeypatch):
         client.close()
     # background task ran the fire for the resolved profile
     assert fired == [("default", "j1")]
+
+
+def test_profile_fire_uses_target_profile_cron_authority(tmp_path, monkeypatch):
+    """A dashboard running an enabled profile cannot fire a disabled target."""
+    active_home = tmp_path / "active"
+    target_home = tmp_path / "target"
+    active_home.mkdir()
+    target_home.mkdir()
+    (active_home / "config.yaml").write_text("cron:\n  enabled: true\n")
+    (target_home / "config.yaml").write_text("cron:\n  enabled: false\n")
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+    monkeypatch.setattr(
+        web_server,
+        "_cron_profile_home",
+        lambda profile: (str(profile), target_home),
+    )
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda job_id: True)
+    monkeypatch.setattr(
+        "cron.jobs.get_job", lambda job_id: {"id": job_id, "name": "must-not-run"}
+    )
+    monkeypatch.setattr("cron.scheduler.run_one_job", lambda job, **kwargs: True)
+
+    assert web_server._fire_cron_job_for_profile("disabled-target", "job-1") is False
