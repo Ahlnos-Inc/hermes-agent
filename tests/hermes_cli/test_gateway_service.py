@@ -1390,46 +1390,10 @@ class TestLaunchdServiceRecovery:
         assert excinfo.value.code == 1
         assert "ai.hermes.gateway-coder" in capsys.readouterr().out
 
-    @pytest.mark.parametrize(
-        "caller_label",
-        ["ai.hermes.gateway", "ai.hermes.gateway-coder"],
-    )
-    def test_gateway_restart_all_restores_every_launchd_label_from_each_caller(
-        self, tmp_path, monkeypatch, caller_label
+    def test_gateway_restart_all_uses_per_target_transaction_without_global_sweep(
+        self, monkeypatch
     ):
-        """--all restarts the inventory, not just the caller's profile."""
-        agents_dir = tmp_path / "Library" / "LaunchAgents"
-        agents_dir.mkdir(parents=True)
-        default_plist = agents_dir / "ai.hermes.gateway.plist"
-        coder_plist = agents_dir / "ai.hermes.gateway-coder.plist"
-        _write_launchd_gateway_plist(default_plist, "ai.hermes.gateway")
-        _write_launchd_gateway_plist(coder_plist, "ai.hermes.gateway-coder")
-
-        events = []
-        registered = {
-            "gui/501/ai.hermes.gateway",
-            "user/501/ai.hermes.gateway-coder",
-        }
-
-        def fake_run(cmd, check=False, **kwargs):
-            events.append(cmd)
-            rc = 0
-            if cmd[:2] == ["launchctl", "print"]:
-                rc = 0 if cmd[2] in registered else 113
-            result = SimpleNamespace(returncode=rc, stdout="", stderr="")
-            if check and rc:
-                raise subprocess.CalledProcessError(rc, cmd)
-            return result
-
-        monkeypatch.setattr(os, "getuid", lambda: 501)
-        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
-        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: caller_label)
-        monkeypatch.setattr(
-            gateway_cli,
-            "get_launchd_plist_path",
-            lambda: default_plist if caller_label == "ai.hermes.gateway" else coder_plist,
-        )
-        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda **kwargs: False)
+        calls = []
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
@@ -1438,26 +1402,19 @@ class TestLaunchdServiceRecovery:
             gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
         )
         monkeypatch.setattr(
+            gateway_cli, "launchd_restart_all", lambda: calls.append("restart-all")
+        )
+        monkeypatch.setattr(
             gateway_cli,
             "kill_gateway_processes",
-            lambda **kwargs: events.append(("sweep", kwargs)) or 2,
+            lambda **kwargs: pytest.fail("restart --all must not sweep globally"),
         )
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: True)
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.gateway_command(
             SimpleNamespace(gateway_command="restart", all=True, system=False)
         )
 
-        sweep_index = events.index(("sweep", {"all_profiles": True}))
-        for domain, label, plist in (
-            ("gui/501", "ai.hermes.gateway", default_plist),
-            ("user/501", "ai.hermes.gateway-coder", coder_plist),
-        ):
-            assert events.index(["launchctl", "disable", f"{domain}/{label}"]) < sweep_index
-            assert events.index(["launchctl", "enable", f"{domain}/{label}"]) > sweep_index
-            assert ["launchctl", "bootstrap", domain, str(plist)] in events
-            assert ["launchctl", "kickstart", f"{domain}/{label}"] in events
+        assert calls == ["restart-all"]
 
     def test_launchd_unloaded_inventory_is_fenced_in_both_domains_without_bootout(
         self, tmp_path, monkeypatch
@@ -1790,74 +1747,6 @@ class TestLaunchdServiceRecovery:
         assert link.is_symlink()
         assert target.exists()
         assert "not a regular file" in capsys.readouterr().out
-
-    def test_gateway_restart_all_partial_restore_lists_stranded_label_and_is_nonzero(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        default_plist = tmp_path / "ai.hermes.gateway.plist"
-        coder_plist = tmp_path / "ai.hermes.gateway-coder.plist"
-        _write_launchd_gateway_plist(default_plist, "ai.hermes.gateway")
-        _write_launchd_gateway_plist(coder_plist, "ai.hermes.gateway-coder")
-        result = gateway_cli.LaunchdStopAllResult(
-            fenced=(
-                gateway_cli.LaunchdFencedGateway(
-                    "ai.hermes.gateway", default_plist, ("gui/501",), ("gui/501",)
-                ),
-                gateway_cli.LaunchdFencedGateway(
-                    "ai.hermes.gateway-coder",
-                    coder_plist,
-                    ("user/501",),
-                    ("user/501",),
-                ),
-            ),
-            failures=(),
-            sweep_safe=True,
-        )
-        calls = []
-
-        def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
-            if cmd == [
-                "launchctl",
-                "enable",
-                "user/501/ai.hermes.gateway-coder",
-            ]:
-                raise subprocess.CalledProcessError(5, cmd)
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
-        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
-        monkeypatch.setattr(
-            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
-        )
-        monkeypatch.setattr(gateway_cli, "launchd_stop_all", lambda: result)
-        monkeypatch.setattr(
-            gateway_cli,
-            "kill_gateway_processes",
-            lambda **kwargs: calls.append(("sweep", kwargs)) or 2,
-        )
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: True)
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-
-        with pytest.raises(SystemExit) as excinfo:
-            gateway_cli.gateway_command(
-                SimpleNamespace(gateway_command="restart", all=True, system=False)
-            )
-
-        assert excinfo.value.code == 1
-        assert [
-            "launchctl",
-            "kickstart",
-            "gui/501/ai.hermes.gateway",
-        ] in calls
-        assert not any(
-            cmd[:2] == ["launchctl", "bootstrap"] and "coder" in " ".join(cmd)
-            for cmd in calls
-            if isinstance(cmd, list)
-        )
-        assert "ai.hermes.gateway-coder" in capsys.readouterr().out
 
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"

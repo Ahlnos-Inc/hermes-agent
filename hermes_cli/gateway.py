@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -3717,6 +3718,445 @@ def _launchd_label_is_disabled(domain: str, label: str) -> bool | None:
     return any(label_pattern.search(line) for line in (result.stdout or "").splitlines())
 
 
+class LaunchdAllOperationError(RuntimeError):
+    """One or more intended all-profile launchd targets were not verified."""
+
+    def __init__(self, message: str, failures: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.failures = failures
+
+
+@dataclass(frozen=True)
+class LaunchdAllTarget:
+    """The immutable identity and state snapshot for one installed target."""
+
+    label: str
+    domain: str
+    plist_path: Path
+    plist_fingerprint: str
+    hermes_home: Path
+    was_disabled: bool
+    was_loaded: bool
+    pid: int | None
+    start_time: int | None
+    profile_identity: str | None = None
+
+    @property
+    def launchctl_target(self) -> str:
+        return f"{self.domain}/{self.label}"
+
+
+@dataclass(frozen=True)
+class _LaunchdAllPlistIdentity:
+    label: str
+    path: Path
+    fingerprint: str
+    hermes_home: Path
+
+
+_LAUNCHD_ABSENCE_EXIT_CODES = frozenset({3, 113})
+
+
+def _launchd_process_start_time(pid: int | None) -> int | None:
+    if pid is None:
+        return None
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _launchd_pid_is_live(
+    pid: int, expected_start_time: int | None = None
+) -> bool:
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+
+        if not _pid_exists(pid):
+            return False
+        if expected_start_time is None:
+            return True
+        current_start_time = get_process_start_time(pid)
+        return current_start_time is not None and current_start_time == expected_start_time
+    except Exception:
+        return False
+
+
+def _launchd_profile_suffix_for_home(
+    hermes_home: Path, *, default_root: Path | None = None
+) -> str:
+    """Derive the service suffix without changing the active profile."""
+    default = default_root
+    if default is None:
+        from hermes_constants import get_default_hermes_root
+
+        default = get_default_hermes_root()
+    home = hermes_home.resolve()
+    default = default.resolve()
+    if home == default:
+        return ""
+    profiles_root = default / "profiles"
+    try:
+        relative = home.relative_to(profiles_root)
+    except ValueError:
+        return hashlib.sha256(str(home).encode()).hexdigest()[:8]
+    if len(relative.parts) == 1 and re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,63}", relative.parts[0]
+    ):
+        return relative.parts[0]
+    return hashlib.sha256(str(home).encode()).hexdigest()[:8]
+
+
+def _read_launchd_all_plist_identity(path: Path) -> _LaunchdAllPlistIdentity:
+    """Read and attest one plist's label, profile invocation, and home."""
+    if path.is_symlink() or not path.is_file():
+        raise LaunchdAllOperationError(f"Refusing non-owned launchd plist: {path}")
+    try:
+        raw = path.read_bytes()
+        document = plistlib.loads(raw)
+    except (OSError, plistlib.InvalidFileException, ValueError, TypeError) as exc:
+        raise LaunchdAllOperationError(f"Could not validate launchd plist {path}") from exc
+    if not isinstance(document, dict):
+        raise LaunchdAllOperationError(f"Could not validate launchd plist {path}")
+
+    label = path.stem
+    if document.get("Label") != label:
+        raise LaunchdAllOperationError(f"Launchd plist label mismatch for {path}")
+    environment = document.get("EnvironmentVariables")
+    home_value = environment.get("HERMES_HOME") if isinstance(environment, dict) else None
+    if not isinstance(home_value, str) or not home_value.strip():
+        raise LaunchdAllOperationError(f"{label}: HERMES_HOME identity is missing")
+    hermes_home = Path(home_value).resolve()
+
+    from hermes_constants import get_default_hermes_root
+
+    default_root = get_default_hermes_root().resolve()
+    suffix = _launchd_profile_suffix_for_home(hermes_home, default_root=default_root)
+    expected_label = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    if label != expected_label:
+        raise LaunchdAllOperationError(
+            f"{label}: HERMES_HOME identity does not match the LaunchAgent label"
+        )
+
+    arguments = document.get("ProgramArguments")
+    if not _launchd_program_arguments_are_hermes_gateway(arguments):
+        raise LaunchdAllOperationError(f"{label}: foreign ProgramArguments")
+    expected_profile = _profile_arg(str(hermes_home), default_root=default_root)
+    expected_tail = expected_profile.split() + ["gateway", "run", "--replace"]
+    if arguments[3:] != expected_tail:
+        raise LaunchdAllOperationError(
+            f"{label}: ProgramArguments do not preserve its HERMES_HOME profile"
+        )
+    return _LaunchdAllPlistIdentity(
+        label=label,
+        path=path,
+        fingerprint=hashlib.sha256(raw).hexdigest(),
+        hermes_home=hermes_home,
+    )
+
+
+def _launchd_all_query_target(domain: str, label: str) -> tuple[bool, int | None]:
+    """Query exactly one launchd target; unknown errors fail closed."""
+    command = ["launchctl", "print", f"{domain}/{label}"]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        raise LaunchdAllOperationError(
+            f"Could not inspect launchd target {domain}/{label}"
+        ) from exc
+    if result.returncode in _LAUNCHD_ABSENCE_EXIT_CODES:
+        return False, None
+    if result.returncode != 0:
+        raise LaunchdAllOperationError(
+            f"Could not inspect launchd target {domain}/{label} "
+            f"(launchd exit {result.returncode})"
+        )
+    output = result.stdout or ""
+    pid = _parse_launchd_pid_from_list_output(output)
+    if pid is None:
+        match = re.search(r"\bpid\b\s*=\s*(-?\d+)", output, re.IGNORECASE)
+        if match and int(match.group(1)) > 0:
+            pid = int(match.group(1))
+    return True, pid
+
+
+def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
+    """Validate the complete installed inventory before any mutation."""
+    targets: list[LaunchdAllTarget] = []
+    try:
+        inventory = _installed_launchd_gateway_plists()
+    except (LaunchdInventoryError, LaunchdAllOperationError) as exc:
+        raise LaunchdAllOperationError(str(exc)) from exc
+
+    for label, plist_path in inventory:
+        identity = _read_launchd_all_plist_identity(plist_path)
+        domain = _launchd_domain_for_label(label)
+        loaded, pid = _launchd_all_query_target(domain, label)
+        disabled = _launchd_label_is_disabled(domain, label)
+        if disabled is None:
+            raise LaunchdAllOperationError(
+                f"Could not verify disabled state for {domain}/{label}"
+            )
+        targets.append(
+            LaunchdAllTarget(
+                label=identity.label,
+                domain=domain,
+                plist_path=identity.path,
+                plist_fingerprint=identity.fingerprint,
+                hermes_home=identity.hermes_home,
+                was_disabled=disabled,
+                was_loaded=loaded,
+                pid=pid,
+                start_time=_launchd_process_start_time(pid) if pid else None,
+                profile_identity=_profile_arg(str(identity.hermes_home)),
+            )
+        )
+    return tuple(targets)
+
+
+def _revalidate_launchd_target(target: LaunchdAllTarget) -> None:
+    """Re-attest a target immediately before bootstrap or a retry."""
+    identity = _read_launchd_all_plist_identity(target.plist_path)
+    if (
+        identity.label != target.label
+        or identity.hermes_home != target.hermes_home
+        or identity.fingerprint != target.plist_fingerprint
+    ):
+        raise LaunchdAllOperationError(
+            f"Launchd target identity changed before bootstrap: {target.launchctl_target}"
+        )
+
+
+def _launchd_all_bootstrap(target: LaunchdAllTarget) -> None:
+    """Bootstrap one target with identity revalidation on every attempt."""
+    _revalidate_launchd_target(target)
+    try:
+        subprocess.run(
+            ["launchctl", "bootstrap", target.domain, str(target.plist_path)],
+            check=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode != 5:
+            raise
+        # A stale registration is target-local. Remove only that exact job,
+        # then attest the plist again before the replacement bootstrap.
+        subprocess.run(
+            ["launchctl", "bootout", target.launchctl_target],
+            check=False,
+            timeout=30,
+        )
+        _revalidate_launchd_target(target)
+        subprocess.run(
+            ["launchctl", "bootstrap", target.domain, str(target.plist_path)],
+            check=True,
+            timeout=30,
+        )
+
+
+def _launchd_all_verify_live(
+    target: LaunchdAllTarget,
+    *,
+    successor_of: tuple[int, int] | None = None,
+) -> bool:
+    """Verify that launchd owns a live PID for the exact target."""
+    loaded, pid = _launchd_all_query_target(target.domain, target.label)
+    if not loaded or pid is None or not _launchd_pid_is_live(pid):
+        return False
+    if successor_of is not None:
+        start_time = _launchd_process_start_time(pid)
+        if start_time is None or (pid, start_time) == successor_of:
+            return False
+    return True
+
+
+def _launchd_all_wait_for_live(
+    target: LaunchdAllTarget,
+    *,
+    successor_of: tuple[int, int] | None = None,
+    timeout: float = 10.0,
+) -> bool:
+    deadline = time.monotonic() + max(timeout, 0.1)
+    while time.monotonic() < deadline:
+        try:
+            if _launchd_all_verify_live(target, successor_of=successor_of):
+                return True
+        except LaunchdAllOperationError:
+            pass
+        time.sleep(0.2)
+    try:
+        return _launchd_all_verify_live(target, successor_of=successor_of)
+    except LaunchdAllOperationError:
+        return False
+
+
+def _launchd_all_wait_for_successor(
+    target: LaunchdAllTarget,
+    old_pid: int,
+    old_start_time: int,
+    *,
+    timeout: float,
+) -> bool:
+    return _launchd_all_wait_for_live(
+        target,
+        successor_of=(old_pid, old_start_time),
+        timeout=timeout,
+    )
+
+
+def _launchd_start_all_target(target: LaunchdAllTarget) -> None:
+    """Enable, bootstrap, kickstart, and verify one explicit start target."""
+    # Attest before clearing a persisted fence, then attest again immediately
+    # before every bootstrap attempt. A plist race must not even release the
+    # target's desired-state fence.
+    _revalidate_launchd_target(target)
+    _launchd_enable(target.domain, target.label)
+    try:
+        _launchd_all_bootstrap(target)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode not in _LAUNCHD_ABSENCE_EXIT_CODES:
+            raise
+        _launchd_all_bootstrap(target)
+    subprocess.run(
+        ["launchctl", "kickstart", target.launchctl_target],
+        check=True,
+        timeout=30,
+    )
+    if not _launchd_all_wait_for_live(target):
+        raise LaunchdAllOperationError(f"{target.launchctl_target} has no live supervised PID")
+
+
+def launchd_start_all() -> None:
+    """Start every installed Hermes LaunchAgent without a process sweep."""
+    try:
+        targets = _launchd_all_preflight_targets()
+    except LaunchdAllOperationError:
+        raise
+    if not targets:
+        print("✓ No installed launchd gateways; nothing to start")
+        return
+
+    failures: list[str] = []
+    for target in targets:
+        try:
+            _launchd_start_all_target(target)
+        except Exception as exc:
+            failures.append(f"{target.launchctl_target}: {exc}")
+    if failures:
+        raise LaunchdAllOperationError(
+            "Could not start every installed launchd gateway: " + "; ".join(failures),
+            tuple(failures),
+        )
+    print(f"✓ Started {len(targets)} launchd gateway target(s)")
+
+
+def _launchd_restart_all_target(target: LaunchdAllTarget) -> None:
+    """Restart one enabled target and verify a new supervised process."""
+    disabled = _launchd_label_is_disabled(target.domain, target.label)
+    if disabled is None:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: disabled state became unknown"
+        )
+    if disabled:
+        return
+
+    if target.was_loaded and target.pid is not None:
+        if target.start_time is None:
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: old PID birth identity is unavailable"
+            )
+        loaded_now, current_pid = _launchd_all_query_target(
+            target.domain, target.label
+        )
+        if not loaded_now:
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: target detached before restart"
+            )
+        if current_pid is not None and current_pid != target.pid:
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: supervised PID changed before restart"
+            )
+        if current_pid == target.pid and _launchd_pid_is_live(
+            target.pid, target.start_time
+        ):
+            if not _graceful_restart_via_sigusr1(
+                target.pid, _get_restart_drain_timeout()
+            ):
+                raise LaunchdAllOperationError(
+                    f"{target.launchctl_target}: old PID did not exit"
+                )
+            if not _launchd_all_wait_for_successor(
+                target,
+                target.pid,
+                target.start_time,
+                timeout=_get_restart_drain_timeout() + 30,
+            ):
+                raise LaunchdAllOperationError(
+                    f"{target.launchctl_target}: new supervised PID was not verified"
+                )
+            return
+
+    if not target.was_loaded:
+        _launchd_all_bootstrap(target)
+    else:
+        # The label is still exact and managed, but its snapshotted PID is gone.
+        # kickstart -k is scoped to this launchd target only.
+        _revalidate_launchd_target(target)
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", target.launchctl_target],
+        check=True,
+        timeout=30,
+    )
+    successor = (
+        (target.pid, target.start_time)
+        if target.pid is not None and target.start_time is not None
+        else None
+    )
+    if not _launchd_all_wait_for_live(target, successor_of=successor):
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: new supervised PID was not verified"
+        )
+
+
+def launchd_restart_all() -> None:
+    """Restart enabled installed targets individually, never by global sweep."""
+    try:
+        targets = _launchd_all_preflight_targets()
+    except LaunchdAllOperationError:
+        raise
+    if not targets:
+        print("✓ No installed launchd gateways; nothing to restart")
+        return
+
+    failures: list[str] = []
+    skipped = 0
+    for target in targets:
+        if target.was_disabled:
+            skipped += 1
+            continue
+        try:
+            _launchd_restart_all_target(target)
+        except Exception as exc:
+            failures.append(f"{target.launchctl_target}: {exc}")
+    if failures:
+        raise LaunchdAllOperationError(
+            "Could not restart every enabled launchd gateway: " + "; ".join(failures),
+            tuple(failures),
+        )
+    print(
+        f"✓ Restarted {len(targets) - skipped} launchd gateway target(s)"
+        + (f"; preserved {skipped} pre-disabled target(s)" if skipped else "")
+    )
+
+
 _LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
     r"^ai\.hermes\.gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.plist$"
 )
@@ -7246,6 +7686,14 @@ def _gateway_command_inner(args):
         if not start_all and _dispatch_via_service_manager_if_s6("start"):
             return
 
+        if start_all and is_macos():
+            try:
+                launchd_start_all()
+            except LaunchdAllOperationError as exc:
+                print_error(str(exc))
+                raise SystemExit(1) from exc
+            return
+
         if start_all:
             # Kill all stale gateway processes across all profiles before starting
             killed = kill_gateway_processes(all_profiles=True)
@@ -7442,6 +7890,14 @@ def _gateway_command_inner(args):
         if restart_all and _dispatch_all_via_service_manager_if_s6("restart"):
             return
         if not restart_all and _dispatch_via_service_manager_if_s6("restart"):
+            return
+
+        if restart_all and is_macos():
+            try:
+                launchd_restart_all()
+            except LaunchdAllOperationError as exc:
+                print_error(str(exc))
+                raise SystemExit(1) from exc
             return
 
         if restart_all:
