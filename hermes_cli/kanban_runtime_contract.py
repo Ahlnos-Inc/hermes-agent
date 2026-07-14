@@ -62,6 +62,20 @@ def _reasoning_effort(reasoning_config: Any) -> str:
     return str(reasoning_config.get("effort") or "").strip().lower()
 
 
+def _canonical_toolsets(value: Any) -> Optional[list[str]]:
+    """Return a stable set representation, or ``None`` for invalid input."""
+    if not isinstance(value, (list, tuple)):
+        return None
+    if any(
+        not isinstance(item, str)
+        or not item.strip()
+        or "," in item
+        for item in value
+    ):
+        return None
+    return sorted({item.strip().casefold() for item in value})
+
+
 def preflight_kanban_cli_route(
     *,
     model: Any,
@@ -78,18 +92,13 @@ def preflight_kanban_cli_route(
     if version not in {1, 2} or not isinstance(requested, dict):
         raise RunRouteMismatch("active run has an unsupported route contract")
 
-    if version == 2 and spec.get("toolsets") is not None:
+    if version == 2:
         expected_toolsets = spec.get("toolsets")
-        if not isinstance(expected_toolsets, list) or any(
-            not isinstance(value, str) for value in expected_toolsets
-        ):
+        expected_normalized = _canonical_toolsets(expected_toolsets)
+        if not expected_normalized:
             raise RunRouteMismatch("active run has invalid toolset contract")
-        actual_toolsets = (
-            [str(value).strip().casefold() for value in toolsets]
-            if isinstance(toolsets, (list, tuple))
-            else []
-        )
-        if actual_toolsets != [value.casefold() for value in expected_toolsets]:
+        actual_toolsets = _canonical_toolsets(toolsets)
+        if actual_toolsets != expected_normalized:
             raise RunRouteMismatch(
                 f"requested toolsets {expected_toolsets!r}, parsed {actual_toolsets!r}"
             )

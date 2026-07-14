@@ -5650,7 +5650,35 @@ def _build_run_spec(
             for value in parsed_toolsets
         ):
             raise ValueError("task toolsets contain unsupported values")
-        toolsets = [value.casefold() for value in parsed_toolsets]
+        toolsets = sorted({value.casefold() for value in parsed_toolsets})
+    if toolsets is None:
+        assignee = str(task_row["assignee"] or "") if task_row else ""
+        profile_home: Optional[str] = None
+        if assignee:
+            try:
+                from hermes_cli.profiles import profile_exists, resolve_profile_env
+
+                if profile_exists(assignee):
+                    profile_home = resolve_profile_env(assignee)
+            except Exception:
+                profile_home = None
+        # Synthetic/non-profile lanes are never dispatcher-spawned. Resolve
+        # against the active home for their audit-only/manual claims so the v2
+        # schema remains closed without pretending a mutable null is safe.
+        profile_home = profile_home or os.environ.get("HERMES_HOME")
+        toolsets = _resolve_worker_cli_toolsets(profile_home)
+    if not toolsets:
+        raise ValueError("could not resolve effective profile toolsets for run")
+    if any(
+        not isinstance(value, str)
+        or not value.strip()
+        or "," in value
+        for value in toolsets
+    ):
+        raise ValueError("effective profile toolsets contain invalid values")
+    toolsets = sorted({value.strip().casefold() for value in toolsets})
+    if not toolsets:
+        raise ValueError("effective profile toolsets are empty")
     return {
         "version": 2,
         "profile": task_row["assignee"] if task_row else None,
@@ -6327,10 +6355,17 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        live_pid = bool(
+            host_local and row["worker_pid"] and _pid_alive(row["worker_pid"])
+        )
+        extension_identity: Optional[bool] = True
+        if live_pid and signal_fn is None:
+            extension_identity = _attest_reclaim_process_identity(
+                int(row["worker_pid"]), str(row["claim_lock"])
+            )
         if (
-            host_local
-            and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            live_pid
+            and extension_identity is not False
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -6354,7 +6389,11 @@ def release_stale_claims(
                 _append_event(
                     conn, row["id"], "claim_extended",
                     {
-                        "reason": "pid_alive",
+                        "reason": (
+                            "pid_alive"
+                            if extension_identity is True
+                            else "pid_identity_unverifiable"
+                        ),
                         "worker_pid": int(row["worker_pid"]),
                         "claim_lock": row["claim_lock"],
                         "claim_expires_was": int(row["claim_expires"]),
@@ -6466,6 +6505,21 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        _log.warning(
+            "manual reclaim deferred for task=%s: worker identity could not "
+            "be safely terminated",
+            task_id,
+        )
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_identity_unverifiable",
+        )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -9362,6 +9416,41 @@ def _log_orphan_worker_canary(
     return matches
 
 
+def _attest_reclaim_process_identity(
+    pid: int,
+    claim_lock: str,
+) -> Optional[bool]:
+    """Match a live PID to the exact claim without trusting PID reuse.
+
+    ``True`` means the process environment and birth identity were observed
+    twice and match. ``False`` means the PID is gone or belongs to a different
+    process. ``None`` means the platform denied inspection; callers must hold
+    the claim rather than guessing.
+    """
+    try:
+        import psutil  # type: ignore
+
+        process = psutil.Process(int(pid))
+        born_at = float(process.create_time())
+        environ = process.environ()
+        if environ.get("HERMES_KANBAN_CLAIM_LOCK") != str(claim_lock):
+            return False
+        return float(process.create_time()) == born_at and process.is_running()
+    except ImportError:
+        return None
+    except Exception as exc:
+        try:
+            import psutil  # type: ignore
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False
+            if isinstance(exc, (psutil.AccessDenied, psutil.ZombieProcess)):
+                return None
+        except Exception:
+            pass
+        return None
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -9377,6 +9466,9 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "identity_verified": False,
+        "identity_mismatch": False,
+        "identity_unverifiable": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -9391,6 +9483,21 @@ def _terminate_reclaimed_worker(
     )
     if kill is None:
         return info
+
+    # Test hooks model signal behavior directly. Production signals must first
+    # prove that a potentially-reused PID is still the worker that inherited
+    # this claim's unguessable identity.
+    if signal_fn is None:
+        identity = _attest_reclaim_process_identity(int(pid), str(claim_lock))
+        if identity is False:
+            info["identity_mismatch"] = True
+            info["terminated"] = True
+            return info
+        if identity is None:
+            info["identity_unverifiable"] = True
+            info["worker_still_alive"] = _pid_alive(pid)
+            return info
+        info["identity_verified"] = True
 
     info["termination_attempted"] = True
     try:
@@ -9411,6 +9518,17 @@ def _terminate_reclaimed_worker(
         time.sleep(0.5)
 
     if _pid_alive(pid):
+        if signal_fn is None:
+            identity = _attest_reclaim_process_identity(
+                int(pid), str(claim_lock)
+            )
+            if identity is not True:
+                info["identity_verified"] = False
+                info["identity_mismatch"] = identity is False
+                info["identity_unverifiable"] = identity is None
+                info["terminated"] = identity is False
+                info["worker_still_alive"] = _pid_alive(pid)
+                return info
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -9433,6 +9551,12 @@ def _worker_survived_termination(termination: dict) -> bool:
     claim lock or a no-op attempt (no ``os.kill`` available) must fall through
     to the normal release path, since we cannot manage that worker anyway.
     """
+    if (
+        termination.get("host_local")
+        and termination.get("identity_unverifiable")
+        and termination.get("worker_still_alive")
+    ):
+        return True
     return bool(
         termination.get("termination_attempted")
         and termination.get("host_local")
@@ -10697,37 +10821,15 @@ def _set_worker_pid(
         )
 
 
-def _abort_spawned_pid(pid: int) -> None:
-    """Best-effort termination for a legacy integer-only spawn receipt."""
-    import signal
-
-    worker_pid = int(pid)
-    if worker_pid <= 1 or worker_pid == os.getpid():
-        _log.error("refusing unsafe abort for worker pid=%s", worker_pid)
-        return
-    try:
-        if not _IS_WINDOWS and os.getpgid(worker_pid) == worker_pid:
-            os.killpg(worker_pid, signal.SIGTERM)
-        else:
-            os.kill(worker_pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        return
-
-
 def _coerce_spawn_receipt(value: Any) -> SpawnReceipt:
-    """Validate a spawn result, accepting positive integer legacy hooks."""
-    if isinstance(value, SpawnReceipt):
-        receipt = value
-    elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        receipt = SpawnReceipt(
-            pid=int(value),
-            release=lambda: None,
-            abort=lambda: _abort_spawned_pid(int(value)),
-        )
-    else:
-        raise RuntimeError("spawn function returned no valid worker receipt")
+    """Require explicit process ownership and gate controls from spawners."""
+    if not isinstance(value, SpawnReceipt):
+        raise RuntimeError("spawn function must return an owned SpawnReceipt")
+    receipt = value
     if receipt.pid <= 0:
         raise RuntimeError("spawn function returned a non-positive worker PID")
+    if not callable(receipt.release) or not callable(receipt.abort):
+        raise RuntimeError("spawn receipt must provide release and abort controls")
     return receipt
 
 
@@ -11071,10 +11173,12 @@ def _dispatch_once_locked(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
-         ``spawn_fn(task, workspace_path, board) -> SpawnReceipt``. Positive
-         integer receipts remain supported for legacy hooks. The exact PID is
-         recorded on both task and run before a gated worker is released, so subsequent
-         ticks can detect crashes before the TTL expires.
+         ``spawn_fn(task, workspace_path, board) -> SpawnReceipt``. The
+         receipt must own both gate release and process-group abort controls;
+         bare integer PIDs are rejected because their ownership is unattested.
+         The exact PID is recorded on both task and run before a gated worker
+         is released, so subsequent ticks can detect crashes before the TTL
+         expires.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -11947,16 +12051,14 @@ def _spawn_contract(
     run_toolsets: Optional[list[str]] = None
     if version == 2:
         raw_toolsets = spec.get("toolsets")
-        if raw_toolsets is not None:
-            if not isinstance(raw_toolsets, list) or not raw_toolsets or any(
-                not isinstance(value, str)
-                or value.casefold() not in KNOWN_TOOLSET_NAMES
-                for value in raw_toolsets
-            ):
-                raise RuntimeError(
-                    f"task {task.id} run {task.current_run_id} has invalid toolsets"
-                )
-            run_toolsets = [value.casefold() for value in raw_toolsets]
+        if not isinstance(raw_toolsets, list) or not raw_toolsets or any(
+            not isinstance(value, str) or not value.strip() or "," in value
+            for value in raw_toolsets
+        ):
+            raise RuntimeError(
+                f"task {task.id} run {task.current_run_id} has invalid toolsets"
+            )
+        run_toolsets = sorted({value.strip().casefold() for value in raw_toolsets})
     try:
         delivery_policy = validate_delivery_policy_snapshot(
             spec.get("delivery_policy")

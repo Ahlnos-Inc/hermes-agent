@@ -192,7 +192,13 @@ def test_max_in_progress_deferred_zero_when_headroom_exists(
     with kb.connect() as conn:
         kb.create_task(conn, title="a", assignee="alice")
         res = kb.dispatch_once(
-            conn, spawn_fn=lambda *a, **k: 1, max_in_progress=5,
+            conn,
+            spawn_fn=lambda *a, **k: kb.SpawnReceipt(
+                pid=31_006,
+                release=lambda: None,
+                abort=lambda: None,
+            ),
+            max_in_progress=5,
         )
 
     assert res.max_in_progress_deferred == 0

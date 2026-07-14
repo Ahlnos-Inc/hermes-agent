@@ -955,6 +955,42 @@ class TestClientCache:
         assert len(_bedrock_runtime_client_cache) == 0
         assert len(_bedrock_control_client_cache) == 0
 
+    def test_budgeted_runtime_client_bounds_connect_and_read_without_caching(self):
+        from agent import bedrock_adapter
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.connect_timeout = kwargs["connect_timeout"]
+                self.read_timeout = kwargs["read_timeout"]
+
+        botocore_mod = ModuleType("botocore")
+        config_mod = ModuleType("botocore.config")
+        config_mod.Config = FakeConfig
+        botocore_mod.config = config_mod
+        boto3 = MagicMock()
+        request_client = MagicMock()
+        boto3.client.return_value = request_client
+        bedrock_adapter.reset_client_cache()
+
+        with (
+            patch.object(bedrock_adapter, "_require_boto3", return_value=boto3),
+            patch.dict(
+                "sys.modules",
+                {"botocore": botocore_mod, "botocore.config": config_mod},
+            ),
+        ):
+            returned = bedrock_adapter._get_bedrock_runtime_client(
+                "us-west-2",
+                attempt_timeout_seconds=7.25,
+            )
+
+        assert returned is request_client
+        kwargs = boto3.client.call_args.kwargs
+        assert kwargs["region_name"] == "us-west-2"
+        assert kwargs["config"].connect_timeout == 7.25
+        assert kwargs["config"].read_timeout == 7.25
+        assert "us-west-2" not in bedrock_adapter._bedrock_runtime_client_cache
+
 
 # ---------------------------------------------------------------------------
 # Streaming with callbacks

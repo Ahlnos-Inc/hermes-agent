@@ -116,6 +116,49 @@ def test_per_provider_cap_clamps_higher_global_max_tokens(isolated_home):
     assert kw["max_tokens"] == 12000
 
 
+def test_legacy_provider_deadlines_reach_gateway_agent(isolated_home):
+    """Legacy provider policy survives normalization and agent construction."""
+    from run_agent import AIAgent
+
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: qwen-local
+          provider: legacy-local
+        custom_providers:
+          - name: legacy-local
+            base_url: http://127.0.0.1:11434/v1
+            api_key: no-key-required
+            model: qwen-local
+            request_timeout_seconds: 41
+            stale_timeout_seconds: 42
+            total_attempt_timeout_seconds: 43
+            first_event_timeout_seconds: 44
+        """
+    )
+    grun = fresh_gateway()
+    runtime = grun._resolve_runtime_agent_kwargs()
+
+    assert runtime["request_timeout_seconds"] == 41
+    assert runtime["stale_timeout_seconds"] == 42
+    assert runtime["total_attempt_timeout_seconds"] == 43
+    assert runtime["first_event_timeout_seconds"] == 44
+
+    model = runtime.pop("model")
+    agent = AIAgent(
+        model=model,
+        **runtime,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent._route_request_timeout_seconds == 41
+    assert agent._route_stale_timeout_seconds == 42
+    assert agent._route_total_attempt_timeout_seconds == 43
+    assert agent._route_first_event_timeout_seconds == 44
+
+
 def test_env_override_beats_everything(isolated_home, monkeypatch):
     """HERMES_MAX_TOKENS is the internal override mechanism (highest priority)."""
     write_cfg, fresh_gateway = isolated_home

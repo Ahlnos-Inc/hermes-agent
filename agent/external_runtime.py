@@ -35,6 +35,11 @@ from hermes_constants import get_hermes_home, get_host_user_home
 
 _runtime_events_logger = logging.getLogger("hermes.runtime_events")
 _CLAUDE_SDK_TEMP_ROOT = Path("/tmp")
+# A successful auth probe may be reused only across the few synchronous steps
+# between runtime preparation and construction of that exact SDK session.
+# A different route, or a delayed session construction, always re-probes with
+# the boundary cache disabled.
+_CLAUDE_NEW_SESSION_ATTESTATION_GRACE_SECONDS = 5.0
 
 
 def _effective_uid() -> int:
@@ -231,7 +236,7 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
             get_hermes_home() / "cache" / "claude-agent-sdk" / "launchers",
             sandbox_profile=sandbox_profile,
         )
-        attestation = attest_claude_max_auth(cli_wrapper)
+        attestation = attest_claude_max_auth(cli_wrapper, cache_ttl_seconds=0)
     except Exception as exc:
         if isinstance(exc, ClaudeAttestationError):
             _runtime_events_logger.warning(
@@ -267,6 +272,11 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
         "workspace": workspace,
         "cli_wrapper": cli_wrapper,
         "kanban_task_id": kanban_task_id,
+        "attested_route": (
+            str(getattr(agent, "provider", "") or ""),
+            str(getattr(agent, "model", "") or ""),
+        ),
+        "attested_at": time.monotonic(),
     }
     return None
 
@@ -296,8 +306,88 @@ def run_claude_agent_sdk_attempt(
     if sessions is None:
         sessions = {}
         agent._claude_sdk_sessions = sessions
+    session_attestations = getattr(agent, "_claude_sdk_attestations", None)
+    if session_attestations is None:
+        session_attestations = {}
+        agent._claude_sdk_attestations = session_attestations
+
+    if key in sessions:
+        session_attestation = session_attestations.get(key)
+        if session_attestation is None:
+            # Compatibility for a session constructed before attestations were
+            # keyed per route. New sessions always populate the map below.
+            session_attestation = getattr(agent, "_claude_max_attestation", None)
+            if session_attestation is not None:
+                session_attestations[key] = session_attestation
+        agent._claude_max_attestation = session_attestation
 
     if key not in sessions:
+        attested_route = tuple(context.get("attested_route") or ())
+        try:
+            attestation_age = time.monotonic() - float(context["attested_at"])
+        except (KeyError, TypeError, ValueError):
+            attestation_age = float("inf")
+        if (
+            attested_route != key
+            or attestation_age < 0
+            or attestation_age > _CLAUDE_NEW_SESSION_ATTESTATION_GRACE_SECONDS
+        ):
+            # Billing/auth evidence belongs to an SDK session, not to the
+            # lifetime of AIAgent. Never let the boundary's positive cache
+            # silently authorize a newly-created session.
+            agent._claude_max_attestation = None
+            try:
+                attestation = attest_claude_max_auth(
+                    cli_wrapper,
+                    cache_ttl_seconds=0,
+                )
+            except Exception as exc:
+                if isinstance(exc, ClaudeAttestationError):
+                    _runtime_events_logger.warning(
+                        "claude_auth_attestation_failure %s",
+                        json.dumps(
+                            {
+                                **exc.diagnostic,
+                                "permanent": bool(exc.permanent),
+                                "kanban_worker": bool(kanban_task_id),
+                                "new_sdk_session": True,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                    reason = (
+                        FailoverReason.auth_permanent
+                        if isinstance(exc, ClaudeAttestationRejectedError)
+                        else FailoverReason.unknown
+                    )
+                    return ClaudeProjection(
+                        failure=RuntimeFailure(reason, str(exc))
+                    )
+                classified = classify_api_error(
+                    exc,
+                    provider=str(getattr(agent, "provider", "") or ""),
+                    model=str(getattr(agent, "model", "") or ""),
+                )
+                return ClaudeProjection(
+                    failure=RuntimeFailure(
+                        classified.reason,
+                        classified.message or str(exc),
+                    )
+                )
+            agent._claude_max_attestation = attestation
+            context["attested_route"] = key
+            context["attested_at"] = time.monotonic()
+
+        session_attestation = getattr(agent, "_claude_max_attestation", None)
+        if session_attestation is None:
+            return ClaudeProjection(
+                failure=RuntimeFailure(
+                    FailoverReason.unknown,
+                    "Claude SDK session has no billing attestation",
+                )
+            )
+        session_attestations[key] = session_attestation
+
         from model_tools import handle_function_call
         from hermes_cli.profiles import get_active_profile_name
 
@@ -355,6 +445,7 @@ def run_claude_agent_sdk_attempt(
         agent._claude_max_attestation = None
         agent._claude_runtime_context = None
         failed_session = sessions.pop(key, None)
+        session_attestations.pop(key, None)
         if failed_session is not None:
             failed_session.close()
 

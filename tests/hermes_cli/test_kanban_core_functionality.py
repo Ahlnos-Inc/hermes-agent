@@ -133,7 +133,11 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
         calls[0] += 1
         if calls[0] <= 2:
             raise RuntimeError("transient")
-        return 99999  # pid value — harmless; crash detection will clear it
+        return kb.SpawnReceipt(
+            pid=99999,
+            release=lambda: None,
+            abort=lambda: None,
+        )
 
     conn = kb.connect()
     try:
@@ -401,7 +405,11 @@ def test_detect_crashed_workers_reclaims(kanban_home):
             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         )
         p.wait()
-        return p.pid
+        return kb.SpawnReceipt(
+            pid=p.pid,
+            release=lambda: None,
+            abort=lambda: None,
+        )
 
     conn = kb.connect()
     try:
@@ -1328,7 +1336,11 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
     """Successful spawn must append a ``spawned`` event with the pid in
     the payload so humans tailing events see pid tracking."""
     def _spawn_returns_pid(task, ws):
-        return 98765
+        return kb.SpawnReceipt(
+            pid=98765,
+            release=lambda: None,
+            abort=lambda: None,
+        )
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")

@@ -31,8 +31,14 @@ def isolated_kanban_home(monkeypatch):
 
 
 def _fake_spawn(*args, **kwargs):
-    """Stand-in for the real worker spawn — returns a fake PID."""
-    return 12345
+    """Stand-in for a spawner with explicit process ownership."""
+    from hermes_cli import kanban_db
+
+    return kanban_db.SpawnReceipt(
+        pid=12345,
+        release=lambda: None,
+        abort=lambda: None,
+    )
 
 
 def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):

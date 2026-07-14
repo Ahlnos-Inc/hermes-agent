@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -210,6 +211,10 @@ def init_agent(
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
     max_tokens: int = None,
+    request_timeout_seconds: float = None,
+    stale_timeout_seconds: float = None,
+    total_attempt_timeout_seconds: float = None,
+    first_event_timeout_seconds: float = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
@@ -550,10 +555,23 @@ def init_agent(
     # Per-route limits are projected when a fallback activates. They remain
     # separate from user/global max_tokens so restoring the primary route can
     # undo fallback-specific timeout policy without rebuilding configuration.
-    agent._route_request_timeout_seconds = None
-    agent._route_stale_timeout_seconds = None
-    agent._route_total_attempt_timeout_seconds = None
-    agent._route_first_event_timeout_seconds = None
+    def _route_timeout(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError):
+            return None
+        return timeout if timeout > 0 and math.isfinite(timeout) else None
+
+    agent._route_request_timeout_seconds = _route_timeout(request_timeout_seconds)
+    agent._route_stale_timeout_seconds = _route_timeout(stale_timeout_seconds)
+    agent._route_total_attempt_timeout_seconds = _route_timeout(
+        total_attempt_timeout_seconds
+    )
+    agent._route_first_event_timeout_seconds = _route_timeout(
+        first_event_timeout_seconds
+    )
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})

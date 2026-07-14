@@ -29,7 +29,13 @@ def isolated_kanban_home_with_profiles(monkeypatch):
 
 
 def _fake_spawn(*args, **kwargs):
-    return 12345
+    from hermes_cli import kanban_db
+
+    return kanban_db.SpawnReceipt(
+        pid=12345,
+        release=lambda: None,
+        abort=lambda: None,
+    )
 
 
 def test_no_cap_all_tasks_dispatched(isolated_kanban_home_with_profiles):

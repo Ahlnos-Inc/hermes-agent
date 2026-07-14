@@ -41,7 +41,12 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
-from agent.request_budgets import AttemptDeadlineExceeded, resolve_attempt_budgets
+from agent.request_budgets import (
+    AttemptDeadlineExceeded,
+    ensure_provider_route_available,
+    quarantine_provider_route,
+    resolve_attempt_budgets,
+)
 from agent.transports.chat_completions import _normalize_developer_role
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -59,6 +64,7 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+_PROVIDER_ABORT_JOIN_GRACE_SECONDS = 2.0
 
 
 def _ra():
@@ -179,6 +185,42 @@ def _local_model_attempt_deadline(
     return attempt_started_monotonic + min(limits)
 
 
+def _remaining_attempt_seconds(
+    attempt_started_monotonic: float,
+    attempt_budgets,
+    *,
+    include_first_event: bool = False,
+) -> float | None:
+    """Return the positive applicable remainder at the transport boundary."""
+    limits = []
+    if attempt_budgets.total_seconds is not None:
+        limits.append(float(attempt_budgets.total_seconds))
+    if include_first_event and attempt_budgets.first_event_seconds is not None:
+        limits.append(float(attempt_budgets.first_event_seconds))
+    if not limits:
+        return None
+    remaining = (
+        attempt_started_monotonic
+        + min(limits)
+        - time.monotonic()
+    )
+    if remaining <= 0:
+        raise AttemptDeadlineExceeded(
+            "Provider attempt deadline elapsed before transport connection"
+        )
+    return remaining
+
+
+def _quarantine_if_worker_alive(agent, api_kwargs: dict, worker: threading.Thread) -> None:
+    if quarantine_provider_route(agent, api_kwargs, worker):
+        logger.warning(
+            "Provider transport abort started; quarantining exact route in this "
+            "process until the worker exits (provider=%s model=%s)",
+            getattr(agent, "provider", None),
+            api_kwargs.get("model") or api_kwargs.get("modelId") or "unknown",
+        )
+
+
 def _acquire_local_model_lease_for_attempt(
     agent,
     api_kwargs: dict,
@@ -201,12 +243,18 @@ def _acquire_local_model_lease_for_attempt(
         attempt_started_monotonic,
         attempt_budgets,
     )
+    lease_deadline = (
+        attempt_started_monotonic + float(attempt_budgets.total_seconds)
+        if attempt_budgets.total_seconds is not None
+        else None
+    )
     try:
         return acquire_local_model_capacity(
             provider=str(getattr(agent, "provider", "") or ""),
             model=str(api_kwargs.get("model") or getattr(agent, "model", "") or ""),
             base_url=base_url,
             deadline_monotonic=deadline,
+            lease_deadline_monotonic=lease_deadline,
             cancelled=cancelled,
         )
     except LocalModelLeaseTimeout as exc:
@@ -231,10 +279,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    ensure_provider_route_available(agent, api_kwargs)
     result = {"response": None, "error": None}
     _attempt_budgets = resolve_attempt_budgets(agent)
     _attempt_started_monotonic = time.monotonic()
     request_client_holder = {"client": None, "owner_tid": None}
+    bedrock_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
     # Request-local cancellation flag. Distinct from agent._interrupt_requested
     # because that flag is cleared at run_conversation() turn boundaries, but
@@ -326,7 +376,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
-                client = _get_bedrock_runtime_client(region)
+                remaining = _remaining_attempt_seconds(
+                    _attempt_started_monotonic,
+                    _attempt_budgets,
+                    include_first_event=True,
+                )
+                client = _get_bedrock_runtime_client(
+                    region,
+                    attempt_timeout_seconds=remaining,
+                )
+                bedrock_client_holder["client"] = client
+                bedrock_client_holder["owner_tid"] = threading.get_ident()
                 try:
                     raw_response = client.converse(**api_kwargs)
                 except Exception as _bedrock_exc:
@@ -364,8 +424,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
             result["error"] = e
         finally:
             _close_request_client_once("request_complete")
+            bedrock_client = bedrock_client_holder.get("client")
+            if (
+                bedrock_client is not None
+                and bedrock_client_holder.get("owner_tid") == threading.get_ident()
+            ):
+                try:
+                    bedrock_client.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close request-scoped Bedrock client",
+                        exc_info=True,
+                    )
             if local_model_lease is not None:
-                local_model_lease.release()
+                try:
+                    local_model_lease.release()
+                except LocalModelLeaseError as exc:
+                    if result["error"] is None:
+                        result["error"] = exc
+                    else:
+                        logger.exception(
+                            "Local-model lease release also failed while handling provider error"
+                        )
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -493,7 +573,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _close_request_client_once("absolute_attempt_deadline")
             except Exception:
                 pass
-            t.join(timeout=2.0)
+            bedrock_client = bedrock_client_holder.get("client")
+            if bedrock_client is not None:
+                try:
+                    bedrock_client.close()
+                except Exception:
+                    pass
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             result["error"] = AttemptDeadlineExceeded(message)
             break
 
@@ -551,7 +638,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
             # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -596,7 +684,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -645,7 +734,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"stale non-streaming call killed after {int(_elapsed)}s"
             )
             # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -680,6 +770,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _close_request_client_once("interrupt_abort")
             except Exception:
                 pass
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -2136,6 +2228,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    ensure_provider_route_available(agent, api_kwargs)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
@@ -2182,7 +2275,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
-                client = _get_bedrock_runtime_client(region)
+                remaining = _remaining_attempt_seconds(
+                    _attempt_started_monotonic,
+                    _attempt_budgets,
+                )
+                client = _get_bedrock_runtime_client(
+                    region,
+                    attempt_timeout_seconds=remaining,
+                )
                 bedrock_client_holder["client"] = client
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
@@ -2206,6 +2306,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "using non-streaming converse() for this session.",
                             type(_bedrock_exc).__name__,
                         )
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        fallback_remaining = _remaining_attempt_seconds(
+                            _attempt_started_monotonic,
+                            _attempt_budgets,
+                            include_first_event=True,
+                        )
+                        client = _get_bedrock_runtime_client(
+                            region,
+                            attempt_timeout_seconds=fallback_remaining,
+                        )
+                        bedrock_client_holder["client"] = client
                         result["response"] = normalize_converse_response(
                             client.converse(**api_kwargs)
                         )
@@ -2239,12 +2353,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
             except Exception as e:
                 result["error"] = e
+            finally:
+                client = bedrock_client_holder.get("client")
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close request-scoped Bedrock client",
+                            exc_info=True,
+                        )
 
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
             if agent._interrupt_requested:
+                client = bedrock_client_holder.get("client")
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                _quarantine_if_worker_alive(agent, api_kwargs, t)
+                t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             elapsed = time.monotonic() - _attempt_started_monotonic
             deadline_message = None
@@ -2273,7 +2407,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         close()
                     except Exception:
                         pass
-                t.join(timeout=2.0)
+                _quarantine_if_worker_alive(agent, api_kwargs, t)
+                t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
                 raise AttemptDeadlineExceeded(deadline_message)
         if result["error"] is not None:
             raise result["error"]
@@ -3178,7 +3313,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         finally:
             _close_request_client_once("stream_request_complete")
             if local_model_lease is not None:
-                local_model_lease.release()
+                try:
+                    local_model_lease.release()
+                except LocalModelLeaseError as exc:
+                    if result["error"] is None:
+                        result["error"] = exc
+                    else:
+                        logger.exception(
+                            "Local-model lease release also failed while handling stream error"
+                        )
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = getattr(agent, "_route_stale_timeout_seconds", None)
@@ -3277,7 +3420,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _close_request_client_once(str(_deadline_reason))
             except Exception:
                 pass
-            t.join(timeout=2.0)
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             result["error"] = AttemptDeadlineExceeded(_deadline_message)
             break
 
@@ -3357,6 +3501,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _close_request_client_once("stream_interrupt_abort")
             except Exception:
                 pass
+            _quarantine_if_worker_alive(agent, api_kwargs, t)
+            t.join(timeout=_PROVIDER_ABORT_JOIN_GRACE_SECONDS)
             raise InterruptedError("Agent interrupted during streaming API call")
     if result["error"] is not None:
         if deltas_were_sent["yes"]:

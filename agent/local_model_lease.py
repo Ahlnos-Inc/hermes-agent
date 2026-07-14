@@ -14,12 +14,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
+import stat
 import tempfile
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -30,10 +33,15 @@ from hermes_constants import get_default_hermes_root
 
 logger = logging.getLogger(__name__)
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _LOCK_POLL_SECONDS = 0.025
 _QUEUE_POLL_SECONDS = 0.05
 _DEFAULT_MAX_WAIT_SECONDS = 120.0
+_DEFAULT_LEASE_TTL_SECONDS = 1800.0
+_HEARTBEAT_INTERVAL_SECONDS = 10.0
+_HEARTBEAT_WINDOW_SECONDS = 60.0
+_OWNER_BIRTH_TOLERANCE_SECONDS = 0.01
+_PRIORITY_AGING_SECONDS_PER_POINT = 2.0
 
 
 class LocalModelLeaseError(RuntimeError):
@@ -44,8 +52,16 @@ class LocalModelLeaseTimeout(TimeoutError, LocalModelLeaseError):
     """Capacity could not be acquired before the caller's deadline."""
 
 
-class LocalModelLeaseStateError(LocalModelLeaseError):
-    """The durable lease state is invalid; fail closed to avoid overload."""
+class LocalModelLeaseQuarantined(LocalModelLeaseTimeout):
+    """A prior request exceeded its lease while its owner is still alive."""
+
+
+class LocalModelLeaseStateError(LocalModelLeaseTimeout):
+    """Durable state is invalid; fail closed but permit provider failover."""
+
+
+class LocalModelLeaseReleaseError(LocalModelLeaseError):
+    """The owner could not durably relinquish its capacity slot."""
 
 
 def _canonical_base_url(base_url: str) -> str:
@@ -111,6 +127,20 @@ def _max_wait_from_env() -> float:
     return value
 
 
+def _lease_ttl_from_env() -> float:
+    raw = os.environ.get(
+        "HERMES_LOCAL_MODEL_LEASE_TTL_SECONDS",
+        str(_DEFAULT_LEASE_TTL_SECONDS),
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LEASE_TTL_SECONDS
+    if not value > 0 or value == float("inf"):
+        return _DEFAULT_LEASE_TTL_SECONDS
+    return value
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -128,12 +158,44 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _process_started_at(pid: int) -> float:
+    """Return a PID-reuse-resistant process birth identity."""
+    try:
+        return float(psutil.Process(pid).create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+        raise LocalModelLeaseStateError(
+            "Unable to attest local-model lease owner process identity"
+        ) from exc
+
+
+def _same_process_birth(pid: int, expected: float) -> bool:
+    """Conservatively compare a live PID with its persisted birth identity."""
+    try:
+        actual = float(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.AccessDenied, OSError):
+        # Expiry remains the cross-host/access-denied recovery bound. Do not
+        # guess that a process is stale merely because it cannot be inspected.
+        return True
+    return abs(actual - float(expected)) <= _OWNER_BIRTH_TOLERANCE_SECONDS
+
+
 def _default_state() -> dict:
     return {"version": _STATE_VERSION, "active": None, "waiters": []}
 
 
 def _valid_identity(value: object, *, maximum: int) -> bool:
     return isinstance(value, str) and 0 < len(value) <= maximum
+
+
+def _valid_number(value: object, *, positive: bool = False) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and (not positive or float(value) > 0)
+    )
 
 
 def _valid_active(value: object) -> bool:
@@ -144,8 +206,16 @@ def _valid_active(value: object) -> bool:
         and isinstance(value.get("pid"), int)
         and value["pid"] > 0
         and _valid_identity(value.get("host"), maximum=255)
+        and _valid_number(value.get("process_started_at"), positive=True)
         and isinstance(value.get("priority"), int)
-        and isinstance(value.get("acquired_at"), (int, float))
+        and not isinstance(value.get("priority"), bool)
+        and _valid_number(value.get("acquired_at"), positive=True)
+        and _valid_number(value.get("heartbeat_at"), positive=True)
+        and _valid_number(value.get("expires_at"), positive=True)
+        and _valid_number(value.get("max_expires_at"), positive=True)
+        and value["acquired_at"] <= value["heartbeat_at"]
+        and value["heartbeat_at"] <= value["expires_at"]
+        and value["expires_at"] <= value["max_expires_at"]
         and (value.get("task_id") is None or isinstance(value.get("task_id"), str))
         and (value.get("run_id") is None or isinstance(value.get("run_id"), str))
     )
@@ -159,17 +229,37 @@ def _valid_waiter(value: object) -> bool:
         and isinstance(value.get("pid"), int)
         and value["pid"] > 0
         and _valid_identity(value.get("host"), maximum=255)
+        and _valid_number(value.get("process_started_at"), positive=True)
         and isinstance(value.get("priority"), int)
+        and not isinstance(value.get("priority"), bool)
         and isinstance(value.get("created_at"), int)
-        and isinstance(value.get("expires_at"), (int, float))
+        and not isinstance(value.get("created_at"), bool)
+        and value["created_at"] > 0
+        and _valid_number(value.get("expires_at"), positive=True)
         and (value.get("task_id") is None or isinstance(value.get("task_id"), str))
         and (value.get("run_id") is None or isinstance(value.get("run_id"), str))
     )
 
 
-def _read_state(path: Path) -> dict:
+def _read_state(path: Path, *, dir_fd: int | None = None) -> dict:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        if dir_fd is None:
+            payload = path.read_text(encoding="utf-8")
+        else:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path.name, flags, dir_fd=dir_fd)
+            try:
+                with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                    descriptor = -1
+                    payload = handle.read()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        raw = json.loads(payload)
     except FileNotFoundError:
         return _default_state()
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -197,10 +287,25 @@ def _read_state(path: Path) -> dict:
     return raw
 
 
-def _atomic_write_state(path: Path, state: dict) -> None:
+def _atomic_write_state(
+    path: Path,
+    state: dict,
+    *,
+    dir_fd: int | None = None,
+) -> None:
     payload = json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp_path = Path(temp_name)
+    temp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    if dir_fd is None:
+        fd, raw_temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temp_path = Path(raw_temp_name)
+    else:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temp_name, flags, 0o600, dir_fd=dir_fd)
+        temp_path = None
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -208,22 +313,39 @@ def _atomic_write_state(path: Path, state: dict) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-        try:
-            dir_fd = os.open(path.parent, os.O_RDONLY)
+        if dir_fd is None:
+            assert temp_path is not None
+            os.replace(temp_path, path)
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+                parent_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError:
+                pass
+        else:
+            os.replace(
+                temp_name,
+                path.name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            os.fsync(dir_fd)
     finally:
         if fd >= 0:
             os.close(fd)
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+        if dir_fd is None:
+            assert temp_path is not None
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            try:
+                os.unlink(temp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
 
 
 class _StateLock:
@@ -235,19 +357,30 @@ class _StateLock:
         *,
         deadline_monotonic: float,
         cancelled: Callable[[], bool],
+        dir_fd: int | None = None,
     ) -> None:
         self.path = path
         self.deadline_monotonic = deadline_monotonic
         self.cancelled = cancelled
+        self.dir_fd = dir_fd
         self._handle = None
 
     def __enter__(self):
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
-        self._handle = open(self.path, "a+b")
+        if self.dir_fd is None:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(self.path.parent, 0o700)
+            except OSError:
+                pass
+            self._handle = open(self.path, "a+b")
+        else:
+            flags = os.O_CREAT | os.O_RDWR
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            lock_fd = os.open(self.path.name, flags, 0o600, dir_fd=self.dir_fd)
+            self._handle = os.fdopen(lock_fd, "a+b")
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -305,38 +438,150 @@ class _StateLock:
 
 @dataclass
 class LocalModelCapacityLease:
-    """An acquired capacity slot. Release is idempotent."""
+    """An acquired, renewable capacity slot with exact-owner release."""
 
     _state_path: Path
     _lock_path: Path
     _token: str
+    _pid: int
+    _host: str
+    _process_started_at: float
+    _max_expires_at: float
+    _dir_fd: int | None = None
     _released: bool = False
+    _heartbeat_stop: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+        repr=False,
+    )
+    _heartbeat_thread: threading.Thread | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"local-model-lease-{self._token[:8]}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _owns(self, active: object) -> bool:
+        return (
+            isinstance(active, dict)
+            and active.get("token") == self._token
+            and active.get("pid") == self._pid
+            and active.get("host") == self._host
+            and active.get("process_started_at") == self._process_started_at
+        )
+
+    def _heartbeat_once(self) -> bool:
+        """Renew this exact owner without exceeding the attempt-derived cap."""
+        now = time.time()
+        with _StateLock(
+            self._lock_path,
+            deadline_monotonic=time.monotonic() + 2.0,
+            cancelled=lambda: self._heartbeat_stop.is_set(),
+            dir_fd=self._dir_fd,
+        ):
+            state = _read_state(self._state_path, dir_fd=self._dir_fd)
+            active = state.get("active")
+            if not self._owns(active):
+                return False
+            # Once expired, an old owner may not resurrect itself. The durable
+            # record becomes a fail-fast route quarantine until this exact
+            # owner releases or its process is proven dead. Reclaiming merely
+            # because a deadline elapsed could overlap a still-hung transport.
+            if float(active["expires_at"]) <= now or self._max_expires_at <= now:
+                return False
+            active["heartbeat_at"] = now
+            active["expires_at"] = min(
+                self._max_expires_at,
+                now + _HEARTBEAT_WINDOW_SECONDS,
+            )
+            _atomic_write_state(self._state_path, state, dir_fd=self._dir_fd)
+            return True
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                if not self._heartbeat_once():
+                    self._heartbeat_stop.set()
+                    return
+            except InterruptedError:
+                return
+            except Exception:
+                # Do not extend in-memory on failure. The durable expires_at is
+                # the safety bound and another waiter may reclaim after it.
+                logger.exception("Failed to heartbeat local-model capacity lease")
+
+    def _stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=2.5)
 
     def release(self) -> None:
+        """Durably clear this exact owner, or raise so the caller can retry."""
         if self._released:
             return
-        self._released = True
+        self._stop_heartbeat()
         try:
             with _StateLock(
                 self._lock_path,
                 deadline_monotonic=time.monotonic() + 2.0,
                 cancelled=lambda: False,
+                dir_fd=self._dir_fd,
             ):
-                state = _read_state(self._state_path)
+                state = _read_state(self._state_path, dir_fd=self._dir_fd)
                 active = state.get("active")
-                if isinstance(active, dict) and active.get("token") == self._token:
+                if self._owns(active):
                     state["active"] = None
-                    _atomic_write_state(self._state_path, state)
-        except Exception:
-            # Never mask a provider result. A process crash/stuck release is
-            # diagnosed by the durable state and reclaimed after PID death.
-            logger.exception("Failed to release local-model capacity lease")
+                    _atomic_write_state(
+                        self._state_path,
+                        state,
+                        dir_fd=self._dir_fd,
+                    )
+                elif isinstance(active, dict) and active.get("token") == self._token:
+                    # Same token with a different owner identity is corrupt,
+                    # not authority to clear a possibly-successor record.
+                    raise LocalModelLeaseStateError(
+                        "local-model lease token owner identity changed"
+                    )
+                # None or a different token means expiry/reclamation already
+                # ended our ownership. Exact compare prevents deleting the
+                # successor that acquired after our lease expired.
+            self._released = True
+            if self._dir_fd is not None:
+                os.close(self._dir_fd)
+                self._dir_fd = None
+        except LocalModelLeaseError:
+            raise
+        except Exception as exc:
+            raise LocalModelLeaseReleaseError(
+                "Failed to durably release local-model capacity lease"
+            ) from exc
 
     def __enter__(self) -> "LocalModelCapacityLease":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
+        try:
+            self.release()
+        except Exception:
+            if exc_type is None:
+                raise
+            # Preserve an exception raised by the provider/body. The release
+            # remains retryable and durable expiry prevents a permanent wedge.
+            logger.exception(
+                "Failed to release local-model capacity lease while unwinding"
+            )
 
 
 def _prune_stale(
@@ -345,36 +590,118 @@ def _prune_stale(
     hostname: str,
     now_wall: float,
     pid_alive: Callable[[int], bool],
+    same_process_birth: Callable[[int, float], bool],
 ) -> bool:
     changed = False
     active = state.get("active")
-    if isinstance(active, dict) and active.get("host") == hostname:
-        try:
-            active_pid = int(active.get("pid", 0))
-        except (TypeError, ValueError):
-            active_pid = 0
-        if not pid_alive(active_pid):
+    if isinstance(active, dict):
+        stale_local_owner = False
+        if active.get("host") == hostname:
+            active_pid = int(active["pid"])
+            stale_local_owner = not pid_alive(active_pid) or not same_process_birth(
+                active_pid,
+                float(active["process_started_at"]),
+            )
+        if stale_local_owner:
             state["active"] = None
             changed = True
 
     live_waiters = []
     for waiter in state.get("waiters", []):
-        if waiter.get("host") != hostname:
-            live_waiters.append(waiter)
-            continue
-        try:
-            waiter_pid = int(waiter.get("pid", 0))
-            expires_at = float(waiter.get("expires_at", 0))
-        except (TypeError, ValueError):
-            changed = True
-            continue
-        if expires_at <= now_wall or not pid_alive(waiter_pid):
+        expires_at = float(waiter["expires_at"])
+        stale_local_waiter = False
+        if waiter.get("host") == hostname:
+            waiter_pid = int(waiter["pid"])
+            stale_local_waiter = not pid_alive(waiter_pid) or not same_process_birth(
+                waiter_pid,
+                float(waiter["process_started_at"]),
+            )
+        if expires_at <= now_wall or stale_local_waiter:
             changed = True
             continue
         live_waiters.append(waiter)
     if len(live_waiters) != len(state.get("waiters", [])):
         state["waiters"] = live_waiters
     return changed
+
+
+def _waiter_order_key(waiter: dict, *, now_ns: int) -> tuple[float, int, str]:
+    """Priority FIFO with aging so bounded low-priority work cannot starve."""
+    created_at = int(waiter.get("created_at", 0))
+    age_seconds = max(0.0, (now_ns - created_at) / 1_000_000_000)
+    effective_priority = int(waiter.get("priority", 0)) + (
+        age_seconds / _PRIORITY_AGING_SECONDS_PER_POINT
+    )
+    return (
+        -effective_priority,
+        created_at,
+        str(waiter.get("token", "")),
+    )
+
+
+def _open_pinned_lease_directory(root: Path, key: str) -> tuple[Path, int | None]:
+    """Create and pin the lease directory without following internal links."""
+    lease_dir = root / "shared" / "local-model-leases" / key
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+        for candidate in (lease_dir.parent.parent, lease_dir.parent, lease_dir):
+            if candidate.is_symlink():
+                raise LocalModelLeaseStateError(
+                    "local-model lease path contains a symbolic link"
+                )
+        lease_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return lease_dir, None
+
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        current = os.open(root, flags)
+    except OSError as exc:
+        raise LocalModelLeaseStateError(
+            "local-model lease root cannot be pinned safely"
+        ) from exc
+    try:
+        for component in ("shared", "local-model-leases", key):
+            try:
+                os.mkdir(component, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(component, flags, dir_fd=current)
+            except OSError as exc:
+                try:
+                    entry_info = os.stat(
+                        component,
+                        dir_fd=current,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    entry_info = None
+                if entry_info is not None and stat.S_ISLNK(entry_info.st_mode):
+                    raise LocalModelLeaseStateError(
+                        "local-model lease path contains a symbolic link"
+                    ) from exc
+                raise LocalModelLeaseStateError(
+                    "local-model lease path cannot be pinned safely"
+                ) from exc
+            info = os.fstat(child)
+            if not stat.S_ISDIR(info.st_mode) or (
+                hasattr(os, "getuid") and info.st_uid != os.getuid()
+            ):
+                os.close(child)
+                raise LocalModelLeaseStateError(
+                    "local-model lease directory has unsafe ownership"
+                )
+            os.fchmod(child, 0o700)
+            os.close(current)
+            current = child
+        return lease_dir, current
+    except BaseException:
+        os.close(current)
+        raise
 
 
 def acquire_local_model_capacity(
@@ -384,9 +711,12 @@ def acquire_local_model_capacity(
     base_url: str,
     deadline_monotonic: float | None,
     cancelled: Callable[[], bool],
+    lease_deadline_monotonic: float | None = None,
     root: Path | None = None,
     priority: int | None = None,
     pid_alive: Callable[[int], bool] = _pid_alive,
+    process_started_at: Callable[[int], float] = _process_started_at,
+    same_process_birth: Callable[[int, float], bool] = _same_process_birth,
 ) -> LocalModelCapacityLease:
     """Wait for and acquire the single slot for a concrete local route.
 
@@ -407,19 +737,10 @@ def acquire_local_model_capacity(
         )
 
     key = local_model_lease_key(provider, model, base_url)
-    lease_root = (root or get_default_hermes_root()) / "shared" / "local-model-leases"
-    lease_dir = lease_root / key
-    for candidate in (lease_root.parent, lease_root, lease_dir):
-        if candidate.is_symlink():
-            raise LocalModelLeaseStateError(
-                "local-model lease path contains a symbolic link"
-            )
-    lease_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(lease_root, 0o700)
-        os.chmod(lease_dir, 0o700)
-    except OSError:
-        pass
+    lease_dir, lease_dir_fd = _open_pinned_lease_directory(
+        root or get_default_hermes_root(),
+        key,
+    )
     state_path = lease_dir / "state.json"
     lock_path = lease_dir / "state.lock"
     if state_path.is_symlink() or lock_path.is_symlink():
@@ -430,13 +751,29 @@ def acquire_local_model_capacity(
     token = uuid.uuid4().hex
     hostname = socket.gethostname()
     pid = os.getpid()
+    owner_process_started_at = process_started_at(pid)
     requested_priority = _priority_from_env() if priority is None else int(priority)
     created_at = time.time_ns()
     expires_at = time.time() + max(0.0, effective_deadline - now_monotonic)
+    lease_budget_deadline = (
+        lease_deadline_monotonic
+        if lease_deadline_monotonic is not None
+        else deadline_monotonic
+    )
+    lease_deadline = (
+        lease_budget_deadline
+        if lease_budget_deadline is not None
+        else now_monotonic + _lease_ttl_from_env()
+    )
+    max_lease_expires_at = time.time() + max(
+        0.0,
+        lease_deadline - time.monotonic(),
+    )
     waiter = {
         "token": token,
         "pid": pid,
         "host": hostname,
+        "process_started_at": owner_process_started_at,
         "priority": requested_priority,
         "created_at": created_at,
         "expires_at": expires_at,
@@ -461,29 +798,61 @@ def acquire_local_model_capacity(
                 lock_path,
                 deadline_monotonic=effective_deadline,
                 cancelled=cancelled,
+                dir_fd=lease_dir_fd,
             ):
-                state = _read_state(state_path)
+                state = _read_state(state_path, dir_fd=lease_dir_fd)
                 changed = _prune_stale(
                     state,
                     hostname=hostname,
                     now_wall=time.time(),
                     pid_alive=pid_alive,
+                    same_process_birth=same_process_birth,
                 )
+                active = state.get("active")
+                if (
+                    isinstance(active, dict)
+                    and float(active["expires_at"]) <= time.time()
+                ):
+                    # The owner is not proven dead, so its underlying provider
+                    # call may still be consuming local capacity. Do not queue
+                    # behind it or admit overlapping work: fail over promptly.
+                    if changed:
+                        _atomic_write_state(
+                            state_path,
+                            state,
+                            dir_fd=lease_dir_fd,
+                        )
+                    raise LocalModelLeaseQuarantined(
+                        "Local-model route is quarantined by an unsettled prior attempt"
+                    )
                 if not registered:
                     state["waiters"].append(waiter)
                     registered = True
                     changed = True
                 if state.get("active") is None:
                     waiters = state["waiters"]
+                    order_now_ns = time.time_ns()
                     winner = min(
                         waiters,
-                        key=lambda item: (
-                            -int(item.get("priority", 0)),
-                            int(item.get("created_at", 0)),
-                            str(item.get("token", "")),
+                        key=lambda item: _waiter_order_key(
+                            item,
+                            now_ns=order_now_ns,
                         ),
                     )
                     if winner.get("token") == token:
+                        acquired_at = time.time()
+                        if max_lease_expires_at <= acquired_at:
+                            # The attempt budget elapsed while this process was
+                            # inside the state transaction. Leave the waiter to
+                            # the exception cleanup path; never persist an
+                            # already-invalid active lease.
+                            raise LocalModelLeaseTimeout(
+                                "Local-model attempt deadline elapsed during admission"
+                            )
+                        active_expires_at = min(
+                            max_lease_expires_at,
+                            acquired_at + _HEARTBEAT_WINDOW_SECONDS,
+                        )
                         state["waiters"] = [
                             item for item in waiters if item.get("token") != token
                         ]
@@ -491,15 +860,23 @@ def acquire_local_model_capacity(
                             "token": token,
                             "pid": pid,
                             "host": hostname,
+                            "process_started_at": owner_process_started_at,
                             "priority": requested_priority,
-                            "acquired_at": time.time(),
+                            "acquired_at": acquired_at,
+                            "heartbeat_at": acquired_at,
+                            "expires_at": active_expires_at,
+                            "max_expires_at": max_lease_expires_at,
                             "task_id": waiter["task_id"],
                             "run_id": waiter["run_id"],
                         }
                         acquired = True
                         changed = True
                 if changed:
-                    _atomic_write_state(state_path, state)
+                    _atomic_write_state(
+                        state_path,
+                        state,
+                        dir_fd=lease_dir_fd,
+                    )
             if acquired:
                 waited = time.monotonic() - wait_started
                 logger.info(
@@ -508,7 +885,18 @@ def acquire_local_model_capacity(
                     requested_priority,
                     waited,
                 )
-                return LocalModelCapacityLease(state_path, lock_path, token)
+                lease = LocalModelCapacityLease(
+                    state_path,
+                    lock_path,
+                    token,
+                    pid,
+                    hostname,
+                    owner_process_started_at,
+                    max_lease_expires_at,
+                    lease_dir_fd,
+                )
+                lease_dir_fd = None
+                return lease
             time.sleep(
                 min(
                     _QUEUE_POLL_SECONDS, max(0.0, effective_deadline - time.monotonic())
@@ -521,22 +909,32 @@ def acquire_local_model_capacity(
                     lock_path,
                     deadline_monotonic=time.monotonic() + 1.0,
                     cancelled=lambda: False,
+                    dir_fd=lease_dir_fd,
                 ):
-                    state = _read_state(state_path)
+                    state = _read_state(state_path, dir_fd=lease_dir_fd)
                     state["waiters"] = [
                         item
                         for item in state.get("waiters", [])
                         if item.get("token") != token
                     ]
-                    _atomic_write_state(state_path, state)
+                    _atomic_write_state(
+                        state_path,
+                        state,
+                        dir_fd=lease_dir_fd,
+                    )
             except Exception:
                 logger.exception("Failed to remove local-model capacity waiter")
         raise
+    finally:
+        if lease_dir_fd is not None:
+            os.close(lease_dir_fd)
 
 
 __all__ = [
     "LocalModelCapacityLease",
     "LocalModelLeaseError",
+    "LocalModelLeaseReleaseError",
+    "LocalModelLeaseQuarantined",
     "LocalModelLeaseStateError",
     "LocalModelLeaseTimeout",
     "acquire_local_model_capacity",

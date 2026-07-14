@@ -163,9 +163,30 @@ def test_dispatch_rejects_missing_spawn_receipt(
 
     assert result.spawned == []
     assert result.spawn_errors == [
-        (task_id, "spawn function returned no valid worker receipt")
+        (task_id, "spawn function must return an owned SpawnReceipt")
     ]
     assert task.status == "ready"
+
+
+def test_dispatch_rejects_legacy_integer_pid_without_signalling_it(
+    kanban_home,
+    all_assignees_spawnable,
+    monkeypatch,
+):
+    signalled = []
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unowned pid", assignee="worker")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 31_004)
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert result.spawn_errors == [
+        (task_id, "spawn function must return an owned SpawnReceipt")
+    ]
+    assert task.status == "ready"
+    assert signalled == []
 
 
 def test_pid_attach_rejects_stale_run_without_partial_write(kanban_home):
@@ -219,6 +240,93 @@ def test_orphan_canary_scans_only_exact_run_identity(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert kb._scan_exact_kanban_workers("t_exact", 17, "host:claim") == [202, 303]
+
+
+def test_reclaim_never_signals_a_verified_pid_identity_mismatch(monkeypatch):
+    host = kb._claimer_id().split(":", 1)[0]
+    signalled = []
+    monkeypatch.setattr(kb, "_attest_reclaim_process_identity", lambda *_args: False)
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    result = kb._terminate_reclaimed_worker(42_001, f"{host}:claim")
+
+    assert result["identity_mismatch"] is True
+    assert result["terminated"] is True
+    assert signalled == []
+
+
+def test_reclaim_identity_attestation_binds_environment_and_birth_time(monkeypatch):
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return 1234.5
+
+        def environ(self):
+            return {"HERMES_KANBAN_CLAIM_LOCK": "host:exact-claim"}
+
+        def is_running(self):
+            return True
+
+    fake_psutil = types.SimpleNamespace(
+        Process=FakeProcess,
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        AccessDenied=type("AccessDenied", (Exception,), {}),
+        ZombieProcess=type("ZombieProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert kb._attest_reclaim_process_identity(42_010, "host:exact-claim") is True
+    assert kb._attest_reclaim_process_identity(42_010, "host:other") is False
+
+
+def test_reclaim_holds_an_unverifiable_live_pid_without_signalling(monkeypatch):
+    host = kb._claimer_id().split(":", 1)[0]
+    signalled = []
+    monkeypatch.setattr(kb, "_attest_reclaim_process_identity", lambda *_args: None)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    result = kb._terminate_reclaimed_worker(42_002, f"{host}:claim")
+
+    assert result["identity_unverifiable"] is True
+    assert kb._worker_survived_termination(result) is True
+    assert signalled == []
+
+
+def test_manual_reclaim_keeps_claim_when_live_pid_identity_is_unverifiable(
+    kanban_home,
+    monkeypatch,
+):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="hold unsafe reclaim", assignee="worker")
+        task = kb.claim_task(conn, task_id, claimer=f"{host}:claim")
+        assert task is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            42_003,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+        )
+        monkeypatch.setattr(
+            kb, "_attest_reclaim_process_identity", lambda *_args: None
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        assert kb.reclaim_task(conn, task_id, reason="operator request") is False
+        current = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert current.status == "running"
+    assert current.worker_pid == 42_003
+    assert any(
+        event.kind == "reclaim_deferred"
+        and event.payload["reason"] == "manual_reclaim_identity_unverifiable"
+        for event in events
+    )
 
 
 def test_manual_reclaim_observes_missing_pid_without_killing_scan_match(

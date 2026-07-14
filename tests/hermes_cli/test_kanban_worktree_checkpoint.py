@@ -124,7 +124,11 @@ def test_dispatch_records_checkpoint_identity(tmp_path, monkeypatch):
         result = kb.dispatch_once(
             conn,
             board="checkpoint-test",
-            spawn_fn=lambda _task, _workspace: None,
+            spawn_fn=lambda _task, _workspace: kb.SpawnReceipt(
+                pid=31_005,
+                release=lambda: None,
+                abort=lambda: None,
+            ),
         )
         events = kb.list_events(conn, task_id)
 

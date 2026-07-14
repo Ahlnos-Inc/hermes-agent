@@ -15,6 +15,7 @@ This module provides:
 import copy
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -4611,6 +4612,26 @@ def _normalize_custom_provider_entry(
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
         normalized["rate_limit_delay"] = rate_limit_delay
 
+    # Preserve route-level execution budgets through the legacy
+    # ``custom_providers`` compatibility layer. Accepting these keys during
+    # validation but dropping them here makes gateway-created agents silently
+    # unbounded for legacy named providers.
+    for timeout_key in (
+        "request_timeout_seconds",
+        "stale_timeout_seconds",
+        "total_attempt_timeout_seconds",
+        "first_event_timeout_seconds",
+    ):
+        raw_timeout = entry.get(timeout_key)
+        if isinstance(raw_timeout, bool):
+            continue
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            continue
+        if timeout > 0 and math.isfinite(timeout):
+            normalized[timeout_key] = timeout
+
     discover_models = entry.get("discover_models")
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
@@ -4654,6 +4675,10 @@ def _custom_provider_entry_to_provider_config(
         "models",
         "context_length",
         "rate_limit_delay",
+        "request_timeout_seconds",
+        "stale_timeout_seconds",
+        "total_attempt_timeout_seconds",
+        "first_event_timeout_seconds",
         "discover_models",
         "extra_body",
         "ssl_ca_cert",

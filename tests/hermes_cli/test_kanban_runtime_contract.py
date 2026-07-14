@@ -17,6 +17,7 @@ def _claimed_routed_task(monkeypatch):
         model_override="gpt-5.6-sol",
         model_provider_override="openai-codex",
         model_reasoning_effort="xhigh",
+        toolsets=["terminal", "file"],
     )
     task = kb.claim_task(conn, tid)
     assert task is not None and task.current_run_id is not None
@@ -40,6 +41,7 @@ def test_preflight_rejects_clobbered_cli_route_before_provider_work(
             model="claude-opus-4-8",
             provider="anthropic",
             reasoning_config={"effort": "max"},
+            toolsets=["FILE", "terminal"],
         )
 
 
@@ -53,6 +55,7 @@ def test_preflight_accepts_canonical_provider_prefixed_model(
         model="openai-codex/gpt-5.6-sol",
         provider="OPENAI-CODEX",
         reasoning_config={"effort": "xhigh"},
+        toolsets=["terminal", "file"],
     )
 
     assert spec["version"] == 2
@@ -84,6 +87,20 @@ def test_preflight_rejects_clobbered_task_toolsets(monkeypatch):
             reasoning_config=None,
             toolsets=["browser", "web"],
         )
+
+
+def test_preflight_compares_toolsets_as_a_normalized_set(monkeypatch):
+    _claimed_routed_task(monkeypatch)
+    from hermes_cli.kanban_runtime_contract import preflight_kanban_cli_route
+
+    spec = preflight_kanban_cli_route(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        reasoning_config={"effort": "xhigh"},
+        toolsets=["TERMINAL", "file", "terminal"],
+    )
+
+    assert spec["toolsets"] == ["file", "terminal"]
 
 
 def test_claim_rejects_corrupt_empty_task_toolsets():

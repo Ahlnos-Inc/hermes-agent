@@ -1,5 +1,6 @@
 import os
 import stat
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -171,7 +172,10 @@ def test_external_runtime_uses_active_profile_capability_policy(
             "workspace": workspace,
             "cli_wrapper": tmp_path / "wrapper",
             "kanban_task_id": "BUILD-425",
+            "attested_route": ("anthropic", "claude-fable-5"),
+            "attested_at": time.monotonic(),
         },
+        _claude_max_attestation=SimpleNamespace(included_usage=True),
     )
 
     projection = run_claude_agent_sdk_attempt(
@@ -248,6 +252,72 @@ def test_auth_failure_clears_preflight_and_session_for_reattestation(
     assert agent._claude_max_attestation is None
     assert agent._claude_sdk_sessions == {}
     assert session.closed is True
+
+
+def test_each_new_sdk_route_requires_fresh_billing_attestation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-472")
+    calls = []
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_turn(self, _prompt):
+            return ClaudeProjection(final_text="ok")
+
+    def attest(wrapper, **kwargs):
+        calls.append((wrapper, kwargs))
+        return SimpleNamespace(included_usage=True, marker=len(calls))
+
+    monkeypatch.setattr(external_runtime, "ClaudeAgentSdkSession", FakeSession)
+    monkeypatch.setattr(external_runtime, "attest_claude_max_auth", attest)
+    key = ("anthropic", "claude-sonnet-4-6")
+    agent = SimpleNamespace(
+        provider=key[0],
+        model=key[1],
+        tools=[],
+        _cached_system_prompt="",
+        max_iterations=2,
+        stream_delta_callback=None,
+        tool_progress_callback=None,
+        _claude_runtime_context={
+            "sdk": object(),
+            "host_home": tmp_path,
+            "workspace": tmp_path,
+            "cli_wrapper": tmp_path / "wrapper",
+            "kanban_task_id": "BUILD-472",
+            "attested_route": key,
+            "attested_at": 0.0,
+        },
+    )
+
+    assert run_claude_agent_sdk_attempt(
+        agent, user_message="first", effective_task_id="task"
+    ).final_text == "ok"
+    assert calls == [(tmp_path / "wrapper", {"cache_ttl_seconds": 0})]
+
+    # The existing session keeps its own already-attested lifecycle.
+    assert run_claude_agent_sdk_attempt(
+        agent, user_message="second", effective_task_id="task"
+    ).final_text == "ok"
+    assert len(calls) == 1
+
+    # A new route means a new SDK session and fresh auth/billing evidence.
+    agent.model = "claude-opus-4-8"
+    assert run_claude_agent_sdk_attempt(
+        agent, user_message="third", effective_task_id="task"
+    ).final_text == "ok"
+    assert len(calls) == 2
+    assert calls[-1][1] == {"cache_ttl_seconds": 0}
+
+    agent.model = "claude-sonnet-4-6"
+    assert run_claude_agent_sdk_attempt(
+        agent, user_message="fourth", effective_task_id="task"
+    ).final_text == "ok"
+    assert len(calls) == 2
+    assert agent._claude_max_attestation.marker == 1
 
 
 def test_raised_auth_failure_also_clears_preflight_and_session(monkeypatch, tmp_path):
@@ -350,7 +420,7 @@ def test_preflight_uses_per_worker_tmpdir_and_narrow_sdk_compatibility_grant(
     monkeypatch.setattr(
         external_runtime,
         "attest_claude_max_auth",
-        lambda _wrapper: SimpleNamespace(included_usage=True),
+        lambda _wrapper, **_kwargs: SimpleNamespace(included_usage=True),
     )
     agent = SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6")
 

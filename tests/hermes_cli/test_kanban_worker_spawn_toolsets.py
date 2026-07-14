@@ -91,6 +91,58 @@ agent:
         assert required in pinned
 
 
+def test_claim_snapshots_profile_toolsets_before_profile_mutation(
+    monkeypatch, tmp_path,
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n    - file\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="profile scoped tools",
+            assignee="elias",
+            workspace_kind="dir",
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        claimed_toolsets = kb.latest_run(conn, task_id).run_spec["toolsets"]
+        assert {"file", "terminal"} <= set(claimed_toolsets)
+        assert "browser" not in claimed_toolsets
+
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - browser\n    - web\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace-snapshot"
+    workspace.mkdir()
+
+    kb._default_spawn(claimed, str(workspace))
+
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert pinned == claimed_toolsets
+
+
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     """Workers are headless: an inherited HERMES_TUI=1 (or a TUI-default
     config) must not send the quiet chat run into the Ink TUI, whose no-TTY
@@ -232,7 +284,7 @@ def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
     pinned_toolsets = captured["cmd"][
         captured["cmd"].index("--toolsets") + 1
     ].split(",")
-    assert pinned_toolsets == ["terminal", "file"]
+    assert pinned_toolsets == ["file", "terminal"]
     assert json.loads(captured["env"]["HERMES_KANBAN_DELIVERY_POLICY"]) == {
         "version": 1,
         "disposition": "none",

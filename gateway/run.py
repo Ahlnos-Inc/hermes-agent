@@ -1815,7 +1815,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
             else _runtime_mot
         )
 
-    return {
+    resolved = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -1828,6 +1828,15 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "model": runtime.get("model"),
         "moa_config": runtime.get("moa_config"),
     }
+    for timeout_key in (
+        "request_timeout_seconds",
+        "stale_timeout_seconds",
+        "total_attempt_timeout_seconds",
+        "first_event_timeout_seconds",
+    ):
+        if runtime.get(timeout_key) is not None:
+            resolved[timeout_key] = runtime[timeout_key]
+    return resolved
 
 
 def _try_resolve_fallback_provider() -> dict | None:
@@ -1879,7 +1888,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     entry.get("provider") or runtime.get("provider"),
                     entry.get("model"),
                 )
-                return {
+                resolved = {
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
                     "provider": runtime.get("provider"),
@@ -1891,6 +1900,15 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "model": runtime.get("model") or entry.get("model"),
                     "moa_config": runtime.get("moa_config"),
                 }
+                for timeout_key in (
+                    "request_timeout_seconds",
+                    "stale_timeout_seconds",
+                    "total_attempt_timeout_seconds",
+                    "first_event_timeout_seconds",
+                ):
+                    if runtime.get(timeout_key) is not None:
+                        resolved[timeout_key] = runtime[timeout_key]
+                return resolved
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
                 continue
@@ -3686,6 +3704,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
             "moa_config": runtime_kwargs.get("moa_config"),
+            "request_timeout_seconds": runtime_kwargs.get(
+                "request_timeout_seconds"
+            ),
+            "stale_timeout_seconds": runtime_kwargs.get("stale_timeout_seconds"),
+            "total_attempt_timeout_seconds": runtime_kwargs.get(
+                "total_attempt_timeout_seconds"
+            ),
+            "first_event_timeout_seconds": runtime_kwargs.get(
+                "first_event_timeout_seconds"
+            ),
         }
         route = {
             "model": model,
@@ -3699,6 +3727,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["command"],
                 tuple(runtime["args"]),
                 repr(runtime.get("moa_config")),
+                runtime.get("request_timeout_seconds"),
+                runtime.get("stale_timeout_seconds"),
+                runtime.get("total_attempt_timeout_seconds"),
+                runtime.get("first_event_timeout_seconds"),
             ),
         }
 
@@ -14993,6 +15025,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("api_mode", ""),
                 runtime.get("runtime", "hermes"),
                 runtime.get("moa_config"),
+                runtime.get("request_timeout_seconds"),
+                runtime.get("stale_timeout_seconds"),
+                runtime.get("total_attempt_timeout_seconds"),
+                runtime.get("first_event_timeout_seconds"),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
@@ -19052,7 +19088,39 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+) -> bool:
+    """Run a gateway while holding the shared config-maintenance interlock."""
+    from gateway.config_writer_interlock import (
+        ConfigWriterMaintenanceActive,
+        acquire_gateway_lifetime_lock,
+        release_gateway_lifetime_lock,
+    )
+
+    try:
+        maintenance_lock = acquire_gateway_lifetime_lock()
+    except ConfigWriterMaintenanceActive as exc:
+        logger.error("Gateway startup refused: %s", exc)
+        print(f"\n❌ Gateway startup refused: {exc}\n")
+        return False
+    try:
+        return await _start_gateway_under_config_lock(
+            config=config,
+            replace=replace,
+            verbosity=verbosity,
+        )
+    finally:
+        release_gateway_lifetime_lock(maintenance_lock)
+
+
+async def _start_gateway_under_config_lock(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+) -> bool:
     """
     Start the gateway and run until interrupted.
     

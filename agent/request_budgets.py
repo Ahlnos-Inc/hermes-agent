@@ -3,12 +3,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import threading
 from typing import Any
+from urllib.parse import urlsplit
 
 from hermes_cli.timeouts import (
     get_provider_first_event_timeout,
     get_provider_total_attempt_timeout,
 )
+from agent.model_metadata import is_local_endpoint
+
+
+# Local inference can legitimately spend several minutes loading weights,
+# prefilling a large context, and generating a response.  It still must not be
+# allowed to run forever when no route policy was supplied.  Fifteen minutes is
+# deliberately generous and remains overrideable through the existing typed
+# ``providers.<id>[.models.<model>].total_attempt_timeout_seconds`` contract.
+DEFAULT_LOCAL_TOTAL_ATTEMPT_TIMEOUT_SECONDS = 15 * 60.0
+DEFAULT_BEDROCK_TOTAL_ATTEMPT_TIMEOUT_SECONDS = 15 * 60.0
+
+
+# A timed-out Python worker cannot be killed safely.  Keep exact routes whose
+# transport thread did not unwind quarantined in this process so retries and
+# new turns fail fast instead of compounding the hung request.  Local routes
+# additionally retain their durable capacity lease in the worker until actual
+# unwind, providing the cross-process containment that this in-memory registry
+# intentionally cannot provide for cloud routes.
+_orphaned_route_threads: dict[tuple[str, ...], set[threading.Thread]] = {}
+_orphaned_route_threads_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -17,6 +40,104 @@ class AttemptBudgets:
 
     total_seconds: float | None
     first_event_seconds: float | None
+
+
+class ProviderRouteQuarantined(TimeoutError):
+    """An earlier timed-out request is still running on the exact route."""
+
+
+def _positive_timeout(raw: object) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or not math.isfinite(value):
+        return None
+    return value
+
+
+def _credential_free_endpoint(raw: object) -> tuple[str, str, str, str]:
+    """Return a stable endpoint identity without userinfo/query/fragment."""
+    value = str(raw or "").strip()
+    if not value:
+        return ("", "", "", "")
+    try:
+        parsed = urlsplit(value if "://" in value else f"https://{value}")
+        return (
+            (parsed.scheme or "").lower(),
+            (parsed.hostname or "").lower(),
+            str(parsed.port or ""),
+            parsed.path.rstrip("/"),
+        )
+    except (TypeError, ValueError):
+        # Do not retain or report a malformed raw URL because it may contain
+        # embedded credentials.  Provider/mode/model still scope the route.
+        return ("invalid", "", "", "")
+
+
+def provider_route_key(agent: Any, api_payload: dict[str, Any]) -> tuple[str, ...]:
+    """Build the credential-free identity used for orphan containment."""
+    model = (
+        api_payload.get("model")
+        or api_payload.get("modelId")
+        or getattr(agent, "model", "")
+        or ""
+    )
+    return (
+        str(getattr(agent, "provider", "") or "").strip().lower(),
+        str(getattr(agent, "api_mode", "") or "").strip().lower(),
+        str(model),
+        *_credential_free_endpoint(getattr(agent, "base_url", None)),
+    )
+
+
+def _live_orphan_threads_locked(
+    route_key: tuple[str, ...],
+) -> set[threading.Thread]:
+    threads = _orphaned_route_threads.get(route_key, set())
+    live = {thread for thread in threads if thread.is_alive()}
+    if live:
+        _orphaned_route_threads[route_key] = live
+    else:
+        _orphaned_route_threads.pop(route_key, None)
+    return live
+
+
+def ensure_provider_route_available(agent: Any, api_payload: dict[str, Any]) -> None:
+    """Fail fast while a timed-out worker still owns the exact route."""
+    route_key = provider_route_key(agent, api_payload)
+    with _orphaned_route_threads_lock:
+        live = _live_orphan_threads_locked(route_key)
+    if live:
+        raise ProviderRouteQuarantined(
+            "Provider route is quarantined while a prior timed-out request "
+            "is still unwinding"
+        )
+
+
+def quarantine_provider_route(
+    agent: Any,
+    api_payload: dict[str, Any],
+    worker: threading.Thread,
+) -> bool:
+    """Quarantine ``agent``'s exact route until ``worker`` really exits.
+
+    Returns ``True`` only when a live worker was registered.  Dead workers are
+    never quarantined, so cooperative transports recover immediately.
+    """
+    if not worker.is_alive():
+        return False
+    route_key = provider_route_key(agent, api_payload)
+    with _orphaned_route_threads_lock:
+        live = _live_orphan_threads_locked(route_key)
+        live.add(worker)
+        _orphaned_route_threads[route_key] = live
+    return True
+
+
+def _reset_provider_route_quarantine_for_tests() -> None:
+    with _orphaned_route_threads_lock:
+        _orphaned_route_threads.clear()
 
 
 def resolve_attempt_budgets(agent: Any) -> AttemptBudgets:
@@ -35,6 +156,15 @@ def resolve_attempt_budgets(agent: Any) -> AttemptBudgets:
             str(getattr(agent, "provider", "") or ""),
             str(getattr(agent, "model", "") or "") or None,
         )
+    if total is None:
+        base_url = getattr(agent, "base_url", None)
+        if isinstance(base_url, str) and base_url and is_local_endpoint(base_url):
+            total = DEFAULT_LOCAL_TOTAL_ATTEMPT_TIMEOUT_SECONDS
+        elif getattr(agent, "api_mode", None) == "bedrock_converse":
+            # Native Bedrock bypasses the OpenAI/httpx request-timeout path.
+            # Give it an absolute default so its request-scoped botocore
+            # connect/read timeouts can always be derived from finite policy.
+            total = DEFAULT_BEDROCK_TOTAL_ATTEMPT_TIMEOUT_SECONDS
 
     first_event = getattr(agent, "_route_first_event_timeout_seconds", None)
     if first_event is None:
@@ -47,8 +177,8 @@ def resolve_attempt_budgets(agent: Any) -> AttemptBudgets:
     if total is not None and first_event is not None:
         first_event = min(float(first_event), float(total))
     return AttemptBudgets(
-        total_seconds=float(total) if total is not None else None,
-        first_event_seconds=(float(first_event) if first_event is not None else None),
+        total_seconds=_positive_timeout(total),
+        first_event_seconds=_positive_timeout(first_event),
     )
 
 
@@ -56,4 +186,14 @@ class AttemptDeadlineExceeded(TimeoutError):
     """A provider attempt exceeded an explicit absolute budget."""
 
 
-__all__ = ["AttemptBudgets", "AttemptDeadlineExceeded", "resolve_attempt_budgets"]
+__all__ = [
+    "AttemptBudgets",
+    "AttemptDeadlineExceeded",
+    "DEFAULT_BEDROCK_TOTAL_ATTEMPT_TIMEOUT_SECONDS",
+    "DEFAULT_LOCAL_TOTAL_ATTEMPT_TIMEOUT_SECONDS",
+    "ProviderRouteQuarantined",
+    "ensure_provider_route_available",
+    "provider_route_key",
+    "quarantine_provider_route",
+    "resolve_attempt_budgets",
+]

@@ -29,6 +29,7 @@ Requires: ``boto3`` (optional dependency — only needed when using the Bedrock 
 
 import json
 import logging
+import math
 import os
 import re
 from types import SimpleNamespace
@@ -88,11 +89,41 @@ def _require_boto3():
     return boto3
 
 
-def _get_bedrock_runtime_client(region: str):
+def _get_bedrock_runtime_client(
+    region: str,
+    *,
+    attempt_timeout_seconds: float | None = None,
+):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
+
+    When ``attempt_timeout_seconds`` is supplied, return a request-scoped
+    client whose botocore connect and read timeouts are both no greater than
+    the remaining absolute provider-attempt budget.  Budgeted clients are not
+    cached: a client created early in one attempt must not carry a larger
+    socket timeout into a later attempt with less wall-clock budget remaining.
     """
+    if attempt_timeout_seconds is not None:
+        try:
+            timeout = float(attempt_timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bedrock attempt timeout must be a positive number") from exc
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("Bedrock attempt timeout must be a positive finite number")
+
+        boto3 = _require_boto3()
+        from botocore.config import Config
+
+        return boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(
+                connect_timeout=timeout,
+                read_timeout=timeout,
+            ),
+        )
+
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
         _bedrock_runtime_client_cache[region] = boto3.client(

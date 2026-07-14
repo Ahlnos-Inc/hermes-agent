@@ -40,6 +40,10 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _owned_receipt(pid: int) -> kb.SpawnReceipt:
+    return kb.SpawnReceipt(pid=pid, release=lambda: None, abort=lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -1468,6 +1472,7 @@ def test_claim_snapshots_an_immutable_versioned_run_spec(kanban_home):
             model_override="gpt-5.6-sol",
             model_provider_override="openai-codex",
             model_reasoning_effort="xhigh",
+            toolsets=["terminal", "file"],
         )
 
         assert kb.claim_task(conn, tid) is not None
@@ -1480,7 +1485,7 @@ def test_claim_snapshots_an_immutable_versioned_run_spec(kanban_home):
                 "model": "gpt-5.6-sol",
                 "reasoning_effort": "xhigh",
             },
-            "toolsets": None,
+            "toolsets": ["file", "terminal"],
             "delivery_policy": {
                 "version": 1,
                 "disposition": "none",
@@ -1814,7 +1819,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
 
     def fake_spawn(task, workspace):
         spawns.append((task.id, task.assignee, workspace))
-        return 20_000 + len(spawns)
+        return _owned_receipt(20_000 + len(spawns))
 
     with kb.connect() as conn:
         p = kb.create_task(conn, title="p", assignee="alice")
@@ -1856,7 +1861,7 @@ def test_dispatch_max_spawn_counts_existing_running_tasks(
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
-        return 21_000 + len(spawns)
+        return _owned_receipt(21_000 + len(spawns))
 
     with kb.connect() as conn:
         running_a = kb.create_task(conn, title="running-a", assignee="alice")
@@ -1880,7 +1885,7 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
-        return 21_500 + len(spawns)
+        return _owned_receipt(21_500 + len(spawns))
 
     with kb.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
@@ -2041,6 +2046,7 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
+        return _owned_receipt(22_500)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="quota-storm", assignee="alice")
@@ -2076,6 +2082,7 @@ def test_dispatch_respawn_guard_skips_recent_success(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
+        return _owned_receipt(22_501)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="recent-winner", assignee="alice")
@@ -2102,6 +2109,7 @@ def test_dispatch_respawn_guard_spawns_despite_pr_comment(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
+        return _owned_receipt(22_502)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
@@ -2142,6 +2150,7 @@ def test_dispatch_respawn_guard_allows_clean_task(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
+        return _owned_receipt(22_503)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="clean-task", assignee="alice")
@@ -2334,7 +2343,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
 
     def fake_spawn(task, workspace, board=None):
         spawns.append((task.id, workspace))
-        return 22_000 + len(spawns)
+        return _owned_receipt(22_000 + len(spawns))
 
     with kb.connect(board="worktree-board") as conn:
         tid = kb.create_task(
@@ -2373,7 +2382,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
 
     def fake_spawn(task, workspace, board=None):
         spawns.append((task.id, workspace))
-        return 23_000 + len(spawns)
+        return _owned_receipt(23_000 + len(spawns))
 
     with kb.connect(board="worktree-rerun-board") as conn:
         tid = kb.create_task(
@@ -3714,7 +3723,7 @@ def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
-        return 24_000 + len(spawns)
+        return _owned_receipt(24_000 + len(spawns))
 
     with kb.connect() as conn:
         # Two running tasks.
@@ -3736,7 +3745,7 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
-        return 24_500 + len(spawns)
+        return _owned_receipt(24_500 + len(spawns))
 
     with kb.connect() as conn:
         # One running task.
@@ -3757,6 +3766,7 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 
     def fake_spawn(task, workspace):
         spawns.append(task.id)
+        return _owned_receipt(25_000 + len(spawns))
 
     with kb.connect() as conn:
         for title in ["a", "b", "c", "d"]:
@@ -3793,6 +3803,7 @@ def test_review_claim_snapshots_its_own_run_spec(kanban_home):
             model_override="claude-opus-4-8",
             model_provider_override="anthropic",
             model_reasoning_effort="xhigh",
+            toolsets=["terminal", "file"],
         )
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
 
@@ -3805,7 +3816,7 @@ def test_review_claim_snapshots_its_own_run_spec(kanban_home):
                 "model": "claude-opus-4-8",
                 "reasoning_effort": "xhigh",
             },
-            "toolsets": None,
+            "toolsets": ["file", "terminal"],
             "delivery_policy": {
                 "version": 1,
                 "disposition": "none",
@@ -3871,7 +3882,7 @@ def test_dispatch_review_spawns_with_correct_skills(
 
     def capture_spawn(task, workspace, board=None):
         spawned_tasks.append(task)
-        return 42  # fake PID
+        return _owned_receipt(42)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
@@ -3900,7 +3911,7 @@ def test_dispatch_review_counts_toward_max_spawn(
 
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
-        return 42
+        return _owned_receipt(42)
 
     with kb.connect() as conn:
         # Create 2 ready tasks + 1 review task, max_spawn=2
@@ -3922,7 +3933,7 @@ def test_dispatch_review_spawns_when_ready_empty(
 
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
-        return 42
+        return _owned_receipt(42)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
@@ -5362,7 +5373,7 @@ def test_dispatch_once_trips_circuit_breaker_blocks_and_comments(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
-        return 12345
+        return _owned_receipt(12345)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="release-saga", assignee="alice")
@@ -5400,7 +5411,7 @@ def test_dispatch_once_does_not_trip_breaker_on_distinct_signatures(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
-        return 12345
+        return _owned_receipt(12345)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="flaky", assignee="alice")
@@ -5429,7 +5440,7 @@ def test_dispatch_once_honours_signature_repeat_threshold_kwarg(
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
-        return 12345
+        return _owned_receipt(12345)
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="lenient-threshold", assignee="alice")
