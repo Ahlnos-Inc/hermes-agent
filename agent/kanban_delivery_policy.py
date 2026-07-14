@@ -9,11 +9,13 @@ before any later byte crosses a transport boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import os
 from typing import Optional
 
 
 _RECEIPT_PREFIX = "Architecture approval pending; output withheld"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,10 +36,21 @@ class ArchitectureDeliveryPolicy:
             # dispatcher-owned task uses the live lookup path.
             return self
         try:
-            from hermes_cli.kanban_db import connect, get_delivery_architecture_gate
+            from hermes_cli.kanban_db import (
+                connect_closing,
+                get_delivery_architecture_gate,
+            )
 
-            with connect() as conn:
+            # sqlite3.Connection.__exit__ only commits or rolls back; it does
+            # not close the connection.  Delivery policy checks run at every
+            # tool/output boundary, so using ``with connect()`` here leaked
+            # DB/WAL descriptors until launchd's maxfiles limit was reached.
+            # The resulting EMFILE was then interpreted as a gate lookup
+            # failure and fail-closed every later tool result, bricking an
+            # otherwise ungated worker.  Use the canonical closing wrapper.
+            with connect_closing() as conn:
                 gate = get_delivery_architecture_gate(conn, self.task_id)
+            recovered = self.lookup_failed
             self.lookup_failed = False
             if gate is None:
                 self.gate_id = None
@@ -47,10 +60,22 @@ class ArchitectureDeliveryPolicy:
                 self.gate_id = gate.gate_id
                 self.architect_task_id = gate.architect_task_id
                 self.state = gate.state
+            if recovered:
+                logger.info(
+                    "Architecture delivery gate lookup recovered for task %s",
+                    self.task_id,
+                )
         except Exception:
             # A live board task must never leak protected content because its
             # authority projection could not be read.  Non-Kanban turns never
             # construct this object.
+            if not self.lookup_failed:
+                logger.warning(
+                    "Architecture delivery gate lookup failed for task %s; "
+                    "withholding output",
+                    self.task_id,
+                    exc_info=True,
+                )
             self.lookup_failed = True
             self.gate_id = "unavailable"
             self.architect_task_id = "unavailable"
