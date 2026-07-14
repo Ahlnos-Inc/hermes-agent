@@ -38,6 +38,9 @@ def _fake_spawn(*args, **kwargs):
         pid=12345,
         release=lambda: None,
         abort=lambda: None,
+        process_started_at=1234.5,
+        process_group_id=12345,
+        session_id=12345,
     )
 
 

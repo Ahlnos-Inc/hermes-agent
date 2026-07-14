@@ -6,7 +6,29 @@ import contextlib
 import signal
 import time
 
+import pytest
+
 from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture(autouse=True)
+def _attested_worker_identity(monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "_attest_reclaim_process_identity",
+        lambda *_args, **_kwargs: True,
+    )
+
+
+def _attach_worker(conn, task_id: str, pid: int) -> None:
+    kb._set_worker_pid(
+        conn,
+        task_id,
+        pid,
+        worker_started_at=1234.5,
+        worker_pgid=pid,
+        worker_sid=pid,
+    )
 
 
 def test_operator_block_fences_running_task_before_terminating(tmp_path) -> None:
@@ -17,7 +39,7 @@ def test_operator_block_fences_running_task_before_terminating(tmp_path) -> None
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
-        kb._set_worker_pid(conn, task_id, 43210)
+        _attach_worker(conn, task_id, 43210)
         original = kb.get_task(conn, task_id)
         assert original is not None
 
@@ -68,7 +90,7 @@ def test_operator_block_keeps_surviving_worker_fenced(tmp_path, monkeypatch) -> 
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
-        kb._set_worker_pid(conn, task_id, 54321)
+        _attach_worker(conn, task_id, 54321)
         original = kb.get_task(conn, task_id)
         assert original is not None
 
@@ -120,7 +142,7 @@ def test_operator_block_retries_a_pending_fence(tmp_path, monkeypatch) -> None:
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
-        kb._set_worker_pid(conn, task_id, 58001)
+        _attach_worker(conn, task_id, 58001)
 
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
         monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
@@ -163,7 +185,7 @@ def test_operator_block_stale_run_cas_does_not_touch_replacement(tmp_path) -> No
         old = kb.claim_task(conn, task_id, claimer=f"{host}:old-worker")
         assert old is not None and old.current_run_id is not None
         old_run_id = old.current_run_id
-        kb._set_worker_pid(conn, task_id, 61001)
+        _attach_worker(conn, task_id, 61001)
         replacement_run_id: list[int] = []
 
         def terminate_old(_pid: int, sig: int) -> None:
@@ -234,7 +256,7 @@ def test_operator_dependency_block_preserves_dependency_routing(tmp_path) -> Non
         host = kb._claimer_id().split(":", 1)[0]
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None
-        kb._set_worker_pid(conn, task_id, 62001)
+        _attach_worker(conn, task_id, 62001)
 
         result = kb.operator_block_task(
             conn,

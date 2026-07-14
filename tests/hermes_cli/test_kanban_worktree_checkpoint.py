@@ -128,6 +128,9 @@ def test_dispatch_records_checkpoint_identity(tmp_path, monkeypatch):
                 pid=31_005,
                 release=lambda: None,
                 abort=lambda: None,
+                process_started_at=1234.5,
+                process_group_id=31_005,
+                session_id=31_005,
             ),
         )
         events = kb.list_events(conn, task_id)

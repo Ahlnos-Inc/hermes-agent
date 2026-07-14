@@ -103,6 +103,70 @@ def test_preflight_compares_toolsets_as_a_normalized_set(monkeypatch):
     assert spec["toolsets"] == ["file", "terminal"]
 
 
+def test_preflight_fails_closed_when_kanban_identity_has_no_current_run(
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_runtime_contract import (
+        RunRouteMismatch,
+        preflight_kanban_cli_route,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="stale worker identity",
+            assignee="verifier",
+            toolsets=["terminal", "file"],
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+
+    with pytest.raises(RunRouteMismatch, match="no active run contract"):
+        preflight_kanban_cli_route(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            reasoning_config={"effort": "xhigh"},
+            toolsets=["terminal", "file"],
+        )
+
+
+def test_preflight_allows_explicit_non_kanban_manual_process(monkeypatch):
+    from hermes_cli.kanban_runtime_contract import preflight_kanban_cli_route
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    assert (
+        preflight_kanban_cli_route(
+            model="manual-model",
+            provider="manual-provider",
+            reasoning_config=None,
+            toolsets=["terminal"],
+        )
+        is None
+    )
+
+
+def test_preflight_rejects_partial_kanban_identity_as_manual(monkeypatch):
+    from hermes_cli.kanban_runtime_contract import (
+        RunRouteMismatch,
+        preflight_kanban_cli_route,
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
+    with pytest.raises(RunRouteMismatch, match="process declares Kanban identity"):
+        preflight_kanban_cli_route(
+            model="manual-model",
+            provider="manual-provider",
+            reasoning_config=None,
+            toolsets=["terminal"],
+        )
+
+
 def test_claim_rejects_corrupt_empty_task_toolsets():
     from hermes_cli import kanban_db as kb
 

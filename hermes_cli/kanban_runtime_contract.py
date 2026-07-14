@@ -28,6 +28,15 @@ def _active_identity() -> tuple[Optional[str], Optional[int]]:
     return task_id, run_id
 
 
+def _kanban_identity_declared() -> bool:
+    """Return whether this process claims to belong to a Kanban run."""
+    return bool(
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        or (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        or (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    )
+
+
 def load_active_run_spec() -> Optional[dict]:
     task_id, run_id = _active_identity()
     if not task_id or run_id is None:
@@ -86,7 +95,11 @@ def preflight_kanban_cli_route(
     """Fail before agent/provider construction when parser/config drifted."""
     spec = load_active_run_spec()
     if spec is None:
-        return None  # legacy or non-Kanban process
+        if _kanban_identity_declared():
+            raise RunRouteMismatch(
+                "process declares Kanban identity but has no active run contract"
+            )
+        return None  # explicit manual or non-Kanban process
     requested = spec.get("requested_route")
     version = spec.get("version")
     if version not in {1, 2} or not isinstance(requested, dict):

@@ -197,6 +197,9 @@ def test_max_in_progress_deferred_zero_when_headroom_exists(
                 pid=31_006,
                 release=lambda: None,
                 abort=lambda: None,
+                process_started_at=1234.5,
+                process_group_id=31_006,
+                session_id=31_006,
             ),
             max_in_progress=5,
         )

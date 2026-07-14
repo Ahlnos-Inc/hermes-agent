@@ -41,7 +41,14 @@ def _init_git_repo(repo: Path) -> None:
 
 
 def _owned_receipt(pid: int) -> kb.SpawnReceipt:
-    return kb.SpawnReceipt(pid=pid, release=lambda: None, abort=lambda: None)
+    return kb.SpawnReceipt(
+        pid=pid,
+        release=lambda: None,
+        abort=lambda: None,
+        process_started_at=1234.5,
+        process_group_id=pid,
+        session_id=pid,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +451,14 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         def _signal(_pid, sig):
             killed.append(sig)
 
-        kb._set_worker_pid(conn, t, 12345)
+        kb._set_worker_pid(
+            conn,
+            t,
+            12345,
+            worker_started_at=1234.5,
+            worker_pgid=12345,
+            worker_sid=12345,
+        )
         # Rewind claim_expires so it looks stale.
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -453,6 +467,11 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         # Worker PID has died — exactly the case ``release_stale_claims``
         # should still reclaim (post-#23025: live PIDs are now extended).
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            _kb,
+            "_attest_reclaim_process_identity",
+            lambda *_args, **_kwargs: True,
+        )
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
@@ -2399,10 +2418,8 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         assert first_task.workspace_path == str(expected)
         assert first_task.branch_name == f"wt/{tid}"
 
-        conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
-            (tid,),
-        )
+        assert kb._end_run(conn, tid, outcome="crashed") == first_task.current_run_id
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
 
         second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")

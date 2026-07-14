@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -55,6 +59,45 @@ def test_start_gate_attests_exact_attached_run(kanban_home, monkeypatch, tmp_pat
 
     assert not gate_path.exists()
     assert "HERMES_KANBAN_START_GATE_TOKEN" not in os.environ
+
+
+def test_start_gate_token_is_atomically_published(monkeypatch, tmp_path):
+    gate_path = tmp_path / "gate"
+    write_started = threading.Event()
+    permit_write = threading.Event()
+    real_write = os.write
+
+    def delayed_write(fd, payload):
+        write_started.set()
+        assert permit_write.wait(timeout=2.0)
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(kb.os, "write", delayed_write)
+    publisher = threading.Thread(
+        target=kb._publish_start_gate_token,
+        args=(gate_path, "release-token"),
+    )
+    publisher.start()
+    assert write_started.wait(timeout=2.0)
+
+    # Publication is a commit point: observers see no final gate until the
+    # complete token has been written and fsynced elsewhere.
+    assert not gate_path.exists()
+    permit_write.set()
+    publisher.join(timeout=2.0)
+
+    assert not publisher.is_alive()
+    assert gate_path.read_text(encoding="utf-8") == "release-token"
+
+
+def test_start_gate_publication_never_replaces_existing_peer(tmp_path):
+    gate_path = tmp_path / "gate"
+    gate_path.write_text("peer-token", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        kb._publish_start_gate_token(gate_path, "release-token")
+
+    assert gate_path.read_text(encoding="utf-8") == "peer-token"
 
 
 def test_start_gate_rejects_pid_mismatch(kanban_home, monkeypatch, tmp_path):
@@ -111,6 +154,9 @@ def test_dispatch_releases_gate_only_after_pid_readback(
             pid=31_001,
             release=release,
             abort=lambda: aborted.append(True),
+            process_started_at=1234.5,
+            process_group_id=31_001,
+            session_id=31_001,
         )
 
     with kb.connect() as conn:
@@ -121,6 +167,42 @@ def test_dispatch_releases_gate_only_after_pid_readback(
     assert release_observed[0][:2] == (31_001, 31_001)
     assert release_observed[0][2]
     assert aborted == []
+
+
+def test_dispatch_persists_exact_worker_process_identity(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="typed worker", assignee="worker")
+
+    def spawn(_task, _workspace):
+        return kb.SpawnReceipt(
+            pid=42_424,
+            process_started_at=1234.5,
+            process_group_id=42_424,
+            session_id=42_424,
+            release=lambda: None,
+            abort=lambda: None,
+        )
+
+    with kb.connect() as conn:
+        kb.dispatch_once(conn, spawn_fn=spawn)
+
+    with kb.connect() as conn:
+        task_row = conn.execute(
+            "SELECT worker_pid, worker_started_at, worker_pgid, worker_sid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT worker_pid, worker_started_at, worker_pgid, worker_sid "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert tuple(task_row) == (42_424, 1234.5, 42_424, 42_424)
+    assert tuple(run_row) == (42_424, 1234.5, 42_424, 42_424)
 
 
 def test_dispatch_aborts_and_releases_claim_when_gate_release_fails(
@@ -137,6 +219,9 @@ def test_dispatch_aborts_and_releases_claim_when_gate_release_fails(
             pid=31_002,
             release=release,
             abort=lambda: aborted.append(True),
+            process_started_at=1234.5,
+            process_group_id=31_002,
+            session_id=31_002,
         )
 
     with kb.connect() as conn:
@@ -245,10 +330,20 @@ def test_orphan_canary_scans_only_exact_run_identity(monkeypatch):
 def test_reclaim_never_signals_a_verified_pid_identity_mismatch(monkeypatch):
     host = kb._claimer_id().split(":", 1)[0]
     signalled = []
-    monkeypatch.setattr(kb, "_attest_reclaim_process_identity", lambda *_args: False)
+    monkeypatch.setattr(
+        kb,
+        "_attest_reclaim_process_identity",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
 
-    result = kb._terminate_reclaimed_worker(42_001, f"{host}:claim")
+    result = kb._terminate_reclaimed_worker(
+        42_001,
+        f"{host}:claim",
+        worker_started_at=1234.5,
+        worker_pgid=42_001,
+        worker_sid=42_001,
+    )
 
     assert result["identity_mismatch"] is True
     assert result["terminated"] is True
@@ -277,14 +372,110 @@ def test_reclaim_identity_attestation_binds_environment_and_birth_time(monkeypat
     )
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
-    assert kb._attest_reclaim_process_identity(42_010, "host:exact-claim") is True
-    assert kb._attest_reclaim_process_identity(42_010, "host:other") is False
+    identity = {
+        "worker_started_at": 1234.5,
+        "worker_pgid": 42_010,
+        "worker_sid": 42_010,
+    }
+    monkeypatch.setattr(kb.os, "getpgid", lambda _pid: 42_010)
+    monkeypatch.setattr(kb.os, "getsid", lambda _pid: 42_010)
+    assert (
+        kb._attest_reclaim_process_identity(
+            42_010, "host:exact-claim", **identity
+        )
+        is True
+    )
+    assert (
+        kb._attest_reclaim_process_identity(42_010, "host:other", **identity)
+        is False
+    )
+
+
+def test_reclaim_identity_attestation_binds_exact_task_and_run(monkeypatch):
+    class FakeProcess:
+        def create_time(self):
+            return 1234.5
+
+        def environ(self):
+            return {
+                "HERMES_KANBAN_TASK": "task-exact",
+                "HERMES_KANBAN_RUN_ID": "17",
+                "HERMES_KANBAN_CLAIM_LOCK": "host:exact-claim",
+            }
+
+        def is_running(self):
+            return True
+
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda _pid: FakeProcess(),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        AccessDenied=type("AccessDenied", (Exception,), {}),
+        ZombieProcess=type("ZombieProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(kb.os, "getpgid", lambda _pid: 42_010)
+    monkeypatch.setattr(kb.os, "getsid", lambda _pid: 42_010)
+
+    identity = {
+        "worker_started_at": 1234.5,
+        "worker_pgid": 42_010,
+        "worker_sid": 42_010,
+        "task_id": "task-exact",
+        "run_id": 17,
+    }
+    assert (
+        kb._attest_reclaim_process_identity(
+            42_010, "host:exact-claim", **identity
+        )
+        is True
+    )
+    assert (
+        kb._attest_reclaim_process_identity(
+            42_010, "host:exact-claim", **{**identity, "run_id": 18}
+        )
+        is False
+    )
+
+
+def test_end_run_clears_task_and_run_worker_identity(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="clear identity", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            42_011,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+            worker_started_at=1234.5,
+            worker_pgid=42_011,
+            worker_sid=42_011,
+        )
+
+        assert kb._end_run(conn, task_id, outcome="completed") == task.current_run_id
+        task_after = kb.get_task(conn, task_id)
+        run_after = kb.get_run(conn, int(task.current_run_id))
+
+    assert task_after.current_run_id is None
+    assert task_after.claim_lock is None
+    assert task_after.claim_expires is None
+    assert task_after.worker_pid is None
+    assert task_after.worker_started_at is None
+    assert task_after.worker_pgid is None
+    assert task_after.worker_sid is None
+    assert run_after.worker_pid is None
+    assert run_after.worker_started_at is None
+    assert run_after.worker_pgid is None
+    assert run_after.worker_sid is None
 
 
 def test_reclaim_holds_an_unverifiable_live_pid_without_signalling(monkeypatch):
     host = kb._claimer_id().split(":", 1)[0]
     signalled = []
-    monkeypatch.setattr(kb, "_attest_reclaim_process_identity", lambda *_args: None)
+    monkeypatch.setattr(
+        kb, "_attest_reclaim_process_identity", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
 
@@ -293,6 +484,61 @@ def test_reclaim_holds_an_unverifiable_live_pid_without_signalling(monkeypatch):
     assert result["identity_unverifiable"] is True
     assert kb._worker_survived_termination(result) is True
     assert signalled == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_reclaim_terminates_attested_worker_process_group():
+    import psutil
+
+    host = kb._claimer_id().split(":", 1)[0]
+    claim_lock = f"{host}:real-process-tree"
+    env = dict(os.environ)
+    env["HERMES_KANBAN_CLAIM_LOCK"] = claim_lock
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                "print(child.pid, flush=True); time.sleep(60)"
+            ),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    assert leader.stdout is not None
+    child_pid = int(leader.stdout.readline().strip())
+    started_at = psutil.Process(leader.pid).create_time()
+    pgid = os.getpgid(leader.pid)
+    sid = os.getsid(leader.pid)
+    try:
+        result = kb._terminate_reclaimed_worker(
+            leader.pid,
+            claim_lock,
+            worker_started_at=started_at,
+            worker_pgid=pgid,
+            worker_sid=sid,
+        )
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and (
+            kb._pid_alive(leader.pid) or kb._pid_alive(child_pid)
+        ):
+            time.sleep(0.05)
+
+        assert result["identity_verified"] is True
+        assert result["terminated"] is True
+        assert not kb._pid_alive(leader.pid)
+        assert not kb._pid_alive(child_pid)
+    finally:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        leader.wait(timeout=3.0)
 
 
 def test_manual_reclaim_keeps_claim_when_live_pid_identity_is_unverifiable(
@@ -312,7 +558,9 @@ def test_manual_reclaim_keeps_claim_when_live_pid_identity_is_unverifiable(
             claim_lock=task.claim_lock,
         )
         monkeypatch.setattr(
-            kb, "_attest_reclaim_process_identity", lambda *_args: None
+            kb,
+            "_attest_reclaim_process_identity",
+            lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
 

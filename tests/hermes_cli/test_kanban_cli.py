@@ -169,12 +169,27 @@ def test_run_slash_block_operator_terminates_running_worker(kanban_home):
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None
 
+    worker_env = dict(os.environ)
+    worker_env["HERMES_KANBAN_TASK"] = task_id
+    worker_env["HERMES_KANBAN_RUN_ID"] = str(claimed.current_run_id)
+    worker_env["HERMES_KANBAN_CLAIM_LOCK"] = str(claimed.claim_lock)
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=worker_env,
+        start_new_session=True,
     )
     try:
+        import psutil
+
         with kb.connect() as conn:
-            kb._set_worker_pid(conn, task_id, proc.pid)
+            kb._set_worker_pid(
+                conn,
+                task_id,
+                proc.pid,
+                worker_started_at=psutil.Process(proc.pid).create_time(),
+                worker_pgid=os.getpgid(proc.pid),
+                worker_sid=os.getsid(proc.pid),
+            )
 
         out = kc.run_slash(f"block {task_id} 'operator pause'")
 
