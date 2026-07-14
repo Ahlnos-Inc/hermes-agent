@@ -29,6 +29,7 @@ through the board.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -1916,21 +1917,307 @@ def _worker_architecture_context(kb: Any, conn: Any) -> Any:
     )
 
 
-def _managed_architecture_gate_mode() -> str:
-    """Read the synced staged policy, failing closed to ``off``."""
+def _managed_architecture_gate_policy() -> tuple[str, bool]:
+    """Return ``(mode, valid)`` for the synced staged policy."""
     try:
         policy_path = get_hermes_home() / "rules" / "architecture-gate-policy.json"
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
-        if not isinstance(policy, dict) or policy.get("version") != "v1":
-            return "off"
+        if not isinstance(policy, dict):
+            return "off", False
+        version = policy.get("version")
+        schema_version = policy.get("schema_version")
+        if version is not None and version != "v1":
+            return "off", False
+        if schema_version is not None and schema_version != 1:
+            return "off", False
+        if version is None and schema_version is None:
+            return "off", False
         mode = policy.get("mode")
         if mode in {"off", "shadow", "orchestrator_only"}:
-            return mode
+            return str(mode), True
+    except FileNotFoundError:
+        # The managed gate is an optional staged rollout. Homes that predate
+        # it have no policy file and retain the legacy explicit-off behavior;
+        # once a file exists, malformed/unreadable content fails closed below.
+        return "off", True
     except Exception:
-        logger.warning("Unable to read managed architecture-gate policy; using off", exc_info=True)
+        logger.warning("Unable to read managed architecture-gate policy", exc_info=True)
+        return "off", False
+    return "off", False
+
+
+def _managed_architecture_gate_mode() -> str:
+    """Compatibility projection; invalid managed policy reads as ``off``."""
+    mode, valid = _managed_architecture_gate_policy()
+    if valid:
+        return mode
     # ``enforce`` remains readable in existing gate rows but is deliberately
     # not a new front-door activation target.
     return "off"
+
+
+def _trusted_workflow_notifications(
+    gateway_source: Optional[dict] = None,
+) -> tuple[list[dict[str, Optional[str]]], str]:
+    """Derive a terminal notification target from runtime-owned context.
+
+    The workflow tool has no model-visible notification fields. This keeps a
+    prompt-injected orchestrator from redirecting completion messages while
+    still letting the kernel insert the one terminal subscription in the same
+    transaction as the graph.
+    """
+    try:
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return [], "disabled"
+    except Exception:
+        cfg = {}
+
+    if gateway_source is not None:
+        platform = str(gateway_source.get("platform") or "").strip()
+        chat_id = str(gateway_source.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            return [], "gateway_source_incomplete"
+        return [{
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": str(gateway_source.get("thread_id") or "") or None,
+            "user_id": str(gateway_source.get("user_id") or "") or None,
+            "notifier_profile": os.environ.get("HERMES_PROFILE") or None,
+        }], "gateway_source"
+
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = (
+            get_session_env("HERMES_SESSION_PLATFORM", "")
+            or os.environ.get("HERMES_SESSION_PLATFORM", "")
+        )
+        chat_id = (
+            get_session_env("HERMES_SESSION_CHAT_ID", "")
+            or os.environ.get("HERMES_SESSION_CHAT_ID", "")
+        )
+        source = "session"
+        if not platform or not chat_id:
+            session_key = (
+                get_session_env("HERMES_SESSION_KEY", "")
+                or os.environ.get("HERMES_SESSION_KEY", "")
+            )
+            if not session_key:
+                kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else {}
+                if not isinstance(kanban_cfg, dict) or not bool(
+                    kanban_cfg.get("auto_subscribe_home_on_create")
+                ):
+                    return [], "unattached"
+                allowed = _parse_platform_filter(
+                    kanban_cfg.get("auto_subscribe_home_platforms", "*")
+                )
+                homes = []
+                for home in _configured_home_channels():
+                    home_platform = str(home.get("platform") or "").lower()
+                    home_chat_id = str(home.get("chat_id") or "")
+                    if (
+                        home_platform
+                        and home_chat_id
+                        and ("*" in allowed or home_platform in allowed)
+                    ):
+                        homes.append({
+                            "platform": home_platform,
+                            "chat_id": home_chat_id,
+                            "thread_id": home.get("thread_id") or None,
+                            "user_id": None,
+                            "notifier_profile": os.environ.get("HERMES_PROFILE") or None,
+                        })
+                return homes, "home_channel" if homes else "unattached"
+            platform, chat_id, source = "tui", session_key, "tui_session"
+        return [{
+            "platform": str(platform),
+            "chat_id": str(chat_id),
+            "thread_id": (
+                get_session_env("HERMES_SESSION_THREAD_ID", "")
+                or os.environ.get("HERMES_SESSION_THREAD_ID", "")
+                or None
+            ),
+            "user_id": (
+                get_session_env("HERMES_SESSION_USER_ID", "")
+                or os.environ.get("HERMES_SESSION_USER_ID", "")
+                or None
+            ),
+            "notifier_profile": (
+                get_session_env("HERMES_SESSION_PROFILE", "")
+                or os.environ.get("HERMES_PROFILE")
+                or None
+            ),
+        }], source
+    except Exception:
+        logger.warning("Unable to derive workflow notification target", exc_info=True)
+        return [], "unavailable"
+
+
+def _trusted_session_id() -> Optional[str]:
+    try:
+        from gateway.session_context import get_session_env
+
+        value = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        value = os.environ.get("HERMES_SESSION_ID", "")
+    return str(value or "").strip() or None
+
+
+def _workflow_request_digest(args: dict[str, Any]) -> str:
+    """Hash only model-visible semantic inputs, excluding volatile runtime state."""
+    payload = {
+        key: args[key]
+        for key in (
+            "workflow_key", "idempotency_key", "steps", "tenant",
+            "workspace_kind", "workspace_path", "priority",
+        )
+        if key in args
+    }
+    steps = payload.get("steps")
+    if isinstance(steps, list) and all(isinstance(step, dict) for step in steps):
+        canonical_steps = []
+        for raw in steps:
+            step = dict(raw)
+            if isinstance(step.get("parents"), list):
+                step["parents"] = sorted(step["parents"])
+            canonical_steps.append(step)
+        payload["steps"] = sorted(
+            canonical_steps, key=lambda step: str(step.get("key") or "")
+        )
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _compiled_workflow_response(kb: Any, conn: Any, compiled: Any) -> str:
+    subscription_count = conn.execute(
+        "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+        (compiled.terminal_task_id,),
+    ).fetchone()[0]
+    return _ok(
+        workflow_key=compiled.workflow_key,
+        task_ids=compiled.task_ids,
+        terminal_task_id=compiled.terminal_task_id,
+        notification={
+            "subscribed": bool(subscription_count),
+            "count": int(subscription_count),
+            "terminal_only": True,
+        },
+    )
+
+
+def _handle_compile_workflow(args: dict, **kw) -> str:
+    """Validate and persist a convergent multi-card workflow in one commit."""
+    guard = _require_orchestrator_tool("kanban_compile_workflow")
+    if guard:
+        return guard
+    workflow_key = str(args.get("workflow_key") or "").strip()
+    idempotency_key = str(args.get("idempotency_key") or "").strip()
+    steps = args.get("steps")
+    if not workflow_key:
+        return tool_error("workflow_key is required")
+    if not idempotency_key:
+        return tool_error("idempotency_key is required")
+    if not isinstance(steps, list) or not steps:
+        return tool_error("steps must be a non-empty list")
+    try:
+        request_digest = _workflow_request_digest(args)
+    except (TypeError, ValueError) as exc:
+        return tool_error(f"kanban_compile_workflow: invalid request: {exc}")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            existing = kb.get_compiled_workflow_retry(
+                conn,
+                workflow_key=workflow_key,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+            )
+            if existing is not None:
+                return _compiled_workflow_response(kb, conn, existing)
+
+            architecture_mode, policy_valid = _managed_architecture_gate_policy()
+            if not policy_valid:
+                return tool_error(
+                    "kanban_compile_workflow: managed architecture-gate policy "
+                    "is missing or invalid; refusing new graph compilation"
+                )
+            if architecture_mode != "off":
+                return tool_error(
+                    "kanban_compile_workflow cannot bypass staged architecture graph "
+                    "issuance; use the authorized architecture graph issuance path "
+                    "while the managed architecture gate is active"
+                )
+
+            resolved_steps: list[Any] = []
+            for raw in steps:
+                if not isinstance(raw, dict):
+                    resolved_steps.append(raw)
+                    continue
+                step = dict(raw)
+                resolved_model, routing = _resolve_model_routing(
+                    step, step.pop("model_override", None),
+                )
+                step.pop("model_routing", None)
+                step.pop("task_category", None)
+                step.pop("data_sensitivity", None)
+                step.pop("verifiability", None)
+                step.pop("quota_policy", None)
+                if resolved_model:
+                    step["model_override"] = resolved_model
+                if routing:
+                    step["model_provider_override"] = routing.get("provider")
+                    step["model_reasoning_effort"] = routing.get("reasoning_effort")
+                resolved_steps.append(step)
+
+            notifications, _notification_source = _trusted_workflow_notifications(
+                kw.get("gateway_source")
+            )
+            known_profiles = set(kb.list_profiles_on_disk())
+            requested_profiles = {
+                str(step.get("assignee") or "").strip()
+                for step in resolved_steps
+                if isinstance(step, dict)
+            }
+            unknown_profiles = sorted(
+                profile for profile in requested_profiles
+                if profile and known_profiles and profile not in known_profiles
+            )
+            if unknown_profiles:
+                raise kb.WorkflowGraphError(
+                    "unknown assignee profile(s): " + ", ".join(unknown_profiles)
+                )
+            compiled = kb.compile_workflow_graph(
+                conn,
+                workflow_key=workflow_key,
+                idempotency_key=idempotency_key,
+                created_by=os.environ.get("HERMES_PROFILE") or "orchestrator",
+                steps=resolved_steps,
+                notification=notifications or None,
+                tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
+                session_id=_trusted_session_id(),
+                workspace_kind=str(args.get("workspace_kind") or "scratch"),
+                workspace_path=args.get("workspace_path"),
+                priority=int(args.get("priority") or 0),
+                request_digest=request_digest,
+                request_scope_id=(
+                    f"front-door:{kw.get('turn_id')}" if kw.get("turn_id") else None
+                ),
+                deny_active_architecture_session=True,
+            )
+            return _compiled_workflow_response(kb, conn, compiled)
+        finally:
+            conn.close()
+    except (ValueError, TypeError) as e:
+        return tool_error(f"kanban_compile_workflow: {e}")
+    except Exception as e:
+        logger.exception("kanban_compile_workflow failed")
+        return tool_error(f"kanban_compile_workflow: {e}")
 
 
 def _trusted_front_door_architecture_context(
@@ -2882,6 +3169,100 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_COMPILE_WORKFLOW_SCHEMA = {
+    "name": "kanban_compile_workflow",
+    "description": (
+        "Atomically validate and create a complete dependency workflow. Use for "
+        "every multi-card decomposition: all tasks, links, the idempotency record, "
+        "and one trusted terminal notification commit together or none do. The "
+        "graph must converge on exactly one terminal finalizer, synthesizer, or "
+        "reporter. Orchestrator-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_key": {
+                "type": "string",
+                "description": "Stable semantic identity for this workflow instance.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Stable retry identity for this exact graph specification.",
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Stable step key used by other steps' parents.",
+                        },
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "assignee": {
+                            "type": "string",
+                            "description": "Existing Hermes profile that executes this step.",
+                        },
+                        "parents": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Predecessor step keys, never task ids.",
+                        },
+                        "role": {
+                            "type": "string",
+                            "description": "Semantic role; terminal must be finalizer, synthesizer, or reporter.",
+                        },
+                        "terminal": {
+                            "type": "boolean",
+                            "description": "True on exactly one convergent final step.",
+                        },
+                        "initial_status": {
+                            "type": "string",
+                            "enum": ["ready", "todo", "done"],
+                        },
+                        "result": {
+                            "type": "string",
+                            "description": "Required handoff text for a precompleted root step.",
+                        },
+                        "skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "max_runtime_seconds": {"type": "integer"},
+                        "priority": {"type": "integer"},
+                        "model_override": {
+                            "type": "string",
+                            "description": "Optional exact model id; use model_routing for a policy lane.",
+                        },
+                        "model_routing": {
+                            "type": "string",
+                            "description": "Routing lane such as code_implementation or verification_leaf.",
+                        },
+                        "task_category": {"type": "string"},
+                        "data_sensitivity": {"type": "string"},
+                        "verifiability": {"type": "string"},
+                        "quota_policy": {"type": "string"},
+                    },
+                    "required": ["key", "title", "assignee"],
+                    "additionalProperties": False,
+                },
+            },
+            "tenant": {"type": "string"},
+            "workspace_kind": {
+                "type": "string",
+                "enum": ["scratch", "dir", "worktree"],
+            },
+            "workspace_path": {"type": "string"},
+            "priority": {"type": "integer"},
+            "board": _board_schema_prop(),
+        },
+        "required": ["workflow_key", "idempotency_key", "steps"],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -2986,6 +3367,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_compile_workflow",
+    toolset="kanban",
+    schema=KANBAN_COMPILE_WORKFLOW_SCHEMA,
+    handler=_handle_compile_workflow,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
 )
 
 registry.register(

@@ -361,3 +361,171 @@ def test_compile_workflow_graph_supports_precompleted_root_and_step_limits(tmp_p
         assert worker.priority == 7
     finally:
         conn.close()
+
+
+def test_compile_workflow_graph_persists_runtime_route_per_step(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        compiled = kb.compile_workflow_graph(
+            conn,
+            workflow_key="routed-workflow",
+            idempotency_key="routed-workflow-v1",
+            created_by="orchestrator",
+            steps=[
+                {
+                    "key": "work",
+                    "title": "Do work",
+                    "assignee": "coder",
+                    "model_override": "gpt-5.6-terra",
+                    "model_provider_override": "openai-codex",
+                    "model_reasoning_effort": "high",
+                },
+                {
+                    "key": "final",
+                    "title": "Verify",
+                    "assignee": "verifier",
+                    "parents": ["work"],
+                    "role": "reporter",
+                    "terminal": True,
+                    "model_override": "gpt-5.6-sol",
+                    "model_provider_override": "openai-codex",
+                    "model_reasoning_effort": "xhigh",
+                },
+            ],
+        )
+
+        work = kb.get_task(conn, compiled.task_ids["work"])
+        final = kb.get_task(conn, compiled.task_ids["final"])
+        assert (
+            work.model_provider_override,
+            work.model_override,
+            work.model_reasoning_effort,
+        ) == ("openai-codex", "gpt-5.6-terra", "high")
+        assert (
+            final.model_provider_override,
+            final.model_override,
+            final.model_reasoning_effort,
+        ) == ("openai-codex", "gpt-5.6-sol", "xhigh")
+
+        with pytest.raises(kb.WorkflowGraphError, match="model_reasoning_effort"):
+            kb.compile_workflow_graph(
+                conn,
+                workflow_key="bad-route",
+                idempotency_key="bad-route-v1",
+                created_by="orchestrator",
+                steps=[
+                    {
+                        "key": "work",
+                        "title": "Do work",
+                        "assignee": "coder",
+                        "model_reasoning_effort": "maximum",
+                    },
+                    {
+                        "key": "final",
+                        "title": "Verify",
+                        "assignee": "verifier",
+                        "parents": ["work"],
+                        "role": "reporter",
+                        "terminal": True,
+                    },
+                ],
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_key = 'bad-route'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_compile_workflow_graph_rejects_invalid_forced_skill_before_write(
+    monkeypatch, tmp_path,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(
+        kb,
+        "_forced_skill_validation_error",
+        lambda assignee, skills: (
+            "forced skill validation failed" if skills else None
+        ),
+    )
+    try:
+        with pytest.raises(kb.WorkflowGraphError, match="forced skill validation"):
+            kb.compile_workflow_graph(
+                conn,
+                workflow_key="bad-forced-skill",
+                idempotency_key="bad-forced-skill-v1",
+                created_by="orchestrator",
+                steps=[
+                    {
+                        "key": "work",
+                        "title": "Work",
+                        "assignee": "coder",
+                        "skills": ["not-installed"],
+                    },
+                    {
+                        "key": "final",
+                        "title": "Final",
+                        "assignee": "verifier",
+                        "parents": ["work"],
+                        "role": "reporter",
+                        "terminal": True,
+                    },
+                ],
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_compile_workflow_graph_denies_active_architecture_session_in_transaction(
+    tmp_path,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        session_id = "architecture-session"
+        context = kb.MutationContext(
+            board_key="default",
+            principal=f"orchestrator:{session_id}",
+            actor_type="orchestrator_agent",
+            profile="orchestrator",
+            session_id=session_id,
+            request_scope_id="front-door:turn-1",
+            mode="shadow",
+            phase="architecture",
+        )
+        kb.create_task(
+            conn,
+            title="Design first",
+            assignee="architect",
+            session_id=session_id,
+            mutation_context=context,
+        )
+
+        with pytest.raises(
+            kb.WorkflowGraphError, match="architecture_graph_issuance_required"
+        ):
+            kb.compile_workflow_graph(
+                conn,
+                workflow_key="must-not-bypass-gate",
+                idempotency_key="must-not-bypass-gate-v1",
+                created_by="orchestrator",
+                session_id=session_id,
+                request_scope_id="front-door:turn-2",
+                deny_active_architecture_session=True,
+                steps=[
+                    {"key": "work", "title": "Work", "assignee": "coder"},
+                    {
+                        "key": "final",
+                        "title": "Final",
+                        "assignee": "verifier",
+                        "parents": ["work"],
+                        "role": "reporter",
+                        "terminal": True,
+                    },
+                ],
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_key = 'must-not-bypass-gate'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()

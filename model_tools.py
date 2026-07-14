@@ -1168,7 +1168,11 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                         gateway_source=gateway_source,
-                        **({"turn_id": turn_id} if function_name == "kanban_create" else {}),
+                        **(
+                            {"turn_id": turn_id}
+                            if function_name in {"kanban_create", "kanban_compile_workflow"}
+                            else {}
+                        ),
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

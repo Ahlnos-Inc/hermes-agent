@@ -1537,6 +1537,7 @@ CREATE TABLE IF NOT EXISTS workflow_graph_compilations (
     workflow_key      TEXT PRIMARY KEY,
     idempotency_key   TEXT NOT NULL,
     spec_digest       TEXT NOT NULL,
+    request_digest    TEXT NOT NULL,
     task_ids          TEXT NOT NULL,
     terminal_step_key TEXT NOT NULL,
     created_by        TEXT NOT NULL,
@@ -2441,6 +2442,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+
+    workflow_compilation_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'workflow_graph_compilations'"
+    ).fetchone()
+    if workflow_compilation_table is not None:
+        compilation_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(workflow_graph_compilations)")
+        }
+        if "request_digest" not in compilation_cols:
+            _add_column_if_missing(
+                conn,
+                "workflow_graph_compilations",
+                "request_digest",
+                "request_digest TEXT",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -3608,6 +3626,51 @@ def issue_architecture_graph(
         return task_ids
 
 
+def _compiled_workflow_from_row(row: sqlite3.Row) -> CompiledWorkflowGraph:
+    try:
+        task_ids = json.loads(row["task_ids"])
+        if not isinstance(task_ids, dict):
+            raise TypeError("task_ids must be an object")
+        terminal_task_id = task_ids[row["terminal_step_key"]]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise WorkflowGraphError("workflow graph compilation is corrupt") from exc
+    return CompiledWorkflowGraph(
+        workflow_key=str(row["workflow_key"]),
+        task_ids={str(key): str(value) for key, value in task_ids.items()},
+        terminal_task_id=str(terminal_task_id),
+    )
+
+
+def get_compiled_workflow_retry(
+    conn: sqlite3.Connection,
+    *,
+    workflow_key: str,
+    idempotency_key: str,
+    request_digest: str,
+) -> Optional[CompiledWorkflowGraph]:
+    """Return an exact prior model-request compilation before volatile work.
+
+    Route resolution, session ids, and delivery targets are execution-time
+    snapshots. They must not turn a semantic retry into an identity conflict.
+    """
+    row = conn.execute(
+        "SELECT * FROM workflow_graph_compilations WHERE workflow_key = ?",
+        (str(workflow_key or "").strip(),),
+    ).fetchone()
+    if row is None:
+        return None
+    keys = set(row.keys())
+    stored_request_digest = (
+        row["request_digest"] if "request_digest" in keys else None
+    ) or row["spec_digest"]
+    if (
+        row["idempotency_key"] != str(idempotency_key or "").strip()
+        or stored_request_digest != str(request_digest or "").strip()
+    ):
+        raise WorkflowGraphError("workflow graph identity conflict")
+    return _compiled_workflow_from_row(row)
+
+
 def compile_workflow_graph(
     conn: sqlite3.Connection,
     *,
@@ -3615,12 +3678,15 @@ def compile_workflow_graph(
     idempotency_key: str,
     created_by: str,
     steps: list[dict[str, Any]],
-    notification: Optional[dict[str, Any]] = None,
+    notification: Optional[dict[str, Any] | list[dict[str, Any]]] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     priority: int = 0,
+    request_digest: Optional[str] = None,
+    request_scope_id: Optional[str] = None,
+    deny_active_architecture_session: bool = False,
 ) -> CompiledWorkflowGraph:
     """Compile one validated workflow graph into the Kanban kernel atomically.
 
@@ -3650,6 +3716,7 @@ def compile_workflow_graph(
     allowed_step_fields = {
         "key", "title", "body", "assignee", "parents", "role", "terminal",
         "initial_status", "result", "skills", "max_runtime_seconds", "priority",
+        "model_override", "model_provider_override", "model_reasoning_effort",
     }
     terminal_roles = {"finalizer", "synthesizer", "reporter"}
     normalized_steps: list[dict[str, Any]] = []
@@ -3674,6 +3741,13 @@ def compile_workflow_graph(
         raw_skills = raw.get("skills")
         max_runtime_seconds = raw.get("max_runtime_seconds")
         step_priority = raw.get("priority", priority)
+        model_override = str(raw.get("model_override") or "").strip() or None
+        model_provider_override = (
+            str(raw.get("model_provider_override") or "").strip() or None
+        )
+        model_reasoning_effort = (
+            str(raw.get("model_reasoning_effort") or "").strip().lower() or None
+        )
         if not step_key:
             raise WorkflowGraphError(f"steps[{index}].key is required")
         if step_key in step_keys:
@@ -3714,6 +3788,9 @@ def compile_workflow_graph(
                 )
             if name not in skills:
                 skills.append(name)
+        skill_validation_error = _forced_skill_validation_error(assignee, skills)
+        if skill_validation_error:
+            raise WorkflowGraphError(skill_validation_error)
         if max_runtime_seconds is not None:
             try:
                 max_runtime_seconds = int(max_runtime_seconds)
@@ -3731,6 +3808,15 @@ def compile_workflow_graph(
             raise WorkflowGraphError(
                 f"steps[{index}].priority must be an integer"
             ) from exc
+        supported_efforts = {"none", *VALID_REASONING_EFFORTS}
+        if (
+            model_reasoning_effort is not None
+            and model_reasoning_effort not in supported_efforts
+        ):
+            raise WorkflowGraphError(
+                f"steps[{index}].model_reasoning_effort must be one of "
+                + ", ".join(sorted(supported_efforts))
+            )
         step_keys.add(step_key)
         normalized_steps.append(
             {
@@ -3746,6 +3832,9 @@ def compile_workflow_graph(
                 "skills": skills,
                 "max_runtime_seconds": max_runtime_seconds,
                 "priority": step_priority,
+                "model_override": model_override,
+                "model_provider_override": model_provider_override,
+                "model_reasoning_effort": model_reasoning_effort,
             }
         )
 
@@ -3810,29 +3899,39 @@ def compile_workflow_graph(
             + ", ".join(unreachable)
         )
 
-    normalized_notification: Optional[dict[str, Optional[str]]] = None
+    normalized_notifications: list[dict[str, Optional[str]]] = []
     if notification is not None:
-        if not isinstance(notification, dict):
-            raise WorkflowGraphError("notification must be an object")
-        platform = str(notification.get("platform") or "").strip()
-        chat_id = str(notification.get("chat_id") or "").strip()
-        if not platform or not chat_id:
-            raise WorkflowGraphError("notification platform and chat_id are required")
-        normalized_notification = {
-            "platform": platform,
-            "chat_id": chat_id,
-            "thread_id": str(notification.get("thread_id") or ""),
-            "user_id": (
-                str(notification["user_id"])
-                if notification.get("user_id") is not None
-                else None
-            ),
-            "notifier_profile": (
-                str(notification["notifier_profile"])
-                if notification.get("notifier_profile") is not None
-                else None
-            ),
-        }
+        raw_notifications = notification if isinstance(notification, list) else [notification]
+        if not all(isinstance(item, dict) for item in raw_notifications):
+            raise WorkflowGraphError("notification must be an object or list of objects")
+        for item in raw_notifications:
+            platform = str(item.get("platform") or "").strip()
+            chat_id = str(item.get("chat_id") or "").strip()
+            if not platform or not chat_id:
+                raise WorkflowGraphError("notification platform and chat_id are required")
+            normalized = {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": str(item.get("thread_id") or ""),
+                "user_id": (
+                    str(item["user_id"])
+                    if item.get("user_id") is not None
+                    else None
+                ),
+                "notifier_profile": (
+                    str(item["notifier_profile"])
+                    if item.get("notifier_profile") is not None
+                    else None
+                ),
+            }
+            if normalized not in normalized_notifications:
+                normalized_notifications.append(normalized)
+        normalized_notifications.sort(
+            key=lambda item: (
+                str(item["platform"]), str(item["chat_id"]),
+                str(item["thread_id"]), str(item["user_id"]),
+            )
+        )
 
     canonical_steps = [
         {**step, "parents": sorted(step["parents"])}
@@ -3843,7 +3942,7 @@ def compile_workflow_graph(
         "workflow_key": workflow_key,
         "created_by": created_by,
         "steps": canonical_steps,
-        "notification": normalized_notification,
+        "notification": normalized_notifications,
         "tenant": tenant,
         "session_id": session_id,
         "workspace_kind": workspace_kind,
@@ -3859,6 +3958,7 @@ def compile_workflow_graph(
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+    request_digest = str(request_digest or "").strip() or spec_digest
 
     with write_txn(conn):
         existing = conn.execute(
@@ -3866,23 +3966,30 @@ def compile_workflow_graph(
             (workflow_key,),
         ).fetchone()
         if existing is not None:
+            existing_keys = set(existing.keys())
+            stored_request_digest = (
+                existing["request_digest"]
+                if "request_digest" in existing_keys else None
+            ) or existing["spec_digest"]
+            expected_digest = request_digest if request_digest else spec_digest
             if (
                 existing["idempotency_key"] != idempotency_key
-                or existing["spec_digest"] != spec_digest
+                or stored_request_digest != expected_digest
             ):
                 raise WorkflowGraphError("workflow graph identity conflict")
-            try:
-                existing_ids = json.loads(existing["task_ids"])
-                if not isinstance(existing_ids, dict):
-                    raise TypeError("task_ids must be an object")
-                terminal_task_id = existing_ids[existing["terminal_step_key"]]
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise WorkflowGraphError("workflow graph compilation is corrupt") from exc
-            return CompiledWorkflowGraph(
-                workflow_key=workflow_key,
-                task_ids={str(key): str(value) for key, value in existing_ids.items()},
-                terminal_task_id=str(terminal_task_id),
-            )
+            return _compiled_workflow_from_row(existing)
+
+        if deny_active_architecture_session and session_id:
+            active_gate = conn.execute(
+                """SELECT gate_id FROM architecture_gates
+                   WHERE (session_id = ? OR request_scope_id = ?)
+                     AND state IN ('open', 'validated_awaiting_approval',
+                                   'policy_accepted', 'human_approved')
+                   LIMIT 1""",
+                (session_id, request_scope_id),
+            ).fetchone()
+            if active_gate is not None:
+                raise WorkflowGraphError("architecture_graph_issuance_required")
 
         partial = conn.execute(
             "SELECT 1 FROM tasks WHERE workflow_key = ? LIMIT 1",
@@ -3907,8 +4014,10 @@ def compile_workflow_graph(
                     id, title, body, assignee, status, priority, created_by,
                     created_at, workspace_kind, workspace_path, tenant,
                     session_id, workflow_key, current_step_key, result,
-                    completed_at, skills, max_runtime_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    completed_at, skills, model_override,
+                    model_provider_override, model_reasoning_effort,
+                    max_runtime_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_ids[step["key"]],
                     step["title"],
@@ -3927,6 +4036,9 @@ def compile_workflow_graph(
                     step["result"],
                     now if task_status == "done" else None,
                     json.dumps(step["skills"]) if step["skills"] else None,
+                    step["model_override"],
+                    step["model_provider_override"],
+                    step["model_reasoning_effort"],
                     step["max_runtime_seconds"],
                 ),
             )
@@ -3942,6 +4054,9 @@ def compile_workflow_graph(
                     "parents": list(step["parents"]),
                     "terminal": step["terminal"],
                     "status": task_status,
+                    "model_override": step["model_override"],
+                    "model_provider_override": step["model_provider_override"],
+                    "model_reasoning_effort": step["model_reasoning_effort"],
                 },
             )
             if task_status == "done":
@@ -3973,7 +4088,7 @@ def compile_workflow_graph(
                 )
 
         terminal_task_id = task_ids[terminal_key]
-        if normalized_notification is not None:
+        for normalized_notification in normalized_notifications:
             conn.execute(
                 """INSERT OR IGNORE INTO kanban_notify_subs
                     (task_id, platform, chat_id, thread_id, user_id,
@@ -3991,13 +4106,14 @@ def compile_workflow_graph(
             )
         conn.execute(
             """INSERT INTO workflow_graph_compilations
-                (workflow_key, idempotency_key, spec_digest, task_ids,
-                 terminal_step_key, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (workflow_key, idempotency_key, spec_digest, request_digest,
+                 task_ids, terminal_step_key, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 workflow_key,
                 idempotency_key,
                 spec_digest,
+                request_digest,
                 json.dumps(task_ids, sort_keys=True),
                 terminal_key,
                 created_by,

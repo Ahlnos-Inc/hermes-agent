@@ -138,10 +138,307 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment", "kanban_create", "kanban_compile_workflow", "kanban_link",
         "kanban_unblock",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
+
+
+def _compiled_workflow_steps():
+    return [
+        {
+            "key": "implement",
+            "title": "Implement the change",
+            "assignee": "coder",
+            "model_routing": "code_implementation",
+        },
+        {
+            "key": "verify",
+            "title": "Verify the result",
+            "assignee": "verifier",
+            "parents": ["implement"],
+            "role": "reporter",
+            "terminal": True,
+            "model_routing": "verification_leaf",
+        },
+    ]
+
+
+def _install_compiler_test_profiles():
+    profiles = Path(os.environ["HERMES_HOME"]) / "profiles"
+    for name in ("coder", "verifier"):
+        profile = profiles / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text("toolsets: []\n")
+    policy = Path(os.environ["HERMES_HOME"]) / "rules" / "architecture-gate-policy.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(json.dumps({"schema_version": 1, "mode": "off"}))
+
+
+def test_compile_workflow_is_orchestrator_only_and_hidden_from_workers(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    refused = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "worker-bypass",
+        "idempotency_key": "worker-bypass-v1",
+        "steps": _compiled_workflow_steps(),
+    }))
+    assert "orchestrator-only" in refused["error"]
+
+
+def test_compile_workflow_atomically_subscribes_only_terminal_gateway_target(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-compile")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    args = {
+        "workflow_key": "BUILD-472:tool-contract",
+        "idempotency_key": "BUILD-472:tool-contract:v1",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/project",
+        "steps": _compiled_workflow_steps(),
+    }
+    gateway_source = {
+        "platform": "telegram",
+        "chat_id": "chat-472",
+        "thread_id": "thread-1",
+        "user_id": "nicholas",
+    }
+
+    first = json.loads(kt._handle_compile_workflow(
+        args, gateway_source=gateway_source,
+    ))
+    second = json.loads(kt._handle_compile_workflow(
+        args, gateway_source=gateway_source,
+    ))
+
+    assert first == second
+    assert first["ok"] is True
+    assert first["workflow_key"] == args["workflow_key"]
+    assert first["terminal_task_id"] == first["task_ids"]["verify"]
+    assert first["notification"] == {
+        "subscribed": True,
+        "count": 1,
+        "terminal_only": True,
+    }
+    with kb.connect() as conn:
+        implementation = kb.get_task(conn, first["task_ids"]["implement"])
+        verification = kb.get_task(conn, first["task_ids"]["verify"])
+        assert implementation.model_provider_override == "deepseek"
+        assert implementation.model_override == "deepseek-v4-pro"
+        assert implementation.model_reasoning_effort == "xhigh"
+        assert verification.model_provider_override == "nous"
+        assert verification.model_override == "deepseek/deepseek-v4-flash:free"
+        assert verification.model_reasoning_effort == "low"
+        subscriptions = kb.list_notify_subs(conn)
+        assert len(subscriptions) == 1
+        assert subscriptions[0]["task_id"] == first["terminal_task_id"]
+        assert subscriptions[0]["platform"] == "telegram"
+        assert subscriptions[0]["chat_id"] == "chat-472"
+
+
+def test_compile_workflow_invalid_graph_rolls_back_without_partial_cards(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    bad_steps = _compiled_workflow_steps()
+    bad_steps[1]["parents"] = ["missing"]
+
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "invalid-tool-graph",
+        "idempotency_key": "invalid-tool-graph-v1",
+        "steps": bad_steps,
+    }))
+
+    assert "unknown parent" in result["error"]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_key = ?",
+            ("invalid-tool-graph",),
+        ).fetchone()[0] == 0
+
+
+def test_compile_workflow_rejects_unknown_assignee_before_creating_cards(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    steps = _compiled_workflow_steps()
+    steps[0]["assignee"] = "profile-that-does-not-exist"
+
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "unknown-assignee",
+        "idempotency_key": "unknown-assignee-v1",
+        "steps": steps,
+    }))
+
+    assert "unknown assignee profile" in result["error"]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_key = 'unknown-assignee'"
+        ).fetchone()[0] == 0
+
+
+def test_compile_workflow_refuses_to_bypass_staged_architecture_gate(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    reset_session_vars()
+    policy_path = Path(os.environ["HERMES_HOME"]) / "rules" / "architecture-gate-policy.json"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(json.dumps({"schema_version": 1, "mode": "shadow"}))
+
+    assert kt._managed_architecture_gate_mode() == "shadow"
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "must-use-gated-issuance",
+        "idempotency_key": "must-use-gated-issuance-v1",
+        "steps": _compiled_workflow_steps(),
+    }))
+    assert "architecture graph issuance" in result["error"]
+
+
+def test_compile_workflow_retry_ignores_new_session_route_and_delivery_context(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "first-session")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    args = {
+        "workflow_key": "stable-request-retry",
+        "idempotency_key": "stable-request-retry-v1",
+        "steps": _compiled_workflow_steps(),
+    }
+
+    first = json.loads(kt._handle_compile_workflow(
+        args,
+        gateway_source={"platform": "telegram", "chat_id": "first-chat"},
+    ))
+    monkeypatch.setenv("HERMES_SESSION_ID", "continued-session")
+    reset_session_vars()
+    policy = Path(os.environ["HERMES_HOME"]) / "rules" / "architecture-gate-policy.json"
+    policy.write_text("invalid-after-first-compile")
+    monkeypatch.setattr(kt, "_resolve_model_routing", lambda *_: (
+        "different-model",
+        {"provider": "different-provider", "reasoning_effort": "medium"},
+    ))
+    retry = json.loads(kt._handle_compile_workflow(
+        args,
+        gateway_source={"platform": "discord", "chat_id": "second-chat"},
+    ))
+
+    assert retry["ok"] is True
+    assert retry["task_ids"] == first["task_ids"]
+    with kb.connect() as conn:
+        subscriptions = kb.list_notify_subs(conn)
+        assert len(subscriptions) == 1
+        assert subscriptions[0]["platform"] == "telegram"
+        assert subscriptions[0]["chat_id"] == "first-chat"
+
+
+def test_compile_workflow_atomically_subscribes_configured_home_channels(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nkanban:\n"
+        "  auto_subscribe_on_create: true\n"
+        "  auto_subscribe_home_on_create: true\n"
+    )
+    monkeypatch.setattr(kt, "_configured_home_channels", lambda: [
+        {"platform": "telegram", "chat_id": "home-a", "thread_id": "1"},
+        {"platform": "discord", "chat_id": "home-b", "thread_id": ""},
+    ])
+
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "home-terminal-delivery",
+        "idempotency_key": "home-terminal-delivery-v1",
+        "steps": _compiled_workflow_steps(),
+    }))
+
+    assert result["ok"] is True
+    assert result["notification"] == {
+        "subscribed": True,
+        "count": 2,
+        "terminal_only": True,
+    }
+    with kb.connect() as conn:
+        subscriptions = kb.list_notify_subs(conn)
+        assert len(subscriptions) == 2
+        assert {row["task_id"] for row in subscriptions} == {
+            result["terminal_task_id"]
+        }
+        assert {row["platform"] for row in subscriptions} == {
+            "telegram", "discord"
+        }
+
+
+def test_compile_workflow_denies_new_work_when_managed_policy_is_invalid(
+    monkeypatch, worker_env,
+):
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    policy = Path(os.environ["HERMES_HOME"]) / "rules" / "architecture-gate-policy.json"
+    policy.write_text("not-json")
+
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "invalid-policy-must-deny",
+        "idempotency_key": "invalid-policy-must-deny-v1",
+        "steps": _compiled_workflow_steps(),
+    }))
+
+    assert "managed architecture-gate policy" in result["error"]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workflow_key = 'invalid-policy-must-deny'"
+        ).fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1886,6 +2183,7 @@ def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(monkeyp
         "kanban:\n  architecture_gate:\n    version: v1\n    mode: orchestrator_only\n"
     )
     assert kt._managed_architecture_gate_mode() == "off"
+    assert kt._managed_architecture_gate_policy() == ("off", True)
     policy_path = _write_architecture_gate_policy(os.environ["HERMES_HOME"])
     assert kt._managed_architecture_gate_mode() == "off"
     args = {

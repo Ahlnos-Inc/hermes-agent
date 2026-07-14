@@ -111,6 +111,17 @@ class TestHandleFunctionCall:
         assert dispatch.call_args.kwargs["turn_id"] == "trusted-runtime-turn"
         assert dispatch.call_args.args[1]["turn_id"] == "forged-model-turn"
 
+    def test_kanban_compile_dispatch_receives_runtime_turn_id(self):
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            result = handle_function_call(
+                "kanban_compile_workflow",
+                {"workflow_key": "wf", "idempotency_key": "wf-v1", "steps": []},
+                turn_id="trusted-runtime-turn",
+            )
+
+        assert result == '{"ok":true}'
+        assert dispatch.call_args.kwargs["turn_id"] == "trusted-runtime-turn"
+
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must
         receive a non-negative integer ``duration_ms`` kwarg measuring
