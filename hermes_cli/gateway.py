@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -3596,6 +3597,99 @@ def _launchd_domain() -> str:
     return user_domain
 
 
+def _launchd_enable(domain: str, label: str) -> None:
+    """Clear launchd's persistent disabled bit for one exact Hermes label."""
+    subprocess.run(
+        ["launchctl", "enable", f"{domain}/{label}"],
+        check=True,
+        timeout=30,
+    )
+
+
+class LaunchdFenceError(RuntimeError):
+    """The exact launchd label could not be put into stopped desired state."""
+
+
+def _launchd_disable(domain: str, label: str) -> bool:
+    """Persist a stopped desired state for one exact Hermes label.
+
+    A failed disable must never be followed by bootout: bootout would remove
+    the current registration while leaving a later naive bootstrap free to
+    start it again.  A domain that cannot manage services is the one
+    exception; there is no launchd supervision to fence, so callers can use
+    the existing detached/PID fallback while reporting that the fence was
+    unavailable.
+    """
+    try:
+        subprocess.run(
+            ["launchctl", "disable", f"{domain}/{label}"],
+            check=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        if _launchctl_domain_unsupported(exc.returncode):
+            print_warning(
+                f"Could not persist the launchd stop fence for {domain}/{label} "
+                f"(launchd exit {exc.returncode}); skipping bootout"
+            )
+            return False
+        raise
+    return True
+
+
+def _launchd_label_is_disabled(domain: str, label: str) -> bool | None:
+    """Return whether launchd reports one exact label as disabled.
+
+    ``launchctl print-disabled`` is not available on every supported macOS
+    release/domain, so an inability to inspect it is represented as ``None``
+    rather than as a false claim about the desired state.
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "print-disabled", domain],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    label_pattern = re.compile(
+        rf"^\s*(?:{re.escape(label)}|\"{re.escape(label)}\"|'"
+        rf"{re.escape(label)}')\s*=>\s*true\b",
+        re.IGNORECASE,
+    )
+    return any(label_pattern.search(line) for line in (result.stdout or "").splitlines())
+
+
+_LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
+    r"^ai\.hermes\.gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.plist$"
+)
+
+
+def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
+    """Return installed Hermes gateway plists, scoped by exact filenames.
+
+    ``gateway stop --all`` cannot switch ``HERMES_HOME`` for every profile
+    safely, so enumerate only Hermes' own LaunchAgent naming convention and
+    derive each exact label from its filename.  No wildcard launchctl command
+    is used, which keeps unrelated/foreign launchd labels untouched.
+    """
+    agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
+    try:
+        entries = sorted(agents_dir.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    return [
+        (path.stem, path)
+        for path in entries
+        if path.is_file() and _LAUNCHD_GATEWAY_PLIST_PATTERN.fullmatch(path.name)
+    ]
+
+
 # On macOS, exit code 125 ("Domain does not support specified action") and
 # 3/113 ("Could not find service") all mean the job isn't currently loaded in
 # the target domain, so start/restart should re-bootstrap the plist and retry.
@@ -3992,7 +4086,9 @@ def launchd_plist_is_current() -> bool:
     ) == _normalize_launchd_plist_for_comparison(expected)
 
 
-def refresh_launchd_plist_if_needed() -> bool:
+def refresh_launchd_plist_if_needed(
+    *, enable_before_reload: bool = False
+) -> bool | None:
     """Rewrite the installed launchd plist when the generated definition has changed.
 
     Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
@@ -4005,12 +4101,19 @@ def refresh_launchd_plist_if_needed() -> bool:
 
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-        return False
+        return None
 
     plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"
+
+    # An explicit start/install intent must clear a maintenance stop fence
+    # before this refresh's bootout/bootstrap sequence.  The plist write and
+    # its temp-home safety check above are deliberately completed first so a
+    # precondition failure cannot mutate launchd's desired state.
+    if enable_before_reload:
+        _launchd_enable(domain, label)
 
     # If this refresh is running INSIDE the gateway's own launchd process tree
     # (e.g. the agent triggered a self-update via its terminal tool), a direct
@@ -4127,13 +4230,24 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 def launchd_install(force: bool = False):
     plist_path = get_launchd_plist_path()
+    domain = _launchd_domain()
+    label = get_launchd_label()
 
     if plist_path.exists() and not force:
         if not launchd_plist_is_current():
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
-            refresh_launchd_plist_if_needed()
+            try:
+                refreshed = refresh_launchd_plist_if_needed(enable_before_reload=True)
+            except subprocess.CalledProcessError as e:
+                if not _launchctl_domain_unsupported(e.returncode):
+                    raise
+                _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
+                return
+            if refreshed is None:
+                return
             print("✓ Service definition updated")
             return
+        _launchd_enable(domain, label)
         print(f"Service already installed at: {plist_path}")
         print("Use --force to reinstall")
         return
@@ -4146,9 +4260,8 @@ def launchd_install(force: bool = False):
     plist_path.write_text(new_plist)
 
     try:
-        _launchctl_bootstrap(
-            _launchd_domain(), plist_path, get_launchd_label(), timeout=30
-        )
+        _launchd_enable(domain, label)
+        _launchctl_bootstrap(domain, plist_path, label, timeout=30)
     except subprocess.CalledProcessError as e:
         if not _launchctl_domain_unsupported(e.returncode):
             raise
@@ -4185,6 +4298,8 @@ def launchd_uninstall():
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
@@ -4195,9 +4310,10 @@ def launchd_start():
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(new_plist, encoding="utf-8")
         try:
-            _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
+            _launchd_enable(domain, label)
+            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
             subprocess.run(
-                ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                ["launchctl", "kickstart", target],
                 check=True,
                 timeout=30,
             )
@@ -4210,10 +4326,20 @@ def launchd_start():
         _clear_launchd_unsupported_marker()
         return
 
-    refresh_launchd_plist_if_needed()
+    try:
+        refreshed = refresh_launchd_plist_if_needed(enable_before_reload=True)
+        if refreshed is None:
+            sys.exit(1)
+        if not refreshed:
+            _launchd_enable(domain, label)
+    except subprocess.CalledProcessError as e:
+        if not _launchctl_domain_unsupported(e.returncode):
+            raise
+        _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
+        return
     try:
         subprocess.run(
-            ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+            ["launchctl", "kickstart", target],
             check=True,
             timeout=30,
         )
@@ -4223,9 +4349,9 @@ def launchd_start():
         # Job not loaded in this domain — re-bootstrap the plist and retry.
         print("↻ launchd job was unloaded; reloading service definition")
         try:
-            _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
+            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
             subprocess.run(
-                ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                ["launchctl", "kickstart", target],
                 check=True,
                 timeout=30,
             )
@@ -4242,15 +4368,52 @@ def launchd_start():
 
 def launchd_stop():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    fenced = _launchd_stop_target(label, domain, record_planned_stop=True, wait=True)
+    if fenced:
+        print("✓ Service stopped")
+    else:
+        print_warning(
+            f"Gateway process stopped, but {domain}/{label} could not be persistently fenced"
+        )
+        print("  Run `hermes gateway status` to inspect launchd support.")
+
+
+def _launchd_stop_target(
+    label: str,
+    domain: str,
+    *,
+    record_planned_stop: bool,
+    wait: bool,
+) -> bool:
+    """Fence and unload one exact launchd gateway target."""
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
 
-        pid = get_running_pid(cleanup_stale=False)
-        if pid is not None:
-            write_planned_stop_marker(pid)
+        if record_planned_stop:
+            pid = get_running_pid(cleanup_stale=False)
+            if pid is not None:
+                write_planned_stop_marker(pid)
     except Exception:
         pass
+
+    try:
+        fenced = _launchd_disable(domain, label)
+    except subprocess.CalledProcessError as exc:
+        raise LaunchdFenceError(
+            f"Could not persist the launchd stop fence for {domain}/{label} "
+            f"(launchd exit {exc.returncode}); bootout was skipped"
+        ) from exc
+    if not fenced:
+        # Do not bootout after a failed disable: the exact ordering is the
+        # maintenance fence.  The existing PID wait still handles detached
+        # fallback processes, while the warning above makes the limitation
+        # visible to the caller.
+        if wait:
+            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+        return False
+
+    target = f"{domain}/{label}"
     # bootout unloads the service definition so KeepAlive doesn't respawn
     # the process.  A plain `kill SIGTERM` only signals the process — launchd
     # immediately restarts it because KeepAlive is unconditionally true.
@@ -4267,8 +4430,37 @@ def launchd_stop():
             pass
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
-    print("✓ Service stopped")
+    if wait:
+        _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    return True
+
+
+def launchd_stop_all() -> tuple[int, list[str]]:
+    """Fence every installed Hermes launchd gateway without wildcard labels."""
+    domain = _launchd_domain()
+    stopped = 0
+    failures: list[str] = []
+    for label, _plist_path in _installed_launchd_gateway_plists():
+        try:
+            if _launchd_stop_target(
+                label,
+                domain,
+                record_planned_stop=False,
+                wait=False,
+            ):
+                stopped += 1
+            else:
+                # The domain-unsupported path deliberately skips bootout and
+                # relies on the existing global PID sweep below; launchd
+                # cannot supervise or respawn the job in that mode.  It is
+                # already reported by _launchd_disable, so do not turn the
+                # safe detached fallback into a hard stop-all failure.
+                stopped += 1
+        except subprocess.CalledProcessError as exc:
+            failures.append(f"{label} (launchd exit {exc.returncode})")
+        except LaunchdFenceError as exc:
+            failures.append(str(exc))
+    return stopped, failures
 
 
 def _wait_for_gateway_exit(
@@ -4325,7 +4517,9 @@ def _wait_for_gateway_exit(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
+    plist_path = get_launchd_plist_path()
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
@@ -4335,6 +4529,12 @@ def launchd_restart():
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
+        if pid is None and not plist_path.exists():
+            print_error(
+                f"Launchd plist is missing: {plist_path}\n"
+                "Install the gateway service before restarting it."
+            )
+            raise SystemExit(1)
         if pid is not None:
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway
@@ -4356,6 +4556,9 @@ def launchd_restart():
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
+        # Clear a maintenance stop fence only after the drain preconditions
+        # above have completed, and before any kickstart/bootstrap operation.
+        _launchd_enable(domain, label)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
@@ -4370,7 +4573,6 @@ def launchd_restart():
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
         try:
             # Restart is the one path where the job is almost always still
             # registered (we just drained it), so a plain bootstrap would hit
@@ -4383,7 +4585,7 @@ def launchd_restart():
                 timeout=90,
             )
             subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                ["launchctl", "bootstrap", domain, str(plist_path)],
                 check=True,
                 timeout=30,
             )
@@ -4400,6 +4602,7 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    domain = _launchd_domain()
     try:
         result = subprocess.run(
             ["launchctl", "list", label],
@@ -4434,9 +4637,13 @@ def launchd_status(deep: bool = False):
     # exit 5/125 on this host.  Lets us explain *why* launchd can't supervise
     # even when no fallback process is currently running.
     launchd_unsupported = _launchd_unsupported_marker_exists()
+    launchd_disabled = _launchd_label_is_disabled(domain, label)
 
     # ── Report ──
     print(f"Launchd plist: {plist_path}")
+    if launchd_disabled is True:
+        print(f"⚠ Launchd label {domain}/{label} is disabled (maintenance stop fence is active)")
+        print("  Run: hermes gateway start  # explicitly re-enable and start it")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:
@@ -6791,20 +6998,27 @@ def _gateway_command_inner(args):
 
         if stop_all:
             # --all: kill every gateway process on the machine
-            service_available = False
+            service_count = 0
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
                 or get_systemd_unit_path(system=True).exists()
             ):
                 try:
                     systemd_stop(system=system)
-                    service_available = True
+                    service_count = 1
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos():
                 try:
-                    launchd_stop()
-                    service_available = True
+                    launchd_stopped, fence_failures = launchd_stop_all()
+                    if fence_failures:
+                        print_error(
+                            "Could not durably fence every installed launchd gateway: "
+                            + ", ".join(fence_failures)
+                        )
+                        print_error("No global process sweep was performed; inspect the listed labels.")
+                        raise SystemExit(1)
+                    service_count = launchd_stopped
                 except subprocess.CalledProcessError:
                     pass
             elif is_windows():
@@ -6813,11 +7027,11 @@ def _gateway_command_inner(args):
                 if gateway_windows.is_installed():
                     try:
                         gateway_windows.stop()
-                        service_available = True
+                        service_count = 1
                     except (subprocess.CalledProcessError, RuntimeError):
                         pass
             killed = kill_gateway_processes(all_profiles=True)
-            total = killed + (1 if service_available else 0)
+            total = killed + service_count
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             else:
@@ -6838,6 +7052,9 @@ def _gateway_command_inner(args):
                 try:
                     launchd_stop()
                     service_available = True
+                except LaunchdFenceError as exc:
+                    print_error(str(exc))
+                    raise SystemExit(1)
                 except subprocess.CalledProcessError:
                     pass
             elif is_windows():
@@ -6888,20 +7105,27 @@ def _gateway_command_inner(args):
 
         if restart_all:
             # --all: stop every gateway process across all profiles, then start fresh
-            service_stopped = False
+            service_count = 0
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
                 or get_systemd_unit_path(system=True).exists()
             ):
                 try:
                     systemd_stop(system=system)
-                    service_stopped = True
+                    service_count = 1
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos():
                 try:
-                    launchd_stop()
-                    service_stopped = True
+                    stopped_count, fence_failures = launchd_stop_all()
+                    if fence_failures:
+                        print_error(
+                            "Could not durably fence every installed launchd gateway: "
+                            + ", ".join(fence_failures)
+                        )
+                        print_error("Restart aborted before sweeping processes.")
+                        raise SystemExit(1)
+                    service_count = stopped_count
                 except subprocess.CalledProcessError:
                     pass
             elif is_windows():
@@ -6910,11 +7134,11 @@ def _gateway_command_inner(args):
                 if gateway_windows.is_installed():
                     try:
                         gateway_windows.stop()
-                        service_stopped = True
+                        service_count = 1
                     except (subprocess.CalledProcessError, RuntimeError):
                         pass
             killed = kill_gateway_processes(all_profiles=True)
-            total = killed + (1 if service_stopped else 0)
+            total = killed + service_count
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             _wait_for_gateway_exit(timeout=10.0, force_after=5.0)

@@ -801,6 +801,7 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_start()
 
         assert calls == [
+            ["launchctl", "enable", target],
             ["launchctl", "kickstart", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
@@ -829,6 +830,7 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_start()
 
         assert calls == [
+            ["launchctl", "enable", target],
             ["launchctl", "kickstart", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
@@ -857,6 +859,7 @@ class TestLaunchdServiceRecovery:
 
         assert calls == [
             ("term", 321, False),
+            ["launchctl", "enable", target],
             ["launchctl", "kickstart", "-k", target],
         ]
         # The drain can silently hold for the full budget (180s default); the
@@ -906,7 +909,10 @@ class TestLaunchdServiceRecovery:
 
         gateway_cli.launchd_stop()
 
-        assert calls == [["launchctl", "bootout", target]]
+        assert calls == [
+            ["launchctl", "disable", target],
+            ["launchctl", "bootout", target],
+        ]
 
     def test_launchd_stop_tolerates_already_unloaded(self, monkeypatch, capsys):
         """launchd_stop silently handles exit codes 3/113 (job not loaded)."""
@@ -945,6 +951,297 @@ class TestLaunchdServiceRecovery:
 
         assert len(wait_called) == 1
         assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
+
+    def test_launchd_stop_fails_closed_when_disable_fails(self, monkeypatch):
+        """A failed desired-state write must never be followed by bootout."""
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "disable", target]:
+                raise subprocess.CalledProcessError(1, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(gateway_cli.LaunchdFenceError):
+            gateway_cli.launchd_stop()
+
+        assert calls == [["launchctl", "disable", target]]
+
+    def test_launchd_stop_domain_unsupported_skips_bootout(self, monkeypatch, capsys):
+        """Unsupported launchd domains preserve fallback semantics without unsafe bootout."""
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "disable", target]:
+                raise subprocess.CalledProcessError(125, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
+
+        gateway_cli.launchd_stop()
+
+        assert calls == [["launchctl", "disable", target]]
+        assert "could not be persistently fenced" in capsys.readouterr().out.lower()
+
+    def test_launchd_restart_from_stopped_state_enables_before_kickstart(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_restart()
+
+        assert calls == [
+            ["launchctl", "enable", target],
+            ["launchctl", "kickstart", "-k", target],
+        ]
+
+    def test_launchd_start_precondition_failure_does_not_enable(self, monkeypatch):
+        """A rejected plist write cannot clear a maintenance fence."""
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_refuse_temp_home_service_write",
+            lambda content, kind: True,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd),
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: Path("/missing/hermes.plist"))
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.launchd_start()
+
+        assert excinfo.value.code == 1
+        assert calls == []
+
+    def test_launchd_start_enables_before_bootstrap_when_label_is_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """A successful bootstrap while disabled is not a start; enable comes first."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+        state = {"disabled": True}
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda **kwargs: False)
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "enable", target]:
+                state["disabled"] = False
+            if cmd[:2] in (["launchctl", "bootstrap"], ["launchctl", "kickstart"]):
+                assert state["disabled"] is False
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start()
+
+        assert calls[:2] == [
+            ["launchctl", "enable", target],
+            ["launchctl", "kickstart", target],
+        ]
+
+    def test_launchd_install_reenable_precedes_bootstrap(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: "<plist><string>/Users/alice/.hermes</string></plist>",
+        )
+        monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda *_: False)
+        calls = []
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.launchd_install(force=True)
+
+        service_calls = [
+            cmd
+            for cmd in calls
+            if cmd[:2] in (["launchctl", "enable"], ["launchctl", "bootstrap"])
+        ]
+        assert service_calls == [
+            ["launchctl", "enable", f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"],
+            ["launchctl", "bootstrap", gateway_cli._launchd_domain(), str(plist_path)],
+        ]
+
+    def test_launchd_stop_all_fences_exact_installed_profile_labels(
+        self, tmp_path, monkeypatch
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        for name in (
+            "ai.hermes.gateway.plist",
+            "ai.hermes.gateway-coder.plist",
+            "ai.hermes.gateway-orchestrator.plist",
+            "ai.hermes.update-checker.plist",
+        ):
+            (agents_dir / name).write_text("plist", encoding="utf-8")
+
+        domain = "user/501"
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        stopped, failures = gateway_cli.launchd_stop_all()
+
+        assert stopped == 3
+        assert failures == []
+        expected_labels = {
+            "ai.hermes.gateway",
+            "ai.hermes.gateway-coder",
+            "ai.hermes.gateway-orchestrator",
+        }
+        assert {
+            cmd[2].split("/", 2)[-1]
+            for cmd in calls
+            if cmd[:2] == ["launchctl", "disable"]
+        } == expected_labels
+        assert {
+            cmd[2].split("/", 2)[-1]
+            for cmd in calls
+            if cmd[:2] == ["launchctl", "bootout"]
+        } == expected_labels
+        assert all(
+            calls.index(["launchctl", "disable", f"{domain}/{label}"])
+            < calls.index(["launchctl", "bootout", f"{domain}/{label}"])
+            for label in expected_labels
+        )
+
+    def test_launchd_named_profile_stop_uses_exact_label(self, tmp_path, monkeypatch):
+        profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
+
+        gateway_cli.launchd_stop()
+
+        target = "gui/501/ai.hermes.gateway-coder"
+        assert calls == [
+            ["launchctl", "disable", target],
+            ["launchctl", "bootout", target],
+        ]
+
+    def test_launchd_status_reports_disabled_fence(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        domain = "user/501"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda cleanup_stale=False: None)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=0, stdout='"Label" = "' + label + '";\n', stderr="")
+            if cmd[:2] == ["launchctl", "print-disabled"]:
+                return SimpleNamespace(returncode=0, stdout=f'"{label}" => true\n', stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "maintenance stop fence is active" in out
+        assert "hermes gateway start" in out
+
+    def test_gateway_stop_all_uses_launchd_fence_sweep(self, monkeypatch, capsys):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_stop_all",
+            lambda: calls.append("fence-all") or (2, []),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes",
+            lambda **kwargs: calls.append(kwargs) or 3,
+        )
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", all=True))
+
+        assert calls == ["fence-all", {"all_profiles": True}]
+        assert "5 gateway process(es)" in capsys.readouterr().out
+
+    def test_gateway_stop_all_aborts_sweep_when_launchd_fence_is_partial(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False)
+        monkeypatch.setattr(gateway_cli, "launchd_stop_all", lambda: (1, ["ai.hermes.gateway-coder"]))
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes",
+            lambda **kwargs: pytest.fail("partial fencing must abort the global sweep"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", all=True))
+
+        assert excinfo.value.code == 1
+        assert "ai.hermes.gateway-coder" in capsys.readouterr().out
 
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -1014,6 +1311,7 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_start()
 
         assert calls == [
+            ["launchctl", "enable", target],
             ["launchctl", "kickstart", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
@@ -1027,7 +1325,11 @@ class TestLaunchdServiceRecovery:
         target = f"{gateway_cli._launchd_domain()}/{label}"
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
-        monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda **kwargs: False,
+        )
 
         def fake_run(cmd, check=False, **kwargs):
             if cmd == ["launchctl", "kickstart", target]:
@@ -1155,6 +1457,7 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_restart()
 
         assert calls == [
+            ["launchctl", "enable", target],
             ["launchctl", "kickstart", "-k", target],
             ["launchctl", "bootout", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
