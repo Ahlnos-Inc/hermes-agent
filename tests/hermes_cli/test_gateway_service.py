@@ -22,20 +22,52 @@ from gateway.restart import (
 
 def _write_launchd_gateway_plist(path: Path, label: str) -> None:
     """Write the smallest authentic Hermes gateway LaunchAgent definition."""
+    profile = label.removeprefix("ai.hermes.gateway-")
+    hermes_home = path.parents[2] / ".hermes"
+    arguments = ["/usr/bin/python3", "-m", "hermes_cli.main"]
+    if profile != label:
+        arguments.extend(["--profile", profile])
+    arguments.extend(["gateway", "run", "--replace"])
     path.write_bytes(
         plistlib.dumps(
             {
                 "Label": label,
-                "ProgramArguments": [
-                    "/usr/bin/python3",
-                    "-m",
-                    "hermes_cli.main",
-                    "gateway",
-                    "run",
-                    "--replace",
-                ],
+                "ProgramArguments": arguments,
+                "EnvironmentVariables": {
+                    "HERMES_HOME": str(
+                        hermes_home
+                        if profile == label
+                        else hermes_home / "profiles" / profile
+                    )
+                },
+                "RunAtLoad": True,
+                "KeepAlive": True,
             }
         )
+    )
+
+
+def _label_probe(
+    *,
+    registered=(),
+    disabled=(),
+    absent=("gui/501", "user/501"),
+    unknown=(),
+    disabled_unknown=(),
+    pids=(),
+):
+    return gateway_cli.LaunchdLabelProbe(
+        tuple(registered),
+        tuple(disabled),
+        tuple(absent),
+        tuple(unknown),
+        tuple(f"{domain}/ai.hermes.gateway probe unknown" for domain in unknown),
+        tuple(disabled_unknown),
+        tuple(
+            f"{domain}/ai.hermes.gateway disabled state unknown"
+            for domain in disabled_unknown
+        ),
+        tuple(pids),
     )
 
 
@@ -1211,13 +1243,34 @@ class TestLaunchdServiceRecovery:
 
         domain = "user/501"
         calls = []
+        disabled = set()
+        loaded = {
+            f"{domain}/{label}"
+            for label in (
+                "ai.hermes.gateway",
+                "ai.hermes.gateway-coder",
+                "ai.hermes.gateway-orchestrator",
+            )
+        }
         monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         def fake_run(cmd, check=False, **kwargs):
             calls.append(cmd)
             rc = 0
             if cmd[:2] == ["launchctl", "print"]:
-                rc = 0 if cmd[2].startswith(f"{domain}/") else 113
-            result = SimpleNamespace(returncode=rc, stdout="", stderr="")
+                rc = 0 if cmd[2] in loaded else 113
+            stdout = ""
+            if cmd[:2] == ["launchctl", "print-disabled"]:
+                current_domain = cmd[2]
+                stdout = "\n".join(
+                    f'"{target.split("/", 2)[2]}" => true'
+                    for target in sorted(disabled)
+                    if target.startswith(f"{current_domain}/")
+                )
+            if cmd[:2] == ["launchctl", "disable"]:
+                disabled.add(cmd[2])
+            if cmd[:2] == ["launchctl", "bootout"]:
+                loaded.discard(cmd[2])
+            result = SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
             if check and rc:
                 raise subprocess.CalledProcessError(rc, cmd)
             return result
@@ -1352,6 +1405,7 @@ class TestLaunchdServiceRecovery:
 
     def test_gateway_stop_all_uses_launchd_fence_sweep(self, monkeypatch, capsys):
         calls = []
+        scans = []
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
@@ -1364,13 +1418,19 @@ class TestLaunchdServiceRecovery:
         )
         monkeypatch.setattr(
             gateway_cli,
-            "kill_gateway_processes",
-            lambda **kwargs: calls.append(kwargs) or 3,
+            "find_gateway_pids_strict",
+            lambda **kwargs: scans.append(kwargs) or [101],
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes_strict",
+            lambda pids, **kwargs: calls.append({"strict": pids}) or 3,
         )
 
         gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", all=True))
 
-        assert calls == ["fence-all", {"all_profiles": True}]
+        assert calls == ["fence-all", {"strict": [101]}]
+        assert scans == [{"all_profiles": True}, {"all_profiles": True}]
         assert "5 gateway process(es)" in capsys.readouterr().out
 
     def test_gateway_stop_all_aborts_sweep_when_launchd_fence_is_partial(
@@ -1382,6 +1442,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False)
         monkeypatch.setattr(gateway_cli, "launchd_stop_all", lambda: (1, ["ai.hermes.gateway-coder"]))
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", lambda **kwargs: [])
         monkeypatch.setattr(
             gateway_cli,
             "kill_gateway_processes",
@@ -1435,6 +1496,12 @@ class TestLaunchdServiceRecovery:
                 return SimpleNamespace(returncode=113, stdout="", stderr="")
             if cmd[:2] == ["launchctl", "managername"]:
                 return SimpleNamespace(returncode=0, stdout="Aqua", stderr="")
+            if cmd[:2] == ["launchctl", "print-disabled"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='"ai.hermes.gateway-coder" => true\n',
+                    stderr="",
+                )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(
@@ -1490,8 +1557,8 @@ class TestLaunchdServiceRecovery:
         assert {
             target.label: target.restore_domains for target in result.fenced
         } == {
-            labels[0]: ("gui/501",),
-            labels[1]: ("user/501",),
+            labels[0]: (),
+            labels[1]: (),
         }
 
     def test_gateway_stop_all_dual_registered_label_fails_before_mutation_or_sweep(
@@ -1641,6 +1708,408 @@ class TestLaunchdServiceRecovery:
 
         assert excinfo.value.code == 1
 
+    def test_launchd_stop_all_rechecks_initially_disabled_domain_after_concurrent_enable(
+        self, tmp_path, monkeypatch
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        calls = []
+        probes = iter(
+            [
+                _label_probe(
+                    registered=("gui/501",),
+                    disabled=("gui/501",),
+                    pids=(("gui/501", 4242),),
+                ),
+                _label_probe(
+                    registered=("gui/501",),
+                    disabled=(),
+                    pids=(("gui/501", 4242),),
+                ),
+            ]
+        )
+
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_candidate_domains", lambda: ("gui/501", "user/501")
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_probe_launchd_label_domains", lambda _label: next(probes)
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_disable",
+            lambda domain, current_label: calls.append(["disable", domain, current_label]),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        result = gateway_cli.launchd_stop_all()
+
+        assert result.sweep_safe is False
+        assert result.failures
+        assert calls.count(["disable", "gui/501", label]) == 1
+        assert calls.count(["disable", "user/501", label]) == 1
+        assert not any(cmd[:2] == ["launchctl", "bootout"] for cmd in calls)
+
+    def test_launchd_stop_all_requires_known_initial_state_before_any_fence(
+        self, tmp_path, monkeypatch
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_candidate_domains", lambda: ("gui/501", "user/501")
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_launchd_label_domains",
+            lambda _label: _label_probe(unknown=("gui/501",)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_disable",
+            lambda *_args: calls.append("disable"),
+        )
+
+        with pytest.raises(gateway_cli.LaunchdInventoryError, match="could not inspect"):
+            gateway_cli.launchd_stop_all()
+
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "barrier_probe",
+        [
+            _label_probe(
+                registered=("gui/501", "user/501"),
+                disabled=("gui/501", "user/501"),
+                pids=(("gui/501", 101), ("user/501", 202)),
+            ),
+            _label_probe(
+                registered=("user/501",),
+                disabled=("gui/501", "user/501"),
+                pids=(("user/501", 202),),
+            ),
+        ],
+        ids=["dual-registration", "registration-moved"],
+    )
+    def test_launchd_stop_all_rejects_registration_conflict_before_bootout(
+        self, tmp_path, monkeypatch, barrier_probe
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        calls = []
+        probes = iter(
+            [
+                _label_probe(
+                    registered=("gui/501",),
+                    pids=(("gui/501", 101),),
+                ),
+                barrier_probe,
+            ]
+        )
+
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_candidate_domains", lambda: ("gui/501", "user/501")
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_probe_launchd_label_domains", lambda _label: next(probes)
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_disable",
+            lambda domain, current_label: calls.append(["disable", domain, current_label]),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        result = gateway_cli.launchd_stop_all()
+
+        assert result.sweep_safe is False
+        assert result.failures
+        assert not any(cmd[:2] == ["launchctl", "bootout"] for cmd in calls)
+
+    @pytest.mark.parametrize(
+        ("bootout_returncode", "post_probe", "safe"),
+        [
+            (
+                5,
+                _label_probe(
+                    registered=("gui/501",),
+                    disabled=("gui/501", "user/501"),
+                    pids=(("gui/501", 101),),
+                ),
+                False,
+            ),
+            (
+                1,
+                _label_probe(
+                    disabled=("gui/501", "user/501"),
+                    absent=("gui/501", "user/501"),
+                ),
+                True,
+            ),
+            (
+                0,
+                _label_probe(
+                    disabled=("gui/501", "user/501"),
+                    unknown=("gui/501",),
+                ),
+                False,
+            ),
+        ],
+        ids=["still-registered", "nonzero-exact-absence", "post-unknown"],
+    )
+    def test_launchd_stop_all_post_bootout_barrier_is_authoritative(
+        self,
+        tmp_path,
+        monkeypatch,
+        bootout_returncode,
+        post_probe,
+        safe,
+    ):
+        agents_dir = tmp_path / "Library" / "LaunchAgents"
+        agents_dir.mkdir(parents=True)
+        label = "ai.hermes.gateway-coder"
+        _write_launchd_gateway_plist(agents_dir / f"{label}.plist", label)
+        calls = []
+        probes = iter(
+            [
+                _label_probe(
+                    registered=("gui/501",),
+                    pids=(("gui/501", 101),),
+                ),
+                _label_probe(
+                    registered=("gui/501",),
+                    disabled=("gui/501", "user/501"),
+                    pids=(("gui/501", 101),),
+                ),
+                post_probe,
+            ]
+        )
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            result = SimpleNamespace(
+                returncode=bootout_returncode if cmd[:2] == ["launchctl", "bootout"] else 0,
+                stdout="",
+                stderr="",
+            )
+            if check and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, cmd)
+            return result
+
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_candidate_domains", lambda: ("gui/501", "user/501")
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_probe_launchd_label_domains", lambda _label: next(probes)
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_disable",
+            lambda domain, current_label: calls.append(["disable", domain, current_label]),
+        )
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        result = gateway_cli.launchd_stop_all()
+
+        assert result.sweep_safe is safe
+        assert bool(result.failures) is (not safe)
+        assert any(cmd[:2] == ["launchctl", "bootout"] for cmd in calls)
+
+    def test_gateway_stop_all_strict_preflight_scan_failure_has_zero_launchctl_mutation(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda _action: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "find_gateway_pids_strict",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                gateway_cli.GatewayProcessEnumerationError("permission denied")
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_stop_all",
+            lambda: pytest.fail("launchd mutation must follow strict PID preflight"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+        assert calls == []
+        assert "permission denied" in capsys.readouterr().out
+
+    def test_gateway_stop_all_post_barrier_scan_failure_never_terminates(
+        self, monkeypatch, capsys
+    ):
+        scan_results = iter(
+            [[101]]
+        )
+        scans = 0
+
+        def strict_scan(**_kwargs):
+            nonlocal scans
+            scans += 1
+            if scans == 1:
+                return next(scan_results)
+            raise gateway_cli.GatewayProcessEnumerationError("post-barrier scan failed")
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda _action: False
+        )
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", strict_scan)
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_stop_all",
+            lambda: gateway_cli.LaunchdStopAllResult((), (), True),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes_strict",
+            lambda *_args, **_kwargs: pytest.fail("post-scan failure must prevent termination"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+        assert "post-barrier scan failed" in capsys.readouterr().out
+
+    def test_gateway_stop_all_strict_termination_permission_failure_names_pid(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda _action: False
+        )
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", lambda **_kwargs: [4242])
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_stop_all",
+            lambda: gateway_cli.LaunchdStopAllResult((), (), True),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes_strict",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                gateway_cli.GatewayProcessTerminationError(["PID 4242: permission denied"])
+            ),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+        assert "PID 4242" in capsys.readouterr().out
+
+    def test_gateway_stop_all_aborts_when_sweep_safe_is_false_without_failure_text(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda _action: False
+        )
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", lambda **_kwargs: [])
+        monkeypatch.setattr(
+            gateway_cli,
+            "launchd_stop_all",
+            lambda: gateway_cli.LaunchdStopAllResult((), (), False),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "kill_gateway_processes_strict",
+            lambda *_args, **_kwargs: pytest.fail("unsafe barrier must prevent termination"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="stop", all=True, system=False)
+            )
+
+        assert excinfo.value.code == 1
+
+    def test_launchd_restore_and_release_only_touch_transaction_owned_domains(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway-coder.plist"
+        _write_launchd_gateway_plist(plist_path, "ai.hermes.gateway-coder")
+        target = gateway_cli.LaunchdFencedGateway(
+            "ai.hermes.gateway-coder",
+            plist_path,
+            ("gui/501", "user/501"),
+            (),
+            ("gui/501",),
+        )
+        result = gateway_cli.LaunchdStopAllResult((target,), (), True)
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_launchd_label_domains",
+            lambda _label: _label_probe(
+                disabled=(), absent=("gui/501", "user/501")
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_enable",
+            lambda domain, label: calls.append(["enable", domain, label]),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchctl_bootstrap",
+            lambda *args, **kwargs: pytest.fail("pre-disabled target must not bootstrap"),
+        )
+
+        restored, restore_failures = gateway_cli.launchd_restore_all(result)
+        release_failures = gateway_cli.launchd_release_all_fences(result)
+
+        assert restored == 1
+        assert restore_failures == []
+        assert release_failures == []
+        assert calls == []
+
     def test_gateway_stop_all_launchagents_permission_error_fails_before_sweep(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -1717,6 +2186,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(
             gateway_cli.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd)
         )
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", lambda **kwargs: [])
         monkeypatch.setattr(
             gateway_cli,
             "kill_gateway_processes",
@@ -1758,6 +2228,7 @@ class TestLaunchdServiceRecovery:
                 "symlink inventory must abort before launchctl"
             ),
         )
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids_strict", lambda **kwargs: [])
         monkeypatch.setattr(
             gateway_cli,
             "kill_gateway_processes",

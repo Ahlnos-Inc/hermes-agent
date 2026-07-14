@@ -89,6 +89,14 @@ class GatewayProcessEnumerationError(RuntimeError):
     """The process table could not be enumerated completely and safely."""
 
 
+class GatewayProcessTerminationError(RuntimeError):
+    """One or more exact gateway PIDs could not be terminated safely."""
+
+    def __init__(self, failures: list[str]):
+        self.failures = tuple(failures)
+        super().__init__("; ".join(self.failures))
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -244,7 +252,11 @@ def _request_gateway_self_restart(pid: int) -> bool:
     return True
 
 
-def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
+def _graceful_restart_via_sigusr1(
+    pid: int,
+    drain_timeout: float,
+    expected_start_time: int | None = None,
+) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
     SIGUSR1 is wired in gateway/run.py to ``request_restart(via_service=True)``
@@ -262,6 +274,9 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
             SIGUSR1.  Should be slightly larger than the gateway's
             ``agent.restart_drain_timeout`` to allow the drain loop to
             finish cleanly.
+        expected_start_time: Optional process birth identity. When supplied,
+            the PID is rechecked immediately before signalling so a PID reuse
+            race cannot signal an unrelated process.
 
     Returns:
         True if the PID was signalled and exited within the timeout.
@@ -271,6 +286,10 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     if not hasattr(signal, "SIGUSR1"):
         return False
     if pid <= 0:
+        return False
+    if expected_start_time is not None and not _launchd_pid_is_live(
+        pid, expected_start_time
+    ):
         return False
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
@@ -709,12 +728,20 @@ def find_gateway_pids_strict(
         raise GatewayProcessEnumerationError(
             "gateway service capability could not be inspected"
         ) from exc
-    for pid in _scan_gateway_pids(
-        exclude,
-        all_profiles=all_profiles,
-        include_restart_managers=include_restart_managers,
-        strict=True,
-    ):
+    try:
+        scanned_pids = _scan_gateway_pids(
+            exclude,
+            all_profiles=all_profiles,
+            include_restart_managers=include_restart_managers,
+            strict=True,
+        )
+    except GatewayProcessEnumerationError:
+        raise
+    except Exception as exc:
+        raise GatewayProcessEnumerationError(
+            "gateway process enumeration failed"
+        ) from exc
+    for pid in scanned_pids:
         _append_unique_pid(pids, pid, exclude)
     return pids
 
@@ -1550,6 +1577,35 @@ def kill_gateway_processes(
 
         except OSError as exc:
             print(f"Failed to kill PID {pid}: {exc}")
+    return killed
+
+
+def kill_gateway_processes_strict(
+    pids: list[int] | tuple[int, ...] | set[int], *, force: bool = False
+) -> int:
+    """Terminate an already-attested PID set and fail closed on real errors.
+
+    This narrow companion to :func:`kill_gateway_processes` is for destructive
+    macOS launchd transactions. The caller must obtain ``pids`` from a strict
+    inventory immediately beforehand; a PID disappearing between inventory
+    and termination is benign, while permission and other OS failures are not.
+    The historical best-effort killer remains unchanged for status and
+    non-macOS service UX.
+    """
+    killed = 0
+    failures: list[str] = []
+    for pid in dict.fromkeys(pids):
+        try:
+            terminate_pid(pid, force=force)
+            killed += 1
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            failures.append(f"PID {pid}: permission denied ({exc})")
+        except OSError as exc:
+            failures.append(f"PID {pid}: {exc}")
+    if failures:
+        raise GatewayProcessTerminationError(failures)
     return killed
 
 
@@ -3867,6 +3923,11 @@ def _launchd_gateway_profile_invocation(
     label: str, document: dict
 ) -> tuple[Path, str | None]:
     """Validate a plist's Hermes identity without consulting the active caller."""
+    for key in ("RunAtLoad", "KeepAlive"):
+        if document.get(key) is not True:
+            raise LaunchdAllOperationError(
+                f"{label}: {key} must be scalar true for Hermes supervision"
+            )
     environment = document.get("EnvironmentVariables")
     home_value = environment.get("HERMES_HOME") if isinstance(environment, dict) else None
     if not isinstance(home_value, str) or not home_value.strip():
@@ -4142,7 +4203,10 @@ def _launchd_all_require_known_probe(label: str, probe: LaunchdLabelProbe) -> No
 
 
 def _launchd_all_observe_target(
-    target: LaunchdAllTarget, expected_disabled: set[str]
+    target: LaunchdAllTarget,
+    expected_disabled: set[str],
+    *,
+    allow_live_pid_appearance: bool = False,
 ) -> tuple[LaunchdLabelProbe, int | None, int | None]:
     """Re-probe and compare the immutable plan before one target mutation."""
     probe = _probe_launchd_label_domains(target.label)
@@ -4170,23 +4234,38 @@ def _launchd_all_observe_target(
     pid = probe.pid_for(current_domain) if probe.registered else None
     start_time = _launchd_process_start_time(pid) if pid is not None else None
     if pid != target.pid or start_time != target.start_time:
-        raise LaunchdAllOperationError(
-            f"{target.launchctl_target}: concurrent PID identity changed from "
-            f"{(target.pid, target.start_time)} to {(pid, start_time)}"
-        )
+        if not (
+            allow_live_pid_appearance
+            and target.was_loaded
+            and target.pid is None
+            and pid is not None
+            and start_time is not None
+        ):
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: concurrent PID identity changed from "
+                f"{(target.pid, target.start_time)} to {(pid, start_time)}"
+            )
     return probe, pid, start_time
 
 
 def _launchd_all_prepare_mutation(
-    target: LaunchdAllTarget, expected_disabled: set[str]
-) -> None:
-    _launchd_all_observe_target(target, expected_disabled)
+    target: LaunchdAllTarget,
+    expected_disabled: set[str],
+    *,
+    allow_live_pid_appearance: bool = False,
+) -> tuple[int | None, int | None]:
+    _probe, pid, start_time = _launchd_all_observe_target(
+        target,
+        expected_disabled,
+        allow_live_pid_appearance=allow_live_pid_appearance,
+    )
     _revalidate_launchd_target(target)
+    return pid, start_time
 
 
 def _launchd_all_prepare_post_bootstrap_kickstart(
     target: LaunchdAllTarget, expected_disabled: set[str]
-) -> None:
+) -> bool:
     """Validate the intended registration before kickstarting a new load."""
     probe = _probe_launchd_label_domains(target.label)
     _launchd_all_require_known_probe(target.label, probe)
@@ -4200,12 +4279,159 @@ def _launchd_all_prepare_post_bootstrap_kickstart(
             f"{target.launchctl_target}: concurrent disabled state changed "
             f"after bootstrap to {list(probe.disabled)}"
         )
+    _revalidate_launchd_target(target)
     pid = probe.pid_for(target.domain)
-    if pid is not None and _launchd_process_start_time(pid) is None:
+    if pid is None:
+        return False
+    start_time = _launchd_process_start_time(pid)
+    if start_time is None:
         raise LaunchdAllOperationError(
             f"{target.launchctl_target}: bootstrapped PID {pid} has no birth identity"
         )
-    _revalidate_launchd_target(target)
+    return _launchd_pid_is_live(pid, start_time)
+
+
+def _launchd_all_start_bootstrapped_target(
+    target: LaunchdAllTarget,
+    expected_disabled: set[str],
+    *,
+    timeout: float = 2.0,
+) -> bool:
+    """Observe a new registration before deciding whether to kickstart it."""
+    if _launchd_all_wait_for_live(
+        target, expected_disabled=expected_disabled, timeout=timeout
+    ):
+        return True
+    # Re-probe immediately before the non-killing action. A RunAtLoad/KeepAlive
+    # job may have started during the bounded observation; never replace it.
+    if _launchd_all_prepare_post_bootstrap_kickstart(target, expected_disabled):
+        return True
+    subprocess.run(
+        ["launchctl", "kickstart", target.launchctl_target],
+        check=True,
+        timeout=30,
+    )
+    return _launchd_all_wait_for_live(
+        target, expected_disabled=expected_disabled, timeout=timeout
+    )
+
+
+def _launchd_all_rollback_bootstrap(
+    target: LaunchdAllTarget, expected_disabled: set[str]
+) -> list[str]:
+    """Remove only a registration definitively created by this operation."""
+    failures: list[str] = []
+    try:
+        _revalidate_launchd_target(target)
+        probe = _probe_launchd_label_domains(target.label)
+        _launchd_all_require_known_probe(target.label, probe)
+        if len(probe.registered) > 1:
+            failures.append(
+                f"{target.launchctl_target} rollback registration conflict"
+            )
+        elif set(probe.disabled) != expected_disabled:
+            failures.append(
+                f"{target.launchctl_target} rollback disabled state changed to "
+                f"{list(probe.disabled)}"
+            )
+        elif probe.registered == (target.domain,):
+            bootout_error: BaseException | None = None
+            try:
+                subprocess.run(
+                    ["launchctl", "bootout", target.launchctl_target],
+                    check=True,
+                    timeout=90,
+                )
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                bootout_error = exc
+
+            post = _probe_launchd_label_domains(target.label)
+            _launchd_all_require_known_probe(target.label, post)
+            if len(post.registered) > 1:
+                failures.append(
+                    f"{target.launchctl_target} rollback registration conflict "
+                    "after bootout"
+                )
+            elif post.registered:
+                failures.append(
+                    f"{target.launchctl_target} rollback bootout left "
+                    f"registration in {post.registered[0]}"
+                )
+            if set(post.disabled) != expected_disabled:
+                failures.append(
+                    f"{target.launchctl_target} rollback disabled state changed to "
+                    f"{list(post.disabled)}"
+                )
+            if bootout_error is not None:
+                failures.append(
+                    f"{target.launchctl_target} rollback bootout "
+                    f"({_launchd_all_failure_detail(bootout_error)})"
+                )
+        elif probe.registered:
+            failures.append(
+                f"{target.launchctl_target} rollback refused registration in "
+                f"{probe.registered[0]}"
+            )
+        # An absent registration is already rolled back. Do not bootout a
+        # registration that launchd no longer reports.
+    except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+        failures.append(
+            f"{target.launchctl_target} rollback ({_launchd_all_failure_detail(exc)})"
+        )
+    return failures
+
+
+def _launchd_all_restore_changed_fences(
+    target: LaunchdAllTarget,
+    changed_domains: list[str],
+    expected_disabled: set[str],
+) -> list[str]:
+    """Restore only desired-state bits changed by one start transaction."""
+    failures: list[str] = []
+    if not changed_domains:
+        return failures
+    try:
+        _revalidate_launchd_target(target)
+        probe = _probe_launchd_label_domains(target.label)
+        _launchd_all_require_known_probe(target.label, probe)
+        if len(probe.registered) > 1:
+            failures.append(
+                f"{target.launchctl_target} rollback registration conflict"
+            )
+            return failures
+        if set(probe.disabled) != expected_disabled:
+            failures.append(
+                f"{target.launchctl_target} rollback disabled state changed to "
+                f"{list(probe.disabled)}"
+            )
+            return failures
+        for domain in reversed(changed_domains):
+            if domain in probe.disabled:
+                continue
+            try:
+                _launchd_disable(domain, target.label)
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                failures.append(
+                    f"{domain}/{target.label} rollback "
+                    f"({_launchd_all_failure_detail(exc)})"
+                )
+        final = _probe_launchd_label_domains(target.label)
+        _launchd_all_require_known_probe(target.label, final)
+        if len(final.registered) > 1:
+            failures.append(
+                f"{target.launchctl_target} rollback registration conflict after fence restore"
+            )
+        expected_final_disabled = expected_disabled | set(changed_domains)
+        if set(final.disabled) != expected_final_disabled:
+            failures.append(
+                f"{target.launchctl_target} rollback disabled state is "
+                f"{list(final.disabled)}, expected {list(expected_final_disabled)}"
+            )
+    except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+        failures.append(
+            f"{target.launchctl_target} rollback ({_launchd_all_failure_detail(exc)})"
+        )
+    return failures
 
 
 _LAUNCHD_ALL_OPERATIONAL_ERRORS = (
@@ -4224,8 +4450,10 @@ def _launchd_all_failure_detail(exc: BaseException) -> str:
 
 def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutcome:
     """Start one target transactionally, without disturbing a live target."""
-    expected_disabled = set(target.probe.disabled)
+    original_disabled = set(target.probe.disabled)
+    expected_disabled = set(original_disabled)
     newly_enabled: list[str] = []
+    bootstrapped_by_us = False
     try:
         for domain in target.probe.disabled:
             _launchd_all_prepare_mutation(target, expected_disabled)
@@ -4249,38 +4477,54 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
                         f"{target.launchctl_target}: exact supervised PID is not live"
                     )
             else:
-                _launchd_all_prepare_mutation(target, expected_disabled)
+                _launchd_all_prepare_mutation(
+                    target,
+                    expected_disabled,
+                    allow_live_pid_appearance=True,
+                )
+                if _launchd_all_verify_live(
+                    target, expected_disabled=expected_disabled
+                ):
+                    return LaunchdAllTargetOutcome(
+                        target.label, target.domain, "started"
+                    )
                 subprocess.run(
                     ["launchctl", "kickstart", target.launchctl_target],
                     check=True,
                     timeout=30,
                 )
-                if not _launchd_all_wait_for_live(
-                    target, expected_disabled=expected_disabled
-                ):
+                if not _launchd_all_wait_for_live(target, expected_disabled=expected_disabled):
                     raise LaunchdAllOperationError(
                         f"{target.launchctl_target}: kickstart produced no live PID"
                     )
         else:
             _launchd_all_prepare_mutation(target, expected_disabled)
-            _launchd_all_bootstrap(target)
-            if not _launchd_all_wait_for_live(
-                target, expected_disabled=expected_disabled
-            ):
+            bootstrap_raced = _launchd_all_bootstrap(target)
+            bootstrapped_by_us = not bootstrap_raced
+            if bootstrap_raced:
+                live = _launchd_all_wait_for_live(
+                    target, expected_disabled=expected_disabled, timeout=2.0
+                )
+            else:
+                live = _launchd_all_start_bootstrapped_target(
+                    target, expected_disabled
+                )
+            if not live:
                 raise LaunchdAllOperationError(
                     f"{target.launchctl_target}: bootstrap produced no live PID"
                 )
         return LaunchdAllTargetOutcome(target.label, target.domain, "started")
     except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
         rollback_failures: list[str] = []
-        for domain in reversed(newly_enabled):
-            try:
-                _revalidate_launchd_target(target)
-                _launchd_disable(domain, target.label)
-            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as rollback_exc:
-                rollback_failures.append(
-                    f"{domain}/{target.label} rollback ({_launchd_all_failure_detail(rollback_exc)})"
-                )
+        if bootstrapped_by_us:
+            rollback_failures.extend(
+                _launchd_all_rollback_bootstrap(target, expected_disabled)
+            )
+        rollback_failures.extend(
+            _launchd_all_restore_changed_fences(
+                target, newly_enabled, expected_disabled
+            )
+        )
         detail = _launchd_all_failure_detail(exc)
         if rollback_failures:
             detail += "; rollback failed: " + "; ".join(rollback_failures)
@@ -4344,9 +4588,10 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
             raise LaunchdAllOperationError(
                 f"{target.launchctl_target}: old supervised PID is not live"
             )
-        _revalidate_launchd_target(target)
         if not _graceful_restart_via_sigusr1(
-            target.pid, _get_restart_drain_timeout()
+            target.pid,
+            _get_restart_drain_timeout(),
+            expected_start_time=target.start_time,
         ):
             raise LaunchdAllOperationError(
                 f"{target.launchctl_target}: old PID did not exit"
@@ -4363,38 +4608,60 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
             )
         return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
 
-    _launchd_all_prepare_mutation(target, expected_disabled)
-    if not target.was_loaded:
-        bootstrap_raced = _launchd_all_bootstrap(target)
-        if bootstrap_raced:
-            raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: bootstrap raced with a concurrent "
-                "registration; no kickstart was attempted"
-            )
-        _launchd_all_prepare_post_bootstrap_kickstart(target, expected_disabled)
-    else:
+    bootstrapped_by_us = False
+    try:
+        if not target.was_loaded:
+            _launchd_all_prepare_mutation(target, expected_disabled)
+            bootstrap_raced = _launchd_all_bootstrap(target)
+            if bootstrap_raced:
+                raise LaunchdAllOperationError(
+                    f"{target.launchctl_target}: bootstrap raced with a concurrent "
+                    "registration; no kickstart was attempted"
+                )
+            bootstrapped_by_us = True
+            if not _launchd_all_start_bootstrapped_target(
+                target, expected_disabled
+            ):
+                raise LaunchdAllOperationError(
+                    f"{target.launchctl_target}: new supervised PID was not verified"
+                )
+            return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+
         # A loaded registration with no PID is a not-running job, not an
-        # unloaded job. Kickstart the exact target and never bootstrap it.
-        pass
-    subprocess.run(
-        ["launchctl", "kickstart", "-k", target.launchctl_target],
-        check=True,
-        timeout=30,
-    )
-    successor = (
-        (target.pid, target.start_time)
-        if target.pid is not None and target.start_time is not None
-        else None
-    )
-    if not _launchd_all_wait_for_live(
-        target,
-        successor_of=successor,
-        expected_disabled=expected_disabled,
-    ):
-        raise LaunchdAllOperationError(
-            f"{target.launchctl_target}: new supervised PID was not verified"
+        # unloaded job. Re-probe immediately before the non-killing kickstart;
+        # if a PID appeared, leave it alone and verify it instead.
+        _launchd_all_prepare_mutation(
+            target,
+            expected_disabled,
+            allow_live_pid_appearance=True,
         )
-    return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+        if _launchd_all_verify_live(target, expected_disabled=expected_disabled):
+            return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+        subprocess.run(
+            ["launchctl", "kickstart", target.launchctl_target],
+            check=True,
+            timeout=30,
+        )
+        if not _launchd_all_wait_for_live(
+            target, expected_disabled=expected_disabled
+        ):
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: new supervised PID was not verified"
+            )
+        return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+    except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+        rollback_failures = (
+            _launchd_all_rollback_bootstrap(target, expected_disabled)
+            if bootstrapped_by_us
+            else []
+        )
+        detail = _launchd_all_failure_detail(exc)
+        if rollback_failures:
+            detail += "; rollback failed: " + "; ".join(rollback_failures)
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: {detail}",
+            (f"{target.launchctl_target}: {detail}",),
+        ) from exc
 
 
 def launchd_restart_all() -> LaunchdAllResult:
@@ -4441,22 +4708,20 @@ _LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
 
 
 def _launchd_program_arguments_are_hermes_gateway(value) -> bool:
-    """Return True only for Hermes' Python module gateway entrypoint."""
+    """Return True only for Hermes' exact Python module gateway entrypoint."""
     if not isinstance(value, list) or not all(isinstance(arg, str) for arg in value):
         return False
-    if not value or "python" not in Path(value[0]).name.lower():
+    if len(value) < 6 or "python" not in Path(value[0]).name.lower():
         return False
-    try:
-        module_index = value.index("-m")
-        gateway_index = value.index("gateway", module_index + 2)
-    except ValueError:
+    if value[1:3] != ["-m", "hermes_cli.main"]:
         return False
-    return (
-        module_index == 1
-        and module_index + 1 < len(value)
-        and value[module_index + 1] == "hermes_cli.main"
-        and gateway_index + 1 < len(value)
-        and value[gateway_index + 1] == "run"
+    if value[-3:] != ["gateway", "run", "--replace"]:
+        return False
+    prefix = value[3:-3]
+    if not prefix:
+        return True
+    return len(prefix) == 2 and prefix[0] == "--profile" and bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", prefix[1])
     )
 
 
@@ -4503,6 +4768,12 @@ def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
             raise LaunchdInventoryError(
                 f"Refusing cross-profile launchd operation: {path} is not a Hermes gateway runtime"
             )
+        try:
+            _launchd_gateway_profile_invocation(label, payload)
+        except LaunchdAllOperationError as exc:
+            raise LaunchdInventoryError(
+                f"Refusing cross-profile launchd operation: {exc}"
+            ) from exc
         candidates.append((label, path))
     return candidates
 
@@ -5447,101 +5718,184 @@ def launchd_stop_all() -> LaunchdStopAllResult:
     ``user/<uid>``; the current caller's cached domain is never reused.
     """
     inventory = _installed_launchd_gateway_plists()
-    planned: list[tuple[str, Path, LaunchdLabelProbe, tuple[str, ...]]] = []
+    domains = _launchd_candidate_domains()
+    planned: list[tuple[str, Path, LaunchdLabelProbe, tuple[str, ...], tuple[str, ...]]] = []
+    preflight_failures: list[str] = []
     for label, plist_path in inventory:
         probe = _probe_launchd_label_domains(label)
-        if len(probe.registered) > 1:
-            raise LaunchdInventoryError(
-                f"Refusing cross-profile launchd operation: {label} is registered "
-                f"in both {probe.registered[0]} and {probe.registered[1]}"
+        if probe.unknown or probe.disabled_unknown:
+            details = (
+                probe.unknown_details
+                + probe.disabled_unknown_details
+                + tuple(probe.unknown)
+                + tuple(probe.disabled_unknown)
             )
-        if probe.registered:
+            preflight_failures.append(
+                f"{label}: could not inspect launchd state ({'; '.join(details)})"
+            )
+            continue
+        if len(probe.registered) > 1:
+            preflight_failures.append(
+                f"{label}: registered in both {probe.registered[0]} and "
+                f"{probe.registered[1]}"
+            )
+            continue
+        if probe.disabled:
+            # A disabled bit in either candidate domain is intentional state;
+            # restart/restore must preserve that label rather than inventing a
+            # new bootstrap domain.
+            restore_domains = ()
+        elif probe.registered:
             restore_domains = probe.registered
         else:
-            # An installed-but-unloaded LaunchAgent can be loaded into either
-            # supported session domain later. Persist the maintenance fence in
-            # both exact domains rather than booting or killing it speculatively.
-            restore_domains = (_launchd_domain_for_label(label),)
-        planned.append((label, plist_path, probe, restore_domains))
+            restore_domains = (_launchd_validated_manager_domain(),)
+        changed_domains = tuple(domain for domain in domains if domain not in probe.disabled)
+        planned.append((label, plist_path, probe, restore_domains, changed_domains))
+
+    if preflight_failures:
+        raise LaunchdInventoryError(
+            "Refusing cross-profile launchd operation: "
+            + "; ".join(preflight_failures)
+        )
 
     fenced: list[LaunchdFencedGateway] = []
     failures: list[str] = []
-    sweep_safe = True
-    registered_to_bootout: list[tuple[str, str]] = []
+    barrier: dict[str, LaunchdLabelProbe] = {}
 
-    for label, plist_path, probe, restore_domains in planned:
-        # Persist the exact stop intent in both possible session domains. A
-        # label registered under user/<uid> today can otherwise be loaded from
-        # the same installed plist under gui/<uid> after the next Aqua login.
-        domains = _launchd_candidate_domains()
-        successful = list(probe.disabled)
-        changed: list[str] = []
-        label_failures: list[str] = []
+    # Every candidate domain receives the stop intent, including a domain that
+    # was already disabled. This closes the concurrent-enable window between
+    # the initial snapshot and the write phase.
+    for label, plist_path, probe, restore_domains, changed_domains in planned:
+        label_errors: list[str] = []
         for domain in domains:
-            if domain in successful:
-                continue
             try:
                 _launchd_disable(domain, label)
-                successful.append(domain)
-                changed.append(domain)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                rc = getattr(exc, "returncode", "unavailable")
-                label_failures.append(f"{domain}/{label} (launchd exit {rc})")
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                # The exact barrier below decides whether this command error
+                # mattered. In particular, launchctl 3/5/113/125 is not a
+                # standalone success or failure signal.
+                label_errors.append(
+                    f"{domain}/{label} disable ({_launchd_all_failure_detail(exc)})"
+                )
 
-        if label_failures:
-            # Once a desired-state write was attempted and failed, the fence
-            # transaction is unsafe. A later "not registered" observation can
-            # race with launchd and must not retroactively authorize a global
-            # PID sweep. Domains known to be inapplicable must be excluded
-            # before attempting disable, not excused afterward.
-            sweep_safe = False
-            # Re-probe after the failure in case the registration moved between
-            # gui/user while fencing. Retry any newly-observed actual domain.
-            retry_probe = _probe_launchd_label_domains(label)
-            for actual_domain in retry_probe.registered:
-                if actual_domain in successful:
-                    continue
-                try:
-                    _launchd_disable(actual_domain, label)
-                    successful.append(actual_domain)
-                    changed.append(actual_domain)
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                    pass
-            failures.extend(label_failures)
+        try:
+            post_write = _probe_launchd_label_domains(label)
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            post_write = None
+            label_errors.append(
+                f"{label} post-fence probe ({_launchd_all_failure_detail(exc)})"
+            )
+        if post_write is not None:
+            if post_write.unknown or post_write.disabled_unknown:
+                label_errors.append(
+                    f"{label} post-fence state is unknown: "
+                    + "; ".join(
+                        post_write.unknown_details
+                        + post_write.disabled_unknown_details
+                        + tuple(post_write.unknown)
+                        + tuple(post_write.disabled_unknown)
+                    )
+                )
+            elif set(post_write.disabled) != set(domains):
+                label_errors.append(
+                    f"{label} post-fence disabled state is "
+                    f"{list(post_write.disabled)}, expected {list(domains)}"
+                )
+            if post_write.registered != probe.registered:
+                label_errors.append(
+                    f"{label} post-fence registration moved from "
+                    f"{probe.registered or 'none'} to "
+                    f"{post_write.registered or 'none'}"
+                )
+            if len(post_write.registered) > 1:
+                label_errors.append(
+                    f"{label} post-fence registration conflict in "
+                    f"{post_write.registered}"
+                )
+            elif post_write.registered == probe.registered:
+                barrier[label] = post_write
+        # A command failure whose exact barrier is correct is not retained as
+        # a transaction failure. Otherwise aggregate every state failure.
+        if post_write is None or label_errors and (
+            post_write is None
+            or post_write.unknown
+            or post_write.disabled_unknown
+            or set(post_write.disabled) != set(domains)
+            or len(post_write.registered) > 1
+        ):
+            failures.extend(label_errors)
 
         fenced.append(
             LaunchdFencedGateway(
                 label=label,
                 plist_path=plist_path,
-                fenced_domains=tuple(dict.fromkeys(successful)),
+                fenced_domains=(
+                    tuple(post_write.disabled)
+                    if post_write is not None
+                    else tuple(probe.disabled)
+                ),
                 restore_domains=restore_domains,
-                changed_domains=tuple(dict.fromkeys(changed)),
+                changed_domains=changed_domains,
             )
         )
-        for registered_domain in probe.registered:
-            if registered_domain in successful:
-                registered_to_bootout.append((registered_domain, label))
 
-    # Never unload a registered job until every possible supervisor is either
-    # fenced or positively absent. This leaves a recoverable state on failure.
-    if sweep_safe:
-        for domain, label in registered_to_bootout:
+    # This is an all-label barrier: no exact bootout is allowed until every
+    # installed label has a known, dual-domain fence and at most one register.
+    if failures or len(barrier) != len(planned):
+        if len(barrier) != len(planned):
+            known_labels = set(barrier)
+            failures.extend(
+                f"{label} has no verified post-fence barrier"
+                for label, *_rest in planned
+                if label not in known_labels and not any(label in failure for failure in failures)
+            )
+        return LaunchdStopAllResult(tuple(fenced), tuple(dict.fromkeys(failures)), False)
+
+    for label, _plist_path, _probe, _restore_domains, _changed_domains in planned:
+        for domain in barrier[label].registered:
             try:
                 subprocess.run(
                     ["launchctl", "bootout", f"{domain}/{label}"],
                     check=True,
                     timeout=90,
                 )
-            except subprocess.CalledProcessError as exc:
-                if not (
-                    _launchd_error_indicates_unloaded(exc)
-                    or _launchctl_domain_unsupported(exc.returncode)
-                ):
-                    failures.append(
-                        f"{domain}/{label} bootout (launchd exit {exc.returncode})"
-                    )
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS:
+                # The final exact registration probe decides whether this
+                # nonzero result was benign (already absent) or unsafe.
+                pass
 
-    return LaunchdStopAllResult(tuple(fenced), tuple(failures), sweep_safe)
+    # A post-bootout nonzero is benign if the exact registration is absent;
+    # unknown state or a surviving registration remains unsafe.
+    final_failures: list[str] = []
+    for label, *_rest in planned:
+        probe = _probe_launchd_label_domains(label)
+        if probe.unknown or probe.disabled_unknown:
+            final_failures.append(
+                f"{label} post-bootout state is unknown: "
+                + "; ".join(
+                    probe.unknown_details
+                    + probe.disabled_unknown_details
+                    + tuple(probe.unknown)
+                    + tuple(probe.disabled_unknown)
+                )
+            )
+            continue
+        if set(probe.disabled) != set(domains):
+            final_failures.append(
+                f"{label} post-bootout disabled state is {list(probe.disabled)}, "
+                f"expected {list(domains)}"
+            )
+        if probe.registered:
+            final_failures.append(
+                f"{label} remains registered in {probe.registered} after bootout"
+            )
+
+    failures.extend(final_failures)
+    if failures:
+        return LaunchdStopAllResult(
+            tuple(fenced), tuple(dict.fromkeys(failures)), False
+        )
+    return LaunchdStopAllResult(tuple(fenced), (), True)
 
 
 def launchd_restore_all(
@@ -5552,15 +5906,58 @@ def launchd_restore_all(
     failures: list[str] = []
     for target in result.fenced:
         label_errors: list[str] = []
-        for domain in target.fenced_domains:
+        try:
+            probe = _probe_launchd_label_domains(target.label)
+            _launchd_all_require_known_probe(target.label, probe)
+            if len(probe.registered) > 1:
+                raise LaunchdAllOperationError(
+                    f"{target.label} restore registration conflict in {probe.registered}"
+                )
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            label_errors.append(
+                f"{target.label} restore preflight ({_launchd_all_failure_detail(exc)})"
+            )
+            failures.extend(label_errors)
+            continue
+
+        # Only clear desired-state bits this transaction changed. A concurrent
+        # enable is already the desired result and must not receive a redundant
+        # enable mutation.
+        for domain in target.changed_domains:
+            if domain not in probe.disabled:
+                continue
             try:
                 _launchd_enable(domain, target.label)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                rc = getattr(exc, "returncode", "unavailable")
-                label_errors.append(f"{domain}/{target.label} enable (launchd exit {rc})")
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                label_errors.append(
+                    f"{domain}/{target.label} enable ({_launchd_all_failure_detail(exc)})"
+                )
         if label_errors:
             failures.extend(label_errors)
             continue
+
+        probe = _probe_launchd_label_domains(target.label)
+        try:
+            _launchd_all_require_known_probe(target.label, probe)
+            if len(probe.registered) > 1:
+                raise LaunchdAllOperationError(
+                    f"{target.label} restore registration conflict in {probe.registered}"
+                )
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            failures.append(
+                f"{target.label} restore state ({_launchd_all_failure_detail(exc)})"
+            )
+            continue
+
+        if probe.registered:
+            if any(domain not in target.restore_domains for domain in probe.registered):
+                failures.append(
+                    f"{target.label} restore registration moved to {probe.registered}"
+                )
+                continue
+            restored += 1
+            continue
+
         for domain in target.restore_domains:
             try:
                 _launchctl_bootstrap(
@@ -5587,12 +5984,30 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
     """Rollback desired-state writes when restart aborts before bootout/sweep."""
     failures: list[str] = []
     for target in result.fenced:
+        try:
+            probe = _probe_launchd_label_domains(target.label)
+            _launchd_all_require_known_probe(target.label, probe)
+            if len(probe.registered) > 1:
+                raise LaunchdAllOperationError(
+                    f"{target.label} fence release registration conflict in "
+                    f"{probe.registered}"
+                )
+        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+            failures.append(
+                f"{target.label} fence release preflight "
+                f"({_launchd_all_failure_detail(exc)})"
+            )
+            continue
         for domain in target.changed_domains:
+            if domain not in probe.disabled:
+                continue
             try:
                 _launchd_enable(domain, target.label)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                rc = getattr(exc, "returncode", "unavailable")
-                failures.append(f"{domain}/{target.label} enable (launchd exit {rc})")
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                failures.append(
+                    f"{domain}/{target.label} enable "
+                    f"({_launchd_all_failure_detail(exc)})"
+                )
     return failures
 
 
@@ -8162,6 +8577,7 @@ def _gateway_command_inner(args):
         if stop_all:
             # --all: kill every gateway process on the machine
             service_count = 0
+            killed = 0
             launchd_result: LaunchdStopAllResult | None = None
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
@@ -8174,19 +8590,35 @@ def _gateway_command_inner(args):
                     pass
             elif is_macos():
                 try:
+                    # A destructive all-profile operation must never turn an
+                    # incomplete process-table read into "zero processes".
+                    find_gateway_pids_strict(all_profiles=True)
                     launchd_result = _coerce_launchd_stop_all_result(
                         launchd_stop_all()
                     )
-                    if launchd_result.failures and not launchd_result.sweep_safe:
+                    if launchd_result.failures or not launchd_result.sweep_safe:
+                        details = ", ".join(launchd_result.failures) or (
+                            "post-fence launchd state was not proven safe"
+                        )
                         print_error(
                             "Could not durably fence every installed launchd gateway: "
-                            + ", ".join(launchd_result.failures)
+                            + details
                         )
                         print_error("No global process sweep was performed; inspect the listed labels.")
                         raise SystemExit(1)
                     service_count = launchd_result.stopped
-                except subprocess.CalledProcessError:
-                    pass
+                    remaining_pids = find_gateway_pids_strict(all_profiles=True)
+                    killed = kill_gateway_processes_strict(remaining_pids)
+                except (
+                    GatewayProcessEnumerationError,
+                    GatewayProcessTerminationError,
+                    LaunchdInventoryError,
+                    LaunchdAllOperationError,
+                ) as exc:
+                    print_error(
+                        "Could not safely stop all macOS gateway processes: " + str(exc)
+                    )
+                    raise SystemExit(1) from exc
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -8196,7 +8628,13 @@ def _gateway_command_inner(args):
                         service_count = 1
                     except (subprocess.CalledProcessError, RuntimeError):
                         pass
-            killed = kill_gateway_processes(all_profiles=True)
+            if is_macos():
+                # The macOS branch performs a strict, post-barrier termination
+                # above. Other platforms retain their historical best-effort
+                # process cleanup behavior.
+                pass
+            else:
+                killed = kill_gateway_processes(all_profiles=True)
             total = killed + service_count
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")

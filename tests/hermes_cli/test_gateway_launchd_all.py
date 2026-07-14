@@ -25,6 +25,8 @@ def _write_gateway_plist(path: Path, label: str, hermes_home: Path) -> None:
                 "Label": label,
                 "ProgramArguments": arguments,
                 "EnvironmentVariables": {"HERMES_HOME": str(hermes_home)},
+                "RunAtLoad": True,
+                "KeepAlive": True,
             }
         )
     )
@@ -37,6 +39,9 @@ class _FakeLaunchd:
         *,
         unmanaged_pids=(),
         bootstrap_exit5_after_load=(),
+        bootstrap_without_pid=(),
+        pid_appears_before_kickstart=(),
+        bootout_failures=(),
         unknown_print_domains=(),
         unknown_disabled_domains=(),
         kickstart_failures=(),
@@ -45,6 +50,9 @@ class _FakeLaunchd:
         self.jobs = jobs
         self.unmanaged_pids = set(unmanaged_pids)
         self.bootstrap_exit5_after_load = set(bootstrap_exit5_after_load)
+        self.bootstrap_without_pid = set(bootstrap_without_pid)
+        self.pid_appears_before_kickstart = set(pid_appears_before_kickstart)
+        self.bootout_failures = set(bootout_failures)
         self.unknown_print_domains = set(unknown_print_domains)
         self.unknown_disabled_domains = set(unknown_disabled_domains)
         self.kickstart_failures = set(kickstart_failures)
@@ -110,9 +118,10 @@ class _FakeLaunchd:
             if job["loaded"]:
                 return self._complete(cmd, check, returncode=5)
             job["loaded"] = True
-            self.next_pid += 1
-            job["pid"] = self.next_pid
-            job["start"] = self.next_pid * 10
+            if target not in self.bootstrap_without_pid:
+                self.next_pid += 1
+                job["pid"] = self.next_pid
+                job["start"] = self.next_pid * 10
             if target in self.bootstrap_exit5_after_load:
                 self.bootstrap_exit5_after_load.remove(target)
                 return self._complete(cmd, check, returncode=5)
@@ -125,6 +134,12 @@ class _FakeLaunchd:
             job = self._job(target)
             if job is None or not job["loaded"]:
                 return self._complete(cmd, check, returncode=113)
+            if target in self.pid_appears_before_kickstart and job["pid"] is None:
+                self.next_pid += 1
+                job["pid"] = self.next_pid
+                job["start"] = self.next_pid * 10
+                self.pid_appears_before_kickstart.remove(target)
+                return self._complete(cmd, check)
             self.next_pid += 1
             job["pid"] = self.next_pid
             job["start"] = self.next_pid * 10
@@ -132,6 +147,8 @@ class _FakeLaunchd:
 
         if cmd[:2] == ["launchctl", "bootout"]:
             target = cmd[2]
+            if target in self.bootout_failures:
+                return self._complete(cmd, check, returncode=1, stdout="rollback failed")
             if target in self.jobs:
                 self.jobs[target]["loaded"] = False
             return self._complete(cmd, check)
@@ -217,6 +234,8 @@ def _write_explicit_gateway_plist(
                 "Label": label,
                 "ProgramArguments": arguments,
                 "EnvironmentVariables": {"HERMES_HOME": str(hermes_home)},
+                "RunAtLoad": True,
+                "KeepAlive": True,
             }
         )
     )
@@ -388,7 +407,7 @@ def test_start_all_explicitly_releases_preexisting_fence_but_restart_preserves_i
     monkeypatch.setattr(
         gateway_cli,
         "_graceful_restart_via_sigusr1",
-        lambda pid, timeout: _replace_fake_pid(sim, pid),
+        lambda pid, timeout, **kwargs: _replace_fake_pid(sim, pid),
     )
 
     gateway_cli.launchd_start_all()
@@ -431,7 +450,7 @@ def test_restart_all_attempts_peers_and_aggregates_a_failed_target(
     _patch_launchd_sim(monkeypatch, sim)
     restart_pids = []
 
-    def fake_graceful(pid, timeout):
+    def fake_graceful(pid, timeout, **kwargs):
         restart_pids.append(pid)
         if pid == 101:
             return False
@@ -454,6 +473,54 @@ def test_restart_all_attempts_peers_and_aggregates_a_failed_target(
     assert sim.jobs["user/501/ai.hermes.gateway-coder"]["pid"] != 202
 
 
+def test_restart_all_passes_birth_identity_to_sigusr1_guard(launchd_env, monkeypatch):
+    root, agents = launchd_env
+    _install_two_profiles(agents, root)
+    sim = _FakeLaunchd(
+        dict([_job("gui/501", "ai.hermes.gateway", pid=101)])
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    observed = {}
+
+    def fake_graceful(pid, timeout, expected_start_time=None):
+        observed.update(
+            pid=pid, timeout=timeout, expected_start_time=expected_start_time
+        )
+        assert _replace_fake_pid(sim, pid)
+        return True
+
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", fake_graceful)
+    monkeypatch.setattr(
+        gateway_cli,
+        "_launchd_all_wait_for_successor",
+        lambda *args, **kwargs: True,
+    )
+
+    gateway_cli.launchd_restart_all()
+
+    assert observed == {
+        "pid": 101,
+        "timeout": gateway_cli._get_restart_drain_timeout(),
+        "expected_start_time": 1010,
+    }
+
+
+def test_sigusr1_birth_identity_change_is_not_signalled(monkeypatch):
+    monkeypatch.setattr(gateway_cli, "_launchd_pid_is_live", lambda pid, start: False)
+    monkeypatch.setattr(
+        gateway_cli.os,
+        "kill",
+        lambda *_args: pytest.fail("changed PID birth identity must not be signalled"),
+    )
+
+    assert (
+        gateway_cli._graceful_restart_via_sigusr1(
+            4242, 1.0, expected_start_time=42420
+        )
+        is False
+    )
+
+
 def test_restart_all_requires_a_new_live_supervised_pid(launchd_env, monkeypatch):
     root, agents = launchd_env
     default, coder = _install_two_profiles(agents, root)
@@ -466,7 +533,9 @@ def test_restart_all_requires_a_new_live_supervised_pid(launchd_env, monkeypatch
         gateway_cli, "_launchd_all_wait_for_successor", lambda *a, **k: False
     )
     monkeypatch.setattr(
-        gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        gateway_cli,
+        "_graceful_restart_via_sigusr1",
+        lambda pid, timeout, **kwargs: True,
     )
     monkeypatch.setattr(
         gateway_cli,
@@ -570,7 +639,7 @@ def test_all_profile_dual_registration_fails_before_any_mutation(launchd_env, mo
     assert _mutating_launchd_calls(sim) == []
 
 
-def test_restart_all_unloaded_target_bootstraps_then_kickstarts_exact_target(
+def test_restart_all_unloaded_target_bootstraps_and_keeps_immediate_live_process(
     launchd_env, monkeypatch
 ):
     root, agents = launchd_env
@@ -583,8 +652,175 @@ def test_restart_all_unloaded_target_bootstraps_then_kickstarts_exact_target(
 
     assert result.outcomes[0].status == "restarted"
     assert ["launchctl", "bootstrap", "gui/501", str(default)] in sim.calls
-    assert ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway"] in sim.calls
+    assert not any(
+        call[:2] == ["launchctl", "kickstart"]
+        for call in sim.calls
+    )
+    assert sim.jobs["gui/501/ai.hermes.gateway"]["pid"] == 901
     assert not any(call[:2] == ["launchctl", "bootout"] for call in sim.calls)
+
+
+def test_restart_all_bootstrap_without_pid_uses_non_killing_kickstart(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd({}, bootstrap_without_pid=(target,))
+    _patch_launchd_sim(monkeypatch, sim)
+    clock = iter((0.0, 11.0, 11.0, 11.0))
+    monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: next(clock, 11.0))
+    monkeypatch.setattr(gateway_cli.time, "sleep", lambda _seconds: None)
+
+    result = gateway_cli.launchd_restart_all()
+
+    assert result.outcomes[0].status == "restarted"
+    assert ["launchctl", "kickstart", target] in sim.calls
+    assert ["launchctl", "kickstart", "-k", target] not in sim.calls
+    assert not any(call[:2] == ["launchctl", "bootout"] for call in sim.calls)
+
+
+def test_start_all_loaded_no_pid_does_not_replace_pid_that_appears_before_kickstart(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {target: dict(_job("gui/501", "ai.hermes.gateway", pid=None)[1])},
+        pid_appears_before_kickstart=(target,),
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    result = gateway_cli.launchd_start_all()
+
+    assert result.outcomes[0].status == "started"
+    assert ["launchctl", "kickstart", target] in sim.calls
+    assert ["launchctl", "kickstart", "-k", target] not in sim.calls
+    assert sim.jobs[target]["pid"] == 901
+
+
+def test_start_all_bootstrap_liveness_failure_rolls_back_registration_and_fence(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    _install_two_profiles(agents, root)
+    target = "gui/501/ai.hermes.gateway"
+    peer = "user/501/ai.hermes.gateway-coder"
+    sim = _FakeLaunchd(
+        {
+            "gui/501/ai.hermes.gateway": dict(
+                _job("gui/501", "ai.hermes.gateway", pid=None, loaded=False, disabled=True)[1]
+            ),
+            "user/501/ai.hermes.gateway": dict(
+                _job("user/501", "ai.hermes.gateway", pid=None, loaded=False, disabled=False)[1]
+            ),
+            peer: dict(_job("user/501", "ai.hermes.gateway-coder", pid=202)[1]),
+        },
+        bootstrap_without_pid=(target,),
+        kickstart_failures=(target,),
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    monkeypatch.setattr(gateway_cli, "_launchd_all_wait_for_live", lambda *a, **k: False)
+
+    with pytest.raises(
+        gateway_cli.LaunchdAllOperationError, match="launchd exit 5"
+    ):
+        gateway_cli.launchd_start_all()
+
+    assert ["launchctl", "bootout", target] in sim.calls
+    assert sim.jobs[target]["loaded"] is False
+    assert sim.jobs[target]["disabled"] is True
+    assert not any(call[-1] == peer for call in sim.calls if call[:2] == ["launchctl", "bootout"])
+
+
+def test_start_all_bootstrap_rollback_failure_is_reported_without_peer_bootout(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    _install_two_profiles(agents, root)
+    target = "gui/501/ai.hermes.gateway"
+    peer = "user/501/ai.hermes.gateway-coder"
+    sim = _FakeLaunchd(
+        {
+            "gui/501/ai.hermes.gateway": dict(
+                _job("gui/501", "ai.hermes.gateway", pid=None, loaded=False)[1]
+            ),
+            peer: dict(_job("user/501", "ai.hermes.gateway-coder", pid=202)[1]),
+        },
+        bootstrap_without_pid=(target,),
+        kickstart_failures=(target,),
+        bootout_failures=(target,),
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    monkeypatch.setattr(gateway_cli, "_launchd_all_wait_for_live", lambda *a, **k: False)
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="rollback") as excinfo:
+        gateway_cli.launchd_start_all()
+
+    assert "launchd exit 1" in str(excinfo.value)
+    assert sim.jobs[target]["loaded"] is True
+    assert not any(call[-1] == peer for call in sim.calls if call[:2] == ["launchctl", "bootout"])
+
+
+@pytest.mark.parametrize(
+    "supervision_change",
+    [
+        lambda document: document.pop("RunAtLoad"),
+        lambda document: document.update(RunAtLoad=False),
+        lambda document: document.update(RunAtLoad={"SuccessfulExit": True}),
+        lambda document: document.pop("KeepAlive"),
+        lambda document: document.update(KeepAlive=False),
+        lambda document: document.update(KeepAlive={"SuccessfulExit": False}),
+    ],
+)
+def test_all_profile_requires_scalar_launchd_supervision_identity(
+    launchd_env, monkeypatch, supervision_change
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    document = plistlib.loads(default.read_bytes())
+    supervision_change(document)
+    default.write_bytes(plistlib.dumps(document))
+    sim = _FakeLaunchd({})
+    _patch_launchd_sim(monkeypatch, sim)
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="RunAtLoad|KeepAlive"):
+        gateway_cli.launchd_start_all()
+
+    assert sim.calls == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["/usr/bin/python3", "-m", "hermes_cli.main", "--evil", "gateway", "run", "--replace"],
+        ["/usr/bin/python3", "--profile", "coder", "-m", "hermes_cli.main", "gateway", "run", "--replace"],
+        ["/usr/bin/python3", "-m", "hermes_cli.main", "gateway", "--profile", "coder", "run", "--replace"],
+    ],
+)
+def test_all_profile_rejects_noncanonical_program_arguments_before_mutation(
+    launchd_env, monkeypatch, arguments
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    document = plistlib.loads(default.read_bytes())
+    document["ProgramArguments"] = arguments
+    default.write_bytes(plistlib.dumps(document))
+    sim = _FakeLaunchd({})
+    _patch_launchd_sim(monkeypatch, sim)
+
+    with pytest.raises(
+        gateway_cli.LaunchdAllOperationError,
+        match="ProgramArguments|foreign|Hermes gateway runtime",
+    ):
+        gateway_cli.launchd_start_all()
+
+    assert sim.calls == []
 
 
 def test_restart_all_bootstrap_exit5_race_does_not_kickstart_new_registration(
@@ -673,7 +909,7 @@ def test_restart_preserves_disabled_peer_domain_and_start_clears_it(
     _patch_launchd_sim(monkeypatch, sim)
     restart_pids = []
 
-    def fake_graceful(pid, timeout):
+    def fake_graceful(pid, timeout, **kwargs):
         restart_pids.append(pid)
         assert _replace_fake_pid(sim, pid)
         return True
@@ -983,6 +1219,11 @@ def test_gateway_all_parser_help_describes_exact_cross_profile_semantics(capsys)
         help_text = capsys.readouterr().out
         assert "across profiles" in help_text
         assert "on macOS" in help_text
+        if verb in ("start", "restart"):
+            assert "installed Hermes LaunchAgents only" in help_text
+        if verb == "restart":
+            assert "SIGUSR1" in help_text
+            assert "already-live" in help_text
         if verb == "stop":
             assert "global PID sweep" not in help_text
         assert "Kill ALL" not in help_text

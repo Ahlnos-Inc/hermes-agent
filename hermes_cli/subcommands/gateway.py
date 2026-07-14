@@ -102,7 +102,8 @@ def build_gateway_parser(
         action="store_true",
         help=(
             "Start across profiles using platform-specific service handling; "
-            "on macOS, verify exact launchd labels without a global PID sweep"
+            "on macOS, target installed Hermes LaunchAgents only and verify "
+            "exact launchd labels without a global PID sweep"
         ),
     )
     _add_compat_platform_flag(gateway_start)
@@ -137,8 +138,9 @@ def build_gateway_parser(
         action="store_true",
         help=(
             "Restart across profiles using platform-specific service handling; "
-            "on macOS, restart exact launchd labels with SIGUSR1 without a "
-            "global PID sweep"
+            "on macOS, target installed Hermes LaunchAgents only and restart "
+            "exact launchd labels (SIGUSR1 for already-live targets) without "
+            "a global PID sweep"
         ),
     )
     _add_compat_platform_flag(gateway_restart)
