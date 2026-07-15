@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
+import signal
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -124,7 +128,29 @@ def test_strict_inventory_excludes_management_commands_without_systemd(
     )
     monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
 
-    assert gateway.find_gateway_pids_strict(all_profiles=True) == [4343]
+    assert gateway.find_gateway_pids_strict(all_profiles=True) == [4242, 4343]
+
+
+def test_strict_runtime_only_policy_excludes_restart_manager_without_systemd(
+    monkeypatch, force_ps_path
+):
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "4242 python -m hermes_cli.main gateway restart\n"
+            "4343 python -m hermes_cli.main gateway run --replace\n",
+            "",
+        ),
+    )
+    monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+
+    assert gateway.find_gateway_pids_strict(
+        all_profiles=True, include_restart_managers=False
+    ) == [4343]
 
 
 def test_canonical_identity_contains_runtime_profile_and_home_attestation(tmp_path):
@@ -154,6 +180,72 @@ def test_canonical_identity_contains_runtime_profile_and_home_attestation(tmp_pa
     assert "HERMES_TOKEN" not in repr(identity)
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        (
+            "/usr/bin/python3",
+            "-m",
+            "foreign.wrapper",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+        ),
+        (
+            "/usr/bin/python3",
+            "-c",
+            "import hermes_cli.main",
+            "gateway",
+            "run",
+        ),
+        (
+            "/usr/bin/python3",
+            "-m",
+            "foreign.gateway.run",
+        ),
+        ("/bin/sh", "-c", "python -m hermes_cli.main gateway run"),
+        ("/opt/foreign-hermes", "gateway", "run"),
+        ("/usr/bin/python3", "--script", "foreign/gateway/run.py"),
+        ("foreign", r"C:\\Program Files\\Hermes\\Hermes.EXE", "gateway", "run"),
+    ],
+)
+def test_canonical_classifier_rejects_decoy_entrypoint_tokens(argv):
+    role, profile, home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.FOREIGN
+    assert profile is None
+    assert home is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("/usr/bin/python3", "-m", "hermes_cli.main", "gateway", "run"),
+        ("/usr/bin/python3", "gateway/run.py"),
+        ("/opt/hermes/hermes_cli/main.py", "gateway", "run"),
+        ("/usr/local/bin/hermes", "gateway", "run"),
+        (r"C:\\Program Files\\Hermes\\Hermes.EXE", "gateway", "run"),
+        ("/usr/local/bin/hermes-gateway",),
+    ],
+)
+def test_canonical_classifier_accepts_supported_entrypoint_shapes(argv):
+    role, _profile, _home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.RUNTIME
+
+
+def test_canonical_classifier_reassembles_unquoted_windows_hermes_path():
+    role, _profile, _home = gateway.classify_gateway_argv(
+        r"C:\\Program Files\\Hermes\\Hermes.EXE gateway run --replace"
+    )
+
+    assert role is gateway.GatewayRuntimeRole.RUNTIME
+    foreign_role, _profile, _home = gateway.classify_gateway_argv(
+        r"foreign C:\\Program Files\\Hermes\\Hermes.EXE gateway run"
+    )
+    assert foreign_role is gateway.GatewayRuntimeRole.FOREIGN
+
+
 def test_live_identity_requires_explicit_home_attestation(monkeypatch):
     class _Process:
         def cmdline(self):
@@ -167,6 +259,56 @@ def test_live_identity_requires_explicit_home_attestation(monkeypatch):
 
     with pytest.raises(gateway.GatewayProcessEnumerationError, match="HERMES_HOME"):
         gateway._read_live_gateway_process_identity(4242)
+
+
+def test_sigusr1_canonical_restart_signals_revalidated_process_handle(monkeypatch):
+    sent = []
+
+    class _Process:
+        def send_signal(self, sig):
+            sent.append(sig)
+
+    identity = _identity()
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: _Process(),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("canonical SIGUSR1 must not use raw os.kill"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_wait_for_exact_gateway_identity_exit",
+        lambda _identity, _timeout: True,
+    )
+
+    assert gateway._graceful_restart_via_sigusr1(
+        identity.pid, 1.0, expected_identity=identity
+    ) is True
+    assert sent == [signal.SIGUSR1]
+
+
+def test_sigusr1_canonical_restart_revalidation_failure_does_not_signal(monkeypatch):
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: (_ for _ in ()).throw(
+            gateway.GatewayProcessTerminationError(["identity changed"])
+        ),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("changed canonical identity must not be signalled"),
+    )
+
+    identity = _identity()
+    assert gateway._graceful_restart_via_sigusr1(
+        identity.pid, 1.0, expected_identity=identity
+    ) is False
 
 
 def test_strict_proc_inventory_fails_closed_on_permission_error(monkeypatch):
@@ -374,6 +516,61 @@ def test_all_profile_lifecycle_lock_rejects_symlinked_path(tmp_path, monkeypatch
 
     with pytest.raises(status.GatewayLifecycleLockError):
         status.acquire_all_profile_lifecycle_lock(timeout=0.0)
+
+
+def test_all_profile_lifecycle_lock_reads_owner_record_only_after_acquire(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "state" / "gateway-all-lifecycle.lock"
+    lock_path.parent.mkdir(mode=0o700)
+    lock_path.write_text('{"pid":', encoding="utf-8")
+    lock_path.chmod(0o600)
+    monkeypatch.setattr(status, "_get_all_profile_lifecycle_lock_path", lambda: lock_path)
+
+    def acquire_after_writer(handle):
+        lock_path.write_text('{"pid": 1234}', encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(status, "_try_acquire_file_lock", acquire_after_writer)
+    handle = status.acquire_all_profile_lifecycle_lock(timeout=0.0)
+    try:
+        assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    finally:
+        status.release_all_profile_lifecycle_lock()
+
+
+def test_all_profile_lifecycle_lock_nested_context_releases_only_at_outer_exit(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "state" / "gateway-all-lifecycle.lock"
+    monkeypatch.setattr(status, "_get_all_profile_lifecycle_lock_path", lambda: lock_path)
+
+    with status.all_profile_lifecycle_lock(timeout=0.0):
+        with status.all_profile_lifecycle_lock(timeout=0.0):
+            assert status._all_profile_lifecycle_lock_context().handle is not None
+        assert status._all_profile_lifecycle_lock_context().handle is not None
+    assert status._all_profile_lifecycle_lock_context().handle is None
+
+
+def test_gateway_all_lifecycle_lock_override_does_not_use_hermes_home(
+    tmp_path, monkeypatch
+):
+    override = tmp_path / "isolated-locks"
+    hermes_home = tmp_path / "profile-home"
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(override))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    calls = []
+    monkeypatch.setattr(
+        gateway,
+        "_gateway_command_inner",
+        lambda _args: calls.append("inner"),
+    )
+
+    gateway.gateway_command(SimpleNamespace(gateway_command="start", all=True))
+
+    assert calls == ["inner"]
+    assert (override / "gateway-all-lifecycle.lock").exists()
+    assert not (hermes_home / "gateway-all-lifecycle.lock").exists()
 
 
 def test_all_profile_lifecycle_transaction_is_reentrant(monkeypatch):

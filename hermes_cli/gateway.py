@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -69,27 +70,29 @@ from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
-_all_profile_lifecycle_lock_depth = 0
+_all_profile_lifecycle_lock_depth = contextvars.ContextVar(
+    "all_profile_lifecycle_lock_depth", default=0
+)
 
 
 @contextmanager
 def _all_profile_lifecycle_transaction():
     """Serialize cooperating all-profile lifecycle mutations on this host."""
-    global _all_profile_lifecycle_lock_depth
-    if _all_profile_lifecycle_lock_depth:
-        _all_profile_lifecycle_lock_depth += 1
+    depth = _all_profile_lifecycle_lock_depth.get()
+    if depth:
+        token = _all_profile_lifecycle_lock_depth.set(depth + 1)
         try:
             yield
         finally:
-            _all_profile_lifecycle_lock_depth -= 1
+            _all_profile_lifecycle_lock_depth.reset(token)
         return
 
     with all_profile_lifecycle_lock(timeout=30.0):
-        _all_profile_lifecycle_lock_depth = 1
+        token = _all_profile_lifecycle_lock_depth.set(1)
         try:
             yield
         finally:
-            _all_profile_lifecycle_lock_depth = 0
+            _all_profile_lifecycle_lock_depth.reset(token)
 
 # =============================================================================
 # Process Management (for manual gateway runs)
@@ -327,21 +330,39 @@ def _graceful_restart_via_sigusr1(
         if expected_identity.pid != pid:
             return False
         try:
-            if _revalidate_gateway_process_identity(expected_identity) is None:
+            process = _revalidate_gateway_process_identity(expected_identity)
+            if process is None:
                 return True
         except GatewayProcessTerminationError:
             return False
+        try:
+            process.send_signal(signal.SIGUSR1)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        except Exception as exc:
+            # psutil's process-handle API uses its own exception classes for
+            # the same birth-aware race.  A vanished handle or zombie is
+            # already converged; access denial is a red signal path.
+            name = type(exc).__name__
+            if name in {"NoSuchProcess", "ZombieProcess"}:
+                return True
+            if name == "AccessDenied":
+                return False
+            raise
     elif expected_start_time is not None and not _launchd_pid_is_live(
         pid, expected_start_time
     ):
         return False
-    try:
-        os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
-    except ProcessLookupError:
-        # Already gone — nothing to drain.
-        return True
-    except (PermissionError, OSError):
-        return False
+    else:
+        try:
+            os.kill(pid, signal.SIGUSR1)  # windows-footgun: POSIX birth-only compatibility path
+        except ProcessLookupError:
+            # Already gone — nothing to drain.
+            return True
+        except (PermissionError, OSError):
+            return False
 
     import time as _time
 
@@ -456,21 +477,13 @@ def _scan_gateway_pids(
     )
 
     def _matches_current_profile(command: str) -> bool:
-        try:
-            argv = tuple(shlex.split(command, posix=True))
-        except ValueError:
-            argv = tuple(command.split())
         _role, profile, home = classify_gateway_argv(
-            argv, default_home=current_profile_root
+            command, default_home=current_profile_root
         )
         return profile == current_profile_name and home == current_home
 
     def _matches_gateway_runtime(command: str) -> bool:
-        try:
-            argv = tuple(shlex.split(command, posix=True))
-        except ValueError:
-            argv = tuple(command.split())
-        role, _profile, _home = classify_gateway_argv(argv)
+        role, _profile, _home = classify_gateway_argv(command)
         if role is GatewayRuntimeRole.RUNTIME:
             return True
         # Best-effort no-supervisor status/recovery retains the historical
@@ -480,7 +493,7 @@ def _scan_gateway_pids(
         return (
             include_restart_managers
             and role is GatewayRuntimeRole.MANAGER
-            and gateway_command_subcommand(argv) == "restart"
+            and gateway_command_subcommand(command) == "restart"
         )
 
     try:
@@ -756,6 +769,8 @@ def find_gateway_pids(
 def find_gateway_pids_strict(
     exclude_pids: set | None = None,
     all_profiles: bool = True,
+    *,
+    include_restart_managers: bool | None = None,
 ) -> list[int]:
     """Return gateway PIDs or raise when the process table is unavailable.
 
@@ -776,10 +791,16 @@ def find_gateway_pids_strict(
             raise GatewayProcessEnumerationError(
                 "current-profile gateway PID could not be inspected"
             ) from exc
-    # Destructive inventory is intentionally runtime-only.  The no-systemd
-    # compatibility allowance for `gateway restart` belongs to best-effort
-    # status/recovery scans and is not an identity eligible for termination.
-    include_restart_managers = False
+    if include_restart_managers is None:
+        # On hosts without a supervisor, the restart command itself can host
+        # the runtime while it drains/relaunches. Generic strict inventory
+        # callers (update/config) need to retain that coverage; callers that
+        # will signal a launchd-owned process must explicitly request the
+        # runtime-only policy below.
+        try:
+            include_restart_managers = not supports_systemd_services()
+        except Exception:
+            include_restart_managers = False
     try:
         scanned_pids = _scan_gateway_pids(
             exclude,
@@ -879,6 +900,8 @@ def _read_live_gateway_process_identity(
 def find_gateway_process_identities_strict(
     exclude_pids: set[int] | None = None,
     all_profiles: bool = True,
+    *,
+    include_restart_managers: bool = False,
 ) -> list[GatewayProcessIdentity]:
     """Return strict gateway inventory with a birth and command attestation.
 
@@ -888,7 +911,9 @@ def find_gateway_process_identities_strict(
     """
     identities: list[GatewayProcessIdentity] = []
     for pid in find_gateway_pids_strict(
-        exclude_pids=exclude_pids, all_profiles=all_profiles
+        exclude_pids=exclude_pids,
+        all_profiles=all_profiles,
+        include_restart_managers=include_restart_managers,
     ):
         try:
             identity, _process = _read_live_gateway_process_identity(pid)
@@ -4875,7 +4900,16 @@ def _launchd_all_prepare_post_bootstrap_kickstart(
         raise LaunchdAllOperationError(
             f"{target.launchctl_target}: bootstrapped PID {pid} has no birth identity"
         )
-    return _launchd_pid_is_live(pid, start_time)
+    if not _launchd_pid_is_live(pid, start_time):
+        return False
+    _attest_launchd_runtime_identity(
+        pid,
+        start_time,
+        plist_argv=target.plist_argv,
+        hermes_home=target.hermes_home,
+        profile=target.plist_profile,
+    )
+    return True
 
 
 def _launchd_all_start_bootstrapped_target(
@@ -5032,6 +5066,7 @@ def _launchd_all_restore_changed_fences(
                 ),
                 pid=expected_state.pid,
                 start_time=expected_state.start_time,
+                runtime_identity=expected_state.runtime_identity,
             )
             current = _launchd_all_capture_snapshot(
                 target, expected_snapshot=expected_state
@@ -9651,7 +9686,8 @@ def _gateway_command_inner(args):
                     # A destructive all-profile operation must never turn an
                     # incomplete process-table read into "zero processes".
                     captured_identities = find_gateway_process_identities_strict(
-                        all_profiles=True
+                        all_profiles=True,
+                        include_restart_managers=False,
                     )
                     launchd_result = _coerce_launchd_stop_all_result(
                         launchd_stop_all()
@@ -9671,7 +9707,8 @@ def _gateway_command_inner(args):
                         captured_identities
                     )
                     final_identities = find_gateway_process_identities_strict(
-                        all_profiles=True
+                        all_profiles=True,
+                        include_restart_managers=False,
                     )
                     captured_keys = {item.identity_key() for item in captured_identities}
                     new_identities = [

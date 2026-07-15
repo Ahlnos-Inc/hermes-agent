@@ -14,11 +14,11 @@ concurrently under distinct configurations).
 import hashlib
 import json
 import os
-import shlex
 import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -47,7 +47,7 @@ _gateway_lock_handle = None
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _ALL_PROFILE_LIFECYCLE_LOCK = "gateway-all-lifecycle.lock"
-_all_profile_lifecycle_lock_handle = None
+_all_profile_lifecycle_lock_state = threading.local()
 _REAL_FSTAT = os.fstat
 _REAL_LSTAT = os.lstat
 
@@ -85,8 +85,24 @@ class GatewayLifecycleLockError(RuntimeError):
 
 
 def _get_all_profile_lifecycle_lock_path() -> Path:
-    """Return a host-wide path independent of the caller's HERMES_HOME."""
+    """Return a host-wide path independent of the caller's HERMES_HOME.
+
+    ``HERMES_GATEWAY_LOCK_DIR`` is intentionally shared with the scoped
+    gateway locks so tests and isolated embeddings can redirect the lifecycle
+    lock without changing the host-wide default semantics.
+    """
+    override = os.getenv("HERMES_GATEWAY_LOCK_DIR")
+    if override:
+        return Path(override) / _ALL_PROFILE_LIFECYCLE_LOCK
     return Path.home() / ".local" / "state" / "hermes" / _ALL_PROFILE_LIFECYCLE_LOCK
+
+
+def _all_profile_lifecycle_lock_context() -> threading.local:
+    state = _all_profile_lifecycle_lock_state
+    if not hasattr(state, "handle"):
+        state.handle = None
+        state.depth = 0
+    return state
 
 
 def _validate_lifecycle_lock_parent(path: Path) -> None:
@@ -143,9 +159,10 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
     serialize with one another.  The lock file contains only non-secret owner
     metadata; malformed content or unsafe filesystem identity fails closed.
     """
-    global _all_profile_lifecycle_lock_handle
-    if _all_profile_lifecycle_lock_handle is not None:
-        return _all_profile_lifecycle_lock_handle
+    state = _all_profile_lifecycle_lock_context()
+    if state.handle is not None:
+        state.depth += 1
+        return state.handle
 
     path = _get_all_profile_lifecycle_lock_path()
     if not path.is_absolute():
@@ -161,9 +178,29 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
             pass
         fd = os.open(path, flags, 0o600)
         handle = os.fdopen(fd, "a+", encoding="utf-8")
-        # Keep the descriptor attestation tied to the module's real syscall.
-        # This also prevents unrelated callers monkeypatching the process-wide
-        # os module from changing the lock's security decision.
+        # Keep descriptor attestation tied to the module's real syscalls.  The
+        # owner record is intentionally not read until after the OS lock below
+        # is held: a contender must never inspect a file another process is
+        # truncating and conclude that partial JSON is corruption.
+    except GatewayLifecycleLockError:
+        if handle is not None:
+            handle.close()
+        raise
+    except OSError as exc:
+        raise GatewayLifecycleLockError(f"could not open lifecycle lock {path}") from exc
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    acquired = False
+    try:
+        while True:
+            if _try_acquire_file_lock(handle):
+                acquired = True
+                break
+            if time.monotonic() >= deadline:
+                raise GatewayLifecycleLockError(
+                    f"timed out acquiring all-profile lifecycle lock {path}"
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         metadata = _REAL_FSTAT(handle.fileno())
         _validate_lifecycle_lock_file(path, metadata)
         opened_path = _REAL_LSTAT(path)
@@ -194,31 +231,13 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
                 raise GatewayLifecycleLockError(
                     f"corrupt lifecycle lock record: {path}"
                 )
-    except GatewayLifecycleLockError:
-        if handle is not None:
-            handle.close()
-        raise
-    except OSError as exc:
-        raise GatewayLifecycleLockError(f"could not open lifecycle lock {path}") from exc
-
-    deadline = time.monotonic() + max(timeout, 0.0)
-    acquired = False
-    try:
-        while True:
-            if _try_acquire_file_lock(handle):
-                acquired = True
-                break
-            if time.monotonic() >= deadline:
-                raise GatewayLifecycleLockError(
-                    f"timed out acquiring all-profile lifecycle lock {path}"
-                )
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         handle.seek(0)
         handle.truncate()
         json.dump({"pid": os.getpid(), "started_at": _utc_now_iso()}, handle)
         handle.flush()
         os.fsync(handle.fileno())
-        _all_profile_lifecycle_lock_handle = handle
+        state.handle = handle
+        state.depth = 1
         return handle
     except GatewayLifecycleLockError:
         if acquired:
@@ -235,11 +254,15 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
 
 
 def release_all_profile_lifecycle_lock() -> None:
-    global _all_profile_lifecycle_lock_handle
-    handle = _all_profile_lifecycle_lock_handle
+    state = _all_profile_lifecycle_lock_context()
+    handle = state.handle
     if handle is None:
         return
-    _all_profile_lifecycle_lock_handle = None
+    if state.depth > 1:
+        state.depth -= 1
+        return
+    state.handle = None
+    state.depth = 0
     _release_file_lock(handle)
     try:
         handle.close()
@@ -405,10 +428,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     """
     if not command:
         return None
-    try:
-        return gateway_command_subcommand(shlex.split(command, posix=True))
-    except ValueError:
-        return gateway_command_subcommand(command.split())
+    return gateway_command_subcommand(command)
 
 
 def looks_like_gateway_command_line(command: str | None) -> bool:

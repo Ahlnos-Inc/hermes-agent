@@ -789,6 +789,89 @@ def test_start_all_loaded_no_pid_does_not_replace_pid_that_appears_before_kickst
     assert sim.jobs[target]["pid"] == 901
 
 
+def test_start_all_post_bootstrap_pid_appearance_requires_exact_runtime_attestation(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd({})
+    _patch_launchd_sim(monkeypatch, sim)
+    planned = gateway_cli._launchd_all_preflight_targets()[0]
+    sim.jobs[target] = dict(_job("gui/501", "ai.hermes.gateway", pid=901)[1])
+
+    foreign = gateway_cli.GatewayProcessIdentity(
+        901,
+        9010,
+        planned.plist_argv,
+        runtime_role=gateway_cli.GatewayRuntimeRole.RUNTIME,
+        profile=planned.plist_profile,
+        hermes_home=root / "foreign",
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_read_live_gateway_process_identity",
+        lambda _pid: (foreign, SimpleNamespace()),
+    )
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="foreign"):
+        gateway_cli._launchd_all_prepare_post_bootstrap_kickstart(planned, set())
+
+
+def test_restore_changed_fences_carries_runtime_identity_across_two_domains(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target_label = "gui/501/ai.hermes.gateway"
+    peer_label = "user/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            target_label: dict(
+                _job(
+                    "gui/501",
+                    "ai.hermes.gateway",
+                    pid=101,
+                    disabled=True,
+                )[1]
+            ),
+            peer_label: dict(
+                _job(
+                    "user/501",
+                    "ai.hermes.gateway",
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    target = gateway_cli._launchd_all_preflight_targets()[0]
+    sim.jobs[target_label]["disabled"] = False
+    sim.jobs[peer_label]["disabled"] = False
+    expected = gateway_cli._LaunchdAllStateSnapshot(
+        registered=("gui/501",),
+        disabled=(),
+        pid=101,
+        start_time=1010,
+        runtime_identity=target.runtime_identity,
+    )
+
+    failures = gateway_cli._launchd_all_restore_changed_fences(
+        target,
+        ["gui/501", "user/501"],
+        set(),
+        expected,
+    )
+
+    assert failures == []
+    assert sim.jobs[target_label]["disabled"] is True
+    assert sim.jobs[peer_label]["disabled"] is True
+
+
 def test_start_all_bootstrap_liveness_failure_rolls_back_registration_and_fence(
     launchd_env, monkeypatch
 ):

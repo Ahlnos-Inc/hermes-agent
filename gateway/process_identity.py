@@ -36,46 +36,143 @@ _MANAGEMENT_SUBCOMMANDS = {
 }
 
 
+def _normalized_token(token: str) -> str:
+    return token.strip("\"'").replace("\\", "/").lower()
+
+
+def _basename(token: str) -> str:
+    return _normalized_token(token).rsplit("/", 1)[-1]
+
+
+def _is_python_executable(token: str) -> bool:
+    return bool(
+        re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?w?(?:\.exe)?", _basename(token))
+    )
+
+
+def _is_gateway_executable(token: str) -> bool:
+    return _basename(token) in {"hermes", "hermes.exe"}
+
+
+def _is_dedicated_gateway_executable(token: str) -> bool:
+    return _basename(token) in {"hermes-gateway", "hermes-gateway.exe"}
+
+
+def _is_gateway_runtime_script(token: str) -> bool:
+    normalized = _normalized_token(token)
+    return normalized == "gateway/run.py" or normalized.endswith("/gateway/run.py")
+
+
+def _is_gateway_cli_script(token: str) -> bool:
+    normalized = _normalized_token(token)
+    return normalized == "hermes_cli/main.py" or normalized.endswith(
+        "/hermes_cli/main.py"
+    )
+
+
+def _merge_unquoted_windows_executable(tokens: list[str]) -> list[str]:
+    """Reassemble the first unquoted spaced Windows executable path.
+
+    WMIC's LIST output can contain ``C:\\Program Files\\Hermes\\Hermes.EXE``
+    without quotes.  ``shlex`` necessarily splits that path, but the exact
+    executable basename still gives us a safe, bounded reassembly point.
+    """
+    first = tokens[0].strip("\"'") if tokens else ""
+    starts_with_path = bool(
+        re.match(r"^[A-Za-z]:[\\/]", first)
+        or first.startswith(("\\\\", "./", ".\\"))
+    )
+    for index, token in enumerate(tokens):
+        if not (
+            _is_python_executable(token)
+            or _is_gateway_executable(token)
+            or _is_dedicated_gateway_executable(token)
+        ):
+            continue
+        if index == 0:
+            return tokens
+        candidate = " ".join(tokens[: index + 1]).strip("\"'")
+        if not starts_with_path:
+            continue
+        return [candidate, *tokens[index + 1 :]]
+    return tokens
+
+
 def _coerce_argv(value: str | Iterable[str]) -> tuple[str, ...]:
     if isinstance(value, str):
         try:
-            return tuple(shlex.split(value, posix=True))
+            tokens = shlex.split(value, posix=True)
         except ValueError:
-            return tuple(value.split())
+            tokens = value.split()
+        try:
+            windows_tokens = shlex.split(value, posix=False)
+        except ValueError:
+            windows_tokens = []
+        if windows_tokens:
+            merged = _merge_unquoted_windows_executable(windows_tokens)
+            if merged != windows_tokens or (
+                merged
+                and (
+                    _is_python_executable(merged[0])
+                    or _is_gateway_executable(merged[0])
+                    or _is_dedicated_gateway_executable(merged[0])
+                )
+            ):
+                tokens = merged
+        return tuple(tokens)
     return tuple(str(part) for part in value)
 
 
 def _normalized_tokens(argv: tuple[str, ...]) -> list[str]:
-    return [token.strip("\"'").replace("\\", "/").lower() for token in argv]
+    return [_normalized_token(token) for token in argv]
 
 
-def gateway_command_subcommand(argv: Iterable[str]) -> str | None:
-    """Return the exact lifecycle subcommand represented by ``argv``."""
-    tokens = _normalized_tokens(tuple(argv))
+def gateway_command_subcommand(argv: str | Iterable[str]) -> str | None:
+    """Return the exact lifecycle subcommand represented by ``argv``.
+
+    The entrypoint must be in one of the supported concrete positions: the
+    argv[0] Hermes CLI/dedicated binary, a Python interpreter followed
+    immediately by ``-m hermes_cli.main`` or a ``hermes_cli/main.py`` script,
+    or the exact ``gateway/run.py`` script.  A matching token later in a
+    foreign command line is deliberately inert.
+    """
+    exact_argv = _coerce_argv(argv)
+    if not _profile_arguments_are_valid(exact_argv):
+        return None
+    tokens = _normalized_tokens(exact_argv)
     if not tokens:
         return None
 
-    for token in tokens:
-        if token == "gateway/run.py" or token.endswith("/gateway/run.py"):
-            return "run"
-        if token.rsplit("/", 1)[-1] in {"hermes-gateway", "hermes-gateway.exe"}:
-            return "run"
+    if _is_dedicated_gateway_executable(tokens[0]):
+        return "run"
+    if _is_gateway_runtime_script(tokens[0]):
+        return "run"
 
-    joined = " ".join(tokens)
-    has_gateway_entry = (
-        "hermes_cli.main" in joined
-        or "hermes_cli/main.py" in joined
-        or any(
-            token.rsplit("/", 1)[-1] in {"hermes", "hermes.exe"}
-            for token in tokens
-        )
-    )
-    if not has_gateway_entry:
+    entrypoint_end: int | None = None
+    if _is_gateway_executable(tokens[0]):
+        entrypoint_end = 1
+    elif _is_gateway_cli_script(tokens[0]):
+        entrypoint_end = 1
+    elif _is_python_executable(tokens[0]) and len(tokens) >= 2:
+        if (
+            len(tokens) >= 3
+            and tokens[1] == "-m"
+            and tokens[2] == "hermes_cli.main"
+        ):
+            entrypoint_end = 3
+        elif _is_gateway_runtime_script(tokens[1]) or _is_gateway_cli_script(
+            tokens[1]
+        ):
+            if _is_gateway_runtime_script(tokens[1]):
+                return "run"
+            entrypoint_end = 2
+    if entrypoint_end is None:
         return None
 
+    args = tokens[entrypoint_end:]
     filtered: list[str] = []
     skip_next = False
-    for token in tokens:
+    for token in args:
         if skip_next:
             skip_next = False
             continue
@@ -86,11 +183,39 @@ def gateway_command_subcommand(argv: Iterable[str]) -> str | None:
             continue
         filtered.append(token)
 
-    for index, token in enumerate(filtered):
-        if token != "gateway":
+    try:
+        gateway_index = filtered.index("gateway")
+    except ValueError:
+        return None
+    if gateway_index + 1 >= len(filtered):
+        return None
+    return filtered[gateway_index + 1]
+
+
+def _profile_arguments_are_valid(argv: tuple[str, ...]) -> bool:
+    """Return whether every profile selector has a valid, unambiguous value."""
+    profile: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--profile", "-p"}:
+            if index + 1 >= len(argv) or not _PROFILE_RE.fullmatch(argv[index + 1]):
+                return False
+            candidate = argv[index + 1]
+            if profile is not None and profile != candidate:
+                return False
+            profile = candidate
+            index += 2
             continue
-        return filtered[index + 1] if index + 1 < len(filtered) else "run"
-    return None
+        if token.startswith("--profile=") or token.startswith("-p="):
+            candidate = token.split("=", 1)[1]
+            if not _PROFILE_RE.fullmatch(candidate):
+                return False
+            if profile is not None and profile != candidate:
+                return False
+            profile = candidate
+        index += 1
+    return True
 
 
 def _profile_from_argv(argv: tuple[str, ...]) -> str | None:
@@ -158,7 +283,7 @@ def _home_from_identity(
 
 
 def classify_gateway_argv(
-    argv: Iterable[str],
+    argv: str | Iterable[str],
     *,
     environment: Mapping[str, str] | None = None,
     default_home: Path | None = None,
@@ -169,9 +294,11 @@ def classify_gateway_argv(
     destructive proof must treat a missing/invalid home as an untrusted
     identity rather than silently falling back to a caller profile.
     """
-    exact_argv = tuple(str(part) for part in argv)
+    exact_argv = _coerce_argv(argv)
     subcommand = gateway_command_subcommand(exact_argv)
-    if subcommand == "run":
+    if not _profile_arguments_are_valid(exact_argv):
+        role = GatewayRuntimeRole.FOREIGN
+    elif subcommand == "run":
         role = GatewayRuntimeRole.RUNTIME
     elif subcommand in _MANAGEMENT_SUBCOMMANDS:
         role = GatewayRuntimeRole.MANAGER
