@@ -999,6 +999,7 @@ def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
         708,
         7080,
         "python -m hermes_cli.main gateway restart",
+        environment={"HERMES_HOME": str(gateway.get_hermes_home())},
     )
     monkeypatch.setattr(
         gateway,
@@ -1085,19 +1086,31 @@ class TestWaitForGatewayExit:
         gateway._wait_for_gateway_exit(timeout=1.0, force_after=0.5)
 
     def test_returns_when_process_exits_gracefully(self, monkeypatch):
-        """Process exits after a couple of polls — no SIGKILL needed."""
+        """The retained process identity exits after a couple of polls."""
+        identity = gateway.GatewayProcessIdentity(
+            12345,
+            123450,
+            "python -m hermes_cli.main gateway run --replace",
+        )
         poll_count = 0
 
-        def mock_get_running_pid():
+        def mock_revalidate(_identity):
             nonlocal poll_count
             poll_count += 1
-            return 12345 if poll_count <= 2 else None
+            return object() if poll_count <= 2 else None
 
-        monkeypatch.setattr("gateway.status.get_running_pid", mock_get_running_pid)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
+        monkeypatch.setattr(
+            gateway,
+            "_capture_current_profile_gateway_identity",
+            lambda *_a, **_k: identity,
+        )
+        monkeypatch.setattr(
+            gateway, "_revalidate_gateway_process_identity", mock_revalidate
+        )
         monkeypatch.setattr("time.sleep", lambda _: None)
 
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=999.0)
-        # Should have polled until None was returned.
         assert poll_count == 3
 
     def test_force_kills_after_grace_period(self, monkeypatch):
@@ -1112,21 +1125,34 @@ class TestWaitForGatewayExit:
             # Then each loop iteration advances time
             return call_num * 2.0  # 2, 4, 6, 8, ...
 
+        identity = gateway.GatewayProcessIdentity(
+            42,
+            420,
+            "python -m hermes_cli.main gateway run --replace",
+        )
         kills = []
-        def mock_terminate(pid, force=False):
-            kills.append((pid, force))
-
-        # get_running_pid returns the PID until kill is sent, then None
-        def mock_get_running_pid():
-            return None if kills else 42
 
         monkeypatch.setattr("time.monotonic", fake_monotonic)
         monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("gateway.status.get_running_pid", mock_get_running_pid)
-        monkeypatch.setattr(gateway, "terminate_pid", mock_terminate)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+        monkeypatch.setattr(
+            gateway,
+            "_capture_current_profile_gateway_identity",
+            lambda *_a, **_k: identity,
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_revalidate_gateway_process_identity",
+            lambda _identity: None if kills else object(),
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_signal_gateway_process_identity",
+            lambda captured, sig: kills.append((captured.pid, sig)) or "signalled",
+        )
 
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
-        assert (42, True) in kills
+        assert (42, signal.SIGKILL) in kills
 
     def test_handles_process_already_gone_on_kill(self, monkeypatch):
         """ProcessLookupError during force-kill is not fatal."""
@@ -1137,16 +1163,50 @@ class TestWaitForGatewayExit:
             call_num += 1
             return call_num * 3.0  # Jump past force_after quickly
 
-        def mock_terminate(pid, force=False):
-            raise ProcessLookupError
+        identity = gateway.GatewayProcessIdentity(
+            99,
+            990,
+            "python -m hermes_cli.main gateway run --replace",
+        )
 
         monkeypatch.setattr("time.monotonic", fake_monotonic)
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 99)
-        monkeypatch.setattr(gateway, "terminate_pid", mock_terminate)
+        monkeypatch.setattr(
+            gateway,
+            "_capture_current_profile_gateway_identity",
+            lambda *_a, **_k: identity,
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_revalidate_gateway_process_identity",
+            lambda _identity: object(),
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_signal_gateway_process_identity",
+            lambda _identity, _sig: "gone",
+        )
 
         # Should not raise — ProcessLookupError means it's already gone.
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=2.0)
+
+    def test_foreign_profile_identity_is_never_signalled(self, monkeypatch):
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
+        monkeypatch.setattr(
+            gateway,
+            "_capture_current_profile_gateway_identity",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                gateway.GatewayProcessTerminationError(["foreign profile"])
+            ),
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_signal_gateway_process_identity",
+            lambda *_a, **_k: pytest.fail("foreign profile must not be signalled"),
+        )
+
+        assert gateway._wait_for_gateway_exit() is False
 
     def test_kill_gateway_processes_force_uses_helper(self, monkeypatch):
         calls = []
@@ -1173,7 +1233,9 @@ class TestStopProfileGateway:
             "python -m hermes_cli.main gateway run --replace",
         )
         monkeypatch.setattr(
-            gateway, "_capture_gateway_process_identity", lambda *_a, **_k: identity
+            gateway,
+            "_capture_current_profile_gateway_identity",
+            lambda *_a, **_k: identity,
         )
         monkeypatch.setattr(
             gateway,

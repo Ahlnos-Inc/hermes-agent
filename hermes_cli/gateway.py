@@ -935,6 +935,35 @@ def _capture_gateway_process_identity(
     return identity
 
 
+def _capture_current_profile_gateway_identity(
+    pid: int,
+    *,
+    include_restart_managers: bool | None = None,
+) -> GatewayProcessIdentity | None:
+    """Capture a PID only when it belongs to the active HERMES_HOME.
+
+    PID files and legacy runtime records are discovery hints, not authority for
+    destructive work.  A stale record may point at a PID now occupied by a
+    different profile's gateway.  Retain the live birth/argv identity and bind
+    it to the active profile before any signal is permitted.
+    """
+    identity = _capture_gateway_process_identity(
+        pid,
+        include_restart_managers=include_restart_managers,
+    )
+    if identity is None:
+        return None
+    expected_home = get_hermes_home().resolve()
+    if identity.hermes_home != expected_home:
+        raise GatewayProcessTerminationError(
+            [
+                f"PID {pid}: gateway belongs to {identity.hermes_home}, not "
+                f"the active HERMES_HOME {expected_home}; signal skipped"
+            ]
+        )
+    return identity
+
+
 def find_gateway_process_identities_strict(
     exclude_pids: set[int] | None = None,
     all_profiles: bool = True,
@@ -2059,6 +2088,13 @@ def _reap_unsupervised_gateway_orphans() -> bool:
     if not orphans:
         return False
 
+    expected_home = get_hermes_home().resolve()
+    orphans = [
+        identity for identity in orphans if identity.hermes_home == expected_home
+    ]
+    if not orphans:
+        return False
+
     reaped = False
     signalled: list[GatewayProcessIdentity] = []
     for identity in orphans:
@@ -2129,7 +2165,7 @@ def stop_profile_gateway() -> bool:
         return _reap_unsupervised_gateway_orphans()
 
     try:
-        identity = _capture_gateway_process_identity(
+        identity = _capture_current_profile_gateway_identity(
             pid,
             include_restart_managers=True,
         )
@@ -3824,16 +3860,17 @@ def systemd_restart(system: bool = False):
     _require_service_installed("restart", system=system)
     refresh_systemd_unit_if_needed(system=system)
     _sync_hermes_home_from_systemd_unit(system=system)
-    from gateway.status import get_running_pid
-
-    pid = get_running_pid() or _systemd_main_pid(system=system)
+    # MainPID is the service manager's exact unit occupant.  A profile PID or
+    # runtime record is only a discovery hint and may have been recycled onto
+    # another profile, so it must never override systemd's target identity.
+    pid = _systemd_main_pid(system=system)
     if pid is not None:
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
         drain_timeout = _get_restart_drain_timeout()
         identity_capture_failed = False
         try:
-            expected_identity = _capture_gateway_process_identity(
+            expected_identity = _capture_current_profile_gateway_identity(
                 pid,
                 include_restart_managers=False,
             )
@@ -4788,6 +4825,90 @@ def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
             )
         )
     return tuple(targets)
+
+
+def _launchd_single_preflight_target(
+    label: str,
+    plist_path: Path,
+) -> LaunchdAllTarget:
+    """Attest one profile's plist, launchd domain, PID, and live identity.
+
+    Single-profile lifecycle commands use this immutable target instead of a
+    profile runtime record.  If launchd has no registered PID, an explicitly
+    managed detached fallback may be used only after it matches the exact
+    plist argv/profile/home and has a readable birth identity.
+    """
+    if not plist_path.exists():
+        raise LaunchdAllOperationError(f"Launchd plist is missing: {plist_path}")
+
+    identity = _read_launchd_all_plist_identity(plist_path)
+    if identity.label != label:
+        raise LaunchdAllOperationError(
+            f"Launchd target label mismatch: expected {label}, got {identity.label}"
+        )
+
+    probe = _probe_launchd_label_domains(label)
+    _launchd_all_require_known_probe(label, probe)
+    if len(probe.registered) > 1:
+        raise LaunchdAllOperationError(
+            f"Refusing single-profile launchd operation: {label} is registered "
+            f"in both {probe.registered[0]} and {probe.registered[1]}"
+        )
+    if not probe.registered and len(probe.disabled) > 1:
+        raise LaunchdAllOperationError(
+            f"Refusing single-profile launchd operation: {label} is disabled "
+            f"in both {probe.disabled[0]} and {probe.disabled[1]}"
+        )
+    domain = (
+        probe.registered[0]
+        if probe.registered
+        else _launchd_domain_for_label(label)
+    )
+    pid = probe.pid_for(domain) if probe.registered else None
+    start_time = _launchd_process_start_time(pid) if pid is not None else None
+    runtime_identity = None
+    if pid is not None:
+        runtime_identity = _attest_launchd_runtime_identity(
+            pid,
+            start_time,
+            plist_argv=identity.argv,
+            hermes_home=identity.hermes_home,
+            profile=identity.profile,
+        )
+    elif _launchd_unsupported_marker_exists():
+        # An unsupported launchd domain may leave an intentionally detached
+        # runtime.  Its profile record is still untrusted: attest the current
+        # live occupant against the exact plist before retaining it.
+        from gateway.status import get_running_pid
+
+        fallback_pid = get_running_pid(cleanup_stale=False)
+        if fallback_pid is not None:
+            fallback_start = _launchd_process_start_time(fallback_pid)
+            runtime_identity = _attest_launchd_runtime_identity(
+                fallback_pid,
+                fallback_start,
+                plist_argv=identity.argv,
+                hermes_home=identity.hermes_home,
+                profile=identity.profile,
+            )
+            pid = fallback_pid
+            start_time = fallback_start
+
+    return LaunchdAllTarget(
+        label=identity.label,
+        domain=domain,
+        plist_path=identity.path,
+        plist_fingerprint=identity.fingerprint,
+        hermes_home=identity.hermes_home,
+        was_loaded=bool(probe.registered),
+        pid=pid,
+        start_time=start_time,
+        probe=probe,
+        plist_stat_identity=identity.stat_identity,
+        plist_argv=identity.argv,
+        plist_profile=identity.profile,
+        runtime_identity=runtime_identity,
+    )
 
 
 def _revalidate_launchd_target(target: LaunchdAllTarget) -> None:
@@ -6492,15 +6613,19 @@ def _launchd_stop_target(
     wait: bool,
 ) -> bool:
     """Fence and unload one exact launchd gateway target."""
-    try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
+    lifecycle_target = _launchd_single_preflight_target(
+        label,
+        get_launchd_plist_path(),
+    )
+    domain = lifecycle_target.domain
+    expected_identity = lifecycle_target.runtime_identity
+    if record_planned_stop and expected_identity is not None:
+        try:
+            from gateway.status import write_planned_stop_marker
 
-        if record_planned_stop:
-            pid = get_running_pid(cleanup_stale=False)
-            if pid is not None:
-                write_planned_stop_marker(pid)
-    except Exception:
-        pass
+            write_planned_stop_marker(expected_identity.pid)
+        except Exception:
+            pass
 
     try:
         fenced = _launchd_disable(domain, label)
@@ -6529,7 +6654,7 @@ def _launchd_stop_target(
         # fallback processes, while the warning above makes the limitation
         # visible to the caller.
         if wait:
-            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            _wait_for_launchd_target_exit(expected_identity, timeout=10.0)
         return False
 
     target = f"{domain}/{label}"
@@ -6550,7 +6675,7 @@ def _launchd_stop_target(
         else:
             raise
     if wait:
-        _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+        _wait_for_launchd_target_exit(expected_identity, timeout=10.0)
     return True
 
 
@@ -7334,6 +7459,22 @@ def _wait_for_gateway_exit(
     import time
     from gateway.status import get_running_pid
 
+    pid = get_running_pid()
+    if pid is None:
+        return True
+    try:
+        identity = _capture_current_profile_gateway_identity(
+            pid,
+            include_restart_managers=True,
+        )
+    except GatewayProcessTerminationError:
+        print_error(
+            f"Could not attest gateway PID {pid} to the active profile; no signal was sent."
+        )
+        return False
+    if identity is None:
+        return True
+
     deadline = time.monotonic() + timeout
     force_deadline = (
         (time.monotonic() + force_after) if force_after is not None else None
@@ -7341,65 +7482,85 @@ def _wait_for_gateway_exit(
     force_sent = False
 
     while time.monotonic() < deadline:
-        pid = get_running_pid()
-        if pid is None:
-            return True  # Process exited cleanly.
+        try:
+            if _revalidate_gateway_process_identity(identity) is None:
+                return True
+        except GatewayProcessTerminationError:
+            return False
 
         if (
             force_after is not None
             and not force_sent
             and time.monotonic() >= force_deadline
         ):
-            # Grace period expired — force-kill the specific PID.
-            try:
-                terminate_pid(pid, force=True)
-                print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
-            except (ProcessLookupError, PermissionError, OSError):
-                return True  # Already gone or we can't touch it.
+            # Grace period expired — force-kill only the retained identity.
+            signal_result = _signal_gateway_process_identity(identity, signal.SIGKILL)
+            if signal_result == "gone":
+                return True
+            if signal_result != "signalled":
+                return False
+            print(
+                f"⚠ Gateway PID {identity.pid} did not exit gracefully; sent SIGKILL"
+            )
             force_sent = True
 
         time.sleep(0.3)
 
     # Timed out even after force-kill.
-    remaining_pid = get_running_pid()
-    if remaining_pid is not None:
-        print(
-            f"⚠ Gateway PID {remaining_pid} still running after {timeout}s — restart may fail"
-        )
+    try:
+        remaining = _revalidate_gateway_process_identity(identity)
+    except GatewayProcessTerminationError:
         return False
-    return True
+    if remaining is None:
+        return True
+    print(
+        f"⚠ Gateway PID {identity.pid} still running after {timeout}s — restart may fail"
+    )
+    return False
+
+
+def _wait_for_launchd_target_exit(
+    identity: GatewayProcessIdentity | None,
+    *,
+    timeout: float,
+) -> bool:
+    """Wait for, then force only, the exact preflighted launchd occupant."""
+    if identity is None:
+        return True
+    graceful_timeout = min(5.0, max(0.0, timeout))
+    if _wait_for_exact_gateway_identity_exit(identity, graceful_timeout):
+        return True
+    signal_result = _signal_gateway_process_identity(identity, signal.SIGKILL)
+    if signal_result == "gone":
+        return True
+    if signal_result != "signalled":
+        return False
+    return _wait_for_exact_gateway_identity_exit(
+        identity,
+        max(0.0, timeout - graceful_timeout),
+    )
 
 
 def launchd_restart():
     label = get_launchd_label()
-    domain = _launchd_domain()
-    target = f"{domain}/{label}"
     plist_path = get_launchd_plist_path()
     drain_timeout = _get_restart_drain_timeout()
-    from gateway.status import get_running_pid
-
-    pid = get_running_pid()
-    expected_identity = None
-    identity_capture_failed = False
-    if pid is not None:
-        try:
-            expected_identity = _capture_gateway_process_identity(
-                pid,
-                include_restart_managers=False,
-            )
-        except GatewayProcessTerminationError:
-            identity_capture_failed = True
+    try:
+        lifecycle_target = _launchd_single_preflight_target(label, plist_path)
+    except LaunchdAllOperationError as exc:
+        print_error(str(exc))
+        return
+    domain = lifecycle_target.domain
+    target = lifecycle_target.launchctl_target
+    pid = lifecycle_target.pid
+    expected_identity = lifecycle_target.runtime_identity
     enabled_before_restart = False
     if pid is not None:
-        if identity_capture_failed:
-            print_error(
-                f"Could not revalidate gateway PID {pid}; no signal was sent."
-            )
-            return
         # A self-restart exits cleanly and relies on launchd KeepAlive to
         # create the replacement. Clear the exact label's maintenance fence
         # before SIGUSR1; if enable fails, do not signal the running gateway
         # and do not spawn a detached duplicate from the fallback below.
+        _revalidate_launchd_target(lifecycle_target)
         _launchd_enable(domain, label)
         enabled_before_restart = True
         if expected_identity is not None and _request_gateway_self_restart(
@@ -7410,12 +7571,6 @@ def launchd_restart():
             return
 
     try:
-        if pid is None and not plist_path.exists():
-            print_error(
-                f"Launchd plist is missing: {plist_path}\n"
-                "Install the gateway service before restarting it."
-            )
-            raise SystemExit(1)
         if pid is not None:
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway

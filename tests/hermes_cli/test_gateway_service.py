@@ -72,6 +72,52 @@ def _label_probe(
     )
 
 
+def _mock_single_launchd_target(
+    monkeypatch,
+    *,
+    pid: int | None = None,
+    identity: gateway_cli.GatewayProcessIdentity | None = None,
+    domain: str | None = None,
+) -> gateway_cli.LaunchdAllTarget:
+    """Install an already-attested single-target preflight result."""
+    label = gateway_cli.get_launchd_label()
+    resolved_domain = domain or gateway_cli._launchd_domain()
+    plist_path = gateway_cli.get_launchd_plist_path()
+    if identity is None and pid is not None:
+        identity = gateway_cli.GatewayProcessIdentity(
+            pid,
+            pid * 10,
+            tuple(gateway_cli._gateway_run_command()),
+            environment={"HERMES_HOME": str(gateway_cli.get_hermes_home())},
+        )
+    target = gateway_cli.LaunchdAllTarget(
+        label=label,
+        domain=resolved_domain,
+        plist_path=plist_path,
+        plist_fingerprint="test-fingerprint",
+        hermes_home=gateway_cli.get_hermes_home().resolve(),
+        was_loaded=pid is not None,
+        pid=pid,
+        start_time=identity.start_time if identity is not None else None,
+        probe=_label_probe(
+            registered=(resolved_domain,) if pid is not None else (),
+            absent=() if pid is not None else (resolved_domain,),
+            pids=((resolved_domain, pid),) if pid is not None else (),
+        ),
+        plist_stat_identity=(1, 2, 3),
+        plist_argv=identity.argv if identity is not None else (),
+        plist_profile=identity.profile if identity is not None else None,
+        runtime_identity=identity,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_launchd_single_preflight_target",
+        lambda _label, _path: target,
+    )
+    monkeypatch.setattr(gateway_cli, "_revalidate_launchd_target", lambda _target: None)
+    return target
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
@@ -691,6 +737,63 @@ class TestLaunchdServiceRecovery:
         # not the host process table.
         monkeypatch.setattr(gateway_cli, "_attest_launchd_runtime_identity", attest)
 
+    def test_single_preflight_ignores_recycled_runtime_record_for_registered_target(
+        self, tmp_path, monkeypatch
+    ):
+        """The exact launchd PID wins over a stale profile runtime record."""
+        label = "ai.hermes.gateway-orchestrator"
+        domain = "gui/501"
+        plist_path = tmp_path / f"{label}.plist"
+        plist_path.write_bytes(b"attested by test double")
+        hermes_home = tmp_path / ".hermes" / "profiles" / "orchestrator"
+        argv = (
+            "/usr/bin/python3",
+            "-m",
+            "hermes_cli.main",
+            "--profile",
+            "orchestrator",
+            "gateway",
+            "run",
+            "--replace",
+        )
+        plist_identity = gateway_cli._LaunchdAllPlistIdentity(
+            label=label,
+            path=plist_path,
+            fingerprint="fingerprint",
+            hermes_home=hermes_home,
+            stat_identity=(1, 2, 3),
+            argv=argv,
+            profile="orchestrator",
+        )
+
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_launchd_all_plist_identity",
+            lambda _path: plist_identity,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_launchd_label_domains",
+            lambda _label: _label_probe(
+                registered=(domain,),
+                absent=("user/501",),
+                pids=((domain, 321),),
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda **_kwargs: pytest.fail(
+                "registered launchd lifecycle must not consult stale runtime records"
+            ),
+        )
+
+        target = gateway_cli._launchd_single_preflight_target(label, plist_path)
+
+        assert target.pid == 321
+        assert target.runtime_identity is not None
+        assert target.runtime_identity.hermes_home == hermes_home.resolve()
+        assert target.launchctl_target == f"{domain}/{label}"
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -925,17 +1028,13 @@ class TestLaunchdServiceRecovery:
             3210,
             "python -m hermes_cli.main gateway run --replace",
         )
+        _mock_single_launchd_target(monkeypatch, pid=321, identity=identity)
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(
             gateway_cli,
             "_request_gateway_self_restart",
             lambda pid, **_kwargs: False,
-        )
-        monkeypatch.setattr(
-            gateway_cli,
-            "_capture_gateway_process_identity",
-            lambda _pid, **_kwargs: identity,
         )
         monkeypatch.setattr(
             gateway_cli,
@@ -948,11 +1047,6 @@ class TestLaunchdServiceRecovery:
             "_wait_for_exact_gateway_identity_exit",
             lambda _identity, timeout: True,
         )
-        monkeypatch.setattr(
-            "gateway.status.get_running_pid",
-            lambda: 321,
-        )
-
         def fake_run(cmd, check=False, **kwargs):
             calls.append(cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -981,16 +1075,7 @@ class TestLaunchdServiceRecovery:
             3210,
             "python -m hermes_cli.main gateway run --replace",
         )
-
-        monkeypatch.setattr(
-            "gateway.status.get_running_pid",
-            lambda: 321,
-        )
-        monkeypatch.setattr(
-            gateway_cli,
-            "_capture_gateway_process_identity",
-            lambda _pid, **_kwargs: identity,
-        )
+        _mock_single_launchd_target(monkeypatch, pid=321, identity=identity)
         monkeypatch.setattr(
             gateway_cli,
             "_request_gateway_self_restart",
@@ -1022,11 +1107,11 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{label}"
         signalled = []
 
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        _mock_single_launchd_target(monkeypatch, pid=321, domain=domain)
         monkeypatch.setattr(
             gateway_cli,
             "_request_gateway_self_restart",
-            lambda pid: signalled.append(pid) or True,
+            lambda pid, **_kwargs: signalled.append(pid) or True,
         )
 
         def fake_run(cmd, **kwargs):
@@ -1054,7 +1139,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
 
         gateway_cli.launchd_stop()
 
@@ -1075,7 +1160,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
 
         # Should not raise — exit code 3 means already unloaded
         gateway_cli.launchd_stop()
@@ -1090,16 +1175,25 @@ class TestLaunchdServiceRecovery:
         def fake_run(cmd, check=False, **kwargs):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        def fake_wait(**kwargs):
+        def fake_wait(_identity, **kwargs):
             wait_called.append(kwargs)
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", fake_wait)
+        identity = gateway_cli.GatewayProcessIdentity(
+            321,
+            3210,
+            tuple(gateway_cli._gateway_run_command()),
+            environment={"HERMES_HOME": str(gateway_cli.get_hermes_home())},
+        )
+        _mock_single_launchd_target(
+            monkeypatch, pid=321, identity=identity
+        )
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_target_exit", fake_wait)
 
         gateway_cli.launchd_stop()
 
         assert len(wait_called) == 1
-        assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
+        assert wait_called[0] == {"timeout": 10.0}
 
     def test_launchd_stop_fails_closed_when_disable_fails(self, monkeypatch):
         """A failed desired-state write must never be followed by bootout."""
@@ -1115,6 +1209,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
         monkeypatch.setattr(
             gateway_cli,
             "_probe_launchd_label_domains",
@@ -1140,7 +1235,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
         monkeypatch.setattr(
             gateway_cli,
             "_probe_launchd_label_domains",
@@ -1165,7 +1260,6 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
         monkeypatch.setattr(
             gateway_cli,
             "_probe_launchd_label_domains",
@@ -1173,11 +1267,11 @@ class TestLaunchdServiceRecovery:
                 (actual_domain,), (), (stale_domain,), ()
             ),
         )
+        _mock_single_launchd_target(monkeypatch, domain=actual_domain)
 
         gateway_cli.launchd_stop()
 
         assert calls == [
-            ["launchctl", "disable", f"{stale_domain}/{label}"],
             ["launchctl", "disable", f"{actual_domain}/{label}"],
             ["launchctl", "bootout", f"{actual_domain}/{label}"],
         ]
@@ -1193,7 +1287,7 @@ class TestLaunchdServiceRecovery:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
 
         def fake_run(cmd, check=False, **kwargs):
             calls.append(cmd)
@@ -1387,7 +1481,7 @@ class TestLaunchdServiceRecovery:
             lambda cmd, **kwargs: calls.append(cmd)
             or SimpleNamespace(returncode=0, stdout="", stderr=""),
         )
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
+        _mock_single_launchd_target(monkeypatch, domain="gui/501")
 
         gateway_cli.launchd_stop()
 
@@ -2729,7 +2823,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        _mock_single_launchd_target(monkeypatch, domain=gateway_cli._launchd_domain())
 
         def fake_run(cmd, check=False, **kwargs):
             if cmd == ["launchctl", "kickstart", "-k", target]:
@@ -2766,7 +2860,7 @@ class TestLaunchdServiceRecovery:
             gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True
         )
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        _mock_single_launchd_target(monkeypatch, domain=domain)
 
         calls = []
 
@@ -2801,7 +2895,7 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+        _mock_single_launchd_target(monkeypatch, domain=gateway_cli._launchd_domain())
 
         gateway_cli.launchd_stop()
 
@@ -3170,13 +3264,10 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(
             gateway_cli,
-            "_capture_gateway_process_identity",
+            "_capture_current_profile_gateway_identity",
             lambda _pid, **_kwargs: identity,
         )
-        monkeypatch.setattr(
-            "gateway.status.get_running_pid",
-            lambda: 654,
-        )
+        monkeypatch.setattr(gateway_cli, "_systemd_main_pid", lambda system=False: 654)
         monkeypatch.setattr(
             gateway_cli,
             "_graceful_restart_via_sigusr1",
@@ -3228,7 +3319,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
         monkeypatch.setattr(
             gateway_cli,
-            "_capture_gateway_process_identity",
+            "_capture_current_profile_gateway_identity",
             lambda _pid, **_kwargs: identity,
         )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -3283,10 +3374,10 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli, "_get_restart_drain_timeout", lambda: 10.0
         )
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 778)
+        monkeypatch.setattr(gateway_cli, "_systemd_main_pid", lambda system=False: 778)
         monkeypatch.setattr(
             gateway_cli,
-            "_capture_gateway_process_identity",
+            "_capture_current_profile_gateway_identity",
             lambda _pid, **_kwargs: None,
         )
         monkeypatch.setattr(
