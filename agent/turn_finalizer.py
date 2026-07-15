@@ -219,30 +219,79 @@ def finalize_turn(
 
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                            "recovery_summary": _summary,
-                            "recovery_handoff": _block_metadata,
-                        },
+                    _run_id_raw = (
+                        os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+                    ).strip()
+                    _run_id = int(_run_id_raw) if _run_id_raw.isdigit() else None
+                    _manifest = (
+                        _kb.get_continuation_manifest(
+                            _conn,
+                            _run_id,
+                            task_id=_kanban_task,
+                            require_current=True,
+                        )
+                        if _run_id is not None
+                        else None
                     )
-                    logger.info(
-                        "recorded budget-exhausted failure with recovery "
-                        "handoff for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    if isinstance(_manifest, _kb.ContinuationManifest):
+                        _checkpoint_outcome = _kb.checkpoint_execution_epoch(
+                            _conn,
+                            _kanban_task,
+                            reason=(
+                                f"Iteration budget exhausted "
+                                f"({api_call_count}/{agent.max_iterations})"
+                            ),
+                            summary=_summary,
+                            metadata={
+                                "trigger": "iteration_budget",
+                                "budget_used": api_call_count,
+                                "budget_max": agent.max_iterations,
+                                "recovery_handoff": _block_metadata,
+                            },
+                            expected_run_id=_run_id,
+                        )
+                        if _checkpoint_outcome not in {
+                            "ready",
+                            "blocked_nonconvergent",
+                        }:
+                            raise RuntimeError(
+                                "continuation checkpoint failed: "
+                                f"{_checkpoint_outcome}"
+                            )
+                        logger.info(
+                            "checkpointed budget-exhausted continuation epoch "
+                            "for task %s run %s: %s",
+                            _kanban_task,
+                            _run_id,
+                            _checkpoint_outcome,
+                        )
+                    else:
+                        # Backward compatibility: a legacy/non-manifested run
+                        # retains the existing failure counter behavior.
+                        _kb._record_task_failure(
+                            _conn,
+                            _kanban_task,
+                            error=(
+                                f"Iteration budget exhausted "
+                                f"({api_call_count}/{agent.max_iterations}) — "
+                                "task could not complete within the allowed "
+                                "iterations"
+                            ),
+                            outcome="timed_out",
+                            release_claim=True,
+                            end_run=True,
+                            event_payload_extra={
+                                "budget_used": api_call_count,
+                                "budget_max": agent.max_iterations,
+                                "recovery_summary": _summary,
+                                "recovery_handoff": _block_metadata,
+                            },
+                        )
+                        logger.info(
+                            "recorded legacy budget-exhausted failure with "
+                            "recovery handoff for task %s (%d/%d)",
+                            _kanban_task, api_call_count, agent.max_iterations,
+                        )
                 finally:
                     try:
                         _conn.close()

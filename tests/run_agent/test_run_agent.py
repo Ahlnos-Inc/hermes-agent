@@ -5503,6 +5503,77 @@ class TestRunConversation:
         assert "recovery_recommendation" in meta
         assert "retry" in meta["recovery_recommendation"].lower()
 
+    def test_manifested_kanban_iteration_exhaustion_checkpoints_epoch(
+        self, agent, monkeypatch,
+    ):
+        """A bounded manifested run requeues without consuming task failures."""
+        from hermes_cli import kanban_db as kb
+
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-luna"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_continuation")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "77")
+
+        tool_call = _mock_tool_call(
+            name="web_search", arguments="{}", call_id="c1",
+        )
+        tool_response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tool_call],
+        )
+        summary_response = _mock_response(
+            content="durable recovery handoff", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_response,
+            tool_response,
+            summary_response,
+        ]
+
+        manifest = kb.ContinuationManifest(
+            run_id=77,
+            task_id="t_continuation",
+            version=1,
+            manifest_digest="a" * 64,
+            manifest={},
+            context_digest="b" * 64,
+            compiled_context={},
+            created_at=1,
+        )
+        mock_checkpoint = MagicMock(return_value="ready")
+        mock_record_failure = MagicMock(return_value=False)
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db.connect", return_value=MagicMock()),
+            patch(
+                "hermes_cli.kanban_db.get_continuation_manifest",
+                return_value=manifest,
+            ),
+            patch(
+                "hermes_cli.kanban_db.checkpoint_execution_epoch",
+                mock_checkpoint,
+            ),
+            patch(
+                "hermes_cli.kanban_db._record_task_failure",
+                mock_record_failure,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the kanban work")
+
+        assert result["completed"] is False
+        mock_record_failure.assert_not_called()
+        mock_checkpoint.assert_called_once()
+        call = mock_checkpoint.call_args
+        assert call.args[1] == "t_continuation"
+        assert call.kwargs["expected_run_id"] == 77
+        assert call.kwargs["summary"] == "durable recovery handoff"
+        assert call.kwargs["metadata"]["trigger"] == "iteration_budget"
+
     def test_kanban_near_budget_nudge(self, agent, monkeypatch):
         """When a Kanban worker reaches the near-budget reserve (3
         iterations remaining), a one-time nudge is injected telling the

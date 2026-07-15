@@ -2580,6 +2580,19 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Opt-in durable execution epochs. Disabled by default so existing
+        # boards/runs retain their exact lifecycle. When enabled, the
+        # dispatcher seals an immutable continuation manifest + bounded
+        # context before each worker starts; iteration/runtime budgets end an
+        # epoch and resume the task instead of counting as task failure.
+        "continuation": {
+            "enabled": False,
+            "max_core_bytes": 16 * 1024,
+            "max_total_bytes": 48 * 1024,
+            # Empty allow = any provider not explicitly denied. Deny wins and
+            # is checked against the primary plus the full fallback chain.
+            "provider_policy": {"allow": [], "deny": []},
+        },
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the

@@ -125,6 +125,11 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+CONTINUATION_BLOCKER_SEVERITIES = {"P0", "P1", "P2", "P3"}
+CONTINUATION_CRITICAL_SEVERITIES = {"P0", "P1"}
+CONTINUATION_RESOURCE_KINDS = {"tmux_session", "worktree", "child_process"}
+CONTINUATION_RESOURCE_CLEANUP_POLICIES = {"on_terminal", "manual", "preserve"}
+CONTINUATION_NONPROGRESS_LIMIT = 3
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1203,6 +1208,53 @@ class Event:
 
 
 @dataclass(frozen=True)
+class ContinuationManifest:
+    run_id: int
+    task_id: str
+    version: int
+    manifest_digest: str
+    manifest: dict[str, Any]
+    context_digest: str
+    compiled_context: dict[str, Any]
+    created_at: int
+
+
+@dataclass(frozen=True)
+class ContinuationBlocker:
+    id: int
+    task_id: str
+    severity: str
+    title: str
+    details: Optional[str]
+    evidence_ref: Optional[str]
+    fingerprint: str
+    status: str
+    discovered_run_id: Optional[int]
+    discovered_by: str
+    discovered_at: int
+    resolved_run_id: Optional[int]
+    resolved_by: Optional[str]
+    resolution_evidence_ref: Optional[str]
+    resolved_at: Optional[int]
+
+
+@dataclass(frozen=True)
+class OwnedRunResource:
+    id: int
+    task_id: str
+    run_id: int
+    claim_lock: str
+    kind: str
+    identity: dict[str, Any]
+    identity_digest: str
+    cleanup_policy: str
+    state: str
+    created_at: int
+    cleaned_at: Optional[int]
+    cleanup_error: Optional[str]
+
+
+@dataclass(frozen=True)
 class MutationContext:
     """Trusted runtime identity for a Kanban mutation.
 
@@ -1594,6 +1646,58 @@ CREATE TABLE IF NOT EXISTS workflow_graph_compilations (
     created_at        INTEGER NOT NULL
 );
 
+-- BUILD-487: immutable, content-addressed bootstrap contract for one worker
+-- epoch. Presence opts that run into the continuation architecture; legacy
+-- runs without a row retain their existing behavior.
+CREATE TABLE IF NOT EXISTS continuation_manifests (
+    run_id                INTEGER PRIMARY KEY,
+    task_id               TEXT NOT NULL,
+    version               INTEGER NOT NULL,
+    manifest_digest       TEXT NOT NULL,
+    manifest_json         TEXT NOT NULL,
+    context_digest        TEXT NOT NULL,
+    compiled_context_json TEXT NOT NULL,
+    created_at            INTEGER NOT NULL
+);
+
+-- Findings survive review/implementation epochs. Completion reads this live
+-- ledger instead of trusting a stale prompt snapshot; any open P0/P1 blocks.
+CREATE TABLE IF NOT EXISTS continuation_blockers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id                 TEXT NOT NULL,
+    severity                TEXT NOT NULL,
+    title                   TEXT NOT NULL,
+    details                 TEXT,
+    evidence_ref            TEXT,
+    fingerprint             TEXT NOT NULL,
+    status                  TEXT NOT NULL,
+    discovered_run_id       INTEGER,
+    discovered_by           TEXT NOT NULL,
+    discovered_at           INTEGER NOT NULL,
+    resolved_run_id         INTEGER,
+    resolved_by             TEXT,
+    resolution_evidence_ref TEXT,
+    resolved_at             INTEGER
+);
+
+-- Destructive cleanup is permitted only for resources registered to the
+-- exact task/run/claim owner. No session-name or path inference is authority.
+CREATE TABLE IF NOT EXISTS continuation_owned_resources (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    run_id          INTEGER NOT NULL,
+    claim_lock      TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    identity_json   TEXT NOT NULL,
+    identity_digest TEXT NOT NULL,
+    cleanup_policy  TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    cleaned_at      INTEGER,
+    cleanup_error   TEXT,
+    UNIQUE(run_id, kind, identity_digest)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1608,6 +1712,12 @@ CREATE INDEX IF NOT EXISTS idx_architecture_gates_architect
     ON architecture_gates(architect_task_id);
 CREATE INDEX IF NOT EXISTS idx_architecture_gates_workflow
     ON architecture_gates(board_key, workflow_key);
+CREATE INDEX IF NOT EXISTS idx_continuation_manifests_task
+    ON continuation_manifests(task_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_continuation_blockers_open
+    ON continuation_blockers(task_id, status, severity);
+CREATE INDEX IF NOT EXISTS idx_continuation_resources_run
+    ON continuation_owned_resources(run_id, state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_architecture_gates_active_scope
     ON architecture_gates(board_key, creator_principal, request_scope_id)
     WHERE state IN ('open', 'validated_awaiting_approval', 'policy_accepted', 'human_approved')
@@ -6990,6 +7100,26 @@ def complete_task(
         if quarantined and quarantined["policy_quarantined"]:
             _append_event(conn, task_id, "completion_blocked", {"reason": "policy_quarantined"})
             return False
+        critical_blockers = open_critical_continuation_blockers(conn, task_id)
+        if critical_blockers:
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked",
+                {
+                    "reason": "open_critical_continuation_blockers",
+                    "blockers": [
+                        {
+                            "id": item.id,
+                            "severity": item.severity,
+                            "title": item.title,
+                        }
+                        for item in critical_blockers
+                    ],
+                },
+                run_id=_current_run_id(conn, task_id),
+            )
+            return False
         gate = get_delivery_architecture_gate(conn, task_id)
         if expected_run_id is not None and (
             gate is None or gate.architect_task_id != task_id
@@ -7196,7 +7326,12 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
+    # Clean exact-owned child/tmux/worktree resources before ordinary scratch
+    # cleanup. Identity mismatch is persisted and never treated as authority.
+    if run_id is not None:
+        cleanup_owned_run_resources(conn, task_id, run_id)
+    # Clean up the scratch workspace. Legacy assignee-derived tmux cleanup was
+    # removed by BUILD-487 because a guessed session name is not ownership.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -7294,7 +7429,7 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Remove a task's scratch workspace dir.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
@@ -7351,9 +7486,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                     "kanban-managed workspaces root)",
                     task_id, wp,
                 )
-        # Also kill the tmux session for the worker that owned this task,
-        # if the tmux session is now dead (worker process exited).
-        _cleanup_worker_tmux(conn, task_id)
         # After cleaning up this task's workspace, check if any parent
         # tasks now have all children done — their deferred cleanup can
         # proceed (#33774).
@@ -7400,32 +7532,6 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
-
-
-def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
-    """Kill the tmux session associated with a task's assignee, if dead."""
-    try:
-        row = conn.execute(
-            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row or not row["assignee"]:
-            return
-        assignee: str = row["assignee"]
-        # Workers named swarm1-12 use tmux sessions named swarm-swarm1 etc.
-        session = f"swarm-{assignee}"
-        # Check if session exists and pane is dead before killing
-        out = subprocess.run(
-            ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.stdout.strip() == "1":
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session],
-                capture_output=True, timeout=5,
-            )
-            _log.debug("Killed stale tmux session: %s", session)
-    except Exception:
-        pass  # best-effort — never block completion
 
 
 # ---------------------------------------------------------------------------
@@ -10259,6 +10365,953 @@ def latest_runtime_observation(
     return value if isinstance(value, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Durable continuation contracts (BUILD-487)
+# ---------------------------------------------------------------------------
+
+def _continuation_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = load_config().get("kanban") or {}
+        continuation = kanban_cfg.get("continuation") or {}
+        return dict(continuation) if isinstance(continuation, dict) else {}
+    except Exception:
+        return {}
+
+
+def continuation_runtime_enabled(config: Optional[dict[str, Any]] = None) -> bool:
+    cfg = config if isinstance(config, dict) else _continuation_config()
+    return bool(cfg.get("enabled", False))
+
+
+def _continuation_manifest_from_row(row: sqlite3.Row) -> ContinuationManifest:
+    from hermes_cli.kanban_continuation import (
+        ContinuationContractError,
+        content_digest,
+        normalize_manifest,
+        validate_compiled_context,
+    )
+
+    try:
+        manifest = normalize_manifest(json.loads(row["manifest_json"]))
+        compiled = validate_compiled_context(
+            manifest, json.loads(row["compiled_context_json"])
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        if isinstance(exc, ContinuationContractError):
+            raise
+        raise ContinuationContractError(
+            "continuation_record_corrupt", "continuation record is not valid JSON"
+        ) from exc
+    if row["manifest_digest"] != content_digest(manifest):
+        raise ContinuationContractError("manifest_digest_mismatch")
+    if row["context_digest"] != compiled["context_digest"]:
+        raise ContinuationContractError("compiled_context_digest_mismatch")
+    return ContinuationManifest(
+        run_id=int(row["run_id"]),
+        task_id=row["task_id"],
+        version=int(row["version"]),
+        manifest_digest=row["manifest_digest"],
+        manifest=manifest,
+        context_digest=row["context_digest"],
+        compiled_context=compiled,
+        created_at=int(row["created_at"]),
+    )
+
+
+def get_continuation_manifest(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    task_id: Optional[str] = None,
+    require_current: bool = False,
+) -> Optional[ContinuationManifest]:
+    clauses = ["m.run_id = ?"]
+    params: list[Any] = [int(run_id)]
+    join = ""
+    if task_id is not None:
+        clauses.append("m.task_id = ?")
+        params.append(task_id)
+    if require_current:
+        join = " JOIN tasks t ON t.id = m.task_id AND t.current_run_id = m.run_id"
+    row = conn.execute(
+        "SELECT m.* FROM continuation_manifests m" + join
+        + " WHERE " + " AND ".join(clauses),
+        params,
+    ).fetchone()
+    return _continuation_manifest_from_row(row) if row is not None else None
+
+
+def _continuation_limits(config: dict[str, Any]) -> tuple[int, int]:
+    from hermes_cli.kanban_continuation import (
+        DEFAULT_MAX_CORE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+
+    def _positive(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    return (
+        _positive(config.get("max_core_bytes"), DEFAULT_MAX_CORE_BYTES),
+        _positive(config.get("max_total_bytes"), DEFAULT_MAX_TOTAL_BYTES),
+    )
+
+
+def _continuation_provider_policy(config: dict[str, Any]) -> dict[str, Any]:
+    from hermes_cli.kanban_continuation import normalize_provider_policy
+
+    raw = config.get("provider_policy") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return normalize_provider_policy(
+        {
+            "allow": raw.get("allow", raw.get("allowed_providers", [])),
+            "deny": raw.get("deny", raw.get("denied_providers", [])),
+        }
+    )
+
+
+def _continuation_references(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> list[dict[str, Any]]:
+    from hermes_cli.kanban_continuation import extract_jira_keys, text_digest
+
+    board = get_current_board()
+    refs: list[dict[str, Any]] = [
+        {
+            "kind": "kanban",
+            "uri": f"kanban://{board}/tasks/{task.id}",
+            "required": True,
+            "label": "authoritative task, graph, runs, comments, and events",
+        }
+    ]
+    if task.body:
+        refs.append(
+            {
+                "kind": "kanban",
+                "uri": f"kanban://{board}/tasks/{task.id}/body",
+                "digest": text_digest(task.body),
+                "required": True,
+                "label": "full opening specification",
+            }
+        )
+    for key in extract_jira_keys(task.title, task.body, task.branch_name):
+        refs.append(
+            {
+                "kind": "jira",
+                "uri": f"jira://ahlnos/{key}",
+                "required": True,
+                "label": "objective, acceptance, dependencies, and final status",
+            }
+        )
+    for parent_id in parent_ids(conn, task.id):
+        refs.append(
+            {
+                "kind": "kanban",
+                "uri": f"kanban://{board}/tasks/{parent_id}",
+                "required": False,
+                "label": "upstream handoff evidence",
+            }
+        )
+    for attachment in list_attachments(conn, task.id):
+        refs.append(
+            {
+                "kind": "artifact",
+                "uri": f"file:{attachment.stored_path}",
+                "required": False,
+                "label": attachment.filename,
+            }
+        )
+    return refs
+
+
+def _render_continuation_blockers(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> str:
+    blockers = list_continuation_blockers(conn, task_id)
+    if not blockers:
+        return ""
+    lines = ["", "## Durable review blocker ledger"]
+    for blocker in blockers[-100:]:
+        evidence = (
+            blocker.resolution_evidence_ref
+            if blocker.status == "resolved"
+            else blocker.evidence_ref
+        )
+        lines.append(
+            f"- `B{blocker.id}` [{blocker.severity}/{blocker.status}] "
+            f"{blocker.title}"
+            + (f" — evidence: `{evidence}`" if evidence else "")
+        )
+    return "\n".join(lines) + "\n"
+
+
+def prepare_run_continuation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    config: Optional[dict[str, Any]] = None,
+) -> ContinuationManifest:
+    """Create one immutable context bundle after workspace resolution.
+
+    The operation is idempotent for a run. Git is sampled before the SQLite
+    write lock; worker bootstrap rechecks it after the start gate opens, so a
+    drift in that interval fails before the agent can mutate the workspace.
+    """
+    from hermes_cli.kanban_continuation import (
+        compile_context,
+        content_digest,
+        decisions_from_comments,
+        extract_acceptance_criteria,
+        git_repository_snapshot,
+        normalize_manifest,
+    )
+
+    existing = get_continuation_manifest(conn, run_id, task_id=task_id)
+    if existing is not None:
+        return existing
+    cfg = dict(config) if isinstance(config, dict) else _continuation_config()
+    if not continuation_runtime_enabled(cfg):
+        raise ValueError("continuation runtime is not enabled")
+    task = get_task(conn, task_id)
+    if task is None or task.current_run_id != int(run_id):
+        raise ValueError("continuation run is no longer current")
+    repository = git_repository_snapshot(task.workspace_path)
+    now = int(time.time())
+    max_core, max_total = _continuation_limits(cfg)
+
+    with write_txn(conn):
+        current = get_task(conn, task_id)
+        if current is None or current.current_run_id != int(run_id):
+            raise ValueError("continuation run is no longer current")
+        run_spec = get_run_spec(
+            conn, run_id, task_id=task_id, require_current=True,
+        )
+        if run_spec is None:
+            raise ValueError("continuation run has no immutable RunSpec")
+        working_set = build_worker_context(
+            conn,
+            task_id,
+            _use_continuation=False,
+            _now_override=now,
+        ) + _render_continuation_blockers(conn, task_id)
+        manifest_value = {
+            "version": 1,
+            "task_id": task_id,
+            "run_id": int(run_id),
+            "objective": current.title,
+            "acceptance_criteria": extract_acceptance_criteria(current.body),
+            "decisions": decisions_from_comments(list_comments(conn, task_id)),
+            "references": _continuation_references(conn, current),
+            "provider_policy": _continuation_provider_policy(cfg),
+            "repository": repository,
+            "created_at": now,
+        }
+        # Persist and digest the canonical validated shape.  Raw reference
+        # objects may omit optional null fields; hashing that pre-normalized
+        # representation would make an immediate readback appear corrupt.
+        manifest_value = normalize_manifest(manifest_value)
+        compiled = compile_context(
+            manifest_value,
+            working_set,
+            max_core_bytes=max_core,
+            max_total_bytes=max_total,
+        )
+        manifest_digest = content_digest(manifest_value)
+        conn.execute(
+            "INSERT INTO continuation_manifests "
+            "(run_id, task_id, version, manifest_digest, manifest_json, "
+            " context_digest, compiled_context_json, created_at) "
+            "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            (
+                int(run_id), task_id, manifest_digest,
+                json.dumps(manifest_value, ensure_ascii=False, sort_keys=True),
+                compiled["context_digest"],
+                json.dumps(compiled, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "continuation_prepared",
+            {
+                "version": 1,
+                "manifest_digest": manifest_digest,
+                "context_digest": compiled["context_digest"],
+                "context_bytes": compiled["bytes"],
+                "provider_policy": manifest_value["provider_policy"],
+            },
+            run_id=int(run_id),
+        )
+    prepared = get_continuation_manifest(conn, run_id, task_id=task_id)
+    if prepared is None:
+        raise RuntimeError("continuation manifest insert readback failed")
+    return prepared
+
+
+def record_continuation_bootstrap_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    code: str,
+    message: str,
+    phase: str,
+) -> bool:
+    """Persist one queryable failure decision for a cold-start operator."""
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND current_run_id = ?",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if current is None:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "continuation_bootstrap_failed",
+            {
+                "code": str(code)[:128],
+                "message": str(message)[:2000],
+                "phase": str(phase)[:64],
+            },
+            run_id=int(run_id),
+        )
+    return True
+
+
+def continuation_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    task = get_task(conn, task_id)
+    active_run = task.current_run_id if task is not None else None
+    selected_run = int(run_id) if run_id is not None else active_run
+    if selected_run is None:
+        latest_manifest = conn.execute(
+            "SELECT run_id FROM continuation_manifests WHERE task_id = ? "
+            "ORDER BY run_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest_manifest is not None:
+            selected_run = int(latest_manifest["run_id"])
+    manifest = (
+        get_continuation_manifest(conn, selected_run, task_id=task_id)
+        if selected_run is not None
+        else None
+    )
+    open_blockers = list_continuation_blockers(conn, task_id, status="open")
+    last_failure = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'continuation_bootstrap_failed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    failure = None
+    if last_failure is not None:
+        try:
+            failure = json.loads(last_failure["payload"] or "null")
+        except (TypeError, ValueError):
+            failure = {"code": "corrupt_failure_event"}
+        if isinstance(failure, dict):
+            failure["created_at"] = int(last_failure["created_at"])
+    return {
+        "enabled_for_run": manifest is not None,
+        "active_run": selected_run is not None and selected_run == active_run,
+        "run_id": selected_run,
+        "manifest_digest": manifest.manifest_digest if manifest else None,
+        "context_digest": manifest.context_digest if manifest else None,
+        "context_bytes": (
+            manifest.compiled_context.get("bytes") if manifest else None
+        ),
+        "open_critical_blockers": [
+            {"id": item.id, "severity": item.severity, "title": item.title}
+            for item in open_blockers
+            if item.severity in CONTINUATION_CRITICAL_SEVERITIES
+        ],
+        "open_advisory_blockers": [
+            {"id": item.id, "severity": item.severity, "title": item.title}
+            for item in open_blockers
+            if item.severity not in CONTINUATION_CRITICAL_SEVERITIES
+        ],
+        "last_bootstrap_failure": failure,
+    }
+
+
+def _continuation_blocker_from_row(row: sqlite3.Row) -> ContinuationBlocker:
+    return ContinuationBlocker(
+        id=int(row["id"]), task_id=row["task_id"], severity=row["severity"],
+        title=row["title"], details=row["details"],
+        evidence_ref=row["evidence_ref"], fingerprint=row["fingerprint"],
+        status=row["status"],
+        discovered_run_id=(int(row["discovered_run_id"]) if row["discovered_run_id"] is not None else None),
+        discovered_by=row["discovered_by"], discovered_at=int(row["discovered_at"]),
+        resolved_run_id=(int(row["resolved_run_id"]) if row["resolved_run_id"] is not None else None),
+        resolved_by=row["resolved_by"],
+        resolution_evidence_ref=row["resolution_evidence_ref"],
+        resolved_at=(int(row["resolved_at"]) if row["resolved_at"] is not None else None),
+    )
+
+
+def list_continuation_blockers(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+) -> list[ContinuationBlocker]:
+    if status is not None and status not in {"open", "resolved"}:
+        raise ValueError("blocker status must be open or resolved")
+    query = "SELECT * FROM continuation_blockers WHERE task_id = ?"
+    params: list[Any] = [task_id]
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id ASC"
+    return [
+        _continuation_blocker_from_row(row)
+        for row in conn.execute(query, params).fetchall()
+    ]
+
+
+def record_continuation_blocker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    severity: str,
+    title: str,
+    discovered_by: str,
+    details: Optional[str] = None,
+    evidence_ref: Optional[str] = None,
+    discovered_run_id: Optional[int] = None,
+) -> ContinuationBlocker:
+    severity = str(severity or "").strip().upper()
+    if severity not in CONTINUATION_BLOCKER_SEVERITIES:
+        raise ValueError(
+            f"severity must be one of {sorted(CONTINUATION_BLOCKER_SEVERITIES)}"
+        )
+    title = " ".join(str(title or "").split())
+    if not title or len(title.encode("utf-8")) > 2000:
+        raise ValueError("blocker title is required and must be <= 2000 bytes")
+    actor = str(discovered_by or "").strip()
+    if not actor:
+        raise ValueError("discovered_by is required")
+    details_clean = str(details).strip()[:16000] if details else None
+    evidence_clean = str(evidence_ref).strip()[:4096] if evidence_ref else None
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {"severity": severity, "title": title.casefold()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    now = int(time.time())
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            raise ValueError(f"unknown task {task_id}")
+        existing = conn.execute(
+            "SELECT * FROM continuation_blockers WHERE task_id = ? "
+            "AND fingerprint = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (task_id, fingerprint),
+        ).fetchone()
+        if existing is not None:
+            return _continuation_blocker_from_row(existing)
+        if discovered_run_id is not None and conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(discovered_run_id), task_id),
+        ).fetchone() is None:
+            raise ValueError("discovered run does not belong to task")
+        cur = conn.execute(
+            "INSERT INTO continuation_blockers "
+            "(task_id, severity, title, details, evidence_ref, fingerprint, "
+            " status, discovered_run_id, discovered_by, discovered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
+            (
+                task_id, severity, title, details_clean, evidence_clean,
+                fingerprint, discovered_run_id, actor, now,
+            ),
+        )
+        blocker_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "continuation_blocker_opened",
+            {
+                "blocker_id": blocker_id,
+                "severity": severity,
+                "title": title,
+                "evidence_ref": evidence_clean,
+            },
+            run_id=discovered_run_id,
+        )
+        row = conn.execute(
+            "SELECT * FROM continuation_blockers WHERE id = ?", (blocker_id,)
+        ).fetchone()
+        assert row is not None
+        return _continuation_blocker_from_row(row)
+
+
+def resolve_continuation_blocker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    blocker_id: int,
+    *,
+    resolved_by: str,
+    resolution_evidence_ref: str,
+    resolved_run_id: Optional[int] = None,
+) -> ContinuationBlocker:
+    actor = str(resolved_by or "").strip()
+    evidence = str(resolution_evidence_ref or "").strip()
+    if not actor:
+        raise ValueError("resolved_by is required")
+    if not evidence or len(evidence.encode("utf-8")) > 4096:
+        raise ValueError("resolution_evidence_ref is required and must be <= 4096 bytes")
+    now = int(time.time())
+    with write_txn(conn):
+        if resolved_run_id is not None and conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(resolved_run_id), task_id),
+        ).fetchone() is None:
+            raise ValueError("resolved run does not belong to task")
+        cur = conn.execute(
+            "UPDATE continuation_blockers SET status = 'resolved', "
+            "resolved_run_id = ?, resolved_by = ?, resolution_evidence_ref = ?, "
+            "resolved_at = ? WHERE id = ? AND task_id = ? AND status = 'open'",
+            (
+                resolved_run_id, actor, evidence, now,
+                int(blocker_id), task_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("unknown or already-resolved blocker")
+        _append_event(
+            conn,
+            task_id,
+            "continuation_blocker_resolved",
+            {
+                "blocker_id": int(blocker_id),
+                "resolution_evidence_ref": evidence,
+            },
+            run_id=resolved_run_id,
+        )
+        row = conn.execute(
+            "SELECT * FROM continuation_blockers WHERE id = ?", (int(blocker_id),)
+        ).fetchone()
+        assert row is not None
+        return _continuation_blocker_from_row(row)
+
+
+def open_critical_continuation_blockers(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[ContinuationBlocker]:
+    placeholders = ",".join("?" for _ in CONTINUATION_CRITICAL_SEVERITIES)
+    rows = conn.execute(
+        "SELECT * FROM continuation_blockers WHERE task_id = ? AND status = 'open' "
+        f"AND severity IN ({placeholders}) ORDER BY id ASC",
+        [task_id, *sorted(CONTINUATION_CRITICAL_SEVERITIES)],
+    ).fetchall()
+    return [_continuation_blocker_from_row(row) for row in rows]
+
+
+class OpenCriticalBlockersError(ValueError):
+    def __init__(self, blockers: list[ContinuationBlocker]):
+        self.blockers = blockers
+        super().__init__(
+            "completion blocked by open critical findings: "
+            + ", ".join(f"B{item.id}/{item.severity}" for item in blockers)
+        )
+
+
+def checkpoint_execution_epoch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    expected_run_id: Optional[int] = None,
+) -> str:
+    """Close only the bounded epoch and return the task to ready.
+
+    Productive epochs are unlimited. Three byte-identical checkpoint digests
+    with no intervening progress trip a non-convergence block; the limit is on
+    repeated no-progress state, not on total implementation/review cycles.
+    """
+    reason_clean = str(reason or "").strip()
+    if not reason_clean:
+        raise ValueError("checkpoint reason is required")
+    task = get_task(conn, task_id)
+    if task is None or task.status != "running" or task.current_run_id is None:
+        return "not_running"
+    run_id = int(task.current_run_id)
+    if expected_run_id is not None and run_id != int(expected_run_id):
+        return "ownership_mismatch"
+    if get_continuation_manifest(conn, run_id, task_id=task_id) is None:
+        return "legacy_run"
+    from hermes_cli.kanban_continuation import git_repository_snapshot
+
+    # Compare semantic state, not volatile timeout/process telemetry.  A run
+    # may checkpoint for a differently worded reason or with a different PID
+    # and still have made no progress.  Conversely a commit, dirty-tree
+    # change, test result, artifact, or explicit progress evidence advances
+    # the digest and permits another bounded epoch.
+    raw_metadata = metadata or {}
+    semantic_metadata_keys = {
+        "artifacts",
+        "changed_files",
+        "commit",
+        "head",
+        "progress_evidence",
+        "tests_run",
+        "workspace_status",
+    }
+    semantic_metadata = {
+        key: raw_metadata[key]
+        for key in sorted(semantic_metadata_keys)
+        if key in raw_metadata
+    }
+    repository = git_repository_snapshot(task.workspace_path)
+    progress_value = {
+        "summary": str(summary or "").strip(),
+        "semantic_metadata": semantic_metadata,
+        "repository": repository,
+    }
+    progress_digest = hashlib.sha256(
+        json.dumps(
+            progress_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    prior = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'checkpointed' ORDER BY id DESC LIMIT ?",
+        (task_id, CONTINUATION_NONPROGRESS_LIMIT - 1),
+    ).fetchall()
+    repeated = 1
+    for row in prior:
+        try:
+            prior_metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            break
+        if prior_metadata.get("progress_digest") != progress_digest:
+            break
+        repeated += 1
+
+    checkpoint_metadata = dict(metadata or {})
+    checkpoint_metadata.update(
+        {
+            "checkpoint_reason": reason_clean,
+            "progress_digest": progress_digest,
+            "identical_checkpoint_count": repeated,
+            "repository_checkpoint": repository,
+        }
+    )
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT current_run_id, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is None or current["status"] != "running" or int(
+            current["current_run_id"] or 0
+        ) != run_id:
+            return "ownership_mismatch"
+        ended_run = _end_run(
+            conn,
+            task_id,
+            outcome="checkpointed",
+            status="checkpointed",
+            summary=summary or reason_clean,
+            metadata=checkpoint_metadata,
+        )
+        if ended_run != run_id:
+            raise RuntimeError("checkpoint closed the wrong run")
+        if repeated >= CONTINUATION_NONPROGRESS_LIMIT:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = ? AND current_run_id IS NULL",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "continuation_nonconvergent",
+                {
+                    "progress_digest": progress_digest,
+                    "identical_checkpoint_count": repeated,
+                    "limit": CONTINUATION_NONPROGRESS_LIMIT,
+                },
+                run_id=run_id,
+            )
+            outcome = "blocked_nonconvergent"
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', last_heartbeat_at = NULL "
+                "WHERE id = ? AND current_run_id IS NULL",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "epoch_checkpointed",
+                {
+                    "reason": reason_clean,
+                    "progress_digest": progress_digest,
+                    "identical_checkpoint_count": repeated,
+                },
+                run_id=run_id,
+            )
+            outcome = "ready"
+    # A new epoch may be claimed on the very next dispatcher tick. Release
+    # only resources with exact registered identity before that can happen.
+    cleanup_owned_run_resources(conn, task_id, run_id)
+    return outcome
+
+
+def _owned_resource_from_row(row: sqlite3.Row) -> OwnedRunResource:
+    try:
+        identity = json.loads(row["identity_json"])
+    except (TypeError, ValueError):
+        identity = {}
+    return OwnedRunResource(
+        id=int(row["id"]), task_id=row["task_id"], run_id=int(row["run_id"]),
+        claim_lock=row["claim_lock"], kind=row["kind"], identity=identity,
+        identity_digest=row["identity_digest"], cleanup_policy=row["cleanup_policy"],
+        state=row["state"], created_at=int(row["created_at"]),
+        cleaned_at=(int(row["cleaned_at"]) if row["cleaned_at"] is not None else None),
+        cleanup_error=row["cleanup_error"],
+    )
+
+
+def register_owned_run_resource(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    *,
+    kind: str,
+    identity: dict[str, Any],
+    cleanup_policy: str = "on_terminal",
+) -> OwnedRunResource:
+    from hermes_cli.kanban_continuation import canonical_json, content_digest
+
+    if kind not in CONTINUATION_RESOURCE_KINDS:
+        raise ValueError(f"unknown resource kind {kind!r}")
+    if cleanup_policy not in CONTINUATION_RESOURCE_CLEANUP_POLICIES:
+        raise ValueError(f"unknown cleanup policy {cleanup_policy!r}")
+    if not isinstance(identity, dict) or not identity:
+        raise ValueError("resource identity must be a non-empty object")
+    canonical_identity = canonical_json(identity)
+    identity_digest = content_digest(identity)
+    now = int(time.time())
+    with write_txn(conn):
+        owner = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? AND claim_lock = ?",
+            (int(run_id), task_id, claim_lock),
+        ).fetchone()
+        if owner is None:
+            raise ValueError("resource owner does not match task/run/claim")
+        conn.execute(
+            "INSERT OR IGNORE INTO continuation_owned_resources "
+            "(task_id, run_id, claim_lock, kind, identity_json, identity_digest, "
+            " cleanup_policy, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (
+                task_id, int(run_id), claim_lock, kind, canonical_identity,
+                identity_digest, cleanup_policy, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM continuation_owned_resources WHERE run_id = ? "
+            "AND kind = ? AND identity_digest = ?",
+            (int(run_id), kind, identity_digest),
+        ).fetchone()
+        assert row is not None
+        resource = _owned_resource_from_row(row)
+        _append_event(
+            conn,
+            task_id,
+            "continuation_resource_registered",
+            {"resource_id": resource.id, "kind": kind, "cleanup_policy": cleanup_policy},
+            run_id=int(run_id),
+        )
+        return resource
+
+
+def list_owned_run_resources(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    state: Optional[str] = None,
+) -> list[OwnedRunResource]:
+    query = "SELECT * FROM continuation_owned_resources WHERE run_id = ?"
+    params: list[Any] = [int(run_id)]
+    if state is not None:
+        query += " AND state = ?"
+        params.append(state)
+    query += " ORDER BY id ASC"
+    return [
+        _owned_resource_from_row(row)
+        for row in conn.execute(query, params).fetchall()
+    ]
+
+
+def _cleanup_exact_tmux(identity: dict[str, Any]) -> tuple[bool, str]:
+    name = str(identity.get("session_name") or "").strip()
+    session_id = str(identity.get("session_id") or "").strip()
+    created = str(identity.get("session_created") or "").strip()
+    if not name or not session_id or not created:
+        return False, "tmux_identity_incomplete"
+    probe = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", name, "#{session_id}\t#{session_created}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if probe.returncode != 0:
+        return True, "already_absent"
+    if probe.stdout.strip() != f"{session_id}\t{created}":
+        return False, "tmux_identity_mismatch"
+    killed = subprocess.run(
+        ["tmux", "kill-session", "-t", name],
+        capture_output=True, text=True, timeout=5,
+    )
+    return (killed.returncode == 0, "cleaned" if killed.returncode == 0 else "tmux_kill_failed")
+
+
+def _cleanup_exact_worktree(identity: dict[str, Any]) -> tuple[bool, str]:
+    path = Path(str(identity.get("path") or ""))
+    repo_root = Path(str(identity.get("repo_root") or ""))
+    if not path.is_absolute() or not repo_root.is_absolute():
+        return False, "worktree_identity_incomplete"
+    listed = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if listed.returncode != 0:
+        return False, "worktree_list_failed"
+    if f"worktree {path}\n" not in listed.stdout:
+        return True, "already_absent"
+    removed = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "remove", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    return (removed.returncode == 0, "cleaned" if removed.returncode == 0 else "worktree_remove_refused")
+
+
+def _cleanup_exact_child_process(identity: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        import psutil  # type: ignore
+    except Exception as exc:
+        return False, f"process_cleanup_dependency_unavailable:{type(exc).__name__}"
+
+    try:
+        pid = int(identity["pid"])
+        started_at = float(identity["process_started_at"])
+        process = psutil.Process(pid)
+        if abs(float(process.create_time()) - started_at) > 0.01:
+            return False, "process_birth_identity_mismatch"
+        if pid == os.getpid():
+            return False, "refusing_to_kill_current_process"
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except psutil.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        return True, "cleaned"
+    except psutil.NoSuchProcess:
+        return True, "already_absent"
+    except Exception as exc:
+        return False, f"process_cleanup_failed:{type(exc).__name__}"
+
+
+def cleanup_owned_run_resources(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+) -> list[dict[str, Any]]:
+    """Best-effort cleanup, but never fail open on identity mismatch."""
+    results: list[dict[str, Any]] = []
+    resources = list_owned_run_resources(conn, run_id, state="active")
+    for resource in resources:
+        if resource.task_id != task_id or resource.cleanup_policy != "on_terminal":
+            continue
+        try:
+            if resource.kind == "tmux_session":
+                ok, detail = _cleanup_exact_tmux(resource.identity)
+            elif resource.kind == "worktree":
+                ok, detail = _cleanup_exact_worktree(resource.identity)
+            else:
+                ok, detail = _cleanup_exact_child_process(resource.identity)
+        except Exception as exc:
+            ok, detail = False, f"cleanup_exception:{type(exc).__name__}"
+        state = "cleaned" if ok else "identity_mismatch" if "mismatch" in detail else "cleanup_failed"
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE continuation_owned_resources SET state = ?, cleaned_at = ?, "
+                "cleanup_error = ? WHERE id = ? AND state = 'active'",
+                (state, int(time.time()), None if ok else detail, resource.id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "continuation_resource_cleanup",
+                {
+                    "resource_id": resource.id,
+                    "kind": resource.kind,
+                    "status": state,
+                    "detail": detail,
+                },
+                run_id=int(run_id),
+            )
+        results.append(
+            {"resource_id": resource.id, "kind": resource.kind, "status": state, "detail": detail}
+        )
+    return results
+
+
+def cleanup_terminal_run_resources(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Sweep exact-owned resources for runs ended through any lifecycle path.
+
+    Completion and checkpoint paths clean immediately. This dispatcher sweep
+    covers block, reclaim, crash, and legacy terminal transitions without
+    duplicating destructive cleanup calls throughout the state machine.
+    """
+    try:
+        bounded_limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        bounded_limit = 100
+    rows = conn.execute(
+        "SELECT DISTINCT o.task_id, o.run_id "
+        "FROM continuation_owned_resources o "
+        "JOIN task_runs r ON r.id = o.run_id AND r.task_id = o.task_id "
+        "WHERE o.state = 'active' AND o.cleanup_policy = 'on_terminal' "
+        "AND r.ended_at IS NOT NULL ORDER BY o.run_id ASC LIMIT ?",
+        (bounded_limit,),
+    ).fetchall()
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        cleaned.extend(
+            cleanup_owned_run_resources(
+                conn, row["task_id"], int(row["run_id"]),
+            )
+        )
+    return cleaned
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -10324,6 +11377,38 @@ def enforce_max_runtime(
             )
             continue
         killed = bool(termination.get("sigkill"))
+
+        continuation = (
+            get_continuation_manifest(
+                conn,
+                int(row["current_run_id"]),
+                task_id=tid,
+                require_current=True,
+            )
+            if row["current_run_id"] is not None
+            else None
+        )
+        if continuation is not None:
+            checkpoint_outcome = checkpoint_execution_epoch(
+                conn,
+                tid,
+                reason=(
+                    f"Execution epoch reached max runtime "
+                    f"({int(elapsed)}s/{int(row['max_runtime_seconds'])}s)"
+                ),
+                metadata={
+                    "trigger": "max_runtime",
+                    "pid": pid,
+                    "elapsed_seconds": int(elapsed),
+                    "limit_seconds": int(row["max_runtime_seconds"]),
+                    "sigkill": killed,
+                    **termination,
+                },
+                expected_run_id=int(row["current_run_id"]),
+            )
+            if checkpoint_outcome in {"ready", "blocked_nonconvergent"}:
+                timed_out.append(tid)
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
@@ -11685,6 +12770,59 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _prepare_continuation_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    config: dict[str, Any],
+) -> Optional[str]:
+    """Prepare the gated bootstrap or stop a deterministic respawn loop."""
+    if not continuation_runtime_enabled(config):
+        return None
+    if task.current_run_id is None:
+        return "continuation_missing_run"
+    try:
+        prepare_run_continuation(
+            conn, task.id, task.current_run_id, config=config,
+        )
+        return None
+    except Exception as exc:
+        code = str(getattr(exc, "code", type(exc).__name__))[:128]
+        message = str(exc)[:2000]
+        _log.warning(
+            "kanban continuation bootstrap preparation failed for %s run %s: %s",
+            task.id,
+            task.current_run_id,
+            message,
+            exc_info=True,
+        )
+        try:
+            record_continuation_bootstrap_failure(
+                conn,
+                task.id,
+                task.current_run_id,
+                code=code,
+                message=message,
+                phase="prepare",
+            )
+            block_task(
+                conn,
+                task.id,
+                reason=f"Continuation bootstrap failed ({code}): {message}",
+                summary="Fail-closed before worker start; inspect continuation status/events.",
+                metadata={"failure_code": code, "phase": "prepare"},
+                kind="capability",
+                expected_run_id=task.current_run_id,
+            )
+        except Exception:
+            _log.error(
+                "failed to persist continuation bootstrap block for task %s",
+                task.id,
+                exc_info=True,
+            )
+        return f"continuation:{code}: {message}"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -11803,6 +12941,12 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # Exact-identity cleanup for runs ended by block/reclaim/crash paths. This
+    # happens before any ready task can be claimed for its next epoch.
+    cleanup_terminal_run_resources(conn)
+    # Snapshot once per tick. New behavior is opt-in and the exact policy is
+    # sealed into each run's immutable continuation manifest.
+    _continuation_cfg = _continuation_config()
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -12135,6 +13279,13 @@ def _dispatch_once_locked(
                             run_id=claimed.current_run_id,
                         )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        continuation_error = _prepare_continuation_or_block(
+            conn, claimed, config=_continuation_cfg,
+        )
+        if continuation_error is not None:
+            result.spawn_errors.append((claimed.id, continuation_error))
+            result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             _spawn_and_attach_worker(
@@ -12270,6 +13421,13 @@ def _dispatch_once_locked(
                             run_id=claimed.current_run_id,
                         )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        continuation_error = _prepare_continuation_or_block(
+            conn, claimed, config=_continuation_cfg,
+        )
+        if continuation_error is not None:
+            result.spawn_errors.append((claimed.id, continuation_error))
+            result.auto_blocked.append(claimed.id)
+            continue
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
@@ -12600,7 +13758,13 @@ def _spawn_contract(
     task: Task,
     *,
     board: Optional[str],
-) -> tuple[str, dict[str, Optional[str]], dict[str, Any], Optional[list[str]]]:
+) -> tuple[
+    str,
+    dict[str, Optional[str]],
+    dict[str, Any],
+    Optional[list[str]],
+    Optional[str],
+]:
     """Load the active run's immutable launch contract.
 
     A task without a run spec is a legacy/manual spawn and keeps the old task
@@ -12618,6 +13782,7 @@ def _spawn_contract(
             legacy_route,
             _delivery_policy_snapshot(None),
             task.toolsets,
+            None,
         )
 
     with connect(board=board) as conn:
@@ -12627,6 +13792,12 @@ def _spawn_contract(
             "WHERE r.id = ? AND r.task_id = ?",
             (int(task.current_run_id), task.id),
         ).fetchone()
+        continuation = get_continuation_manifest(
+            conn,
+            int(task.current_run_id),
+            task_id=task.id,
+            require_current=True,
+        )
     if row is None:
         raise RuntimeError(
             f"task {task.id} run {task.current_run_id} is no longer current"
@@ -12680,6 +13851,7 @@ def _spawn_contract(
         },
         delivery_policy,
         run_toolsets,
+        continuation.manifest_digest if continuation is not None else None,
     )
 
 
@@ -12711,6 +13883,7 @@ def _default_spawn(
         requested_route,
         delivery_policy,
         run_toolsets,
+        continuation_digest,
     ) = _spawn_contract(
         task, board=board,
     )
@@ -12784,6 +13957,10 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if continuation_digest is not None:
+        env["HERMES_KANBAN_CONTINUATION_DIGEST"] = continuation_digest
+    else:
+        env.pop("HERMES_KANBAN_CONTINUATION_DIGEST", None)
     # The dispatcher already read and validated the immutable RunSpec before
     # spawning. Pass only its delivery attestation to the child so output
     # boundaries do not need SQLite merely to discover that this run is
@@ -13045,7 +14222,13 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _use_continuation: bool = True,
+    _now_override: Optional[int] = None,
+) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -13074,10 +14257,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
+    # A continuation-enabled run consumes its immutable claim-time snapshot.
+    # Live blockers still gate completion and surface in kanban_show status;
+    # they are intentionally not injected mid-conversation because mutating a
+    # cached prompt is one of Hermes's most expensive correctness failures.
+    if _use_continuation and task.current_run_id is not None:
+        continuation = get_continuation_manifest(
+            conn, task.current_run_id, task_id=task_id, require_current=True,
+        )
+        if continuation is not None:
+            return str(continuation.compiled_context["rendered"])
+
     # Single clock reading shared by every relative-age stamp below, so all
     # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
     # by the seconds it takes to build the block).
-    _now = int(time.time())
+    _now = int(_now_override) if _now_override is not None else int(time.time())
 
     def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""

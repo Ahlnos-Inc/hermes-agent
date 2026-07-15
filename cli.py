@@ -15498,12 +15498,39 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     conn = _kb.connect()
     try:
         task = _kb.get_task(conn, task_id)
+        continuation_active = bool(
+            task is not None
+            and task.current_run_id is not None
+            and _kb.get_continuation_manifest(
+                conn, task.current_run_id, task_id=task_id
+            ) is not None
+        )
     finally:
         try:
             conn.close()
         except Exception:
             pass
     if task is None:
+        return
+    expected_run_raw = (
+        _os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+    ).strip()
+    expected_run_id = (
+        int(expected_run_raw) if expected_run_raw.isdigit() else None
+    )
+    if (
+        task.status != "running"
+        or expected_run_id is None
+        or task.current_run_id != expected_run_id
+    ):
+        # The first conversation turn may itself have completed, blocked, or
+        # checkpointed the epoch. Never continue goal mode in the old process
+        # after its claim/run ownership has ended.
+        logger.info(
+            "kanban goal loop: task %s run %s is no longer active; stopping",
+            task_id,
+            expected_run_id,
+        )
         return
 
     goal_parts = [task.title or ""]
@@ -15552,12 +15579,35 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _checkpoint(reason: str, handoff: str) -> None:
+        c = _kb.connect()
+        try:
+            outcome = _kb.checkpoint_execution_epoch(
+                c,
+                task_id,
+                reason=reason,
+                summary=(handoff or reason)[:12000],
+                metadata={
+                    "trigger": "goal_turn_budget",
+                    "turn_budget": int(max_turns),
+                },
+                expected_run_id=task.current_run_id,
+            )
+            if outcome not in {"ready", "blocked_nonconvergent"}:
+                raise RuntimeError(f"checkpoint failed: {outcome}")
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        checkpoint_fn=_checkpoint if continuation_active else None,
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),

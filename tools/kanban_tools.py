@@ -1449,6 +1449,7 @@ def _handle_show(args: dict, **kw) -> str:
                     ],
                     "runs": [_run_dict(r) for r in runs],
                     "worker_context": kb.build_worker_context(conn, tid),
+                    "continuation": kb.continuation_status(conn, tid),
                     "detail": "full",
                 })
 
@@ -1466,6 +1467,7 @@ def _handle_show(args: dict, **kw) -> str:
                 return json.dumps({
                     "task": compact_task,
                     "worker_context": kb.build_worker_context(conn, tid),
+                    "continuation": kb.continuation_status(conn, tid),
                     "detail": "compact",
                 })
 
@@ -1506,6 +1508,7 @@ def _handle_show(args: dict, **kw) -> str:
                 },
                 "latest_run": _compact_run_dict(latest_run),
                 "latest_event": latest_event,
+                "continuation": kb.continuation_status(conn, tid),
                 "detail": "compact",
             })
 
@@ -1738,6 +1741,18 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
+                blockers = kb.open_critical_continuation_blockers(conn, tid)
+                if blockers:
+                    rendered = ", ".join(
+                        f"B{item.id}/{item.severity}: {item.title}"
+                        for item in blockers
+                    )
+                    return tool_error(
+                        f"kanban_complete blocked by unresolved critical "
+                        f"findings: {rendered}. Resolve every finding with "
+                        f"kanban_comment resolve_blocker_id plus "
+                        f"resolution_evidence_ref, then retry completion."
+                    )
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
@@ -1942,12 +1957,67 @@ def _handle_comment(args: dict, **kw) -> str:
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
+    blocker = args.get("blocker")
+    resolve_blocker_id = args.get("resolve_blocker_id")
+    resolution_evidence_ref = args.get("resolution_evidence_ref")
+    if blocker is not None and resolve_blocker_id is not None:
+        return tool_error("pass blocker or resolve_blocker_id, not both")
+    if blocker is not None and not isinstance(blocker, dict):
+        return tool_error("blocker must be an object")
+    if resolve_blocker_id is not None and not resolution_evidence_ref:
+        return tool_error(
+            "resolution_evidence_ref is required when resolving a blocker"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            current_task = os.environ.get("HERMES_KANBAN_TASK")
+            run_id = _worker_run_id(tid) if current_task == str(tid) else None
+            blocker_result = None
+            if blocker is not None:
+                blocker_title = redact_sensitive_text(
+                    str(blocker.get("title") or body), force=True,
+                )
+                blocker_details = redact_sensitive_text(
+                    str(blocker.get("details") or body), force=True,
+                )
+                blocker_evidence = blocker.get("evidence_ref")
+                if blocker_evidence is not None:
+                    blocker_evidence = redact_sensitive_text(
+                        str(blocker_evidence), force=True,
+                    )
+                blocker_result = kb.record_continuation_blocker(
+                    conn,
+                    str(tid),
+                    severity=blocker.get("severity"),
+                    title=blocker_title,
+                    details=blocker_details,
+                    evidence_ref=blocker_evidence,
+                    discovered_by=author,
+                    discovered_run_id=run_id,
+                )
+            elif resolve_blocker_id is not None:
+                resolution_evidence_ref = redact_sensitive_text(
+                    str(resolution_evidence_ref), force=True,
+                )
+                blocker_result = kb.resolve_continuation_blocker(
+                    conn,
+                    str(tid),
+                    int(resolve_blocker_id),
+                    resolved_by=author,
+                    resolution_evidence_ref=resolution_evidence_ref,
+                    resolved_run_id=run_id,
+                )
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
+            payload = {"task_id": tid, "comment_id": cid}
+            if blocker_result is not None:
+                payload["blocker"] = {
+                    "id": blocker_result.id,
+                    "severity": blocker_result.severity,
+                    "status": blocker_result.status,
+                }
+            return _ok(**payload)
         finally:
             conn.close()
     except ValueError as e:
@@ -2991,8 +3061,10 @@ KANBAN_COMMENT_SCHEMA = {
     "description": (
         "Append a comment to a task's thread. Use for durable notes "
         "that should outlive this run (questions for the next worker, "
-        "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "partial findings, rationale). Reviews must also record P0/P1 "
+        "findings in the typed blocker ledger; completion stays closed until "
+        "every critical blocker has resolution evidence. Ephemeral reasoning "
+        "doesn't belong here — use your normal response instead."
     ),
     "parameters": {
         "type": "object",
@@ -3007,6 +3079,36 @@ KANBAN_COMMENT_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": "Markdown-supported comment body.",
+            },
+            "blocker": {
+                "type": "object",
+                "description": (
+                    "Optional typed review finding to persist beside the "
+                    "comment. Open P0/P1 findings mechanically block task "
+                    "completion; P2/P3 remain advisory. Duplicate open "
+                    "severity+title findings are idempotent."
+                ),
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["P0", "P1", "P2", "P3"],
+                    },
+                    "title": {"type": "string"},
+                    "details": {"type": "string"},
+                    "evidence_ref": {
+                        "type": "string",
+                        "description": "Artifact, test, diff, log, or source reference supporting discovery.",
+                    },
+                },
+                "required": ["severity", "title"],
+            },
+            "resolve_blocker_id": {
+                "type": "integer",
+                "description": "Typed blocker id to resolve after implementing its fix.",
+            },
+            "resolution_evidence_ref": {
+                "type": "string",
+                "description": "Required commit/test/artifact evidence when resolve_blocker_id is set.",
             },
             "board": _board_schema_prop(),
         },

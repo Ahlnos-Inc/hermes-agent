@@ -1624,6 +1624,7 @@ def run_kanban_goal_loop(
     run_turn,
     task_status_fn,
     block_fn,
+    checkpoint_fn=None,
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
@@ -1641,9 +1642,9 @@ def run_kanban_goal_loop(
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
        task is still open → one explicit "call kanban_complete" nudge.
-    3. When the turn budget is exhausted and the worker still hasn't
-       terminated the task, ``block_fn`` is invoked so the card lands in a
-       sticky ``blocked`` state for human review (NOT a silent exit).
+    3. When the turn budget is exhausted, continuation-enabled callers invoke
+       ``checkpoint_fn`` so only the bounded epoch ends and the task resumes
+       with durable context. Legacy callers without it retain ``block_fn``.
 
     This function performs NO SessionDB persistence — a worker process is
     ephemeral, so the turn budget lives in a local counter. It is fully
@@ -1652,8 +1653,8 @@ def run_kanban_goal_loop(
     (reason: str -> None).
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    outcome is one of ``"completed_by_worker"``, ``"checkpointed_budget"``,
+    ``"blocked_budget"``, ``"blocked_by_worker"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1703,16 +1704,34 @@ def run_kanban_goal_loop(
         if verdict == "done":
             if nudged_to_finalize:
                 # Already asked once to call kanban_complete and it still
-                # didn't — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
+                # didn't. A continuation epoch checkpoints; a legacy run
+                # blocks for review rather than spinning.
+                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize")
+                reason_text = (
+                    f"Goal-mode worker's output looked complete but it never "
+                    f"called kanban_complete after a finalize nudge ({reason})."
+                )
                 try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
+                    if checkpoint_fn is not None:
+                        checkpoint_fn(reason_text, last_response)
+                    else:
+                        block_fn(reason_text)
                 except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                    _log(f"kanban goal loop: terminal handoff failed ({exc})")
+                    if checkpoint_fn is not None:
+                        return {
+                            "outcome": "stopped",
+                            "turns_used": turns_used,
+                            "reason": f"checkpoint failed: {type(exc).__name__}",
+                        }
+                return {
+                    "outcome": (
+                        "checkpointed_budget" if checkpoint_fn is not None
+                        else "blocked_budget"
+                    ),
+                    "turns_used": turns_used,
+                    "reason": "judged done, never finalized",
+                }
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -1720,16 +1739,33 @@ def run_kanban_goal_loop(
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
+            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns")
+            reason_text = (
+                f"Goal-mode worker exhausted its turn budget "
+                f"({turns_used}/{max_turns}) without completing the task. "
+                f"Last judge verdict: {_truncate(reason, 300)}"
+            )
             try:
-                block_fn(
-                    f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
-                )
+                if checkpoint_fn is not None:
+                    checkpoint_fn(reason_text, last_response)
+                else:
+                    block_fn(reason_text)
             except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+                _log(f"kanban goal loop: terminal handoff failed ({exc})")
+                if checkpoint_fn is not None:
+                    return {
+                        "outcome": "stopped",
+                        "turns_used": turns_used,
+                        "reason": f"checkpoint failed: {type(exc).__name__}",
+                    }
+            return {
+                "outcome": (
+                    "checkpointed_budget" if checkpoint_fn is not None
+                    else "blocked_budget"
+                ),
+                "turns_used": turns_used,
+                "reason": "turn budget exhausted",
+            }
 
         # Run another turn in the same session.
         try:

@@ -49,6 +49,75 @@ def load_active_run_spec() -> Optional[dict]:
         )
 
 
+def load_active_continuation():
+    task_id, run_id = _active_identity()
+    if not task_id or run_id is None:
+        return None
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect() as conn:
+        return kanban_db.get_continuation_manifest(
+            conn, run_id, task_id=task_id, require_current=True,
+        )
+
+
+def _record_continuation_failure(*, code: str, message: str, phase: str) -> None:
+    task_id, run_id = _active_identity()
+    if not task_id or run_id is None:
+        return
+    try:
+        from hermes_cli import kanban_db
+
+        with kanban_db.connect() as conn:
+            kanban_db.record_continuation_bootstrap_failure(
+                conn,
+                task_id,
+                run_id,
+                code=code,
+                message=message,
+                phase=phase,
+            )
+    except Exception:
+        # The original fail-closed error remains authoritative. A logging
+        # outage must not accidentally permit startup.
+        return
+
+
+def _validate_continuation_route(
+    continuation: Any,
+    *,
+    provider: Any,
+    phase: str,
+) -> None:
+    if continuation is None:
+        if (os.environ.get("HERMES_KANBAN_CONTINUATION_DIGEST") or "").strip():
+            raise RunRouteMismatch(
+                "worker declares a continuation digest but no active manifest exists"
+            )
+        return
+    from hermes_cli.kanban_continuation import (
+        assert_provider_allowed,
+        assert_repository_compatible,
+    )
+
+    expected_digest = str(
+        os.environ.get("HERMES_KANBAN_CONTINUATION_DIGEST") or ""
+    ).strip()
+    if expected_digest != continuation.manifest_digest:
+        from hermes_cli.kanban_continuation import ContinuationContractError
+
+        raise ContinuationContractError(
+            "manifest_digest_mismatch",
+            "worker continuation digest does not match the active run",
+        )
+    assert_repository_compatible(continuation.manifest.get("repository"))
+    assert_provider_allowed(
+        provider,
+        continuation.manifest["provider_policy"],
+        phase=phase,
+    )
+
+
 def _canonical_provider(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", "-")
 
@@ -100,6 +169,21 @@ def preflight_kanban_cli_route(
                 "process declares Kanban identity but has no active run contract"
             )
         return None  # explicit manual or non-Kanban process
+    continuation = load_active_continuation()
+    try:
+        _validate_continuation_route(
+            continuation,
+            provider=provider,
+            phase="cli_preflight",
+        )
+    except Exception as exc:
+        code = str(getattr(exc, "code", type(exc).__name__))
+        _record_continuation_failure(
+            code=code,
+            message=str(exc),
+            phase="cli_preflight",
+        )
+        raise RunRouteMismatch(f"continuation bootstrap denied: {code}: {exc}") from exc
     requested = spec.get("requested_route")
     version = spec.get("version")
     if version not in {1, 2} or not isinstance(requested, dict):
@@ -178,11 +262,59 @@ def attach_kanban_runtime_observer(agent: Any) -> bool:
     task_id, run_id = _active_identity()
     if not task_id or run_id is None:
         return False
+    continuation = load_active_continuation()
+    if continuation is not None:
+        from hermes_cli.kanban_continuation import assert_provider_allowed
+
+        policy = continuation.manifest["provider_policy"]
+        routes = [
+            ("initial", getattr(agent, "provider", None)),
+            *[
+                (f"fallback[{index}]", entry.get("provider"))
+                for index, entry in enumerate(
+                    list(getattr(agent, "_fallback_chain", []) or [])
+                )
+                if isinstance(entry, dict)
+            ],
+        ]
+        try:
+            for phase, provider in routes:
+                assert_provider_allowed(provider, policy, phase=phase)
+        except Exception as exc:
+            code = str(getattr(exc, "code", type(exc).__name__))
+            _record_continuation_failure(
+                code=code,
+                message=str(exc),
+                phase="agent_attach",
+            )
+            raise RuntimeObservationError(
+                f"continuation provider policy denied agent bootstrap: {code}: {exc}"
+            ) from exc
 
     def observer(
         *, phase: str, reason: Any = None, from_route: Any = None,
     ) -> None:
         from hermes_cli import kanban_db
+
+        if continuation is not None:
+            from hermes_cli.kanban_continuation import assert_provider_allowed
+
+            try:
+                assert_provider_allowed(
+                    getattr(agent, "provider", None),
+                    continuation.manifest["provider_policy"],
+                    phase=phase,
+                )
+            except Exception as exc:
+                code = str(getattr(exc, "code", type(exc).__name__))
+                _record_continuation_failure(
+                    code=code,
+                    message=str(exc),
+                    phase=f"runtime_{phase}",
+                )
+                raise RuntimeObservationError(
+                    f"continuation provider policy denied runtime route: {code}: {exc}"
+                ) from exc
 
         payload = runtime_observation(agent, phase=phase, reason=reason)
         safe_from = _safe_route_snapshot(from_route)

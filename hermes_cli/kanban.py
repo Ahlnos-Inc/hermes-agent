@@ -1551,6 +1551,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        continuation = kb.continuation_status(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1591,6 +1592,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 }
                 for r in runs
             ],
+            "continuation": continuation,
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -1628,6 +1630,33 @@ def _cmd_show(args: argparse.Namespace) -> int:
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+    if continuation["enabled_for_run"]:
+        state = "enabled" if continuation["active_run"] else "historical"
+        print(
+            f"  continuation: {state} "
+            f"(run {continuation['run_id']}, "
+            f"context {continuation['context_bytes']['total']} bytes)"
+        )
+        print(f"  manifest:  {continuation['manifest_digest']}")
+    critical = continuation["open_critical_blockers"]
+    advisory = continuation["open_advisory_blockers"]
+    if critical or advisory:
+        print(
+            f"  blockers:  {len(critical)} critical open, "
+            f"{len(advisory)} advisory open"
+        )
+        for blocker in critical:
+            print(
+                f"    ! B{blocker['id']}/{blocker['severity']}: "
+                f"{blocker['title']}"
+            )
+    if continuation["last_bootstrap_failure"]:
+        failure = continuation["last_bootstrap_failure"]
+        print(
+            "  bootstrap: failed "
+            f"({failure.get('code', 'unknown')}: "
+            f"{failure.get('message', 'no message')})"
+        )
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through
