@@ -27,6 +27,8 @@ from hermes_constants import get_hermes_home
 from typing import Any, Optional
 from utils import atomic_json_write
 from gateway.process_identity import (
+    GatewayRuntimeRole,
+    classify_gateway_argv,
     gateway_command_subcommand,
 )
 
@@ -474,54 +476,32 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
     return looks_like_gateway_runtime_command_line(cmdline)
 
 
-def _profile_name_for_home(profile_home: Path) -> Optional[str]:
-    """Return the profile id a HERMES_HOME directory represents, or None.
-
-    A named profile's home is ``<root>/profiles/<name>`` (immediate parent is
-    ``profiles``).  The root/default home (``~/.hermes`` or ``$HERMES_HOME``)
-    has no such parent, so it maps to the default profile (``None`` here, which
-    callers treat as "the bare, flag-less gateway").
-    """
-    if profile_home.parent.name == "profiles":
-        return profile_home.name
-    return None
-
-
 def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     """Return True when a gateway command line belongs to ``profile_home``.
 
-    Mirrors ``hermes_cli.gateway._matches_current_profile`` so the dashboard's
-    cross-profile liveness fallback scopes a live PID to the *right* profile.
-    In a per-profile container, one profile's stale ``gateway_state.json`` can
-    record a PID that the OS has since recycled onto a DIFFERENT profile's live
-    gateway.  That recycled PID's command line still ``looks_like_gateway`` —
-    so without a profile check the dead profile is reported running.  A named
-    profile gateway carries ``-p <name>``/``--profile <name>`` (or, rarely, an
-    explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
-    bare with no profile flag.
+    Scope the dashboard's cross-profile liveness fallback with the canonical
+    gateway identity parser. A per-profile stale ``gateway_state.json`` can
+    outlive its process and point at a PID recycled onto another profile's
+    gateway, so a readable command line must prove both a gateway runtime role
+    and the exact expected home. The runtime matcher retains the existing
+    no-supervisor ``gateway restart`` compatibility policy.
     """
-    command_lc = command.lower()
-    profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower()
-
-    if profile_name is not None and profile_name != "default":
-        profile_lc = profile_name.lower()
-        return (
-            f"--profile {profile_lc}" in command_lc
-            or f"-p {profile_lc}" in command_lc
-            or f"hermes_home={home_lc}" in command_lc
-        )
-
-    # Default/root profile: the gateway runs with no profile flag. Accept unless
-    # the command advertises *some other* profile (an explicit -p/--profile) or
-    # a non-matching explicit HERMES_HOME= on the argv. HERMES_HOME is usually
-    # passed via the environment (not visible on the command line), so its mere
-    # absence is not disqualifying — only a conflicting explicit value is.
-    if "--profile " in command_lc or " -p " in command_lc:
+    if not looks_like_gateway_runtime_command_line(command):
         return False
-    if "hermes_home=" in command_lc and f"hermes_home={home_lc}" not in command_lc:
+
+    expected_home = profile_home.expanduser().resolve()
+    root = (
+        expected_home.parent.parent
+        if expected_home.parent.name.casefold() == "profiles"
+        else expected_home
+    )
+    role, _profile, resolved_home = classify_gateway_argv(
+        command,
+        default_home=root,
+    )
+    if role not in {GatewayRuntimeRole.RUNTIME, GatewayRuntimeRole.MANAGER}:
         return False
-    return True
+    return resolved_home == expected_home
 
 
 def _record_matches_live_gateway_pid(

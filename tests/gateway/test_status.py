@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gateway import status
+from gateway.process_identity import GatewayRuntimeRole, classify_gateway_argv
 
 
 class TestGatewayPidState:
@@ -454,6 +455,131 @@ class TestGatewayRuntimeStatus:
                 == 139
             ), cmdline
 
+    def test_profile_scope_matches_canonical_identity(self):
+        default_home = Path("/opt/data")
+        coder_home = default_home / "profiles" / "coder"
+        other_home = default_home / "profiles" / "other"
+        cases = (
+            (
+                "hermes -p coder gateway run",
+                coder_home,
+                (GatewayRuntimeRole.RUNTIME, "coder", coder_home.resolve()),
+                True,
+            ),
+            (
+                "hermes --profile=CoDeR gateway run",
+                coder_home,
+                (GatewayRuntimeRole.RUNTIME, "coder", coder_home.resolve()),
+                True,
+            ),
+            (
+                "hermes gateway --profile CoDeR run",
+                coder_home,
+                (GatewayRuntimeRole.RUNTIME, "coder", coder_home.resolve()),
+                True,
+            ),
+            (
+                "hermes gateway run",
+                default_home,
+                (GatewayRuntimeRole.RUNTIME, None, default_home.resolve()),
+                True,
+            ),
+            (
+                "hermes --profile coder gateway run",
+                default_home,
+                (GatewayRuntimeRole.RUNTIME, "coder", coder_home.resolve()),
+                False,
+            ),
+            (
+                f"HERMES_HOME={coder_home} hermes gateway run",
+                coder_home,
+                (GatewayRuntimeRole.RUNTIME, None, coder_home.resolve()),
+                True,
+            ),
+            (
+                f"HERMES_HOME={other_home} hermes gateway run",
+                coder_home,
+                (GatewayRuntimeRole.RUNTIME, None, other_home.resolve()),
+                False,
+            ),
+            (
+                f"HERMES_HOME={other_home} hermes --profile=CoDeR gateway run",
+                coder_home,
+                (GatewayRuntimeRole.FOREIGN, None, None),
+                False,
+            ),
+            (
+                "hermes --oneshot probe gateway run",
+                default_home,
+                (GatewayRuntimeRole.FOREIGN, None, None),
+                False,
+            ),
+            (
+                "hermes gateway restart --invalid",
+                default_home,
+                (GatewayRuntimeRole.FOREIGN, None, None),
+                False,
+            ),
+            (
+                "hermes gateway restart",
+                default_home,
+                (GatewayRuntimeRole.MANAGER, None, default_home.resolve()),
+                True,
+            ),
+            (
+                "hermes-gateway restart",
+                default_home,
+                (GatewayRuntimeRole.MANAGER, None, default_home.resolve()),
+                False,
+            ),
+        )
+
+        for command, expected_home, expected_identity, belongs in cases:
+            expected_home = expected_home.resolve()
+            root = (
+                expected_home.parent.parent
+                if expected_home.parent.name == "profiles"
+                else expected_home
+            )
+            assert classify_gateway_argv(command, default_home=root) == expected_identity
+            assert (
+                status._command_line_belongs_to_profile(command, expected_home)
+                is belongs
+            ), command
+
+    def test_runtime_status_running_pid_rejects_pid_reused_by_other_named_profile(
+        self, monkeypatch
+    ):
+        payload = {
+            "pid": 139,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "--profile", "coder", "gateway", "run"],
+        }
+        coder_home = Path("/opt/data/profiles/coder")
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: "hermes --profile=other gateway run --replace",
+        )
+
+        role, profile, home = classify_gateway_argv(
+            "hermes --profile=other gateway run --replace",
+            default_home=coder_home.parent.parent,
+        )
+        assert (role, profile, home) == (
+            GatewayRuntimeRole.RUNTIME,
+            "other",
+            Path("/opt/data/profiles/other").resolve(),
+        )
+        assert (
+            status.get_runtime_status_running_pid(payload, expected_home=coder_home)
+            is None
+        )
+
     def test_runtime_status_running_pid_default_profile_rejects_named_cmdline(self, monkeypatch):
         """The default/root profile runs a bare gateway (no profile flag).  A
         recycled PID now hosting a *named* profile gateway must not be reported
@@ -517,6 +643,13 @@ class TestGatewayRuntimeStatus:
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1000)
         monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
 
+        assert classify_gateway_argv(
+            payload["argv"], default_home=coder_home.parent.parent
+        ) == (
+            GatewayRuntimeRole.RUNTIME,
+            None,
+            coder_home.parent.parent.resolve(),
+        )
         assert (
             status.get_runtime_status_running_pid(payload, expected_home=coder_home)
             == 139
