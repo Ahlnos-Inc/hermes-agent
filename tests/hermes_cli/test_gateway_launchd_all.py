@@ -872,13 +872,14 @@ def test_restore_changed_fences_carries_runtime_identity_across_two_domains(
     assert sim.jobs[peer_label]["disabled"] is True
 
 
-def test_start_all_bootstrap_liveness_failure_rolls_back_registration_and_fence(
+def test_start_all_unloaded_pre_disabled_target_is_preserved_without_bootstrap(
     launchd_env, monkeypatch
 ):
     root, agents = launchd_env
-    _install_two_profiles(agents, root)
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
     target = "gui/501/ai.hermes.gateway"
-    peer = "user/501/ai.hermes.gateway-coder"
+    peer = "user/501/ai.hermes.gateway"
     sim = _FakeLaunchd(
         {
             "gui/501/ai.hermes.gateway": dict(
@@ -887,7 +888,6 @@ def test_start_all_bootstrap_liveness_failure_rolls_back_registration_and_fence(
             "user/501/ai.hermes.gateway": dict(
                 _job("user/501", "ai.hermes.gateway", pid=None, loaded=False, disabled=False)[1]
             ),
-            peer: dict(_job("user/501", "ai.hermes.gateway-coder", pid=202)[1]),
         },
         bootstrap_without_pid=(target,),
         kickstart_failures=(target,),
@@ -895,15 +895,28 @@ def test_start_all_bootstrap_liveness_failure_rolls_back_registration_and_fence(
     _patch_launchd_sim(monkeypatch, sim)
     monkeypatch.setattr(gateway_cli, "_launchd_all_wait_for_live", lambda *a, **k: False)
 
-    with pytest.raises(
-        gateway_cli.LaunchdAllOperationError, match="launchd exit 5"
-    ):
-        gateway_cli.launchd_start_all()
+    result = gateway_cli.launchd_start_all()
 
-    assert ["launchctl", "bootout", target] not in sim.calls
-    assert sim.jobs[target]["loaded"] is True
-    assert sim.jobs[target]["disabled"] is False
-    assert not any(call[-1] == peer for call in sim.calls if call[:2] == ["launchctl", "bootout"])
+    assert {
+        outcome.label: outcome.status for outcome in result.outcomes
+    }["ai.hermes.gateway"] == "preserved"
+    assert ["launchctl", "enable", target] not in sim.calls
+    assert ["launchctl", "bootstrap", "gui/501", str(default)] not in sim.calls
+    assert ["launchctl", "kickstart", target] not in sim.calls
+    assert sim.jobs[target]["loaded"] is False
+    assert sim.jobs[target]["disabled"] is True
+    assert not any(
+        call[-1] == peer for call in sim.calls if call[:2] == ["launchctl", "bootout"]
+    )
+
+    sim.calls.clear()
+    restart_result = gateway_cli.launchd_restart_all()
+
+    assert restart_result.outcomes[0].status == "preserved"
+    assert ["launchctl", "bootstrap", "gui/501", str(default)] not in sim.calls
+    assert ["launchctl", "kickstart", target] not in sim.calls
+    assert sim.jobs[target]["loaded"] is False
+    assert sim.jobs[target]["disabled"] is True
 
 
 def test_start_all_bootstrap_rollback_failure_is_reported_without_peer_bootout(
@@ -1061,7 +1074,7 @@ def test_all_profile_unknown_launchd_state_fails_before_mutation(
     assert _mutating_launchd_calls(sim) == []
 
 
-def test_restart_preserves_disabled_peer_domain_and_start_clears_it(
+def test_restart_preserves_disabled_peer_domain_and_start_preserves_it(
     launchd_env, monkeypatch
 ):
     root, agents = launchd_env
@@ -1088,19 +1101,291 @@ def test_restart_preserves_disabled_peer_domain_and_start_clears_it(
     monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", fake_graceful)
 
     gateway_cli.launchd_start_all()
-    assert ["launchctl", "enable", peer_target] in sim.calls
-    assert sim.jobs[peer_target]["disabled"] is False
+    assert not any(
+        call == ["launchctl", "enable", peer_target] for call in sim.calls
+    )
+    assert sim.jobs[peer_target]["disabled"] is True
 
-    sim.jobs[peer_target]["disabled"] = True
     sim.calls.clear()
     result = gateway_cli.launchd_restart_all()
 
-    assert restart_pids == [202]
+    assert set(restart_pids) == {101, 202}
+    assert sim.jobs[peer_target]["disabled"] is True
     assert not any(call[-1] == default_target for call in sim.calls if call[0:2] == ["launchctl", "enable"])
-    assert not any(pid == 101 for pid in restart_pids)
     assert {
         outcome.label: outcome.status for outcome in result.outcomes
-    }["ai.hermes.gateway"] == "preserved"
+    }["ai.hermes.gateway"] == "restarted"
+
+
+def test_restart_registered_gui_restores_only_gui_and_preserves_disabled_user_peer(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    gui_target = "gui/501/ai.hermes.gateway"
+    user_target = "user/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            gui_target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1]),
+            user_target: dict(
+                _job(
+                    "user/501",
+                    "ai.hermes.gateway",
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    restarted = []
+
+    def graceful(pid, _timeout, **_kwargs):
+        restarted.append(pid)
+        assert _replace_fake_pid(sim, pid)
+        return True
+
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", graceful)
+
+    result = gateway_cli.launchd_restart_all()
+
+    assert restarted == [101]
+    assert result.outcomes == (
+        gateway_cli.LaunchdAllTargetOutcome(
+            "ai.hermes.gateway", "gui/501", "restarted"
+        ),
+    )
+    assert sim.jobs[gui_target]["pid"] != 101
+    assert sim.jobs[user_target]["disabled"] is True
+    assert not any(
+        call[:2] in (["launchctl", "enable"], ["launchctl", "bootstrap"])
+        for call in sim.calls
+    )
+
+
+def test_stop_restore_mixed_registered_gui_bootstraps_gui_only(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    gui_target = "gui/501/ai.hermes.gateway"
+    user_target = "user/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            gui_target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1]),
+            user_target: dict(
+                _job(
+                    "user/501",
+                    "ai.hermes.gateway",
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    stopped = gateway_cli.launchd_stop_all()
+    fenced = stopped.fenced[0]
+    assert fenced.restore_domains == ("gui/501",)
+    assert fenced.changed_domains == ("gui/501",)
+    assert ["launchctl", "bootout", gui_target] in sim.calls
+    assert ["launchctl", "bootout", user_target] not in sim.calls
+    assert sim.jobs[gui_target]["disabled"] is True
+    assert sim.jobs[user_target]["disabled"] is True
+
+    sim.calls.clear()
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 1
+    assert failures == []
+    assert ["launchctl", "enable", gui_target] in sim.calls
+    assert ["launchctl", "enable", user_target] not in sim.calls
+    assert ["launchctl", "bootstrap", "gui/501", str(default)] in sim.calls
+    assert not any(
+        call == ["launchctl", "bootstrap", "user/501", str(default)]
+        for call in sim.calls
+    )
+    assert sim.jobs[gui_target]["loaded"] is True
+    assert sim.jobs[gui_target]["disabled"] is False
+    assert sim.jobs[user_target]["disabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("registered_domain", "peer_domain"),
+    [("gui/501", "user/501"), ("user/501", "gui/501")],
+    ids=["gui-registered-user-disabled", "user-registered-gui-disabled"],
+)
+def test_restart_registered_domain_ignores_disabled_peer_domain(
+    launchd_env, monkeypatch, registered_domain, peer_domain
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    label = "ai.hermes.gateway"
+    registered_target = f"{registered_domain}/{label}"
+    peer_target = f"{peer_domain}/{label}"
+    sim = _FakeLaunchd(
+        {
+            registered_target: dict(
+                _job(registered_domain, label, pid=101)[1]
+            ),
+            peer_target: dict(
+                _job(
+                    peer_domain,
+                    label,
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    restarted = []
+
+    def graceful(pid, _timeout, **_kwargs):
+        restarted.append(pid)
+        assert _replace_fake_pid(sim, pid)
+        return True
+
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", graceful)
+
+    result = gateway_cli.launchd_restart_all()
+
+    assert restarted == [101]
+    assert result.outcomes[0].status == "restarted"
+    assert sim.jobs[peer_target]["disabled"] is True
+
+
+def test_stop_restore_two_profile_mixed_domain_matrix_preserves_peer_fences(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    sim = _FakeLaunchd(
+        {
+            "gui/501/ai.hermes.gateway": dict(
+                _job("gui/501", "ai.hermes.gateway", pid=101)[1]
+            ),
+            "user/501/ai.hermes.gateway": dict(
+                _job(
+                    "user/501",
+                    "ai.hermes.gateway",
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+            "gui/501/ai.hermes.gateway-coder": dict(
+                _job(
+                    "gui/501",
+                    "ai.hermes.gateway-coder",
+                    pid=None,
+                    disabled=True,
+                    loaded=False,
+                )[1]
+            ),
+            "user/501/ai.hermes.gateway-coder": dict(
+                _job("user/501", "ai.hermes.gateway-coder", pid=202)[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    stopped = gateway_cli.launchd_stop_all()
+
+    assert {
+        target.label: (target.restore_domains, target.changed_domains)
+        for target in stopped.fenced
+    } == {
+        "ai.hermes.gateway": (("gui/501",), ("gui/501",)),
+        "ai.hermes.gateway-coder": (("user/501",), ("user/501",)),
+    }
+    assert {
+        call[2]
+        for call in sim.calls
+        if call[:2] == ["launchctl", "bootout"]
+    } == {
+        "gui/501/ai.hermes.gateway",
+        "user/501/ai.hermes.gateway-coder",
+    }
+    assert all(
+        sim.jobs[target]["disabled"] is True
+        for target in sim.jobs
+    )
+
+    sim.calls.clear()
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 2
+    assert failures == []
+    assert {
+        call[2]
+        for call in sim.calls
+        if call[:2] == ["launchctl", "enable"]
+    } == {
+        "gui/501/ai.hermes.gateway",
+        "user/501/ai.hermes.gateway-coder",
+    }
+    assert {
+        (call[2], call[3])
+        for call in sim.calls
+        if call[:2] == ["launchctl", "bootstrap"]
+    } == {
+        ("gui/501", str(default)),
+        ("user/501", str(coder)),
+    }
+    assert sim.jobs["user/501/ai.hermes.gateway"]["disabled"] is True
+    assert sim.jobs["gui/501/ai.hermes.gateway-coder"]["disabled"] is True
+    assert sim.jobs["gui/501/ai.hermes.gateway"]["loaded"] is True
+    assert sim.jobs["user/501/ai.hermes.gateway-coder"]["loaded"] is True
+
+
+def test_registered_own_disabled_domain_stays_fenced_without_restore_bootstrap(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    gui_target = "gui/501/ai.hermes.gateway"
+    user_target = "user/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            gui_target: dict(
+                _job("gui/501", "ai.hermes.gateway", pid=101, disabled=True)[1]
+            ),
+            user_target: dict(
+                _job(
+                    "user/501",
+                    "ai.hermes.gateway",
+                    pid=None,
+                    loaded=False,
+                )[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    stopped = gateway_cli.launchd_stop_all()
+    assert stopped.fenced[0].restore_domains == ()
+    assert stopped.fenced[0].changed_domains == ("user/501",)
+
+    sim.calls.clear()
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 1
+    assert failures == []
+    assert ["launchctl", "enable", user_target] in sim.calls
+    assert ["launchctl", "enable", gui_target] not in sim.calls
+    assert not any(call[:2] == ["launchctl", "bootstrap"] for call in sim.calls)
+    assert sim.jobs[gui_target]["loaded"] is False
+    assert sim.jobs[gui_target]["disabled"] is True
+    assert sim.jobs[user_target]["disabled"] is False
 
 
 @pytest.mark.parametrize("operation_name", ["launchd_start_all", "launchd_restart_all"])
@@ -1219,7 +1504,7 @@ def test_all_profile_missing_birth_identity_aborts_before_any_peer_mutation(
     assert _mutating_launchd_calls(sim) == []
 
 
-def test_start_target_rolls_back_only_its_new_fence_after_operational_failure(
+def test_start_target_failure_does_not_touch_disabled_peer_domain(
     launchd_env, monkeypatch
 ):
     root, agents = launchd_env
@@ -1242,8 +1527,8 @@ def test_start_target_rolls_back_only_its_new_fence_after_operational_failure(
     with pytest.raises(gateway_cli.LaunchdAllOperationError):
         gateway_cli.launchd_start_all()
 
-    assert ["launchctl", "enable", rollback_domain] in sim.calls
-    assert ["launchctl", "disable", rollback_domain] in sim.calls
+    assert ["launchctl", "enable", rollback_domain] not in sim.calls
+    assert ["launchctl", "disable", rollback_domain] not in sim.calls
     assert not any(call[-1] == peer_target for call in sim.calls if call[:2] == ["launchctl", "disable"])
     assert sim.jobs[rollback_domain]["disabled"] is True
 

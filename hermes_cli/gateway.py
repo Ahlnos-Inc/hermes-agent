@@ -5087,7 +5087,23 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
     fence_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
     bootstrap_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
     try:
-        for domain in target.probe.disabled:
+        if target.probe.registered:
+            # An existing registration owns exactly one domain.  A disabled
+            # peer is independent desired state and must not be cleared by
+            # starting the registered target.
+            domains_to_enable = (
+                (target.domain,) if target.domain in original_disabled else ()
+            )
+        elif original_disabled:
+            # An unloaded target with any pre-existing fence has no
+            # authoritative domain.  Preserve the fence rather than choosing
+            # a manager domain and inventing a bootstrap.
+            _launchd_all_prepare_mutation(target, expected_disabled)
+            return LaunchdAllTargetOutcome(target.label, target.domain, "preserved")
+        else:
+            domains_to_enable = ()
+
+        for domain in domains_to_enable:
             _launchd_all_prepare_mutation(target, expected_disabled)
             _launchd_enable(domain, target.label)
             newly_enabled.append(domain)
@@ -5219,7 +5235,15 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
     """Restart one enabled target and verify a new supervised process."""
     expected_disabled = set(target.probe.disabled)
     _launchd_all_prepare_mutation(target, expected_disabled)
-    if expected_disabled:
+    # A registered target is authoritative for its own domain.  A disabled
+    # peer must not strand an enabled registration; only the registered
+    # target's own disabled bit suppresses restart.  An unloaded target has no
+    # authoritative domain, so any pre-disabled bit remains a fence.
+    if (
+        target.domain in expected_disabled
+        if target.probe.registered
+        else bool(expected_disabled)
+    ):
         return LaunchdAllTargetOutcome(target.label, target.domain, "preserved")
 
     if target.was_loaded and target.pid is not None:
@@ -6516,13 +6540,19 @@ def _launchd_stop_all_locked() -> LaunchdStopAllResult:
                 f"{probe.registered[1]}"
             )
             continue
-        if probe.disabled:
-            # A disabled bit in either candidate domain is intentional state;
-            # restore must preserve that label rather than invent a bootstrap
-            # domain for it.
+        if probe.registered:
+            registered_domain = probe.registered[0]
+            if registered_domain in probe.disabled:
+                # The registered domain is the authority for an existing
+                # target.  Its own fence suppresses restore; a disabled peer
+                # does not.
+                restore_domains = ()
+            else:
+                restore_domains = probe.registered
+        elif probe.disabled:
+            # An unloaded target has no authoritative domain.  Preserve any
+            # pre-disabled bit rather than inventing a bootstrap domain.
             restore_domains = ()
-        elif probe.registered:
-            restore_domains = probe.registered
         else:
             restore_domains = (_launchd_validated_manager_domain(),)
         runtime_identity = None
@@ -6849,6 +6879,61 @@ def _launchd_restore_all_locked(
                     f"{target.label} restore changed its pre-disabled fence from "
                     f"{list(expected_fence)} to {list(probe.disabled)}"
                 )
+            elif target.post_mutation_snapshot is not None:
+                # Restore only bits this stop transaction fenced.  The
+                # registered/pre-disabled domain remains disabled and no
+                # domain is bootstrapped; an enabled peer is merely returned
+                # to its pre-stop desired state.
+                expected_state = _LaunchdAllStateSnapshot(
+                    registered=(),
+                    disabled=tuple(sorted(set(expected_fence))),
+                    pid=None,
+                    start_time=None,
+                )
+                try:
+                    current = _launchd_all_capture_label_snapshot(target.label, target)
+                    if not _launchd_all_snapshot_matches(expected_state, current):
+                        raise LaunchdAllOperationError(
+                            f"{target.label} restore state diverged before fence release"
+                        )
+                    for domain in target.changed_domains:
+                        if domain not in expected_state.disabled:
+                            continue
+                        _launchd_all_revalidate_fenced_plist(target)
+                        current = _launchd_all_capture_label_snapshot(target.label, target)
+                        if not _launchd_all_snapshot_matches(expected_state, current):
+                            raise LaunchdAllOperationError(
+                                f"{target.label} restore state diverged before "
+                                f"enabling {domain}/{target.label}"
+                            )
+                        _launchd_enable(domain, target.label)
+                        expected_state = _LaunchdAllStateSnapshot(
+                            registered=expected_state.registered,
+                            disabled=tuple(
+                                sorted(set(expected_state.disabled) - {domain})
+                            ),
+                            pid=None,
+                            start_time=None,
+                        )
+                        current = _launchd_all_capture_label_snapshot(target.label, target)
+                        if not _launchd_all_snapshot_matches(expected_state, current):
+                            raise LaunchdAllOperationError(
+                                f"{target.label} restore state diverged after "
+                                f"enabling {domain}/{target.label}"
+                            )
+                    remaining_owned = set(target.changed_domains) & set(
+                        expected_state.disabled
+                    )
+                    if remaining_owned:
+                        raise LaunchdAllOperationError(
+                            f"{target.label} restore left transaction-owned domains "
+                            f"disabled: {sorted(remaining_owned)}"
+                        )
+                except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                    label_errors.append(
+                        f"{target.label} restore fence release "
+                        f"({_launchd_all_failure_detail(exc)})"
+                    )
             if label_errors:
                 failures.extend(label_errors)
                 continue
