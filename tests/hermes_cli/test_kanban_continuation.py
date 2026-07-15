@@ -430,6 +430,61 @@ def test_fallback_chain_cannot_smuggle_denied_provider(
         attach_kanban_runtime_observer(agent)
 
 
+def test_denied_explicit_provider_fails_before_worker_popen(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = _init_repo(tmp_path / "repo")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="deny before spawn",
+            assignee="coder",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            model_provider_override="openrouter",
+            model_override="forbidden-model",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test-host:worker")
+        assert claimed is not None
+        kb.prepare_run_continuation(
+            conn, task_id, claimed.current_run_id, config=_config(),
+        )
+
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda _name: str(kanban_home))
+    popen_calls = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: popen_calls.append(True),
+    )
+    with pytest.raises(ContinuationContractError, match="pre_spawn_primary"):
+        kb._default_spawn(claimed, str(repo))
+    assert popen_calls == []
+
+
+def test_profile_fallback_policy_is_checked_pre_spawn(monkeypatch, tmp_path):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "model": {"provider": "openai-codex"},
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "forbidden-fallback"},
+            ],
+        },
+    )
+    with pytest.raises(ContinuationContractError, match=r"pre_spawn_fallback\[0\]"):
+        kb._assert_worker_continuation_provider_policy(
+            str(tmp_path),
+            {"provider": None, "model": None, "reasoning_effort": None},
+            {"version": 1, "allow": [], "deny": ["openrouter"]},
+        )
+
+
 def test_productive_epochs_are_unlimited_but_three_identical_states_block(
     kanban_home, tmp_path,
 ):

@@ -13754,6 +13754,51 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _assert_worker_continuation_provider_policy(
+    hermes_home: Optional[str],
+    requested_route: dict[str, Optional[str]],
+    provider_policy: dict[str, Any],
+) -> None:
+    """Reject known primary/fallback providers before creating the worker.
+
+    Runtime preflight remains authoritative for `auto` resolution and route
+    mutation, but every provider already named by the RunSpec/profile config is
+    knowable here and must pass before Popen.
+    """
+    from hermes_cli.kanban_continuation import assert_provider_allowed
+
+    config: dict[str, Any] = {}
+    if hermes_home:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            loaded = load_config()
+            if isinstance(loaded, dict):
+                config = loaded
+        finally:
+            reset_hermes_home_override(token)
+
+    configured_model = config.get("model") or {}
+    if not isinstance(configured_model, dict):
+        configured_model = {}
+    primary = requested_route.get("provider") or configured_model.get("provider")
+    assert_provider_allowed(primary, provider_policy, phase="pre_spawn_primary")
+
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    for index, fallback in enumerate(get_fallback_chain(config)):
+        assert_provider_allowed(
+            fallback.get("provider"),
+            provider_policy,
+            phase=f"pre_spawn_fallback[{index}]",
+        )
+
+
 def _spawn_contract(
     task: Task,
     *,
@@ -13764,6 +13809,7 @@ def _spawn_contract(
     dict[str, Any],
     Optional[list[str]],
     Optional[str],
+    Optional[dict[str, Any]],
 ]:
     """Load the active run's immutable launch contract.
 
@@ -13782,6 +13828,7 @@ def _spawn_contract(
             legacy_route,
             _delivery_policy_snapshot(None),
             task.toolsets,
+            None,
             None,
         )
 
@@ -13852,6 +13899,7 @@ def _spawn_contract(
         delivery_policy,
         run_toolsets,
         continuation.manifest_digest if continuation is not None else None,
+        continuation.manifest["provider_policy"] if continuation is not None else None,
     )
 
 
@@ -13884,6 +13932,7 @@ def _default_spawn(
         delivery_policy,
         run_toolsets,
         continuation_digest,
+        continuation_provider_policy,
     ) = _spawn_contract(
         task, board=board,
     )
@@ -13916,6 +13965,12 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    if continuation_provider_policy is not None:
+        _assert_worker_continuation_provider_policy(
+            env.get("HERMES_HOME"),
+            requested_route,
+            continuation_provider_policy,
+        )
     # Do not leak the dispatcher's HOME into a worker for another profile.
     # The worker process itself should use the assignee profile's isolated
     # home; host-auth CLIs get the OS-account home only through explicit,
