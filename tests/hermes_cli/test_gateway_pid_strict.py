@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -656,6 +658,11 @@ def test_all_profile_lifecycle_lock_rejects_corrupt_record(tmp_path, monkeypatch
     with pytest.raises(status.GatewayLifecycleLockError, match="corrupt"):
         status.acquire_all_profile_lifecycle_lock(timeout=0.0)
 
+    state = status._all_profile_lifecycle_lock_context()
+    assert state.handle is None
+    assert state.depth == 0
+    assert state.owner is None
+
 
 def test_all_profile_lifecycle_lock_times_out_while_owned(tmp_path, monkeypatch):
     fcntl = pytest.importorskip("fcntl")
@@ -710,10 +717,107 @@ def test_all_profile_lifecycle_lock_nested_context_releases_only_at_outer_exit(
     monkeypatch.setattr(status, "_get_all_profile_lifecycle_lock_path", lambda: lock_path)
 
     with status.all_profile_lifecycle_lock(timeout=0.0):
+        assert status._all_profile_lifecycle_lock_context().depth == 1
         with status.all_profile_lifecycle_lock(timeout=0.0):
-            assert status._all_profile_lifecycle_lock_context().handle is not None
+            state = status._all_profile_lifecycle_lock_context()
+            assert state.handle is not None
+            assert state.depth == 2
         assert status._all_profile_lifecycle_lock_context().handle is not None
+        assert status._all_profile_lifecycle_lock_context().depth == 1
     assert status._all_profile_lifecycle_lock_context().handle is None
+    assert status._all_profile_lifecycle_lock_context().depth == 0
+    assert status._all_profile_lifecycle_lock_context().owner is None
+
+    with pytest.raises(RuntimeError, match="body failure"):
+        with status.all_profile_lifecycle_lock(timeout=0.0):
+            raise RuntimeError("body failure")
+    state = status._all_profile_lifecycle_lock_context()
+    assert state.handle is None
+    assert state.depth == 0
+    assert state.owner is None
+
+
+def test_all_profile_lifecycle_lock_excludes_different_thread(tmp_path, monkeypatch):
+    lock_path = tmp_path / "state" / "gateway-all-lifecycle.lock"
+    monkeypatch.setattr(status, "_get_all_profile_lifecycle_lock_path", lambda: lock_path)
+    result = {}
+
+    with status.all_profile_lifecycle_lock(timeout=0.0):
+        def contender():
+            try:
+                status.acquire_all_profile_lifecycle_lock(timeout=0.0)
+            except status.GatewayLifecycleLockError as exc:
+                result["error"] = str(exc)
+            else:
+                result["acquired"] = True
+                status.release_all_profile_lifecycle_lock()
+
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert "timed out" in result["error"]
+    assert "acquired" not in result
+
+
+def test_all_profile_lifecycle_lock_async_siblings_cannot_nest_or_release(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "state" / "gateway-all-lifecycle.lock"
+    monkeypatch.setattr(status, "_get_all_profile_lifecycle_lock_path", lambda: lock_path)
+
+    async def exercise():
+        holder_ready = asyncio.Event()
+        child_checked = asyncio.Event()
+        holder_released = asyncio.Event()
+        result = {}
+
+        async def child_created_inside_holder():
+            await holder_ready.wait()
+            try:
+                status.acquire_all_profile_lifecycle_lock(timeout=0.0)
+            except status.GatewayLifecycleLockError as exc:
+                result["acquire_error"] = str(exc)
+            else:
+                result["acquired_while_held"] = True
+                status.release_all_profile_lifecycle_lock()
+
+            try:
+                status.release_all_profile_lifecycle_lock()
+            except status.GatewayLifecycleLockError as exc:
+                result["release_error"] = str(exc)
+            else:
+                result["released_while_held"] = True
+            child_checked.set()
+
+            await holder_released.wait()
+            handle = status.acquire_all_profile_lifecycle_lock(timeout=0.0)
+            result["acquired_after_release"] = handle is not None
+            status.release_all_profile_lifecycle_lock()
+
+        with status.all_profile_lifecycle_lock(timeout=0.0):
+            child = asyncio.create_task(child_created_inside_holder())
+            holder_ready.set()
+            await child_checked.wait()
+            state = status._all_profile_lifecycle_lock_context()
+            assert state.depth == 1
+            assert state.owner.task is asyncio.current_task()
+
+        holder_released.set()
+        await child
+        return result
+
+    result = asyncio.run(exercise())
+    assert "another execution context" in result["acquire_error"]
+    assert "another execution context" in result["release_error"]
+    assert "acquired_while_held" not in result
+    assert "released_while_held" not in result
+    assert result["acquired_after_release"] is True
+    state = status._all_profile_lifecycle_lock_context()
+    assert state.handle is None
+    assert state.depth == 0
+    assert state.owner is None
 
 
 def test_gateway_all_lifecycle_lock_override_does_not_use_hermes_home(
@@ -723,6 +827,16 @@ def test_gateway_all_lifecycle_lock_override_does_not_use_hermes_home(
     hermes_home = tmp_path / "profile-home"
     monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(override))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    host_path = Path.home() / ".local" / "state" / "hermes" / "gateway-all-lifecycle.lock"
+
+    def snapshot(path):
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            return (False, None, None, None)
+        return (True, metadata.st_ino, metadata.st_mtime_ns, path.read_bytes())
+
+    host_before = snapshot(host_path)
     calls = []
     monkeypatch.setattr(
         gateway,
@@ -735,9 +849,10 @@ def test_gateway_all_lifecycle_lock_override_does_not_use_hermes_home(
     assert calls == ["inner"]
     assert (override / "gateway-all-lifecycle.lock").exists()
     assert not (hermes_home / "gateway-all-lifecycle.lock").exists()
+    assert snapshot(host_path) == host_before
 
 
-def test_all_profile_lifecycle_transaction_is_reentrant(monkeypatch):
+def test_gateway_all_lifecycle_entrypoint_uses_status_lock(monkeypatch):
     calls = []
 
     class _Lock:
@@ -748,11 +863,14 @@ def test_all_profile_lifecycle_transaction_is_reentrant(monkeypatch):
             calls.append("release")
 
     monkeypatch.setattr(gateway, "all_profile_lifecycle_lock", lambda **_kwargs: _Lock())
-    with gateway._all_profile_lifecycle_transaction():
-        with gateway._all_profile_lifecycle_transaction():
-            calls.append("body")
+    monkeypatch.setattr(
+        gateway,
+        "_launchd_start_all_locked",
+        lambda: calls.append("locked") or "result",
+    )
 
-    assert calls == ["acquire", "body", "release"]
+    assert gateway.launchd_start_all() == "result"
+    assert calls == ["acquire", "locked", "release"]
 
 
 def test_build_472_gateway_identity_all_entry_point_semantics():

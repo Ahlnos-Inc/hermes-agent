@@ -5,7 +5,6 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
-import contextvars
 import hashlib
 import json
 import logging
@@ -20,7 +19,6 @@ import subprocess
 import sys
 import textwrap
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -69,30 +67,6 @@ from hermes_cli.setup import (
 from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
-
-_all_profile_lifecycle_lock_depth = contextvars.ContextVar(
-    "all_profile_lifecycle_lock_depth", default=0
-)
-
-
-@contextmanager
-def _all_profile_lifecycle_transaction():
-    """Serialize cooperating all-profile lifecycle mutations on this host."""
-    depth = _all_profile_lifecycle_lock_depth.get()
-    if depth:
-        token = _all_profile_lifecycle_lock_depth.set(depth + 1)
-        try:
-            yield
-        finally:
-            _all_profile_lifecycle_lock_depth.reset(token)
-        return
-
-    with all_profile_lifecycle_lock(timeout=30.0):
-        token = _all_profile_lifecycle_lock_depth.set(1)
-        try:
-            yield
-        finally:
-            _all_profile_lifecycle_lock_depth.reset(token)
 
 # =============================================================================
 # Process Management (for manual gateway runs)
@@ -5237,7 +5211,7 @@ def _launchd_start_all_locked() -> LaunchdAllResult:
 
 
 def launchd_start_all() -> LaunchdAllResult:
-    with _all_profile_lifecycle_transaction():
+    with all_profile_lifecycle_lock(timeout=30.0):
         return _launchd_start_all_locked()
 
 
@@ -5384,7 +5358,7 @@ def _launchd_restart_all_locked() -> LaunchdAllResult:
 
 
 def launchd_restart_all() -> LaunchdAllResult:
-    with _all_profile_lifecycle_transaction():
+    with all_profile_lifecycle_lock(timeout=30.0):
         return _launchd_restart_all_locked()
 
 
@@ -6794,7 +6768,7 @@ def _launchd_stop_all_locked() -> LaunchdStopAllResult:
 
 
 def launchd_stop_all() -> LaunchdStopAllResult:
-    with _all_profile_lifecycle_transaction():
+    with all_profile_lifecycle_lock(timeout=30.0):
         return _launchd_stop_all_locked()
 
 
@@ -6991,7 +6965,7 @@ def _launchd_restore_all_locked(
 def launchd_restore_all(
     result: LaunchdStopAllResult,
 ) -> tuple[int, list[str]]:
-    with _all_profile_lifecycle_transaction():
+    with all_profile_lifecycle_lock(timeout=30.0):
         return _launchd_restore_all_locked(result)
 
 
@@ -7084,7 +7058,7 @@ def _launchd_release_all_fences_locked(result: LaunchdStopAllResult) -> list[str
 
 
 def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
-    with _all_profile_lifecycle_transaction():
+    with all_profile_lifecycle_lock(timeout=30.0):
         return _launchd_release_all_fences_locked(result)
 
 
@@ -9251,7 +9225,7 @@ def gateway_command(args):
             # launchctl invocations from another actor can still race the
             # probe-to-bootout gap; the adjacent revalidations remain required
             # because this lock coordinates cooperating Hermes CLIs only.
-            with _all_profile_lifecycle_transaction():
+            with all_profile_lifecycle_lock(timeout=30.0):
                 return _gateway_command_inner(args)
         return _gateway_command_inner(args)
     except GatewayLifecycleLockError as e:

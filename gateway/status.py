@@ -11,6 +11,7 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -52,6 +54,15 @@ _ALL_PROFILE_LIFECYCLE_LOCK = "gateway-all-lifecycle.lock"
 _all_profile_lifecycle_lock_state = threading.local()
 _REAL_FSTAT = os.fstat
 _REAL_LSTAT = os.lstat
+
+
+@dataclass(frozen=True)
+class _LifecycleLockOwner:
+    """Execution identity allowed to nest the lifecycle lock."""
+
+    process_id: int
+    thread_id: int
+    task: object | None
 
 
 def _get_pid_path() -> Path:
@@ -104,7 +115,40 @@ def _all_profile_lifecycle_lock_context() -> threading.local:
     if not hasattr(state, "handle"):
         state.handle = None
         state.depth = 0
+        state.owner = None
+    elif not hasattr(state, "owner"):
+        # Be defensive if a long-lived interpreter reloads this module after
+        # the state was initialized by an older version.
+        state.owner = None
     return state
+
+
+def _current_lifecycle_lock_owner() -> _LifecycleLockOwner:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return _LifecycleLockOwner(os.getpid(), threading.get_ident(), task)
+
+
+def _same_lifecycle_lock_owner(
+    left: _LifecycleLockOwner | None,
+    right: _LifecycleLockOwner,
+) -> bool:
+    return (
+        left is not None
+        and left.process_id == right.process_id
+        and left.thread_id == right.thread_id
+        and left.task is right.task
+    )
+
+
+def _close_lifecycle_lock_handle(handle) -> None:
+    _release_file_lock(handle)
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 def _validate_lifecycle_lock_parent(path: Path) -> None:
@@ -162,7 +206,13 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
     metadata; malformed content or unsafe filesystem identity fails closed.
     """
     state = _all_profile_lifecycle_lock_context()
+    owner = _current_lifecycle_lock_owner()
     if state.handle is not None:
+        if not _same_lifecycle_lock_owner(state.owner, owner):
+            raise GatewayLifecycleLockError(
+                "all-profile lifecycle lock is already owned by another "
+                "execution context"
+            )
         state.depth += 1
         return state.handle
 
@@ -240,16 +290,23 @@ def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
         os.fsync(handle.fileno())
         state.handle = handle
         state.depth = 1
+        state.owner = owner
         return handle
     except GatewayLifecycleLockError:
         if acquired:
             _release_file_lock(handle)
-        handle.close()
+        try:
+            handle.close()
+        except OSError:
+            pass
         raise
     except OSError as exc:
         if acquired:
             _release_file_lock(handle)
-        handle.close()
+        try:
+            handle.close()
+        except OSError:
+            pass
         raise GatewayLifecycleLockError(
             f"could not write all-profile lifecycle lock {path}"
         ) from exc
@@ -260,16 +317,18 @@ def release_all_profile_lifecycle_lock() -> None:
     handle = state.handle
     if handle is None:
         return
+    owner = _current_lifecycle_lock_owner()
+    if not _same_lifecycle_lock_owner(state.owner, owner):
+        raise GatewayLifecycleLockError(
+            "all-profile lifecycle lock is owned by another execution context"
+        )
     if state.depth > 1:
         state.depth -= 1
         return
     state.handle = None
     state.depth = 0
-    _release_file_lock(handle)
-    try:
-        handle.close()
-    except OSError:
-        pass
+    state.owner = None
+    _close_lifecycle_lock_handle(handle)
 
 
 @contextmanager
