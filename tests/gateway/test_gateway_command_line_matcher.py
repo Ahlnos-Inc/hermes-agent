@@ -37,7 +37,7 @@ ACCEPT = [
     "python -m hermes_cli.main --profile gateway gateway run",
     # quoted Windows paths with spaces (shlex-aware tokenization)
     r'"C:\Program Files\Hermes\hermes-gateway.exe"',
-    r'"C:\Program Files\Hermes\gateway\run.py" run',
+    r'"C:\Program Files\Hermes\gateway\run.py"',
     r'"C:\Program Files\Py\pythonw.exe" -m hermes_cli.main gateway run',
 ]
 
@@ -67,3 +67,8 @@ def test_runtime_matcher_accepts_no_supervisor_restart_process():
     assert matches("python -m hermes_cli.main gateway restart") is False
     assert matches_runtime("python -m hermes_cli.main gateway restart") is True
     assert matches_runtime("python -m hermes_cli.main gateway status") is False
+
+
+def test_build_472_wrapper_management_is_not_runtime_match():
+    assert matches_runtime(["hermes-gateway", "run"])
+    assert not matches_runtime(["hermes-gateway", "restart"])

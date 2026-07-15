@@ -756,3 +756,107 @@ def test_all_profile_lifecycle_transaction_is_reentrant(monkeypatch):
             calls.append("body")
 
     assert calls == ["acquire", "body", "release"]
+
+
+def test_build_472_gateway_identity_all_entry_point_semantics():
+    from gateway.process_identity import classify_gateway_argv
+
+    def kind(argv, **kwargs):
+        role, _profile, _home = classify_gateway_argv(argv, **kwargs)
+        return role.value
+
+    assert kind(["hermes-gateway"]) == "runtime"
+    assert kind(["hermes-gateway", "run"]) == "runtime"
+    for verb in ("install", "uninstall", "start", "stop", "restart", "status"):
+        assert kind(["hermes-gateway", verb]) == "manager"
+    assert kind(["hermes-gateway", "unknown"]) == "foreign"
+
+    assert kind(["python", "-m", "gateway.run"]) == "runtime"
+    assert kind(
+        [
+            "python",
+            "gateway/run.py",
+            "--config",
+            "x",
+            "--config=y",
+            "-c",
+            "z",
+            "--verbose",
+            "-v",
+        ]
+    ) == "runtime"
+    assert kind(["python", "-m", "gateway.run", "--profile", "p"]) == "foreign"
+    assert kind(["python", "-m", "gateway.run", "--unknown"]) == "foreign"
+    assert kind(["python", "-m", "gateway.run", "positional"]) == "foreign"
+
+
+def test_build_472_cli_prefix_and_profile_grammar():
+    from gateway.process_identity import classify_gateway_argv
+
+    def kind(argv, **kwargs):
+        role, _profile, _home = classify_gateway_argv(argv, **kwargs)
+        return role.value
+
+    assert kind(["hermes", "--accept-hooks", "--model", "X", "gateway"]) == "runtime"
+    assert kind(["hermes", "--model=X", "-m", "Y", "--tui", "gateway"]) == "runtime"
+    assert kind(["hermes", "--skills", "a", "--skills=b", "-p", "one", "gateway"]) == "runtime"
+    assert kind(["hermes", "gateway", "-p", "one"]) == "runtime"
+    assert kind(["hermes", "-p", "one", "--profile=two", "gateway"]) == "foreign"
+    assert kind(["hermes", "-p=x", "gateway"]) == "foreign"
+    assert kind(["hermes", "--unknown", "gateway"]) == "foreign"
+    assert kind(["hermes", "--model", "gateway"]) == "foreign"
+    assert kind(["hermes", "-c", "gateway", "run"]) == "foreign"
+    assert kind(["hermes", "--model", "gateway", "--profile"]) == "foreign"
+
+
+def test_build_472_windows_prefix_and_home_consistency():
+    from gateway.process_identity import _coerce_argv, classify_gateway_argv
+
+    prefixed = _coerce_argv(
+        r"HERMES_HOME=C:\hermes C:\Program Files\Hermes\Hermes.EXE gateway"
+    )
+    assert prefixed[0] == r"HERMES_HOME=C:\hermes"
+    assert prefixed[1].lower() == r"c:\program files\hermes\hermes.exe"
+
+    no_prefix = _coerce_argv(r"C:\Program Files\Hermes\Hermes.EXE gateway")
+    assert no_prefix[0].lower() == r"c:\program files\hermes\hermes.exe"
+
+    role, profile, home = classify_gateway_argv(
+        ["hermes", "gateway"],
+        environment={"HERMES_HOME": "/tmp/b"},
+    )
+    assert role.value == "runtime"
+    assert profile is None
+    assert home == Path("/tmp/b").resolve()
+
+    role, profile, home = classify_gateway_argv(
+        ["HERMES_HOME=/tmp/a", "hermes", "gateway"],
+        environment={"HERMES_HOME": "/tmp/b"},
+    )
+    assert role.value == "foreign"
+    assert profile is None
+    assert home is None
+
+    role, profile, home = classify_gateway_argv(
+        ["hermes", "-p", "a", "gateway"],
+        environment={"HERMES_HOME": "/tmp/root/profiles/a"},
+    )
+    assert role.value == "runtime"
+    assert profile == "a"
+    assert home == Path("/tmp/root/profiles/a").resolve()
+
+    role, profile, home = classify_gateway_argv(
+        ["hermes", "-p", "a", "gateway"],
+        default_home=Path("/tmp/root"),
+    )
+    assert role.value == "runtime"
+    assert profile == "a"
+    assert home == Path("/tmp/root/profiles/a").resolve()
+
+    role, profile, home = classify_gateway_argv(
+        ["hermes", "-p", "a", "gateway"],
+        environment={"HERMES_HOME": "/tmp/root/profiles/b"},
+    )
+    assert role.value == "foreign"
+    assert profile is None
+    assert home is None
