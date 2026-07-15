@@ -14104,10 +14104,16 @@ def _default_spawn(
     )
     if worker_toolsets is not None:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
+    cmd.append("chat")
+    if task.goal_mode:
+        # The Kanban goal/checkpoint wrapper is wired into Hermes' quiet
+        # single-query path. Without ``-Q``, a goal-mode worker completes its
+        # first ordinary ``-q`` turn and exits before the wrapper can judge or
+        # checkpoint the epoch; the dispatcher then misclassifies that clean
+        # process exit as a crash. Keep normal workers' human-readable logs,
+        # but make goal-mode launch semantics explicit and deterministic.
+        cmd.append("-Q")
+    cmd.extend(["-q", prompt])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

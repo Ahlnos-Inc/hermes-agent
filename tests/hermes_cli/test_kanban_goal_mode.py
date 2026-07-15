@@ -128,6 +128,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
         pid = 4242
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
         captured["env"] = kwargs.get("env", {})
         return _FakeProc()
 
@@ -147,6 +148,8 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
     assert env.get("HERMES_KANBAN_GOAL_MAX_TURNS") == "5"
+    assert "-Q" in captured["cmd"]
+    assert captured["cmd"].index("-Q") > captured["cmd"].index("chat")
 
 
 def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
@@ -156,6 +159,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
         pid = 4243
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
         captured["env"] = kwargs.get("env", {})
         return _FakeProc()
 
@@ -169,6 +173,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     env = captured["env"]
     assert "HERMES_KANBAN_GOAL_MODE" not in env
     assert "HERMES_KANBAN_GOAL_MAX_TURNS" not in env
+    assert "-Q" not in captured["cmd"]
 
 
 # ---------------------------------------------------------------------------
