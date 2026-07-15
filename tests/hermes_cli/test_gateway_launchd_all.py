@@ -557,6 +557,67 @@ def test_restart_all_attempts_peers_and_aggregates_a_failed_target(
     assert sim.jobs["user/501/ai.hermes.gateway-coder"]["pid"] != 202
 
 
+def test_restart_all_accepts_exact_successor_when_drain_watcher_reports_false(
+    launchd_env, monkeypatch
+):
+    """Supervisor convergence outranks a transient predecessor wait failure."""
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1])}
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    def false_negative_drain(pid, _timeout, **_kwargs):
+        assert pid == 101
+        assert _replace_fake_pid(sim, pid)
+        return False
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "_graceful_restart_via_sigusr1",
+        false_negative_drain,
+    )
+
+    result = gateway_cli.launchd_restart_all()
+
+    assert result.outcomes == (
+        gateway_cli.LaunchdAllTargetOutcome(
+            "ai.hermes.gateway", "gui/501", "restarted"
+        ),
+    )
+    assert sim.jobs[target]["pid"] != 101
+
+
+def test_restart_all_rejects_same_pid_with_new_birth_as_successor(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    default, coder = _install_two_profiles(agents, root)
+    coder.unlink()
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1])}
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    def reused_pid_drain(pid, _timeout, **_kwargs):
+        assert pid == 101
+        sim.jobs[target]["start"] = 9999
+        return False
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "_graceful_restart_via_sigusr1",
+        reused_pid_drain,
+    )
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="PID 101 was reused"):
+        gateway_cli.launchd_restart_all()
+
+
 def test_restart_all_passes_birth_identity_to_sigusr1_guard(launchd_env, monkeypatch):
     root, agents = launchd_env
     _install_two_profiles(agents, root)

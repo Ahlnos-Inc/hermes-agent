@@ -5011,8 +5011,15 @@ def _launchd_all_verify_live(
             raise LaunchdAllOperationError(
                 f"{target.launchctl_target}: live runtime identity changed"
             )
-    if successor_of is not None and (pid, start_time) == successor_of:
-        return False
+    if successor_of is not None:
+        old_pid, old_start_time = successor_of
+        if (pid, start_time) == successor_of:
+            return False
+        if pid == old_pid and start_time != old_start_time:
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: supervised PID {pid} was reused "
+                "while waiting for a successor"
+            )
     return True
 
 
@@ -5543,26 +5550,30 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
             raise LaunchdAllOperationError(
                 f"{target.launchctl_target}: old supervised PID is not live"
             )
-        if not _graceful_restart_via_sigusr1(
+        drain_timeout = _get_restart_drain_timeout()
+        predecessor_wait_succeeded = _graceful_restart_via_sigusr1(
             target.pid,
-            _get_restart_drain_timeout(),
+            drain_timeout,
             expected_start_time=target.start_time,
             expected_identity=target.runtime_identity,
-        ):
-            raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: old PID did not exit"
-            )
-        if not _launchd_all_wait_for_successor(
+        )
+        successor_verified = _launchd_all_wait_for_successor(
             target,
             target.pid,
             target.start_time,
             expected_disabled=expected_disabled,
-            timeout=_get_restart_drain_timeout() + 30,
-        ):
+            timeout=(drain_timeout + 30 if predecessor_wait_succeeded else 5),
+        )
+        if successor_verified:
+            return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+        if not predecessor_wait_succeeded:
             raise LaunchdAllOperationError(
-                f"{target.launchctl_target}: new supervised PID was not verified"
+                f"{target.launchctl_target}: old PID did not exit and no exact "
+                "successor was verified"
             )
-        return LaunchdAllTargetOutcome(target.label, target.domain, "restarted")
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: new supervised PID was not verified"
+        )
 
     bootstrapped_by_us = False
     bootstrap_post_mutation_snapshot: _LaunchdAllStateSnapshot | None = None
