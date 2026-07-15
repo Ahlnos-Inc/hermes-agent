@@ -662,6 +662,43 @@ def test_goal_budget_uses_epoch_checkpoint_when_available(monkeypatch):
     assert len(checkpoints) == 1
 
 
+def test_goal_budget_checkpoints_before_spending_terminal_judge_call(monkeypatch):
+    from hermes_cli import goals
+
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal budget must checkpoint without an unused judge call"
+        ),
+    )
+    checkpoints = []
+
+    result = goals.run_kanban_goal_loop(
+        task_id="t_terminal_budget",
+        goal_text="continue safely",
+        run_turn=lambda _prompt: pytest.fail("budget is already exhausted"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: pytest.fail("must not block the task"),
+        checkpoint_fn=lambda reason, handoff: checkpoints.append((reason, handoff)),
+        max_turns=1,
+        first_response="durable phase-one result",
+    )
+
+    assert result == {
+        "outcome": "checkpointed_budget",
+        "turns_used": 1,
+        "reason": "turn budget exhausted",
+    }
+    assert checkpoints == [
+        (
+            "Goal-mode worker exhausted its turn budget (1/1) without "
+            "completing the task.",
+            "durable phase-one result",
+        )
+    ]
+
+
 def test_goal_wrapper_does_not_continue_after_first_turn_checkpoint(
     kanban_home, tmp_path, monkeypatch,
 ):
