@@ -81,19 +81,29 @@ For more help on a command:
 """
 
 
-def build_top_level_parser():
+def build_top_level_parser(parser_class=None, parser_factory=None):
     """Build the top-level parser, the subparsers action, and the ``chat`` subparser.
 
     Returns ``(parser, subparsers, chat_parser)``. The caller wires
     ``chat_parser.set_defaults(func=cmd_chat)`` and continues registering
     other subparsers via ``subparsers.add_parser(...)``.
     """
-    parser = argparse.ArgumentParser(
+    if parser_class is not None and parser_factory is not None:
+        raise TypeError("pass parser_class or parser_factory, not both")
+
+    parser_class = parser_class or argparse.ArgumentParser
+    parser_factory = parser_factory or parser_class
+    parser = parser_factory(
         prog="hermes",
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
     )
+    if (
+        parser_class is argparse.ArgumentParser
+        and parser_factory is not argparse.ArgumentParser
+    ):
+        parser_class = type(parser)
 
     parser.add_argument(
         "--version", "-V", action="store_true", help="Show version and exit"
@@ -252,7 +262,9 @@ def build_top_level_parser():
         help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )
 
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    subparsers = parser.add_subparsers(
+        dest="command", help="Command to run", parser_class=parser_class
+    )
 
     # =========================================================================
     # chat command

@@ -21,7 +21,6 @@ Usage::
 
 import json
 import os
-import re
 import shlex
 import shutil
 import stat
@@ -33,8 +32,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
-
-_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+from hermes_cli.profile_contract import (
+    _PROFILE_ID_RE,
+    _RESERVED_NAMES,
+    normalize_profile_name,
+    validate_profile_name,
+)
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -224,11 +227,6 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "logs",                 # gateway logs
 })
 
-# Names that cannot be used as profile aliases
-_RESERVED_NAMES = frozenset({
-    "hermes", "default", "test", "tmp", "root", "sudo",
-})
-
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -280,54 +278,6 @@ def _get_wrapper_dir() -> Path:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-
-def normalize_profile_name(name: str) -> str:
-    """Return the canonical profile id used on disk and in CLI ``-p`` argv.
-
-    Named profiles are stored lowercase under ``profiles/<id>/``. The special
-    alias ``default`` is matched case-insensitively (``Default`` → ``default``).
-    Dashboards and tools may pass title-cased display labels; normalize before
-    validation, assignment, and subprocess spawn (see issue #18498).
-    """
-    if not isinstance(name, str):
-        name = str(name)
-    stripped = name.strip()
-    if not stripped:
-        raise ValueError("profile name cannot be empty")
-    if stripped.casefold() == "default":
-        return "default"
-    return stripped.lower()
-
-
-def validate_profile_name(name: str) -> None:
-    """Raise ``ValueError`` if *name* is not a valid profile identifier.
-
-    Validates the input as-given — strict lowercase match. Callers that accept
-    mixed-case or title-cased input from users (dashboard UI, CLI args) should
-    call :func:`normalize_profile_name` first. This separation keeps validate
-    honest about what the on-disk directory name must look like, while
-    ingress-point normalization handles UX flexibility (see #18498).
-
-    Also rejects names in :data:`_RESERVED_NAMES` (``hermes``, ``test``,
-    ``tmp``, ``root``, ``sudo``) that would create confusing on-disk
-    collisions (a ``hermes`` profile inside ``~/.hermes/``) or get refused
-    at alias-creation time anyway. ``default`` is a special pass-through —
-    it's a valid alias for the built-in root profile.
-    """
-    if name == "default":
-        return  # special alias for ~/.hermes
-    if not _PROFILE_ID_RE.match(name):
-        raise ValueError(
-            f"Invalid profile name {name!r}. Must match "
-            f"[a-z0-9][a-z0-9_-]{{0,63}}"
-        )
-    if name in _RESERVED_NAMES:
-        raise ValueError(
-            f"Profile name {name!r} is reserved — it collides with either "
-            f"the Hermes installation itself or a common system binary.  "
-            f"Pick a different name."
-        )
-
 
 def validate_alias_name(name: str) -> None:
     """Raise ``ValueError`` if *name* is not a safe wrapper-alias identifier.

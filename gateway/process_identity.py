@@ -15,6 +15,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from gateway.command_line import (
+    ArgumentParseFailure,
+    NonExitingArgumentParser,
+    build_direct_gateway_parser,
+    build_legacy_gateway_parser,
+)
+
 
 class GatewayRuntimeRole(str, Enum):
     """The role represented by one exact Hermes command line."""
@@ -24,7 +31,6 @@ class GatewayRuntimeRole(str, Enum):
     FOREIGN = "foreign"
 
 
-_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _MANAGEMENT_SUBCOMMANDS = {
     "start",
     "stop",
@@ -34,43 +40,6 @@ _MANAGEMENT_SUBCOMMANDS = {
     "uninstall",
     "setup",
 }
-
-_CLI_REQUIRED_LONG_OPTIONS = {
-    "--oneshot",
-    "--model",
-    "--provider",
-    "--reasoning-effort",
-    "--toolsets",
-    "--resume",
-    "--skills",
-}
-_CLI_REQUIRED_SHORT_OPTIONS = {"-z", "-m", "-t", "-r", "-s"}
-_CLI_BOOLEAN_OPTIONS = {
-    "-w",
-    "--worktree",
-    "--accept-hooks",
-    "--yolo",
-    "--pass-session-id",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--safe-mode",
-    "--tui",
-    "--cli",
-    "--dev",
-}
-_CLI_CONTINUE_OPTIONS = {"-c", "--continue"}
-_GATEWAY_RUN_OPTIONS = {
-    "--replace",
-    "--force",
-    "--no-supervise",
-    "--accept-hooks",
-    "-v",
-    "--verbose",
-    "-q",
-    "--quiet",
-}
-_DIRECT_RUN_VERBOSE_OPTIONS = {"-v", "--verbose"}
-_DIRECT_CONFIG_OPTIONS = {"-c", "--config"}
 
 
 def _normalized_token(token: str) -> str:
@@ -182,13 +151,6 @@ def _normalized_tokens(argv: tuple[str, ...]) -> list[str]:
 
 
 @dataclass(frozen=True)
-class _ProfileArgumentParse:
-    remaining: tuple[str, ...]
-    profile: str | None
-    valid: bool
-
-
-@dataclass(frozen=True)
 class _GatewayCommandParse:
     subcommand: str | None
     profile: str | None
@@ -261,224 +223,64 @@ def _entrypoint_arguments(
     return None
 
 
-def _profile_selector_token(token: str) -> bool:
-    return (
-        token in {"--profile", "-p"}
-        or token.startswith("--profile=")
-        or token.startswith("-p=")
-    )
-
-
-def _required_cli_option(token: str) -> tuple[str, str | None] | None:
-    for option in _CLI_REQUIRED_LONG_OPTIONS:
-        if token == option:
-            return "spaced", None
-        prefix = f"{option}="
-        if token.startswith(prefix):
-            return "inline", token[len(prefix) :]
-
-    for option in _CLI_REQUIRED_SHORT_OPTIONS:
-        if token == option:
-            return "spaced", None
-        if token.startswith(option) and len(token) > len(option):
-            value = token[len(option) :]
-            if value.startswith("="):
-                value = value[1:]
-            return "attached", value
-    return None
-
-
-def _continue_cli_option(token: str) -> tuple[str, str | None] | None:
-    if token in _CLI_CONTINUE_OPTIONS:
-        return "spaced", None
-    if token.startswith("--continue="):
-        return "inline", token[len("--continue=") :]
-    if token.startswith("-c") and len(token) > len("-c"):
-        value = token[len("-c") :]
-        if value.startswith("="):
-            value = value[1:]
-        return "attached", value
-    return None
-
-
 def _parse_direct_runner_tail(args: tuple[str, ...]) -> bool:
-    index = 0
-    while index < len(args):
-        token = args[index]
-        if token in _DIRECT_RUN_VERBOSE_OPTIONS:
-            index += 1
-            continue
-        if token in _DIRECT_CONFIG_OPTIONS:
-            if index + 1 >= len(args) or args[index + 1].startswith("-"):
-                return False
-            index += 2
-            continue
-        if token.startswith("--config="):
-            if not token[len("--config=") :]:
-                return False
-            index += 1
-            continue
+    parser = build_direct_gateway_parser(NonExitingArgumentParser)
+    try:
+        parser.parse_args(args)
+    except ArgumentParseFailure:
         return False
     return True
 
 
-def _parse_legacy_wrapper_tail(args: tuple[str, ...]) -> tuple[str, bool]:
-    remaining = [token for token in args if token not in {"-v", "--verbose"}]
-    if not remaining:
-        return "run", True
-
-    subcommand = _normalized_token(remaining[0])
-    if len(remaining) == 1 and subcommand == "run":
-        return "run", True
-    if subcommand in _MANAGEMENT_SUBCOMMANDS:
-        return subcommand, True
-    return "", False
+def _parse_legacy_wrapper_tail(args: tuple[str, ...]) -> str | None:
+    parser = build_legacy_gateway_parser(NonExitingArgumentParser)
+    try:
+        parsed = parser.parse_args(args)
+    except ArgumentParseFailure:
+        return None
+    return _normalized_token(parsed.command)
 
 
-def _parse_profile_arguments(args: tuple[str, ...]) -> _ProfileArgumentParse:
-    """Mirror the CLI profile pre-parser and preserve non-profile arguments."""
-    remaining: list[str] = []
-    profile: str | None = None
-    selector_seen = False
-    passthrough = False
-    index = 0
+def _build_cli_identity_parser():
+    """Build the real top-level plus gateway parser without runtime imports."""
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.subcommands.gateway import build_gateway_parser
 
-    while index < len(args):
-        token = args[index]
-        if passthrough:
-            if _profile_selector_token(token):
-                return _ProfileArgumentParse((), None, False)
-            remaining.append(token)
-            index += 1
-            continue
+    parser, subparsers, _chat_parser = build_top_level_parser(
+        parser_class=NonExitingArgumentParser
+    )
 
-        if token == "--":
-            passthrough = True
-            remaining.append(token)
-            index += 1
-            continue
+    def inert_handler(_args):
+        return None
 
-        required_option = _required_cli_option(token)
-        if required_option is not None:
-            mode, value = required_option
-            if mode != "spaced":
-                if not value:
-                    return _ProfileArgumentParse((), None, False)
-                remaining.append(token)
-                index += 1
-                continue
-            if index + 1 >= len(args):
-                return _ProfileArgumentParse((), None, False)
-            remaining.extend((token, args[index + 1]))
-            index += 2
-            continue
-
-        continue_option = _continue_cli_option(token)
-        if continue_option is not None:
-            mode, value = continue_option
-            if mode != "spaced":
-                if not value:
-                    return _ProfileArgumentParse((), None, False)
-                remaining.append(token)
-                index += 1
-                continue
-            remaining.append(token)
-            if index + 1 < len(args) and not args[index + 1].startswith("-"):
-                remaining.append(args[index + 1])
-                index += 2
-            else:
-                index += 1
-            continue
-
-        if token in {"--profile", "-p"}:
-            if (
-                selector_seen
-                or index + 1 >= len(args)
-                or not _PROFILE_RE.fullmatch(args[index + 1])
-            ):
-                return _ProfileArgumentParse((), None, False)
-            profile = args[index + 1]
-            selector_seen = True
-            index += 2
-            continue
-
-        if token.startswith("--profile="):
-            candidate = token.split("=", 1)[1]
-            if selector_seen or not _PROFILE_RE.fullmatch(candidate):
-                return _ProfileArgumentParse((), None, False)
-            profile = candidate
-            selector_seen = True
-            index += 1
-            continue
-
-        if token.startswith("-p="):
-            return _ProfileArgumentParse((), None, False)
-
-        remaining.append(token)
-        index += 1
-
-    return _ProfileArgumentParse(tuple(remaining), profile, True)
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=inert_handler,
+        cmd_proxy=inert_handler,
+        cmd_gateway_enroll=inert_handler,
+    )
+    return parser
 
 
-def _parse_cli_command(args: tuple[str, ...]) -> _ProfileArgumentParse:
-    profile_parse = _parse_profile_arguments(args)
-    if not profile_parse.valid:
-        return _ProfileArgumentParse((), None, False)
+def _parse_cli_command(args: tuple[str, ...]) -> tuple[str, str | None] | None:
+    from hermes_cli.profile_argv import parse_profile_argv
 
-    remaining = profile_parse.remaining
-    index = 0
-    while index < len(remaining) and _normalized_token(remaining[index]) != "gateway":
-        token = remaining[index]
-        if token in _CLI_BOOLEAN_OPTIONS:
-            index += 1
-            continue
+    profile_parse = parse_profile_argv(args)
+    parser = _build_cli_identity_parser()
+    try:
+        parsed = parser.parse_args(profile_parse.argv)
+    except ArgumentParseFailure:
+        return None
 
-        required_option = _required_cli_option(token)
-        if required_option is not None:
-            mode, value = required_option
-            if mode != "spaced":
-                if not value:
-                    return _ProfileArgumentParse((), None, False)
-                index += 1
-                continue
-            if index + 1 >= len(remaining) or remaining[index + 1].startswith("-"):
-                return _ProfileArgumentParse((), None, False)
-            index += 2
-            continue
+    if getattr(parsed, "command", None) != "gateway":
+        return None
+    if getattr(parsed, "version", False) or getattr(parsed, "oneshot", None) is not None:
+        return None
 
-        continue_option = _continue_cli_option(token)
-        if continue_option is not None:
-            mode, value = continue_option
-            if mode != "spaced":
-                if not value:
-                    return _ProfileArgumentParse((), None, False)
-                index += 1
-                continue
-            if index + 1 >= len(remaining):
-                return _ProfileArgumentParse((), None, False)
-            if not remaining[index + 1].startswith("-"):
-                index += 2
-                continue
-            index += 1
-            continue
-
-        return _ProfileArgumentParse((), None, False)
-
-    if index >= len(remaining):
-        return _ProfileArgumentParse((), None, False)
-
-    command = remaining[index:]
-    if len(command) == 1:
-        return _ProfileArgumentParse(("run",), profile_parse.profile, True)
-
-    subcommand = _normalized_token(command[1])
-    if subcommand == "run":
-        if all(token in _GATEWAY_RUN_OPTIONS for token in command[2:]):
-            return _ProfileArgumentParse(("run",), profile_parse.profile, True)
-        return _ProfileArgumentParse((), None, False)
-    if subcommand in _MANAGEMENT_SUBCOMMANDS:
-        return _ProfileArgumentParse((subcommand,), profile_parse.profile, True)
-    return _ProfileArgumentParse((), None, False)
+    subcommand = getattr(parsed, "gateway_command", None) or "run"
+    if subcommand != "run" and subcommand not in _MANAGEMENT_SUBCOMMANDS:
+        return None
+    return _normalized_token(subcommand), profile_parse.profile
 
 
 def _parse_gateway_command(argv: tuple[str, ...]) -> _GatewayCommandParse:
@@ -497,16 +299,17 @@ def _parse_gateway_command(argv: tuple[str, ...]) -> _GatewayCommandParse:
         return _GatewayCommandParse("run", None, leading_home, True, "direct")
 
     if kind == "legacy":
-        subcommand, valid = _parse_legacy_wrapper_tail(args)
-        if not valid:
+        subcommand = _parse_legacy_wrapper_tail(args)
+        if subcommand is None:
             return _GatewayCommandParse(None, None, None, False)
         return _GatewayCommandParse(subcommand, None, leading_home, True, "legacy")
 
-    profile_parse = _parse_cli_command(args)
-    if not profile_parse.valid:
+    cli_parse = _parse_cli_command(args)
+    if cli_parse is None:
         return _GatewayCommandParse(None, None, None, False)
+    subcommand, profile = cli_parse
     return _GatewayCommandParse(
-        profile_parse.remaining[0], profile_parse.profile, leading_home, True, "cli"
+        subcommand, profile, leading_home, True, "cli"
     )
 
 
@@ -523,33 +326,6 @@ def gateway_command_subcommand(argv: str | Iterable[str]) -> str | None:
         # so keep this manager-only shape out of that compatibility path.
         return None
     return parsed.subcommand if parsed.valid else None
-
-
-def _profile_arguments_are_valid(argv: tuple[str, ...]) -> bool:
-    """Return whether profile selectors are valid and bounded in this argv."""
-    return _parse_profile_arguments(argv).valid
-
-
-def _profile_from_argv(argv: tuple[str, ...]) -> str | None:
-    """Return the profile from a fully recognized gateway command, if any."""
-    parsed = _parse_gateway_command(argv)
-    return parsed.profile
-
-
-def _home_from_identity(
-    argv: tuple[str, ...],
-    environment: Mapping[str, str] | None,
-    default_home: Path | None,
-    *,
-    profile: str | None = None,
-    explicit_argv_home: str | None = None,
-) -> Path | None:
-    environment_has_home = environment is not None and "HERMES_HOME" in environment
-    if environment_has_home:
-        return _resolve_home_value(environment.get("HERMES_HOME"))
-    if explicit_argv_home is not None:
-        return _resolve_home_value(explicit_argv_home)
-    return _default_profile_home(default_home, profile)
 
 
 def _resolve_home_value(value: object) -> Path | None:
@@ -580,10 +356,18 @@ def _default_profile_home(
     return default
 
 
-def _profile_home_conflicts(home: Path, profile: str | None) -> bool:
-    if not profile or home.parent.name.lower() != "profiles":
+def _profile_home_conflicts(
+    home: Path, profile: str | None, default_home: Path | None
+) -> bool:
+    if not profile or profile == "default":
         return False
-    return home.name.lower() != profile.lower()
+    if default_home is not None:
+        expected = _default_profile_home(default_home, profile)
+        return expected is not None and home != expected
+    return not (
+        home.parent.name.casefold() == "profiles"
+        and home.name.casefold() == profile.casefold()
+    )
 
 
 def _resolve_identity_home(
@@ -602,6 +386,8 @@ def _resolve_identity_home(
     )
     explicit_home = _resolve_home_value(explicit_argv_home)
 
+    if environment_has_home and environment_home is None:
+        return None, True
     if environment_home is not None and explicit_home is not None:
         if environment_home != explicit_home:
             return None, True
@@ -610,15 +396,11 @@ def _resolve_identity_home(
         resolved_home = environment_home
     elif explicit_home is not None:
         resolved_home = explicit_home
-    elif environment_has_home:
-        # An invalid explicit environment override is not a reason to trust a
-        # caller-provided default home.
-        return None, False
     else:
         resolved_home = _default_profile_home(default_home, profile)
 
     if resolved_home is not None and _profile_home_conflicts(
-        resolved_home, profile
+        resolved_home, profile, default_home
     ):
         return None, True
     return resolved_home, False

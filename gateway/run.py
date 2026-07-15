@@ -19695,11 +19695,9 @@ def main():
     except Exception:
         pass
 
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
-    parser.add_argument("--config", "-c", help="Path to gateway config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    from gateway.command_line import build_direct_gateway_parser
+
+    parser = build_direct_gateway_parser()
     
     args = parser.parse_args()
     

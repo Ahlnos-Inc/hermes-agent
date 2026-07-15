@@ -22,7 +22,6 @@ Usage:
     ./scripts/hermes-gateway uninstall
 """
 
-import argparse
 import asyncio
 import os
 import subprocess
@@ -306,49 +305,9 @@ def run_gateway():
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Hermes Gateway - Messaging Platform Integration",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Run in foreground (for testing)
-    ./scripts/hermes-gateway run
-    
-    # Install as system service
-    ./scripts/hermes-gateway install
-    
-    # Manage the service
-    ./scripts/hermes-gateway start
-    ./scripts/hermes-gateway stop
-    ./scripts/hermes-gateway restart
-    ./scripts/hermes-gateway status
-    
-    # Uninstall
-    ./scripts/hermes-gateway uninstall
+    from gateway.command_line import build_legacy_gateway_parser
 
-Configuration:
-    Set environment variables in .env file or system environment:
-    - TELEGRAM_BOT_TOKEN
-    - DISCORD_BOT_TOKEN
-    - WHATSAPP_ENABLED
-    
-    Or create ~/.hermes/gateway.json for advanced configuration.
-"""
-    )
-    
-    parser.add_argument(
-        "command",
-        choices=["run", "install", "uninstall", "start", "stop", "restart", "status"],
-        nargs="?",
-        default="run",
-        help="Command to execute (default: run)"
-    )
-    
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Verbose output"
-    )
+    parser = build_legacy_gateway_parser()
     
     args = parser.parse_args()
     
