@@ -995,14 +995,38 @@ def test_reap_unsupervised_orphans_noop_on_systemd_hosts(monkeypatch):
 def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
     """No-systemd: orphan gets SIGTERM, and a survivor is force-killed."""
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "find_gateway_pids", lambda exclude_pids=None: [708])
+    identity = gateway.GatewayProcessIdentity(
+        708,
+        7080,
+        "python -m hermes_cli.main gateway restart",
+    )
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_process_identities_strict",
+        lambda **_kwargs: [identity],
+    )
     monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: True)
-    # Orphan ignores SIGTERM (matches the field report) and stays alive, so the
-    # follow-up SIGKILL must fire.
-    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
 
-    sent = []
-    monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    class _Process:
+        def __init__(self):
+            self.signals = []
+            self.kills = 0
+
+        def send_signal(self, sig):
+            self.signals.append(sig)
+
+        def kill(self):
+            self.kills += 1
+
+    process = _Process()
+    monkeypatch.setattr(
+        gateway, "_revalidate_gateway_process_identity", lambda _identity: process
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_wait_for_exact_gateway_identity_exit",
+        lambda _identity, _timeout: False,
+    )
     # Collapse the drain window: no real sleeping, and jump past the deadline
     # after the first check so the loop exits immediately.
     monkeypatch.setattr(gateway.time, "sleep", lambda _s: None)
@@ -1010,8 +1034,8 @@ def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
     monkeypatch.setattr(gateway.time, "monotonic", lambda: next(ticks, 200.0))
 
     assert gateway._reap_unsupervised_gateway_orphans() is True
-    assert (708, signal.SIGTERM) in sent
-    assert (708, signal.SIGKILL) in sent
+    assert process.signals == [signal.SIGTERM]
+    assert process.kills == 1
 
 
 def test_reap_unsupervised_orphans_returns_false_when_none_found(monkeypatch):
@@ -1137,21 +1161,26 @@ class TestWaitForGatewayExit:
 
 
 class TestStopProfileGateway:
-    def test_stop_profile_gateway_keeps_pid_file_when_process_still_running(self, monkeypatch):
-        calls = {"kill": 0, "alive_probes": 0, "remove": 0}
+    def test_stop_profile_gateway_keeps_pid_file_when_process_still_running(
+        self, monkeypatch
+    ):
+        calls = {"signals": 0, "revalidations": 0, "remove": 0}
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
-        # Post-#21561: the stop loop sends one SIGTERM via ``os.kill`` then
-        # polls liveness via ``gateway.status._pid_exists`` (safe on
-        # Windows — bpo-14484). Instrument both seams separately.
-        monkeypatch.setattr(
-            gateway.os,
-            "kill",
-            lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
+        identity = gateway.GatewayProcessIdentity(
+            12345,
+            123450,
+            "python -m hermes_cli.main gateway run --replace",
         )
         monkeypatch.setattr(
-            "gateway.status._pid_exists",
-            lambda pid: calls.__setitem__("alive_probes", calls["alive_probes"] + 1) or True,
+            gateway, "_capture_gateway_process_identity", lambda *_a, **_k: identity
+        )
+        monkeypatch.setattr(
+            gateway,
+            "_revalidate_gateway_process_identity",
+            lambda _identity: calls.__setitem__(
+                "revalidations", calls["revalidations"] + 1
+            ) or SimpleNamespace(send_signal=lambda _sig: calls.__setitem__("signals", calls["signals"] + 1)),
         )
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr(
@@ -1160,8 +1189,8 @@ class TestStopProfileGateway:
         )
 
         assert gateway.stop_profile_gateway() is True
-        assert calls["kill"] == 1          # one SIGTERM
-        assert calls["alive_probes"] == 20 # 20 liveness polls over the 2s window
+        assert calls["signals"] == 1
+        assert calls["revalidations"] == 21
         assert calls["remove"] == 0
 
 

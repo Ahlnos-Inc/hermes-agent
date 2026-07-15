@@ -15,6 +15,12 @@ from hermes_cli import gateway
 from gateway import status
 
 
+def _sigusr1():
+    value = getattr(signal, "SIGUSR1", None)
+    assert value is not None
+    return value
+
+
 @pytest.fixture
 def force_ps_path(monkeypatch):
     monkeypatch.setattr(gateway.os.path, "isdir", lambda path: False)
@@ -454,7 +460,7 @@ def test_sigusr1_canonical_restart_signals_revalidated_process_handle(monkeypatc
     assert gateway._graceful_restart_via_sigusr1(
         identity.pid, 1.0, expected_identity=identity
     ) is True
-    assert sent == [signal.SIGUSR1]
+    assert sent == [_sigusr1()]
 
 
 def test_sigusr1_canonical_restart_revalidation_failure_does_not_signal(monkeypatch):
@@ -475,6 +481,173 @@ def test_sigusr1_canonical_restart_revalidation_failure_does_not_signal(monkeypa
     assert gateway._graceful_restart_via_sigusr1(
         identity.pid, 1.0, expected_identity=identity
     ) is False
+
+
+def test_sigusr1_without_identity_captures_and_signals_exact_handle(monkeypatch):
+    sent = []
+
+    class _Process:
+        def send_signal(self, sig):
+            sent.append(sig)
+
+    identity = _identity()
+    process = _Process()
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: process,
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("generic SIGUSR1 must not use raw os.kill"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_wait_for_exact_gateway_identity_exit",
+        lambda _identity, _timeout: True,
+    )
+
+    assert gateway._graceful_restart_via_sigusr1(identity.pid, 1.0) is True
+    assert sent == [_sigusr1()]
+
+
+def test_sigusr1_identity_replacement_between_capture_and_signal_fails_closed(
+    monkeypatch,
+):
+    identity = _identity()
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: (_ for _ in ()).throw(
+            gateway.GatewayProcessTerminationError(["identity changed"])
+        ),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("replaced PID must not use raw os.kill"),
+    )
+
+    assert gateway._graceful_restart_via_sigusr1(identity.pid, 1.0) is False
+
+
+def test_sigusr1_identity_access_denial_does_not_signal(monkeypatch):
+    identity = _identity()
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: (_ for _ in ()).throw(
+            gateway.GatewayProcessTerminationError(["permission denied"])
+        ),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("denied identity must not use raw os.kill"),
+    )
+
+    assert gateway._graceful_restart_via_sigusr1(identity.pid, 1.0) is False
+
+
+def test_sigusr1_identity_already_gone_is_converged_without_signal(monkeypatch):
+    identity = _identity()
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("gone identity must not use raw os.kill"),
+    )
+
+    assert gateway._graceful_restart_via_sigusr1(identity.pid, 1.0) is True
+
+
+def test_launchd_self_sigusr1_uses_revalidated_handle(monkeypatch):
+    sent = []
+    identity = _identity()
+
+    monkeypatch.setattr(gateway, "_is_pid_ancestor_of_current_process", lambda _pid: True)
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: SimpleNamespace(send_signal=sent.append),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("launchd SIGUSR1 must not use raw os.kill"),
+    )
+
+    assert gateway._request_gateway_self_restart(identity.pid) is True
+    assert sent == [_sigusr1()]
+
+
+def test_identity_signal_for_term_uses_revalidated_handle(monkeypatch):
+    sent = []
+    identity = _identity()
+    monkeypatch.setattr(
+        gateway,
+        "_revalidate_gateway_process_identity",
+        lambda _identity: SimpleNamespace(send_signal=sent.append),
+    )
+    monkeypatch.setattr(
+        gateway.os,
+        "kill",
+        lambda *_args: pytest.fail("identity TERM must not use raw os.kill"),
+    )
+
+    assert gateway._signal_gateway_process_identity(identity, signal.SIGTERM) == "signalled"
+    assert sent == [signal.SIGTERM]
+
+
+def test_strict_identity_inventory_captures_allowed_no_supervisor_manager(
+    monkeypatch,
+):
+    manager = gateway.GatewayProcessIdentity(
+        708,
+        7080,
+        "python -m hermes_cli.main gateway restart",
+    )
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids_strict",
+        lambda **_kwargs: [manager.pid],
+    )
+    seen_roles = []
+
+    def read_identity(_pid, **kwargs):
+        seen_roles.append(kwargs["allowed_roles"])
+        return manager, object()
+
+    monkeypatch.setattr(gateway, "_read_live_gateway_process_identity", read_identity)
+
+    identities = gateway.find_gateway_process_identities_strict(
+        all_profiles=True,
+        include_restart_managers=True,
+    )
+
+    assert identities == [manager]
+    assert gateway.GatewayRuntimeRole.MANAGER in seen_roles[0]
 
 
 def test_strict_proc_inventory_fails_closed_on_permission_error(monkeypatch):

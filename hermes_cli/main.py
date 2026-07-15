@@ -8725,20 +8725,22 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
         from hermes_cli.gateway import (
-            _capture_gateway_argv,
             _get_restart_drain_timeout,
-            find_gateway_pids_strict,
+            find_gateway_process_identities_strict,
             find_profile_gateway_processes,
+            terminate_gateway_process_identities_strict,
         )
     except Exception as exc:
         logger.debug("Could not prepare Windows gateway pause for update: %s", exc)
         return None
 
     try:
-        running_pids = list(
-            dict.fromkeys(find_gateway_pids_strict(all_profiles=True))
+        running_identities = list(
+            find_gateway_process_identities_strict(
+                all_profiles=True,
+                include_restart_managers=True,
+            )
         )
     except Exception as exc:
         # Updating a shared checkout while process discovery is incomplete can
@@ -8746,6 +8748,8 @@ def _pause_windows_gateways_for_update() -> dict | None:
         # inventory is deliberately fail-closed for this mutation path.
         logger.error("Could not discover Windows gateway PIDs before update: %s", exc)
         raise
+    identity_by_pid = {identity.pid: identity for identity in running_identities}
+    running_pids = list(identity_by_pid)
     if not running_pids:
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
@@ -8803,28 +8807,51 @@ def _pause_windows_gateways_for_update() -> dict | None:
     )
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
 
-    # Snapshot each unmapped gateway's command line *before* we force-kill it,
-    # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
-    # its own argv. Unmapped gateways are ones with no profile→PID-file mapping
-    # — e.g. a Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main
-    # gateway run``. Without this snapshot they were force-killed and never
-    # restarted (the "Restart manually after update" dead-end from #50090).
+    # Snapshot each unmapped gateway's attested command line before we
+    # force-kill it, so ``_resume_windows_gateways_after_update`` can respawn it
+    # by replaying its own argv. Unmapped gateways are ones with no
+    # profile→PID-file mapping — e.g. a Windows Scheduled Task running
+    # ``pythonw.exe -m hermes_cli.main gateway run``. The identity inventory
+    # already retained the exact argv, birth, profile, and HERMES_HOME without
+    # retaining any other environment values.
     unmapped: list[dict] = []
     for pid in unmapped_pids:
-        argv = None
-        try:
-            argv = _capture_gateway_argv(int(pid))
-        except Exception as exc:
-            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
+        identity = identity_by_pid.get(pid)
+        argv = list(identity.argv) if identity is not None else None
         unmapped.append({"pid": int(pid), "argv": argv})
 
     force_killed = []
+    identity_failures: set[int] = set()
     for pid in sorted(set(survivors).union(unmapped_pids)):
+        identity = identity_by_pid.get(pid)
+        if identity is None:
+            continue
         try:
-            terminate_pid(int(pid), force=True)
+            terminate_gateway_process_identities_strict([identity], force=True)
             force_killed.append(int(pid))
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            identity_failures.add(int(pid))
+        except Exception as exc:
+            identity_failures.add(int(pid))
+            logger.warning(
+                "Could not force-stop exact Windows gateway identity PID %s: %s",
+                pid,
+                exc,
+            )
+
+    if identity_failures:
+        # Do not let the resume phase replay stale argv or PID-file state after
+        # identity revalidation failed. The process may have been replaced or
+        # become unreadable, so abort before mutating the checkout.
+        print(
+            "  ⚠ Could not safely stop "
+            f"{len(identity_failures)} Windows gateway process(es); "
+            "update aborted without signaling or restarting stale identities"
+        )
+        raise RuntimeError(
+            "Windows gateway identity revalidation failed before update: "
+            + ", ".join(str(pid) for pid in sorted(identity_failures))
+        )
 
     if profiles:
         print(f"  ✓ Paused gateway profile(s): {', '.join(sorted(profiles))}")
@@ -9970,12 +9997,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 is_macos,
                 supports_systemd_services,
                 _ensure_user_systemd_env,
-                find_gateway_pids_strict,
+                find_gateway_process_identities_strict,
                 find_profile_gateway_processes,
                 launch_detached_profile_gateway_restart,
                 _get_service_pids,
+                _capture_gateway_process_identity,
                 _graceful_restart_via_sigusr1,
-                _wait_for_gateway_exit,
+                _signal_gateway_process_identity,
+                terminate_gateway_process_identities_strict,
+                _wait_for_exact_gateway_identity_exit,
             )
             import signal as _signal
 
@@ -10153,6 +10183,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             restarted_services = []
             killed_pids = set()
+            attempted_identity_keys = set()
             relaunched_profiles = []
 
             # --- Systemd services (Linux) ---
@@ -10244,10 +10275,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 print(
                                     f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
                                 )
-                                _graceful_ok = _graceful_restart_via_sigusr1(
-                                    _main_pid,
-                                    drain_timeout=_drain_budget,
-                                )
+                                _main_identity_capture_failed = False
+                                try:
+                                    _main_identity = _capture_gateway_process_identity(
+                                        _main_pid,
+                                        include_restart_managers=False,
+                                    )
+                                except Exception:
+                                    _main_identity = None
+                                    _main_identity_capture_failed = True
+                                if _main_identity_capture_failed:
+                                    _graceful_ok = False
+                                elif _main_identity is None:
+                                    # The discovered MainPID vanished before
+                                    # attestation. Treat it as converged, but
+                                    # never recapture and signal a successor.
+                                    _graceful_ok = True
+                                else:
+                                    _graceful_ok = _graceful_restart_via_sigusr1(
+                                        _main_pid,
+                                        drain_timeout=_drain_budget,
+                                        expected_identity=_main_identity,
+                                    )
 
                             if _graceful_ok:
                                 # Gateway exited after a planned restart.
@@ -10476,15 +10525,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids_strict(
-                exclude_pids=service_pids, all_profiles=True
+            manual_identities = find_gateway_process_identities_strict(
+                exclude_pids=service_pids,
+                all_profiles=True,
+                include_restart_managers=(
+                    not supports_systemd_services() and not is_macos()
+                ),
             )
+            identity_by_pid = {identity.pid: identity for identity in manual_identities}
+            manual_pids = tuple(identity_by_pid)
             profile_processes = {
                 proc.pid: proc
                 for proc in find_profile_gateway_processes(exclude_pids=service_pids)
                 if proc.pid in manual_pids
             }
             for pid, proc in profile_processes.items():
+                identity = identity_by_pid.get(pid)
+                if identity is None:
+                    continue
                 if not launch_detached_profile_gateway_restart(proc.profile, pid):
                     continue
                 # Prefer a graceful SIGUSR1 drain so in-flight agent runs
@@ -10503,12 +10561,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 drained = _graceful_restart_via_sigusr1(
                     pid,
                     drain_timeout=_drain_budget,
+                    expected_identity=identity,
                 )
                 if not drained:
-                    try:
-                        os.kill(pid, _signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                    signal_result = _signal_gateway_process_identity(
+                        identity, _signal.SIGTERM
+                    )
+                    if signal_result == "failed":
+                        print(
+                            f"  ⚠ Could not signal gateway PID {pid}; "
+                            "identity was not revalidated"
+                        )
+                        continue
+                attempted_identity_keys.add(identity.identity_key())
                 # Wait for the old process to fully exit before the watcher
                 # spawns the new gateway.  Telegram holds the previous
                 # getUpdates long-poll session open on its servers for up to
@@ -10523,18 +10588,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # watcher take over.  The Telegram adapter's retry logic
                 # handles any remaining 409s if the server session is still
                 # live when the new gateway polls.
-                _wait_for_gateway_exit(timeout=5.0, force_after=None)
+                _wait_for_exact_gateway_identity_exit(identity, timeout=5.0)
                 killed_pids.add(pid)
                 relaunched_profiles.append(proc.profile)
 
             for pid in manual_pids:
                 if pid in profile_processes:
                     continue
-                try:
-                    os.kill(pid, _signal.SIGTERM)
+                identity = identity_by_pid[pid]
+                signal_result = _signal_gateway_process_identity(
+                    identity, _signal.SIGTERM
+                )
+                if signal_result in {"signalled", "gone"}:
+                    attempted_identity_keys.add(identity.identity_key())
                     killed_pids.add(pid)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                elif signal_result == "failed":
+                    print(
+                        f"  ⚠ Could not signal gateway PID {pid}; "
+                        "identity was not revalidated"
+                    )
 
             if restarted_services or killed_pids:
                 print()
@@ -10568,30 +10640,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
             try:
                 _time.sleep(3.0)
                 _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids_strict(
+                _surviving = find_gateway_process_identities_strict(
                     exclude_pids=_service_pids_after,
                     all_profiles=True,
+                    include_restart_managers=(
+                        not supports_systemd_services() and not is_macos()
+                    ),
                 )
                 # Scope to PIDs we already tried to kill during this
                 # update (killed_pids).  Anything new is a gateway that
                 # started AFTER our restart attempt — respecting user
                 # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
+                _stuck = [
+                    identity
+                    for identity in _surviving
+                    if identity.identity_key() in attempted_identity_keys
+                ]
                 if _stuck:
                     print()
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
                     )
-                    from gateway.status import terminate_pid as _terminate_pid
                     for pid in _stuck:
                         try:
-                            # Routes through taskkill /T /F on Windows,
-                            # SIGKILL on POSIX — _signal.SIGKILL doesn't
-                            # exist on Windows so the old raw os.kill call
-                            # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
+                            terminate_gateway_process_identities_strict(
+                                [pid], force=True
+                            )
                         except (ProcessLookupError, PermissionError, OSError):
                             pass
+                        except Exception as _force_exc:
+                            logger.debug(
+                                "Could not force-stop exact gateway identity PID %s: %s",
+                                pid.pid,
+                                _force_exc,
+                            )
                     # Give the OS a beat to reap the processes so the
                     # watchers see them exit and respawn.
                     _time.sleep(1.5)

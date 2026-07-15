@@ -590,7 +590,16 @@ def test_restart_all_passes_birth_identity_to_sigusr1_guard(launchd_env, monkeyp
 
 
 def test_sigusr1_birth_identity_change_is_not_signalled(monkeypatch):
-    monkeypatch.setattr(gateway_cli, "_launchd_pid_is_live", lambda pid, start: False)
+    identity = gateway_cli.GatewayProcessIdentity(
+        4242,
+        42421,
+        "python -m hermes_cli.main gateway run --replace",
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_capture_gateway_process_identity",
+        lambda _pid, **_kwargs: identity,
+    )
     monkeypatch.setattr(
         gateway_cli.os,
         "kill",

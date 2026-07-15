@@ -459,15 +459,26 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     tmp_path,
     capsys,
 ):
-    import gateway.status as status_mod
     import hermes_cli.gateway as gateway_mod
 
     profile_home = tmp_path / "profiles" / "work"
     profile_home.mkdir(parents=True)
     profile_proc = SimpleNamespace(profile="work", path=profile_home, pid=101)
+    gateway_argv = ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    identities = [
+        gateway_mod.GatewayProcessIdentity(
+            pid,
+            pid * 10,
+            gateway_argv,
+            environment={"HERMES_HOME": str(tmp_path)},
+        )
+        for pid in (101, 202)
+    ]
 
     monkeypatch.setattr(
-        gateway_mod, "find_gateway_pids_strict", lambda **_k: [101, 202]
+        gateway_mod,
+        "find_gateway_process_identities_strict",
+        lambda **_k: identities,
     )
     monkeypatch.setattr(
         gateway_mod,
@@ -482,19 +493,14 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
         return set()
 
     monkeypatch.setattr(cli_main, "_wait_for_windows_update_gateway_exit", fake_wait)
-    monkeypatch.setattr(
-        gateway_mod,
-        "_capture_gateway_argv",
-        lambda pid: ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
-        if pid == 202
-        else None,
-    )
-
     terminated = []
     monkeypatch.setattr(
-        status_mod,
-        "terminate_pid",
-        lambda pid, force=False: terminated.append((pid, force)),
+        gateway_mod,
+        "terminate_gateway_process_identities_strict",
+        lambda exact_identities, force=False: terminated.extend(
+            (identity.pid, force) for identity in exact_identities
+        )
+        or tuple(exact_identities),
     )
 
     token = cli_main._pause_windows_gateways_for_update()
@@ -523,6 +529,41 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     # An unmapped PID whose argv we captured is respawnable, so we must NOT
     # tell the user to restart it manually.
     assert "Restart manually after update" not in captured
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_windows_update_does_not_respawn_replaced_identity(
+    _winp, monkeypatch, tmp_path, capsys
+):
+    import hermes_cli.gateway as gateway_mod
+
+    identity = gateway_mod.GatewayProcessIdentity(
+        202,
+        2020,
+        ["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"],
+        environment={"HERMES_HOME": str(tmp_path)},
+    )
+    monkeypatch.setattr(
+        gateway_mod,
+        "find_gateway_process_identities_strict",
+        lambda **_kwargs: [identity],
+    )
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 0.1)
+    monkeypatch.setattr(
+        gateway_mod,
+        "terminate_gateway_process_identities_strict",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            gateway_mod.GatewayProcessTerminationError(["identity changed"])
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="202"):
+        cli_main._pause_windows_gateways_for_update()
+
+    assert "update aborted without signaling" in capsys.readouterr().out
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -614,7 +655,9 @@ def test_pause_returns_cold_start_token_when_installed_but_none_running(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids_strict", lambda **_k: [])
+    monkeypatch.setattr(
+        gateway_mod, "find_gateway_process_identities_strict", lambda **_k: []
+    )
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
 
     token = cli_main._pause_windows_gateways_for_update()
@@ -641,7 +684,9 @@ def test_pause_returns_none_when_nothing_running_and_not_installed(
     import hermes_cli.gateway as gateway_mod
     from hermes_cli import gateway_windows
 
-    monkeypatch.setattr(gateway_mod, "find_gateway_pids_strict", lambda **_k: [])
+    monkeypatch.setattr(
+        gateway_mod, "find_gateway_process_identities_strict", lambda **_k: []
+    )
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
 
     assert cli_main._pause_windows_gateways_for_update() is None

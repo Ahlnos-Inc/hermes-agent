@@ -251,17 +251,31 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
     return False
 
 
-def _request_gateway_self_restart(pid: int) -> bool:
+def _request_gateway_self_restart(
+    pid: int,
+    *,
+    expected_identity: GatewayProcessIdentity | None = None,
+) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if not _is_pid_ancestor_of_current_process(pid):
         return False
-    try:
-        os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
-    except (ProcessLookupError, PermissionError, OSError):
+    identity = expected_identity
+    if identity is None:
+        try:
+            identity = _capture_gateway_process_identity(
+                pid,
+                include_restart_managers=False,
+            )
+        except GatewayProcessTerminationError:
+            return False
+    if identity is None:
         return False
-    return True
+    if identity.pid != pid or identity.runtime_role is not GatewayRuntimeRole.RUNTIME:
+        return False
+    return _signal_gateway_process_identity(identity, sigusr1) == "signalled"
 
 
 def _graceful_restart_via_sigusr1(
@@ -288,56 +302,48 @@ def _graceful_restart_via_sigusr1(
             ``agent.restart_drain_timeout`` to allow the drain loop to
             finish cleanly.
         expected_start_time: Optional process birth identity. When supplied,
-            the PID is rechecked immediately before signalling so a PID reuse
-            race cannot signal an unrelated process.
+            it must match the captured identity before the retained,
+            revalidated handle can be signalled.
 
     Returns:
-        True if the PID was signalled and exited within the timeout.
+        True if the exact identity was signalled and exited within the timeout,
+        or if it was already gone.
         False if SIGUSR1 couldn't be sent or the process didn't exit in
         time (caller should fall back to a harder restart path).
     """
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if pid <= 0:
         return False
-    if expected_identity is not None:
-        if expected_identity.pid != pid:
-            return False
+    if expected_identity is None:
         try:
-            process = _revalidate_gateway_process_identity(expected_identity)
-            if process is None:
-                return True
+            expected_identity = _capture_gateway_process_identity(
+                pid,
+                expected_start_time=expected_start_time,
+            )
         except GatewayProcessTerminationError:
             return False
-        try:
-            process.send_signal(signal.SIGUSR1)
-        except ProcessLookupError:
+        if expected_identity is None:
+            # The process vanished before we could capture a canonical
+            # identity. There is nothing left to signal.
             return True
-        except (PermissionError, OSError):
-            return False
-        except Exception as exc:
-            # psutil's process-handle API uses its own exception classes for
-            # the same birth-aware race.  A vanished handle or zombie is
-            # already converged; access denial is a red signal path.
-            name = type(exc).__name__
-            if name in {"NoSuchProcess", "ZombieProcess"}:
-                return True
-            if name == "AccessDenied":
-                return False
-            raise
-    elif expected_start_time is not None and not _launchd_pid_is_live(
-        pid, expected_start_time
+    elif expected_identity.pid != pid:
+        return False
+
+    if (
+        expected_start_time is not None
+        and expected_identity.start_time != expected_start_time
     ):
         return False
-    else:
-        try:
-            os.kill(pid, signal.SIGUSR1)  # windows-footgun: POSIX birth-only compatibility path
-        except ProcessLookupError:
-            # Already gone — nothing to drain.
-            return True
-        except (PermissionError, OSError):
-            return False
 
+    signal_result = _signal_gateway_process_identity(
+        expected_identity, sigusr1
+    )
+    if signal_result == "gone":
+        return True
+    if signal_result != "signalled":
+        return False
     import time as _time
 
     if expected_identity is not None:
@@ -775,6 +781,11 @@ def find_gateway_pids_strict(
             include_restart_managers = not supports_systemd_services()
         except Exception:
             include_restart_managers = False
+    elif include_restart_managers:
+        try:
+            include_restart_managers = not supports_systemd_services()
+        except Exception:
+            include_restart_managers = False
     try:
         scanned_pids = _scan_gateway_pids(
             exclude,
@@ -806,6 +817,8 @@ def _psutil_process(pid: int):
 
 def _read_live_gateway_process_identity(
     pid: int,
+    *,
+    allowed_roles: tuple[GatewayRuntimeRole, ...] = (GatewayRuntimeRole.RUNTIME,),
 ) -> tuple[GatewayProcessIdentity, object]:
     """Read one live PID's canonical birth/argv/profile/home attestation.
 
@@ -860,15 +873,66 @@ def _read_live_gateway_process_identity(
             else {}
         ),
     )
-    if identity.runtime_role is not GatewayRuntimeRole.RUNTIME:
+    if identity.runtime_role not in allowed_roles:
         raise GatewayProcessEnumerationError(
-            f"gateway PID {pid} is not an attested gateway runtime"
+            f"gateway PID {pid} is not an attested gateway process for the requested role"
         )
     if identity.hermes_home is None:
         raise GatewayProcessEnumerationError(
             f"gateway PID {pid} has no resolved HERMES_HOME identity"
         )
     return identity, process
+
+
+def _gateway_process_identity_roles(
+    include_restart_managers: bool | None,
+) -> tuple[GatewayRuntimeRole, ...]:
+    """Return the exact roles allowed for destructive process operations."""
+    if include_restart_managers is None:
+        try:
+            include_restart_managers = not supports_systemd_services()
+        except Exception:
+            include_restart_managers = False
+    if include_restart_managers:
+        try:
+            include_restart_managers = not supports_systemd_services()
+        except Exception:
+            include_restart_managers = False
+    if include_restart_managers:
+        return (GatewayRuntimeRole.RUNTIME, GatewayRuntimeRole.MANAGER)
+    return (GatewayRuntimeRole.RUNTIME,)
+
+
+def _capture_gateway_process_identity(
+    pid: int,
+    *,
+    expected_start_time: int | None = None,
+    include_restart_managers: bool | None = None,
+) -> GatewayProcessIdentity | None:
+    """Capture one allowed identity, without retaining process environment."""
+    if pid <= 0:
+        return None
+    try:
+        allowed_roles = _gateway_process_identity_roles(include_restart_managers)
+        if allowed_roles == (GatewayRuntimeRole.RUNTIME,):
+            identity, _process = _read_live_gateway_process_identity(pid)
+        else:
+            identity, _process = _read_live_gateway_process_identity(
+                pid, allowed_roles=allowed_roles
+            )
+    except ProcessLookupError:
+        return None
+    except PermissionError as exc:
+        raise GatewayProcessTerminationError(
+            [f"PID {pid}: permission denied while capturing identity"]
+        ) from exc
+    except GatewayProcessEnumerationError as exc:
+        raise GatewayProcessTerminationError([f"PID {pid}: {exc}"]) from exc
+    if expected_start_time is not None and identity.start_time != expected_start_time:
+        raise GatewayProcessTerminationError(
+            [f"PID {pid}: birth identity changed; signal skipped"]
+        )
+    return identity
 
 
 def find_gateway_process_identities_strict(
@@ -883,14 +947,23 @@ def find_gateway_process_identities_strict(
     callers.  macOS destructive transactions use this stronger companion so a
     later signal cannot silently follow a recycled PID or an argv change.
     """
+    allowed_roles = _gateway_process_identity_roles(include_restart_managers)
     identities: list[GatewayProcessIdentity] = []
+    effective_include_restart_managers = (
+        GatewayRuntimeRole.MANAGER in allowed_roles
+    )
     for pid in find_gateway_pids_strict(
         exclude_pids=exclude_pids,
         all_profiles=all_profiles,
-        include_restart_managers=include_restart_managers,
+        include_restart_managers=effective_include_restart_managers,
     ):
         try:
-            identity, _process = _read_live_gateway_process_identity(pid)
+            if allowed_roles == (GatewayRuntimeRole.RUNTIME,):
+                identity, _process = _read_live_gateway_process_identity(pid)
+            else:
+                identity, _process = _read_live_gateway_process_identity(
+                    pid, allowed_roles=allowed_roles
+                )
         except ProcessLookupError:
             # A process can exit between the strict scan and identity read.
             continue
@@ -1773,7 +1846,13 @@ def _revalidate_gateway_process_identity(
 ):
     """Return a live process handle only when its attestation still matches."""
     try:
-        current, process = _read_live_gateway_process_identity(identity.pid)
+        if identity.runtime_role is GatewayRuntimeRole.RUNTIME:
+            current, process = _read_live_gateway_process_identity(identity.pid)
+        else:
+            current, process = _read_live_gateway_process_identity(
+                identity.pid,
+                allowed_roles=(identity.runtime_role,),
+            )
     except ProcessLookupError:
         return None
     except PermissionError as exc:
@@ -1792,6 +1871,33 @@ def _revalidate_gateway_process_identity(
             ]
         )
     return process
+
+
+def _signal_gateway_process_identity(
+    identity: GatewayProcessIdentity,
+    sig: int,
+) -> str:
+    """Signal one revalidated process handle, returning ``signalled/gone/failed``."""
+    try:
+        process = _revalidate_gateway_process_identity(identity)
+    except GatewayProcessTerminationError:
+        return "failed"
+    if process is None:
+        return "gone"
+    try:
+        process.send_signal(sig)
+    except ProcessLookupError:
+        return "gone"
+    except (PermissionError, OSError):
+        return "failed"
+    except Exception as exc:
+        name = type(exc).__name__
+        if name in {"NoSuchProcess", "ZombieProcess"}:
+            return "gone"
+        if name == "AccessDenied":
+            return "failed"
+        raise
+    return "signalled"
 
 
 def _wait_for_exact_gateway_identity_exit(
@@ -1936,46 +2042,64 @@ def _reap_unsupervised_gateway_orphans() -> bool:
     except Exception:
         return False
 
-    from gateway.status import _pid_exists, write_planned_stop_marker
+    from gateway.status import write_planned_stop_marker
 
     own = {os.getpid()}
     try:
-        # find_gateway_pids() includes no-supervisor `gateway restart` runtimes
-        # for the current profile when no systemd supervisor is present.
-        orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
+        # find_gateway_process_identities_strict() includes the explicit
+        # no-supervisor `gateway restart` manager role, which can itself host
+        # the runtime while it drains/relaunches.
+        orphans = find_gateway_process_identities_strict(
+            exclude_pids=own,
+            all_profiles=False,
+            include_restart_managers=True,
+        )
     except Exception:
         return False
     if not orphans:
         return False
 
     reaped = False
-    for pid in orphans:
+    signalled: list[GatewayProcessIdentity] = []
+    for identity in orphans:
         try:
-            write_planned_stop_marker(pid)
+            write_planned_stop_marker(identity.pid)
         except Exception:
             pass
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        signal_result = _signal_gateway_process_identity(identity, signal.SIGTERM)
+        if signal_result == "gone":
             continue
-        except PermissionError:
-            print(f"⚠ Permission denied to kill orphaned gateway PID {pid}")
+        if signal_result != "signalled":
+            print(
+                f"⚠ Could not signal orphaned gateway PID {identity.pid}; "
+                "identity was not revalidated"
+            )
             continue
+        signalled.append(identity)
         reaped = True
 
     # SIGTERM released the port in the field report but the orphan kept
     # running until a follow-up SIGKILL — wait briefly, then force-kill
     # any survivor so the replacement can bind the port cleanly.
     deadline = time.monotonic() + 5.0
-    survivors = list(orphans)
+    survivors = list(signalled)
     while survivors and time.monotonic() < deadline:
-        survivors = [p for p in survivors if _pid_exists(p)]
+        remaining: list[GatewayProcessIdentity] = []
+        for identity in survivors:
+            try:
+                if _revalidate_gateway_process_identity(identity) is not None:
+                    remaining.append(identity)
+            except GatewayProcessTerminationError:
+                # Changed or unreadable identities are red; never escalate
+                # them to a second signal.
+                continue
+        survivors = remaining
         if survivors:
             time.sleep(0.2)
-    for pid in survivors:
+    if survivors:
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except (ProcessLookupError, PermissionError, OSError):
+            terminate_gateway_process_identities_strict(survivors, force=True)
+        except GatewayProcessTerminationError:
             pass
 
     return reaped
@@ -2005,28 +2129,42 @@ def stop_profile_gateway() -> bool:
         return _reap_unsupervised_gateway_orphans()
 
     try:
+        identity = _capture_gateway_process_identity(
+            pid,
+            include_restart_managers=True,
+        )
+    except GatewayProcessTerminationError:
+        print(f"⚠ Permission denied to signal PID {pid}")
+        return False
+    if identity is None:
+        remove_pid_file()
+        return True
+
+    try:
         from gateway.status import write_planned_stop_marker
 
         write_planned_stop_marker(pid)
     except Exception:
         pass
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
-    except PermissionError:
-        print(f"⚠ Permission denied to kill PID {pid}")
+    signal_result = _signal_gateway_process_identity(identity, signal.SIGTERM)
+    if signal_result == "gone":
+        remove_pid_file()
+        return True
+    if signal_result != "signalled":
+        print(f"⚠ Permission denied to signal PID {pid}")
         return False
 
-    # Wait briefly for it to exit. On Windows, os.kill(pid, 0) is NOT
-    # a no-op — route through the cross-platform existence check.
+    # Wait briefly for exactly the attested process to exit. A PID-only poll
+    # could follow a recycled PID and must not drive a later mutation.
     import time as _time
-    from gateway.status import _pid_exists
 
     for _ in range(20):
-        if not _pid_exists(pid):
-            break
+        try:
+            if _revalidate_gateway_process_identity(identity) is None:
+                break
+        except GatewayProcessTerminationError:
+            return False
         _time.sleep(0.5)
 
     if get_running_pid() is None:
@@ -3693,9 +3831,30 @@ def systemd_restart(system: bool = False):
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
         drain_timeout = _get_restart_drain_timeout()
+        identity_capture_failed = False
+        try:
+            expected_identity = _capture_gateway_process_identity(
+                pid,
+                include_restart_managers=False,
+            )
+        except GatewayProcessTerminationError:
+            expected_identity = None
+            identity_capture_failed = True
 
         print(f"⏳ {scope_label} service restarting gracefully (PID {pid})...")
-        if _graceful_restart_via_sigusr1(pid, drain_timeout + 5):
+        if identity_capture_failed:
+            graceful_restart_ok = False
+        elif expected_identity is None:
+            # The discovered process vanished before identity capture. Do not
+            # recapture this PID: a successor must never receive this restart.
+            graceful_restart_ok = True
+        else:
+            graceful_restart_ok = _graceful_restart_via_sigusr1(
+                pid,
+                drain_timeout + 5,
+                expected_identity=expected_identity,
+            )
+        if graceful_restart_ok:
             # The gateway exits with code 75 for a planned service restart.
             # RestartSec can otherwise delay the relaunch even though the
             # operator asked for an immediate restart, so kick the unit once
@@ -7220,15 +7379,32 @@ def launchd_restart():
     from gateway.status import get_running_pid
 
     pid = get_running_pid()
+    expected_identity = None
+    identity_capture_failed = False
+    if pid is not None:
+        try:
+            expected_identity = _capture_gateway_process_identity(
+                pid,
+                include_restart_managers=False,
+            )
+        except GatewayProcessTerminationError:
+            identity_capture_failed = True
     enabled_before_restart = False
     if pid is not None:
+        if identity_capture_failed:
+            print_error(
+                f"Could not revalidate gateway PID {pid}; no signal was sent."
+            )
+            return
         # A self-restart exits cleanly and relies on launchd KeepAlive to
         # create the replacement. Clear the exact label's maintenance fence
         # before SIGUSR1; if enable fails, do not signal the running gateway
         # and do not spawn a detached duplicate from the fallback below.
         _launchd_enable(domain, label)
         enabled_before_restart = True
-        if _request_gateway_self_restart(pid):
+        if expected_identity is not None and _request_gateway_self_restart(
+            pid, expected_identity=expected_identity
+        ):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
@@ -7251,12 +7427,25 @@ def launchd_restart():
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
                 f"(up to {drain_timeout:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
+            if expected_identity is None:
+                # The PID disappeared after the initial discovery. Treat that
+                # as converged and let launchd kickstart the service.
                 pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+            else:
+                signal_result = _signal_gateway_process_identity(
+                    expected_identity, signal.SIGTERM
+                )
+                if signal_result == "gone":
+                    pid = None
+                elif signal_result != "signalled":
+                    print_error(
+                        f"Could not revalidate gateway PID {pid}; no signal was sent."
+                    )
+                    return
+            if pid is not None and expected_identity is not None:
+                exited = _wait_for_exact_gateway_identity_exit(
+                    expected_identity, timeout=drain_timeout
+                )
                 if not exited:
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
