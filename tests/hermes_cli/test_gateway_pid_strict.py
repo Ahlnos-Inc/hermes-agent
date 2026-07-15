@@ -207,10 +207,177 @@ def test_canonical_identity_contains_runtime_profile_and_home_attestation(tmp_pa
         ("/opt/foreign-hermes", "gateway", "run"),
         ("/usr/bin/python3", "--script", "foreign/gateway/run.py"),
         ("foreign", r"C:\\Program Files\\Hermes\\Hermes.EXE", "gateway", "run"),
+        ("hermes", "chat", "gateway", "run"),
+        ("hermes", "mcp", "servers", "gateway", "run"),
     ],
 )
 def test_canonical_classifier_rejects_decoy_entrypoint_tokens(argv):
     role, profile, home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.FOREIGN
+    assert profile is None
+    assert home is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("hermes", "foo", "gateway", "run"),
+        ("hermes", "--help", "gateway", "run"),
+        ("hermes", "--profile", "x", "nonsense", "gateway", "run"),
+        ("python", "-m", "hermes_cli.main", "garbage", "gateway", "run"),
+        ("python", "-m", "hermes_cli/main.py", "garbage", "gateway", "run"),
+        ("python", "hermes_cli/main.py", "garbage", "gateway", "run"),
+        ("hermes_cli/main.py", "dashboard", "gateway", "run"),
+        ("hermes", "--profile", "x", "--profile", "y", "gateway", "run"),
+        ("hermes", "--profile", "x", "--profile", "x", "gateway", "run"),
+        ("hermes", "--profile=bad.profile", "gateway", "run"),
+        ("hermes", "gateway", "run", "--", "--profile", "x"),
+        ("python", "-m", "hermes_cli.main", "gateway", "run", "--", "-p", "x"),
+    ],
+    ids=[
+        "foreign-prefix",
+        "help-prefix",
+        "profile-then-foreign-prefix",
+        "module-foreign-prefix",
+        "historical-module-foreign-prefix",
+        "script-foreign-prefix",
+        "direct-script-foreign-prefix",
+        "multiple-conflicting-profiles",
+        "multiple-identical-profiles",
+        "invalid-profile",
+        "profile-after-passthrough",
+        "short-profile-after-passthrough",
+    ],
+)
+def test_canonical_classifier_rejects_non_profile_cli_prefixes(argv):
+    role, profile, home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.FOREIGN
+    assert profile is None
+    assert home is None
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_role", "expected_profile"),
+    [
+        (("hermes", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, None),
+        (("hermes", "--profile", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("hermes", "--profile=x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("hermes", "-p", "x", "gateway", "restart"), gateway.GatewayRuntimeRole.MANAGER, "x"),
+        (("python", "-m", "hermes_cli.main", "--profile=x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("python", "-m", "hermes_cli.main", "-p", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("python", "-m", "hermes_cli/main.py", "--profile", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("python", "hermes_cli/main.py", "--profile", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+        (("hermes_cli/main.py", "--profile=x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
+    ],
+    ids=[
+        "default-hermes",
+        "hermes-long-profile",
+        "hermes-inline-profile",
+        "hermes-short-profile-manager",
+        "module-inline-profile",
+        "module-spaced-profile",
+        "historical-module-spaced-profile",
+        "script-spaced-profile",
+        "direct-script-inline-profile",
+    ],
+)
+def test_canonical_classifier_accepts_profile_selectors_before_gateway(
+    argv, expected_role, expected_profile
+):
+    role, profile, _home = gateway.classify_gateway_argv(argv)
+
+    assert role is expected_role
+    assert profile == expected_profile
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("hermes", "gateway", "--profile", "x", "run"),
+        ("hermes", "gateway", "run", "--profile", "x"),
+        ("hermes", "gateway", "run", "--profile=x"),
+        ("python", "-m", "hermes_cli.main", "gateway", "run", "-p", "x"),
+    ],
+    ids=[
+        "between-gateway-and-subcommand",
+        "after-runtime-subcommand",
+        "inline-after-runtime-subcommand",
+        "module-after-runtime-subcommand",
+    ],
+)
+def test_canonical_classifier_accepts_profile_selectors_after_gateway(argv):
+    role, profile, home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.RUNTIME
+    assert profile == "x"
+    assert home is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("hermes", "gateway"),
+        ("python", "-m", "hermes_cli.main", "gateway"),
+        ("python", "-m", "hermes_cli/main.py", "gateway"),
+        ("python", "hermes_cli/main.py", "gateway"),
+        ("hermes_cli/main.py", "gateway"),
+    ],
+    ids=[
+        "hermes",
+        "module",
+        "historical-module",
+        "python-script",
+        "direct-script",
+    ],
+)
+def test_canonical_classifier_defaults_bare_gateway_to_run(argv):
+    role, profile, home = gateway.classify_gateway_argv(argv)
+
+    assert role is gateway.GatewayRuntimeRole.RUNTIME
+    assert profile is None
+    assert home is None
+
+
+def test_canonical_classifier_accepts_one_leading_hermes_home_assignment(tmp_path):
+    home = tmp_path / "profile-home"
+    command_line = f"HERMES_HOME={home} hermes gateway run"
+
+    role, profile, resolved_home = gateway.classify_gateway_argv(command_line)
+
+    assert role is gateway.GatewayRuntimeRole.RUNTIME
+    assert profile is None
+    assert resolved_home == home.resolve()
+
+    identity = gateway.GatewayProcessIdentity(4242, 100, command_line)
+    assert identity.exact_argv == (
+        f"HERMES_HOME={home}",
+        "hermes",
+        "gateway",
+        "run",
+    )
+
+
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        "FOO=bar hermes gateway run",
+        "env HERMES_HOME=/tmp/hermes hermes gateway run",
+        "HERMES_HOME=/tmp/hermes FOO=bar hermes gateway run",
+        "HERMES_HOME=relative hermes gateway run",
+        "hermes gateway run HERMES_HOME=/tmp/hermes",
+    ],
+    ids=[
+        "foreign-env-assignment",
+        "env-wrapper",
+        "second-env-assignment",
+        "relative-home",
+        "trailing-home-assignment",
+    ],
+)
+def test_canonical_classifier_rejects_noncanonical_environment_prefixes(command_line):
+    role, profile, home = gateway.classify_gateway_argv(command_line)
 
     assert role is gateway.GatewayRuntimeRole.FOREIGN
     assert profile is None

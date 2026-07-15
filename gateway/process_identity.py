@@ -63,6 +63,11 @@ def _is_gateway_runtime_script(token: str) -> bool:
     return normalized == "gateway/run.py" or normalized.endswith("/gateway/run.py")
 
 
+def _is_hermes_home_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    return bool(separator) and name.lower() == "hermes_home"
+
+
 def _is_gateway_cli_script(token: str) -> bool:
     normalized = _normalized_token(token)
     return normalized == "hermes_cli/main.py" or normalized.endswith(
@@ -77,24 +82,25 @@ def _merge_unquoted_windows_executable(tokens: list[str]) -> list[str]:
     without quotes.  ``shlex`` necessarily splits that path, but the exact
     executable basename still gives us a safe, bounded reassembly point.
     """
-    first = tokens[0].strip("\"'") if tokens else ""
+    prefix_length = 1 if tokens and _is_hermes_home_assignment(tokens[0]) else 0
+    first = tokens[prefix_length].strip("\"'") if len(tokens) > prefix_length else ""
     starts_with_path = bool(
         re.match(r"^[A-Za-z]:[\\/]", first)
         or first.startswith(("\\\\", "./", ".\\"))
     )
-    for index, token in enumerate(tokens):
+    for index, token in enumerate(tokens[prefix_length:], start=prefix_length):
         if not (
             _is_python_executable(token)
             or _is_gateway_executable(token)
             or _is_dedicated_gateway_executable(token)
         ):
             continue
-        if index == 0:
+        if index == prefix_length:
             return tokens
-        candidate = " ".join(tokens[: index + 1]).strip("\"'")
+        candidate = " ".join(tokens[prefix_length : index + 1]).strip("\"'")
         if not starts_with_path:
             continue
-        return [candidate, *tokens[index + 1 :]]
+        return [*tokens[:prefix_length], candidate, *tokens[index + 1 :]]
     return tokens
 
 
@@ -127,134 +133,189 @@ def _normalized_tokens(argv: tuple[str, ...]) -> list[str]:
     return [_normalized_token(token) for token in argv]
 
 
-def gateway_command_subcommand(argv: str | Iterable[str]) -> str | None:
-    """Return the exact lifecycle subcommand represented by ``argv``.
+@dataclass(frozen=True)
+class _ProfileArgumentParse:
+    remaining: tuple[str, ...]
+    profile: str | None
+    valid: bool
 
-    The entrypoint must be in one of the supported concrete positions: the
-    argv[0] Hermes CLI/dedicated binary, a Python interpreter followed
-    immediately by ``-m hermes_cli.main`` or a ``hermes_cli/main.py`` script,
-    or the exact ``gateway/run.py`` script.  A matching token later in a
-    foreign command line is deliberately inert.
-    """
-    exact_argv = _coerce_argv(argv)
-    if not _profile_arguments_are_valid(exact_argv):
-        return None
-    tokens = _normalized_tokens(exact_argv)
+
+@dataclass(frozen=True)
+class _GatewayCommandParse:
+    subcommand: str | None
+    profile: str | None
+    leading_home: str | None
+    valid: bool
+
+
+def _absolute_home_value(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        return Path(value).expanduser().is_absolute()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _split_leading_hermes_home(
+    argv: tuple[str, ...],
+) -> tuple[tuple[str, ...], str | None, bool]:
+    """Strip exactly one canonical process-table HERMES_HOME assignment."""
+    if not argv:
+        return argv, None, True
+
+    first = argv[0]
+    if _is_hermes_home_assignment(first):
+        value = first.split("=", 1)[1]
+        if not _absolute_home_value(value):
+            return argv, None, False
+        if any(_is_hermes_home_assignment(token) for token in argv[1:]):
+            return argv, None, False
+        return argv[1:], value, True
+
+    if any(_is_hermes_home_assignment(token) for token in argv):
+        return argv, None, False
+    return argv, None, True
+
+
+def _entrypoint_arguments(
+    argv: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return the supported entrypoint kind and its post-entrypoint argv."""
+    tokens = _normalized_tokens(argv)
     if not tokens:
         return None
 
     if _is_dedicated_gateway_executable(tokens[0]):
-        return "run"
+        return "direct", argv[1:]
     if _is_gateway_runtime_script(tokens[0]):
-        return "run"
-
-    entrypoint_end: int | None = None
+        return "direct", argv[1:]
     if _is_gateway_executable(tokens[0]):
-        entrypoint_end = 1
-    elif _is_gateway_cli_script(tokens[0]):
-        entrypoint_end = 1
-    elif _is_python_executable(tokens[0]) and len(tokens) >= 2:
-        if (
-            len(tokens) >= 3
-            and tokens[1] == "-m"
-            and tokens[2] == "hermes_cli.main"
-        ):
-            entrypoint_end = 3
-        elif _is_gateway_runtime_script(tokens[1]) or _is_gateway_cli_script(
-            tokens[1]
-        ):
-            if _is_gateway_runtime_script(tokens[1]):
-                return "run"
-            entrypoint_end = 2
-    if entrypoint_end is None:
-        return None
+        return "cli", argv[1:]
+    if _is_gateway_cli_script(tokens[0]):
+        return "cli", argv[1:]
 
-    args = tokens[entrypoint_end:]
-    filtered: list[str] = []
-    skip_next = False
-    for token in args:
-        if skip_next:
-            skip_next = False
+    if not _is_python_executable(tokens[0]) or len(tokens) < 2:
+        return None
+    if _is_gateway_runtime_script(tokens[1]):
+        return "direct", argv[2:]
+    if _is_gateway_cli_script(tokens[1]):
+        return "cli", argv[2:]
+    if (
+        len(tokens) >= 3
+        and tokens[1] == "-m"
+        and tokens[2] in {"hermes_cli.main", "hermes_cli/main.py"}
+    ):
+        return "cli", argv[3:]
+    return None
+
+
+def _profile_selector_token(token: str) -> bool:
+    return (
+        token in {"--profile", "-p"}
+        or token.startswith("--profile=")
+        or token.startswith("-p=")
+    )
+
+
+def _parse_profile_arguments(args: tuple[str, ...]) -> _ProfileArgumentParse:
+    """Apply the CLI's broad profile scan while honoring passthrough bounds."""
+    remaining: list[str] = []
+    profile: str | None = None
+    selector_seen = False
+    passthrough = False
+    index = 0
+
+    while index < len(args):
+        token = args[index]
+        if passthrough:
+            if _profile_selector_token(token):
+                return _ProfileArgumentParse((), None, False)
+            remaining.append(token)
+            index += 1
             continue
+
+        if token == "--":
+            passthrough = True
+            remaining.append(token)
+            index += 1
+            continue
+
         if token in {"--profile", "-p"}:
-            skip_next = True
+            if (
+                selector_seen
+                or index + 1 >= len(args)
+                or not _PROFILE_RE.fullmatch(args[index + 1])
+            ):
+                return _ProfileArgumentParse((), None, False)
+            profile = args[index + 1]
+            selector_seen = True
+            index += 2
             continue
-        if token.startswith("--profile=") or token.startswith("-p="):
-            continue
-        filtered.append(token)
 
-    try:
-        gateway_index = filtered.index("gateway")
-    except ValueError:
-        return None
-    if gateway_index + 1 >= len(filtered):
-        return None
-    return filtered[gateway_index + 1]
+        if token.startswith("--profile=") or token.startswith("-p="):
+            candidate = token.split("=", 1)[1]
+            if selector_seen or not _PROFILE_RE.fullmatch(candidate):
+                return _ProfileArgumentParse((), None, False)
+            profile = candidate
+            selector_seen = True
+            index += 1
+            continue
+
+        remaining.append(token)
+        index += 1
+
+    return _ProfileArgumentParse(tuple(remaining), profile, True)
+
+
+def _parse_gateway_command(argv: tuple[str, ...]) -> _GatewayCommandParse:
+    command_argv, leading_home, prefix_valid = _split_leading_hermes_home(argv)
+    if not prefix_valid:
+        return _GatewayCommandParse(None, None, None, False)
+
+    entrypoint = _entrypoint_arguments(command_argv)
+    if entrypoint is None:
+        return _GatewayCommandParse(None, None, None, False)
+    kind, args = entrypoint
+
+    profile_parse = _parse_profile_arguments(args)
+    if not profile_parse.valid:
+        return _GatewayCommandParse(None, None, None, False)
+    if kind == "direct":
+        return _GatewayCommandParse("run", profile_parse.profile, leading_home, True)
+
+    remaining = profile_parse.remaining
+    if not remaining or _normalized_token(remaining[0]) != "gateway":
+        return _GatewayCommandParse(None, None, leading_home, True)
+    subcommand = "run" if len(remaining) == 1 else _normalized_token(remaining[1])
+    return _GatewayCommandParse(subcommand, profile_parse.profile, leading_home, True)
+
+
+def gateway_command_subcommand(argv: str | Iterable[str]) -> str | None:
+    """Return the lifecycle subcommand represented by one exact argv grammar."""
+    parsed = _parse_gateway_command(_coerce_argv(argv))
+    return parsed.subcommand if parsed.valid else None
 
 
 def _profile_arguments_are_valid(argv: tuple[str, ...]) -> bool:
-    """Return whether every profile selector has a valid, unambiguous value."""
-    profile: str | None = None
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token in {"--profile", "-p"}:
-            if index + 1 >= len(argv) or not _PROFILE_RE.fullmatch(argv[index + 1]):
-                return False
-            candidate = argv[index + 1]
-            if profile is not None and profile != candidate:
-                return False
-            profile = candidate
-            index += 2
-            continue
-        if token.startswith("--profile=") or token.startswith("-p="):
-            candidate = token.split("=", 1)[1]
-            if not _PROFILE_RE.fullmatch(candidate):
-                return False
-            if profile is not None and profile != candidate:
-                return False
-            profile = candidate
-        index += 1
-    return True
+    """Return whether profile selectors are valid and bounded in this argv."""
+    return _parse_profile_arguments(argv).valid
 
 
 def _profile_from_argv(argv: tuple[str, ...]) -> str | None:
-    profile: str | None = None
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token in {"--profile", "-p"}:
-            if index + 1 >= len(argv):
-                return None
-            candidate = argv[index + 1]
-            if not _PROFILE_RE.fullmatch(candidate):
-                return None
-            if profile is not None and profile != candidate:
-                return None
-            profile = candidate
-            index += 2
-            continue
-        if token.startswith("--profile=") or token.startswith("-p="):
-            candidate = token.split("=", 1)[1]
-            if not _PROFILE_RE.fullmatch(candidate):
-                return None
-            if profile is not None and profile != candidate:
-                return None
-            profile = candidate
-        index += 1
-    return profile
+    """Return the profile from a fully recognized gateway command, if any."""
+    parsed = _parse_gateway_command(argv)
+    return parsed.profile
 
 
 def _home_from_identity(
     argv: tuple[str, ...],
     environment: Mapping[str, str] | None,
     default_home: Path | None,
+    *,
+    profile: str | None = None,
+    explicit_argv_home: str | None = None,
 ) -> Path | None:
-    explicit_argv_home: str | None = None
-    for token in argv:
-        if token.startswith("HERMES_HOME="):
-            explicit_argv_home = token.split("=", 1)[1]
-            break
     raw_home: str | None = None
     environment_has_home = environment is not None and "HERMES_HOME" in environment
     if environment_has_home:
@@ -266,7 +327,6 @@ def _home_from_identity(
         if not raw_home:
             return None
     elif default_home is not None:
-        profile = _profile_from_argv(argv)
         default = Path(default_home)
         raw_home = str(
             default / "profiles" / profile if profile and profile != "default" else default
@@ -295,17 +355,22 @@ def classify_gateway_argv(
     identity rather than silently falling back to a caller profile.
     """
     exact_argv = _coerce_argv(argv)
-    subcommand = gateway_command_subcommand(exact_argv)
-    if not _profile_arguments_are_valid(exact_argv):
+    parsed = _parse_gateway_command(exact_argv)
+    if not parsed.valid:
         role = GatewayRuntimeRole.FOREIGN
-    elif subcommand == "run":
+    elif parsed.subcommand == "run":
         role = GatewayRuntimeRole.RUNTIME
-    elif subcommand in _MANAGEMENT_SUBCOMMANDS:
+    elif parsed.subcommand in _MANAGEMENT_SUBCOMMANDS:
         role = GatewayRuntimeRole.MANAGER
     else:
         role = GatewayRuntimeRole.FOREIGN
-    return role, _profile_from_argv(exact_argv), _home_from_identity(
-        exact_argv, environment, default_home
+    recognized_gateway = parsed.valid and parsed.subcommand is not None
+    return role, parsed.profile if recognized_gateway else None, _home_from_identity(
+        exact_argv,
+        environment,
+        default_home if recognized_gateway else None,
+        profile=parsed.profile if recognized_gateway else None,
+        explicit_argv_home=parsed.leading_home if recognized_gateway else None,
     )
 
 
