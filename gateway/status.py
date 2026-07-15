@@ -16,13 +16,19 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
 from utils import atomic_json_write
+from gateway.process_identity import (
+    gateway_command_subcommand,
+)
 
 if sys.platform == "win32":
     import msvcrt
@@ -40,6 +46,10 @@ _gateway_lock_handle = None
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
+_ALL_PROFILE_LIFECYCLE_LOCK = "gateway-all-lifecycle.lock"
+_all_profile_lifecycle_lock_handle = None
+_REAL_FSTAT = os.fstat
+_REAL_LSTAT = os.lstat
 
 
 def _get_pid_path() -> Path:
@@ -68,6 +78,182 @@ def _get_lock_dir() -> Path:
         return Path(override)
     state_home = Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return state_home / "hermes" / _LOCKS_DIRNAME
+
+
+class GatewayLifecycleLockError(RuntimeError):
+    """The host-wide all-profile lifecycle lock is unsafe or unavailable."""
+
+
+def _get_all_profile_lifecycle_lock_path() -> Path:
+    """Return a host-wide path independent of the caller's HERMES_HOME."""
+    return Path.home() / ".local" / "state" / "hermes" / _ALL_PROFILE_LIFECYCLE_LOCK
+
+
+def _validate_lifecycle_lock_parent(path: Path) -> None:
+    parent = path.parent
+    current = Path(parent.anchor)
+    for component in parent.parts[1:]:
+        current /= component
+        try:
+            metadata = _REAL_LSTAT(current)
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+                metadata = _REAL_LSTAT(current)
+            except OSError as exc:
+                raise GatewayLifecycleLockError(
+                    f"could not prepare lifecycle lock directory {parent}"
+                ) from exc
+        except OSError as exc:
+            raise GatewayLifecycleLockError(
+                f"could not inspect lifecycle lock directory {current}"
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise GatewayLifecycleLockError(
+                f"unsafe lifecycle lock directory {current}"
+            )
+        mode = metadata.st_mode
+        sticky_shared_dir = (
+            current != parent and bool(mode & stat.S_ISVTX) and mode & 0o002
+        )
+        current_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
+        unsafe_mode = mode & 0o022
+        if metadata.st_uid not in {current_uid, 0} or (
+            unsafe_mode and not sticky_shared_dir
+        ):
+            raise GatewayLifecycleLockError(
+                f"unsafe lifecycle lock ownership or mode: {current}"
+            )
+
+
+def _validate_lifecycle_lock_file(path: Path, metadata) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise GatewayLifecycleLockError(f"unsafe lifecycle lock path: {path}")
+    current_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
+    if metadata.st_uid not in {current_uid, 0} or metadata.st_mode & 0o077:
+        raise GatewayLifecycleLockError(
+            f"unsafe lifecycle lock ownership or mode: {path}"
+        )
+
+
+def acquire_all_profile_lifecycle_lock(timeout: float = 30.0):
+    """Acquire the machine-local all-profile lifecycle transaction lock.
+
+    The path is deliberately outside ``HERMES_HOME`` so profile commands
+    serialize with one another.  The lock file contains only non-secret owner
+    metadata; malformed content or unsafe filesystem identity fails closed.
+    """
+    global _all_profile_lifecycle_lock_handle
+    if _all_profile_lifecycle_lock_handle is not None:
+        return _all_profile_lifecycle_lock_handle
+
+    path = _get_all_profile_lifecycle_lock_path()
+    if not path.is_absolute():
+        raise GatewayLifecycleLockError("lifecycle lock path must be absolute")
+    _validate_lifecycle_lock_parent(path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    handle = None
+    try:
+        try:
+            if stat.S_ISLNK(_REAL_LSTAT(path).st_mode):
+                raise GatewayLifecycleLockError(f"unsafe lifecycle lock path: {path}")
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, flags, 0o600)
+        handle = os.fdopen(fd, "a+", encoding="utf-8")
+        # Keep the descriptor attestation tied to the module's real syscall.
+        # This also prevents unrelated callers monkeypatching the process-wide
+        # os module from changing the lock's security decision.
+        metadata = _REAL_FSTAT(handle.fileno())
+        _validate_lifecycle_lock_file(path, metadata)
+        opened_path = _REAL_LSTAT(path)
+        if (metadata.st_dev, metadata.st_ino) != (
+            opened_path.st_dev,
+            opened_path.st_ino,
+        ):
+            raise GatewayLifecycleLockError(
+                f"lifecycle lock path changed during open: {path}"
+            )
+        handle.seek(0)
+        raw = handle.read(4097)
+        if len(raw) > 4096:
+            raise GatewayLifecycleLockError(
+                f"corrupt lifecycle lock record: {path}"
+            )
+        if raw.strip():
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise GatewayLifecycleLockError(
+                    f"corrupt lifecycle lock record: {path}"
+                ) from exc
+            if (
+                not isinstance(record, dict)
+                or type(record.get("pid")) is not int
+            ):
+                raise GatewayLifecycleLockError(
+                    f"corrupt lifecycle lock record: {path}"
+                )
+    except GatewayLifecycleLockError:
+        if handle is not None:
+            handle.close()
+        raise
+    except OSError as exc:
+        raise GatewayLifecycleLockError(f"could not open lifecycle lock {path}") from exc
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    acquired = False
+    try:
+        while True:
+            if _try_acquire_file_lock(handle):
+                acquired = True
+                break
+            if time.monotonic() >= deadline:
+                raise GatewayLifecycleLockError(
+                    f"timed out acquiring all-profile lifecycle lock {path}"
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        handle.seek(0)
+        handle.truncate()
+        json.dump({"pid": os.getpid(), "started_at": _utc_now_iso()}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _all_profile_lifecycle_lock_handle = handle
+        return handle
+    except GatewayLifecycleLockError:
+        if acquired:
+            _release_file_lock(handle)
+        handle.close()
+        raise
+    except OSError as exc:
+        if acquired:
+            _release_file_lock(handle)
+        handle.close()
+        raise GatewayLifecycleLockError(
+            f"could not write all-profile lifecycle lock {path}"
+        ) from exc
+
+
+def release_all_profile_lifecycle_lock() -> None:
+    global _all_profile_lifecycle_lock_handle
+    handle = _all_profile_lifecycle_lock_handle
+    if handle is None:
+        return
+    _all_profile_lifecycle_lock_handle = None
+    _release_file_lock(handle)
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+@contextmanager
+def all_profile_lifecycle_lock(timeout: float = 30.0):
+    handle = acquire_all_profile_lifecycle_lock(timeout=timeout)
+    try:
+        yield handle
+    finally:
+        release_all_profile_lifecycle_lock()
 
 
 def _utc_now_iso() -> str:
@@ -219,56 +405,10 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     """
     if not command:
         return None
-
     try:
-        raw_tokens = shlex.split(command, posix=False)
+        return gateway_command_subcommand(shlex.split(command, posix=True))
     except ValueError:
-        raw_tokens = command.split()
-    # Strip surrounding quotes, normalize slashes + case per token.
-    tokens = [t.strip("\"'").replace("\\", "/").lower() for t in raw_tokens]
-    if not tokens:
-        return None
-
-    # Gateway-dedicated entrypoints carry no subcommand to inspect.
-    for token in tokens:
-        if token == "gateway/run.py" or token.endswith("/gateway/run.py"):
-            return "run"
-        basename = token.rsplit("/", 1)[-1]
-        if basename in ("hermes-gateway", "hermes-gateway.exe"):
-            return "run"
-
-    joined = " ".join(tokens)
-    has_gateway_entry = (
-        "hermes_cli.main" in joined
-        or "hermes_cli/main.py" in joined
-        or any(t.rsplit("/", 1)[-1] in ("hermes", "hermes.exe") for t in tokens)
-    )
-    if not has_gateway_entry:
-        return None
-
-    # Drop profile selectors anywhere: --profile X / -p X / --profile=X / -p=X.
-    # This consumes a profile VALUE of "gateway" too, so the real subcommand
-    # token is the one we land on below.
-    filtered: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in ("--profile", "-p"):
-            skip_next = True
-            continue
-        if token.startswith("--profile=") or token.startswith("-p="):
-            continue
-        filtered.append(token)
-
-    for i, token in enumerate(filtered):
-        if token != "gateway":
-            continue
-        if i + 1 >= len(filtered):
-            return "run"  # bare `hermes gateway` defaults to `run`
-        return filtered[i + 1]
-    return None
+        return gateway_command_subcommand(command.split())
 
 
 def looks_like_gateway_command_line(command: str | None) -> bool:
@@ -287,7 +427,10 @@ def looks_like_gateway_runtime_command_line(command: str | None) -> bool:
     use this broader matcher only when validating Hermes-owned runtime records
     or no-supervisor cleanup scans.
     """
-    return _gateway_command_subcommand(command) in {"run", "restart"}
+    if not command:
+        return False
+    subcommand = _gateway_command_subcommand(command)
+    return subcommand == "run" or subcommand == "restart"
 
 
 def _looks_like_gateway_process(pid: int) -> bool:

@@ -19,12 +19,25 @@ import subprocess
 import sys
 import textwrap
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.status import terminate_pid
+from gateway.status import (
+    GatewayLifecycleLockError,
+    all_profile_lifecycle_lock,
+    terminate_pid,
+)
+from gateway.process_identity import (
+    GatewayProcessIdentity,
+    GatewayRuntimeRole,
+    classify_gateway_argv,
+    gateway_command_subcommand,
+    process_identity_matches_target,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -56,6 +69,28 @@ from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
+_all_profile_lifecycle_lock_depth = 0
+
+
+@contextmanager
+def _all_profile_lifecycle_transaction():
+    """Serialize cooperating all-profile lifecycle mutations on this host."""
+    global _all_profile_lifecycle_lock_depth
+    if _all_profile_lifecycle_lock_depth:
+        _all_profile_lifecycle_lock_depth += 1
+        try:
+            yield
+        finally:
+            _all_profile_lifecycle_lock_depth -= 1
+        return
+
+    with all_profile_lifecycle_lock(timeout=30.0):
+        _all_profile_lifecycle_lock_depth = 1
+        try:
+            yield
+        finally:
+            _all_profile_lifecycle_lock_depth = 0
+
 # =============================================================================
 # Process Management (for manual gateway runs)
 # =============================================================================
@@ -83,15 +118,6 @@ class ProfileGatewayProcess:
     profile: str
     path: Path
     pid: int
-
-
-@dataclass(frozen=True)
-class GatewayProcessIdentity:
-    """Birth- and command-attested identity of one gateway process."""
-
-    pid: int
-    start_time: int
-    command_line: str
 
 
 class GatewayProcessEnumerationError(RuntimeError):
@@ -265,6 +291,7 @@ def _graceful_restart_via_sigusr1(
     pid: int,
     drain_timeout: float,
     expected_start_time: int | None = None,
+    expected_identity: GatewayProcessIdentity | None = None,
 ) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
@@ -296,7 +323,15 @@ def _graceful_restart_via_sigusr1(
         return False
     if pid <= 0:
         return False
-    if expected_start_time is not None and not _launchd_pid_is_live(
+    if expected_identity is not None:
+        if expected_identity.pid != pid:
+            return False
+        try:
+            if _revalidate_gateway_process_identity(expected_identity) is None:
+                return True
+        except GatewayProcessTerminationError:
+            return False
+    elif expected_start_time is not None and not _launchd_pid_is_live(
         pid, expected_start_time
     ):
         return False
@@ -309,6 +344,17 @@ def _graceful_restart_via_sigusr1(
         return False
 
     import time as _time
+
+    if expected_identity is not None:
+        try:
+            return _wait_for_exact_gateway_identity_exit(
+                expected_identity, max(drain_timeout, 1.0)
+            )
+        except GatewayProcessTerminationError:
+            # A changed/unreadable identity after SIGUSR1 is not proof that the
+            # predecessor converged safely.  The caller must fail closed and
+            # refuse to signal or accept a successor on this transaction.
+            return False
 
     deadline = _time.monotonic() + max(drain_timeout, 1.0)
     # IMPORTANT Windows note: ``os.kill(pid, 0)`` is NOT a no-op on
@@ -398,45 +444,44 @@ def _scan_gateway_pids(
     # scan no longer false-matches ``gateway status``/``dashboard`` siblings or
     # unrelated processes like ``python -m tui_gateway``. Lazy import mirrors the
     # circular-import avoidance used elsewhere in this module.
-    from gateway.status import (
-        looks_like_gateway_command_line,
-        looks_like_gateway_runtime_command_line,
-    )
-    current_home = str(get_hermes_home().resolve())
-    current_home_lc = current_home.lower()
-    current_profile_arg = _profile_arg(current_home)
+    current_home = get_hermes_home().resolve()
+    current_profile_arg = _profile_arg(str(current_home))
     current_profile_name = (
-        current_profile_arg.split()[-1] if current_profile_arg else ""
+        current_profile_arg.split()[-1] if current_profile_arg else None
     )
-    current_profile_name_lc = current_profile_name.lower()
+    current_profile_root = (
+        current_home.parent.parent
+        if current_home.parent.name == "profiles"
+        else current_home
+    )
 
     def _matches_current_profile(command: str) -> bool:
-        command_lc = command.lower()
-        if current_profile_name:
-            return (
-                f"--profile {current_profile_name_lc}" in command_lc
-                or f"-p {current_profile_name_lc}" in command_lc
-                or f"hermes_home={current_home_lc}" in command_lc
-            )
-
-        # Default-profile case: no profile flag in argv. Accept as long as
-        # the command doesn't advertise *some other* profile. HERMES_HOME
-        # may be passed via env (not visible in wmic/CIM command line) so
-        # its absence is NOT disqualifying — only a non-matching explicit
-        # HERMES_HOME= in argv is.
-        if "--profile " in command_lc or " -p " in command_lc:
-            return False
-        if (
-            "hermes_home=" in command_lc
-            and f"hermes_home={current_home_lc}" not in command_lc
-        ):
-            return False
-        return True
+        try:
+            argv = tuple(shlex.split(command, posix=True))
+        except ValueError:
+            argv = tuple(command.split())
+        _role, profile, home = classify_gateway_argv(
+            argv, default_home=current_profile_root
+        )
+        return profile == current_profile_name and home == current_home
 
     def _matches_gateway_runtime(command: str) -> bool:
-        if looks_like_gateway_command_line(command):
+        try:
+            argv = tuple(shlex.split(command, posix=True))
+        except ValueError:
+            argv = tuple(command.split())
+        role, _profile, _home = classify_gateway_argv(argv)
+        if role is GatewayRuntimeRole.RUNTIME:
             return True
-        return include_restart_managers and looks_like_gateway_runtime_command_line(command)
+        # Best-effort no-supervisor status/recovery retains the historical
+        # manager-runtime compatibility.  Strict destructive inventory never
+        # sets this flag, so a concurrent `gateway restart` manager can never
+        # be signalled or turn into a false inventory error there.
+        return (
+            include_restart_managers
+            and role is GatewayRuntimeRole.MANAGER
+            and gateway_command_subcommand(argv) == "restart"
+        )
 
     try:
         if is_windows():
@@ -731,12 +776,10 @@ def find_gateway_pids_strict(
             raise GatewayProcessEnumerationError(
                 "current-profile gateway PID could not be inspected"
             ) from exc
-    try:
-        include_restart_managers = not supports_systemd_services()
-    except Exception as exc:
-        raise GatewayProcessEnumerationError(
-            "gateway service capability could not be inspected"
-        ) from exc
+    # Destructive inventory is intentionally runtime-only.  The no-systemd
+    # compatibility allowance for `gateway restart` belongs to best-effort
+    # status/recovery scans and is not an identity eligible for termination.
+    include_restart_managers = False
     try:
         scanned_pids = _scan_gateway_pids(
             exclude,
@@ -769,8 +812,12 @@ def _psutil_process(pid: int):
 def _read_live_gateway_process_identity(
     pid: int,
 ) -> tuple[GatewayProcessIdentity, object]:
-    """Read one live PID's birth and exact command attestation."""
-    from gateway.status import looks_like_gateway_command_line
+    """Read one live PID's canonical birth/argv/profile/home attestation.
+
+    ``psutil`` is asked for the command line and only the single
+    ``HERMES_HOME`` environment key.  The full environment is discarded
+    immediately so credentials can never enter an identity, log, or error.
+    """
     try:
         import psutil  # type: ignore
     except ImportError as exc:
@@ -781,7 +828,15 @@ def _read_live_gateway_process_identity(
     try:
         process = _psutil_process(pid)
         start_time = _launchd_process_start_time(pid)
-        command_line = " ".join(process.cmdline() or []).strip()
+        argv = tuple(process.cmdline() or ())
+        process_environment = process.environ()
+        hermes_home_value = (
+            process_environment.get("HERMES_HOME")
+            if isinstance(process_environment, dict)
+            else None
+        )
+        # Never retain the process environment: it may contain API keys.
+        del process_environment
     except (ProcessLookupError, FileNotFoundError):
         raise
     except (psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
@@ -796,11 +851,29 @@ def _read_live_gateway_process_identity(
         raise GatewayProcessEnumerationError(
             f"gateway PID {pid} has no readable birth identity"
         )
-    if not command_line or not looks_like_gateway_command_line(command_line):
+    if not argv:
         raise GatewayProcessEnumerationError(
-            f"gateway PID {pid} is not an attested gateway command"
+            f"gateway PID {pid} has no readable argv"
         )
-    return GatewayProcessIdentity(pid, start_time, command_line), process
+    identity = GatewayProcessIdentity(
+        pid,
+        start_time,
+        argv,
+        environment=(
+            {"HERMES_HOME": hermes_home_value}
+            if isinstance(hermes_home_value, str)
+            else {}
+        ),
+    )
+    if identity.runtime_role is not GatewayRuntimeRole.RUNTIME:
+        raise GatewayProcessEnumerationError(
+            f"gateway PID {pid} is not an attested gateway runtime"
+        )
+    if identity.hermes_home is None:
+        raise GatewayProcessEnumerationError(
+            f"gateway PID {pid} has no resolved HERMES_HOME identity"
+        )
+    return identity, process
 
 
 def find_gateway_process_identities_strict(
@@ -901,9 +974,8 @@ def _capture_gateway_argv(pid: int) -> list[str] | None:
     # reported by the scan: only respawn things that actually look like a
     # gateway run command line.
     try:
-        from gateway.status import looks_like_gateway_command_line
-
-        if not looks_like_gateway_command_line(" ".join(argv)):
+        role, _profile, _home = classify_gateway_argv(argv)
+        if role is not GatewayRuntimeRole.RUNTIME:
             return None
     except Exception:
         pass
@@ -1713,14 +1785,39 @@ def _revalidate_gateway_process_identity(
         raise GatewayProcessTerminationError(
             [f"PID {identity.pid}: {exc}"]
         ) from exc
-    if current != identity:
+    if current.identity_key() != identity.identity_key():
         raise GatewayProcessTerminationError(
             [
-                f"PID {identity.pid}: birth or gateway command identity changed; "
+                f"PID {identity.pid}: birth/argv/profile/home identity changed; "
                 "signal skipped"
             ]
         )
     return process
+
+
+def _wait_for_exact_gateway_identity_exit(
+    identity: GatewayProcessIdentity,
+    timeout: float,
+) -> bool:
+    """Wait until exactly ``identity`` is gone, rejecting PID reuse.
+
+    A plain PID existence probe is insufficient between TERM and KILL: the
+    number may already belong to another process, or argv/environment reads may
+    have become unavailable.  Both are red states and deliberately stop the
+    convergence transaction before another signal.
+    """
+    from gateway.status import _pid_exists
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        if not _pid_exists(identity.pid):
+            return True
+        current = _revalidate_gateway_process_identity(identity)
+        if current is None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 def terminate_gateway_process_identities_strict(
@@ -1729,12 +1826,18 @@ def terminate_gateway_process_identities_strict(
     | set[GatewayProcessIdentity],
     *,
     force: bool = False,
+    graceful_timeout: float = 5.0,
+    kill_timeout: float = 5.0,
 ) -> tuple[GatewayProcessIdentity, ...]:
-    """Terminate only the exact process identities captured before a sweep.
+    """Converge termination for only exact process identities.
 
-    A vanished process is benign.  Reused PIDs, changed birth times, changed
-    or unreadable commands, and permission failures are red conditions and are
-    never signalled.
+    Normal termination sends TERM, waits for the exact identity to disappear,
+    then revalidates that same PID/birth/argv/profile/home before KILL. A
+    vanished process is success. Reused PIDs, changed or unreadable identity,
+    and permission failures are red conditions and never receive the next
+    signal. The optional ``force`` mode retains the historical API for callers
+    that explicitly request an immediate KILL, while still requiring exact
+    identity proof and bounded post-signal convergence.
     """
     try:
         import psutil  # type: ignore
@@ -1744,15 +1847,16 @@ def terminate_gateway_process_identities_strict(
         ) from exc
     terminated: list[GatewayProcessIdentity] = []
     failures: list[str] = []
-    seen: set[tuple[int, int, str]] = set()
+    seen: set[tuple[object, ...]] = set()
     for identity in identities:
-        key = (identity.pid, identity.start_time, identity.command_line)
+        key = identity.identity_key()
         if key in seen:
             continue
         seen.add(key)
         try:
             process = _revalidate_gateway_process_identity(identity)
             if process is None:
+                terminated.append(identity)
                 continue
             try:
                 if force:
@@ -1760,6 +1864,7 @@ def terminate_gateway_process_identities_strict(
                 else:
                     process.terminate()
             except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+                terminated.append(identity)
                 continue
             except (PermissionError, psutil.AccessDenied) as exc:
                 failures.append(f"PID {identity.pid}: permission denied ({exc})")
@@ -1767,7 +1872,43 @@ def terminate_gateway_process_identities_strict(
             except OSError as exc:
                 failures.append(f"PID {identity.pid}: {exc}")
                 continue
-            terminated.append(identity)
+
+            if _wait_for_exact_gateway_identity_exit(identity, graceful_timeout):
+                terminated.append(identity)
+                continue
+            if force:
+                failures.append(
+                    f"PID {identity.pid}: exact gateway identity remained after KILL"
+                )
+                continue
+
+            # This is the last permitted revalidation before escalation.  A
+            # changed or unreadable identity is never allowed to receive KILL.
+            try:
+                process = _revalidate_gateway_process_identity(identity)
+                if process is None:
+                    terminated.append(identity)
+                    continue
+                process.kill()
+            except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+                terminated.append(identity)
+                continue
+            except (PermissionError, psutil.AccessDenied) as exc:
+                failures.append(f"PID {identity.pid}: permission denied ({exc})")
+                continue
+            except OSError as exc:
+                failures.append(f"PID {identity.pid}: {exc}")
+                continue
+
+            try:
+                if _wait_for_exact_gateway_identity_exit(identity, kill_timeout):
+                    terminated.append(identity)
+                else:
+                    failures.append(
+                        f"PID {identity.pid}: exact gateway identity remained after KILL"
+                    )
+            except GatewayProcessTerminationError as exc:
+                failures.extend(exc.failures)
         except GatewayProcessTerminationError as exc:
             failures.extend(exc.failures)
     if failures:
@@ -3892,6 +4033,8 @@ class LaunchdFencedGateway:
     hermes_home: Path | None = None
     preflight_snapshot: "_LaunchdAllStateSnapshot | None" = None
     post_mutation_snapshot: "_LaunchdAllStateSnapshot | None" = None
+    plist_argv: tuple[str, ...] = ()
+    plist_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3997,6 +4140,9 @@ class LaunchdAllTarget:
         default_factory=lambda: LaunchdLabelProbe((), (), (), ())
     )
     plist_stat_identity: tuple[int, ...] = ()
+    plist_argv: tuple[str, ...] = ()
+    plist_profile: str | None = None
+    runtime_identity: GatewayProcessIdentity | None = None
 
     @property
     def was_disabled(self) -> bool:
@@ -4015,6 +4161,7 @@ class _LaunchdAllStateSnapshot:
     disabled: tuple[str, ...]
     pid: int | None
     start_time: int | None
+    runtime_identity: GatewayProcessIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -4024,6 +4171,8 @@ class _LaunchdAllPlistIdentity:
     fingerprint: str
     hermes_home: Path
     stat_identity: tuple[int, ...]
+    argv: tuple[str, ...]
+    profile: str | None
 
 
 @dataclass(frozen=True)
@@ -4037,6 +4186,8 @@ class _SecureLaunchdPlist:
 
 def _launchd_all_snapshot_from_probe(
     probe: LaunchdLabelProbe,
+    *,
+    runtime_identity: GatewayProcessIdentity | None = None,
 ) -> _LaunchdAllStateSnapshot:
     """Turn one exact probe into the state used by compensation guards."""
     registration = probe.registered
@@ -4048,6 +4199,7 @@ def _launchd_all_snapshot_from_probe(
         disabled=tuple(probe.disabled),
         pid=pid,
         start_time=start_time,
+        runtime_identity=runtime_identity,
     )
 
 
@@ -4060,6 +4212,7 @@ def _launchd_all_initial_snapshot(
         disabled=tuple(target.probe.disabled),
         pid=target.pid,
         start_time=target.start_time,
+        runtime_identity=target.runtime_identity,
     )
 
 
@@ -4072,6 +4225,14 @@ def _launchd_all_snapshot_matches(
         and set(actual.disabled) == set(expected.disabled)
         and actual.pid == expected.pid
         and actual.start_time == expected.start_time
+        and (
+            actual.runtime_identity is None
+            and expected.runtime_identity is None
+            or actual.runtime_identity is not None
+            and expected.runtime_identity is not None
+            and actual.runtime_identity.identity_key()
+            == expected.runtime_identity.identity_key()
+        )
     )
 
 
@@ -4089,7 +4250,20 @@ def _launchd_all_capture_snapshot(
             f"{target.launchctl_target}: concurrent disabled state changed to "
             f"{list(probe.disabled)}"
         )
-    snapshot = _launchd_all_snapshot_from_probe(probe)
+    runtime_identity = None
+    if target is not None:
+        pid = probe.pid_for(probe.registered[0]) if len(probe.registered) == 1 else None
+        if pid is not None:
+            runtime_identity = _attest_launchd_runtime_identity(
+                pid,
+                _launchd_process_start_time(pid),
+                plist_argv=target.plist_argv,
+                hermes_home=target.hermes_home,
+                profile=target.plist_profile,
+            )
+    snapshot = _launchd_all_snapshot_from_probe(
+        probe, runtime_identity=runtime_identity
+    )
     if snapshot.pid is not None and snapshot.start_time is None:
         raise LaunchdAllOperationError(
             f"{target.launchctl_target}: PID {snapshot.pid} has no birth identity"
@@ -4113,6 +4287,7 @@ def _launchd_all_fence_snapshot(
         disabled=tuple(sorted(expected_disabled)),
         pid=target.pid,
         start_time=target.start_time,
+        runtime_identity=target.runtime_identity,
     )
     return _launchd_all_capture_snapshot(
         target,
@@ -4138,11 +4313,29 @@ def _launchd_all_bootstrap_snapshot(
 
 def _launchd_all_capture_label_snapshot(
     label: str,
+    target: LaunchdFencedGateway | None = None,
 ) -> _LaunchdAllStateSnapshot:
     """Capture one label snapshot for stop-fence compensation."""
     probe = _probe_launchd_label_domains(label)
     _launchd_all_require_known_probe(label, probe)
-    snapshot = _launchd_all_snapshot_from_probe(probe)
+    runtime_identity = None
+    if target is not None and len(probe.registered) == 1:
+        pid = probe.pid_for(probe.registered[0])
+        if pid is not None:
+            if not target.plist_argv or target.hermes_home is None:
+                raise LaunchdAllOperationError(
+                    f"{label}: compensation runtime identity was not retained"
+                )
+            runtime_identity = _attest_launchd_runtime_identity(
+                pid,
+                _launchd_process_start_time(pid),
+                plist_argv=target.plist_argv,
+                hermes_home=target.hermes_home,
+                profile=target.plist_profile,
+            )
+    snapshot = _launchd_all_snapshot_from_probe(
+        probe, runtime_identity=runtime_identity
+    )
     if snapshot.pid is not None and snapshot.start_time is None:
         raise LaunchdAllOperationError(
             f"{label}: PID {snapshot.pid} has no birth identity"
@@ -4169,6 +4362,47 @@ def _launchd_pid_is_live(
         return True
     current_start_time = get_process_start_time(pid)
     return current_start_time is not None and current_start_time == expected_start_time
+
+
+def _attest_launchd_runtime_identity(
+    pid: int,
+    start_time: int | None,
+    *,
+    plist_argv: Iterable[str],
+    hermes_home: Path,
+    profile: str | None,
+) -> GatewayProcessIdentity:
+    """Prove that a launchd PID is the runtime described by its plist."""
+    if start_time is None:
+        raise LaunchdAllOperationError(
+            f"PID {pid} has no birth identity for launchd attestation"
+        )
+    try:
+        identity, _process = _read_live_gateway_process_identity(pid)
+    except ProcessLookupError as exc:
+        raise LaunchdAllOperationError(
+            f"PID {pid} disappeared during launchd attestation"
+        ) from exc
+    except PermissionError as exc:
+        raise LaunchdAllOperationError(
+            f"PID {pid} identity is unreadable during launchd attestation"
+        ) from exc
+    except GatewayProcessEnumerationError as exc:
+        raise LaunchdAllOperationError(str(exc)) from exc
+    if identity.start_time != start_time:
+        raise LaunchdAllOperationError(
+            f"PID {pid} birth identity changed during launchd attestation"
+        )
+    if not process_identity_matches_target(
+        identity,
+        argv=plist_argv,
+        hermes_home=hermes_home,
+        profile=profile,
+    ):
+        raise LaunchdAllOperationError(
+            f"PID {pid} is a foreign launchd runtime (argv/profile/home mismatch)"
+        )
+    return identity
 
 
 def _read_secure_launchd_plist(path: Path) -> _SecureLaunchdPlist:
@@ -4308,12 +4542,26 @@ def _read_launchd_all_plist_identity(path: Path) -> _LaunchdAllPlistIdentity:
     hermes_home, _ = _launchd_gateway_profile_invocation(
         label, secure.document
     )
+    arguments = tuple(secure.document["ProgramArguments"])
+    role, profile, classified_home = classify_gateway_argv(
+        arguments,
+        environment={"HERMES_HOME": str(hermes_home)},
+    )
+    if (
+        role is not GatewayRuntimeRole.RUNTIME
+        or classified_home != hermes_home
+    ):
+        raise LaunchdAllOperationError(
+            f"{label}: canonical runtime identity does not match the plist"
+        )
     return _LaunchdAllPlistIdentity(
         label=label,
         path=path,
         fingerprint=secure.fingerprint,
         hermes_home=hermes_home,
         stat_identity=secure.stat_identity,
+        argv=arguments,
+        profile=profile,
     )
 
 
@@ -4355,6 +4603,15 @@ def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
             raise LaunchdAllOperationError(
                 f"{domain}/{label}: loaded PID {pid} has no birth identity"
             )
+        runtime_identity = None
+        if pid is not None:
+            runtime_identity = _attest_launchd_runtime_identity(
+                pid,
+                start_time,
+                plist_argv=identity.argv,
+                hermes_home=identity.hermes_home,
+                profile=identity.profile,
+            )
         targets.append(
             LaunchdAllTarget(
                 label=identity.label,
@@ -4367,6 +4624,9 @@ def _launchd_all_preflight_targets() -> tuple[LaunchdAllTarget, ...]:
                 start_time=start_time,
                 probe=probe,
                 plist_stat_identity=identity.stat_identity,
+                plist_argv=identity.argv,
+                plist_profile=identity.profile,
+                runtime_identity=runtime_identity,
             )
         )
     return tuple(targets)
@@ -4380,6 +4640,8 @@ def _revalidate_launchd_target(target: LaunchdAllTarget) -> None:
         or identity.hermes_home != target.hermes_home
         or identity.fingerprint != target.plist_fingerprint
         or identity.stat_identity != target.plist_stat_identity
+        or identity.argv != target.plist_argv
+        or identity.profile != target.plist_profile
     ):
         raise LaunchdAllOperationError(
             f"Launchd target identity changed before mutation: {target.launchctl_target}"
@@ -4450,9 +4712,28 @@ def _launchd_all_verify_live(
             f"{target.launchctl_target}: supervised PID identity changed while "
             f"verifying from {expected_identity} to {(pid, start_time)}"
         )
-    if successor_of is not None:
-        if (pid, start_time) == successor_of:
-            return False
+    if not target.plist_argv:
+        raise LaunchdAllOperationError(
+            f"{target.launchctl_target}: plist argv was not retained for attestation"
+        )
+    runtime_identity = _attest_launchd_runtime_identity(
+        pid,
+        start_time,
+        plist_argv=target.plist_argv,
+        hermes_home=target.hermes_home,
+        profile=target.plist_profile,
+    )
+    if target.runtime_identity is not None and expected_identity is None:
+        # A preflight identity is immutable for a loaded predecessor.  For a
+        # target that became live after bootstrap, no predecessor is retained.
+        if runtime_identity.pid == target.runtime_identity.pid and (
+            runtime_identity.start_time == target.runtime_identity.start_time
+        ) and runtime_identity.identity_key() != target.runtime_identity.identity_key():
+            raise LaunchdAllOperationError(
+                f"{target.launchctl_target}: live runtime identity changed"
+            )
+    if successor_of is not None and (pid, start_time) == successor_of:
+        return False
     return True
 
 
@@ -4882,7 +5163,7 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
         ) from exc
 
 
-def launchd_start_all() -> LaunchdAllResult:
+def _launchd_start_all_locked() -> LaunchdAllResult:
     """Start every installed Hermes LaunchAgent without a process sweep."""
     try:
         targets = _launchd_all_preflight_targets()
@@ -4920,6 +5201,11 @@ def launchd_start_all() -> LaunchdAllResult:
     return result
 
 
+def launchd_start_all() -> LaunchdAllResult:
+    with _all_profile_lifecycle_transaction():
+        return _launchd_start_all_locked()
+
+
 def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutcome:
     """Restart one enabled target and verify a new supervised process."""
     expected_disabled = set(target.probe.disabled)
@@ -4944,6 +5230,7 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
             target.pid,
             _get_restart_drain_timeout(),
             expected_start_time=target.start_time,
+            expected_identity=target.runtime_identity,
         ):
             raise LaunchdAllOperationError(
                 f"{target.launchctl_target}: old PID did not exit"
@@ -5019,7 +5306,7 @@ def _launchd_restart_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOut
         ) from exc
 
 
-def launchd_restart_all() -> LaunchdAllResult:
+def _launchd_restart_all_locked() -> LaunchdAllResult:
     """Restart enabled installed targets individually, never by global sweep."""
     try:
         targets = _launchd_all_preflight_targets()
@@ -5059,6 +5346,11 @@ def launchd_restart_all() -> LaunchdAllResult:
         + (f"; preserved {preserved} pre-disabled target(s)" if preserved else "")
     )
     return result
+
+
+def launchd_restart_all() -> LaunchdAllResult:
+    with _all_profile_lifecycle_transaction():
+        return _launchd_restart_all_locked()
 
 
 _LAUNCHD_GATEWAY_PLIST_PATTERN = re.compile(
@@ -6123,10 +6415,47 @@ def _launchd_stop_commit_snapshot(
     label: str,
     barrier: _LaunchdAllStateSnapshot,
     probe: LaunchdLabelProbe,
+    *,
+    expected_runtime_identity: GatewayProcessIdentity | None = None,
+    plist_argv: Iterable[str] | None = None,
+    hermes_home: Path | None = None,
+    profile: str | None = None,
 ) -> _LaunchdAllStateSnapshot:
     """Build the commit attestation for one mutation-adjacent bootout."""
     _launchd_all_require_known_probe(label, probe)
-    snapshot = _launchd_all_snapshot_from_probe(probe)
+    runtime_identity = expected_runtime_identity
+    if snapshot_pid := (
+        probe.pid_for(probe.registered[0]) if len(probe.registered) == 1 else None
+    ):
+        if runtime_identity is None:
+            raise LaunchdAllOperationError(
+                f"{label}: commit PID {snapshot_pid} has no retained runtime identity"
+            )
+        try:
+            if plist_argv is not None and hermes_home is not None:
+                current_identity = _attest_launchd_runtime_identity(
+                    snapshot_pid,
+                    _launchd_process_start_time(snapshot_pid),
+                    plist_argv=plist_argv,
+                    hermes_home=hermes_home,
+                    profile=profile,
+                )
+            else:
+                current_identity, _process = _read_live_gateway_process_identity(
+                    snapshot_pid
+                )
+        except (GatewayProcessEnumerationError, PermissionError, ProcessLookupError) as exc:
+            raise LaunchdAllOperationError(
+                f"{label}: commit runtime identity is unreadable or vanished"
+            ) from exc
+        if current_identity.identity_key() != runtime_identity.identity_key():
+            raise LaunchdAllOperationError(
+                f"{label}: commit runtime argv/profile/home identity changed"
+            )
+        runtime_identity = current_identity
+    snapshot = _launchd_all_snapshot_from_probe(
+        probe, runtime_identity=runtime_identity
+    )
     if snapshot.pid is not None and snapshot.start_time is None:
         raise LaunchdAllOperationError(
             f"{label}: commit PID {snapshot.pid} has no birth identity"
@@ -6145,7 +6474,7 @@ def _launchd_stop_commit_snapshot(
     return snapshot
 
 
-def launchd_stop_all() -> LaunchdStopAllResult:
+def _launchd_stop_all_locked() -> LaunchdStopAllResult:
     """Fence every validated Hermes LaunchAgent before a global PID sweep.
 
     Inventory validation and all desired-state writes happen before any
@@ -6187,17 +6516,32 @@ def launchd_stop_all() -> LaunchdStopAllResult:
             restore_domains = probe.registered
         else:
             restore_domains = (_launchd_validated_manager_domain(),)
+        runtime_identity = None
+        if len(probe.registered) == 1:
+            registered_domain = probe.registered[0]
+            registered_pid = probe.pid_for(registered_domain)
+            if registered_pid is not None:
+                runtime_identity = _attest_launchd_runtime_identity(
+                    registered_pid,
+                    _launchd_process_start_time(registered_pid),
+                    plist_argv=identity.argv,
+                    hermes_home=identity.hermes_home,
+                    profile=identity.profile,
+                )
         planned.append(
             {
                 "label": label,
                 "plist_path": plist_path,
                 "identity": identity,
                 "probe": probe,
-                "preflight_snapshot": _launchd_all_snapshot_from_probe(probe),
+                "preflight_snapshot": _launchd_all_snapshot_from_probe(
+                    probe, runtime_identity=runtime_identity
+                ),
                 "restore_domains": restore_domains,
                 "changed_domains": tuple(
                     domain for domain in domains if domain not in probe.disabled
                 ),
+                "runtime_identity": runtime_identity,
             }
         )
 
@@ -6249,8 +6593,14 @@ def launchd_stop_all() -> LaunchdStopAllResult:
                 try:
                     barrier_snapshots[label] = _launchd_stop_commit_snapshot(
                         label,
-                        _launchd_all_snapshot_from_probe(after),
+                        _launchd_all_snapshot_from_probe(
+                            after, runtime_identity=plan["runtime_identity"]
+                        ),
                         after,
+                        expected_runtime_identity=plan["runtime_identity"],
+                        plist_argv=plan["identity"].argv,
+                        hermes_home=plan["identity"].hermes_home,
+                        profile=plan["identity"].profile,
                     )
                 except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
                     failures.append(
@@ -6284,10 +6634,19 @@ def launchd_stop_all() -> LaunchdStopAllResult:
                 hermes_home=plan["identity"].hermes_home,
                 preflight_snapshot=plan["preflight_snapshot"],
                 post_mutation_snapshot=(
-                    _launchd_all_snapshot_from_probe(after)
+                    _launchd_all_snapshot_from_probe(
+                        after,
+                        runtime_identity=(
+                            barrier_snapshots[label].runtime_identity
+                            if label in barrier_snapshots
+                            else plan["runtime_identity"]
+                        ),
+                    )
                     if after is not None
                     else None
                 ),
+                plist_argv=plan["identity"].argv,
+                plist_profile=plan["identity"].profile,
             )
         )
 
@@ -6329,7 +6688,13 @@ def launchd_stop_all() -> LaunchdStopAllResult:
             # This probe is intentionally the last launchd observation before
             # the exact bootout command for this label.
             commit = _launchd_stop_commit_snapshot(
-                label, barrier_snapshots[label], _probe_launchd_label_domains(label)
+                label,
+                barrier_snapshots[label],
+                _probe_launchd_label_domains(label),
+                expected_runtime_identity=barrier_snapshots[label].runtime_identity,
+                plist_argv=expected_identity.argv,
+                hermes_home=expected_identity.hermes_home,
+                profile=expected_identity.profile,
             )
             if commit.registered != barrier_snapshots[label].registered:
                 raise LaunchdAllOperationError(
@@ -6393,6 +6758,11 @@ def launchd_stop_all() -> LaunchdStopAllResult:
     )
 
 
+def launchd_stop_all() -> LaunchdStopAllResult:
+    with _all_profile_lifecycle_transaction():
+        return _launchd_stop_all_locked()
+
+
 def _launchd_all_revalidate_fenced_plist(target: LaunchdFencedGateway) -> None:
     """Re-attest the exact plist identity retained by a stop transaction."""
     if not target.plist_fingerprint or not target.plist_stat_identity:
@@ -6405,16 +6775,24 @@ def _launchd_all_revalidate_fenced_plist(target: LaunchdFencedGateway) -> None:
         or identity.fingerprint != target.plist_fingerprint
         or identity.stat_identity != target.plist_stat_identity
         or identity.hermes_home != target.hermes_home
+        or (target.plist_argv and identity.argv != target.plist_argv)
+        or (target.plist_argv and identity.profile != target.plist_profile)
     ):
         raise LaunchdAllOperationError(
             f"{target.label}: restore plist identity changed before bootstrap"
         )
 
 
-def launchd_restore_all(
+def _launchd_restore_all_locked(
     result: LaunchdStopAllResult,
 ) -> tuple[int, list[str]]:
-    """Restore every exact LaunchAgent recorded by ``launchd_stop_all``."""
+    """Restore only the exact domains recorded by ``launchd_stop_all``.
+
+    ``restore_domains`` is transaction evidence, not a hint.  In particular,
+    an empty tuple means the target was intentionally pre-disabled: an
+    unexpected registration is reported, but no enable/bootstrap/kickstart is
+    ever attempted to revive it.
+    """
     restored = 0
     failures: list[str] = []
     for target in result.fenced:
@@ -6429,6 +6807,11 @@ def launchd_restore_all(
                 raise LaunchdAllOperationError(
                     f"{target.label} restore registration conflict in {probe.registered}"
                 )
+            if len(target.restore_domains) > 1:
+                raise LaunchdAllOperationError(
+                    f"{target.label} restore has multiple recorded domains: "
+                    f"{target.restore_domains}"
+                )
         except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
             label_errors.append(
                 f"{target.label} restore preflight ({_launchd_all_failure_detail(exc)})"
@@ -6436,151 +6819,153 @@ def launchd_restore_all(
             failures.extend(label_errors)
             continue
 
-        # Only clear desired-state bits this transaction changed. A concurrent
-        # enable is already the desired result and must not receive a redundant
-        # enable mutation.
-        for domain in target.changed_domains:
-            if domain not in probe.disabled:
-                continue
-            try:
-                _launchd_all_revalidate_fenced_plist(target)
-                _launchd_enable(domain, target.label)
-            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-                label_errors.append(
-                    f"{domain}/{target.label} enable ({_launchd_all_failure_detail(exc)})"
-                )
-        if label_errors:
-            failures.extend(label_errors)
-            continue
-
-        probe = _probe_launchd_label_domains(target.label)
-        try:
-            _launchd_all_require_known_probe(target.label, probe)
-            if len(probe.registered) > 1:
-                raise LaunchdAllOperationError(
-                    f"{target.label} restore registration conflict in {probe.registered}"
-                )
-        except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-            failures.append(
-                f"{target.label} restore state ({_launchd_all_failure_detail(exc)})"
-            )
-            continue
-
-        remaining_owned = set(target.changed_domains) & set(probe.disabled)
-        if remaining_owned:
-            failures.append(
-                f"{target.label} restore left transaction-owned domains disabled: "
-                f"{sorted(remaining_owned)}"
-            )
-            continue
-
-        def _restore_live_state(
-            current: LaunchdLabelProbe, domain: str
-        ) -> tuple[LaunchdLabelProbe, bool]:
-            _launchd_all_require_known_probe(target.label, current)
-            if len(current.registered) > 1:
-                raise LaunchdAllOperationError(
-                    f"{target.label} restore registration conflict in "
-                    f"{current.registered}"
-                )
-            if current.registered and current.registered != (domain,):
-                raise LaunchdAllOperationError(
-                    f"{target.label} restore registration moved to "
-                    f"{current.registered}"
-                )
-            if set(target.changed_domains) & set(current.disabled):
-                raise LaunchdAllOperationError(
-                    f"{target.label} restore left transaction-owned domains "
-                    f"disabled: {sorted(set(target.changed_domains) & set(current.disabled))}"
-                )
-            if current.registered != (domain,):
-                return current, False
-            pid = current.pid_for(domain)
-            if pid is None:
-                return current, False
-            start_time = _launchd_process_start_time(pid)
-            if start_time is None or not _launchd_pid_is_live(pid, start_time):
-                return current, False
-            return current, True
-
         restore_domain = target.restore_domains[0] if target.restore_domains else None
-        if probe.registered:
-            domain = probe.registered[0]
-            try:
-                probe, live = _restore_live_state(probe, domain)
-                if not live:
-                    if not target.changed_domains:
-                        restored += 1
-                        continue
-                    # A loaded no-PID target gets a non-killing kickstart, never
-                    # a bootstrap or kill -k replacement.
-                    _launchd_all_revalidate_fenced_plist(target)
-                    subprocess.run(
-                        ["launchctl", "kickstart", f"{domain}/{target.label}"],
-                        check=True,
-                        timeout=30,
-                    )
-                    probe, live = _restore_live_state(
-                        _probe_launchd_label_domains(target.label), domain
-                    )
-                if not live:
-                    raise LaunchdAllOperationError(
-                        f"{domain}/{target.label} restore produced no live PID"
-                    )
-                restored += 1
-            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-                label_errors.append(
-                    f"{target.label} restore "
-                    f"({_launchd_all_failure_detail(exc)})"
-                )
-            failures.extend(label_errors)
-            continue
-
         if restore_domain is None:
-            # A pre-disabled, unloaded label is intentionally preserved. No
-            # launchd registration is expected, but the exact state was known.
+            # A pre-disabled target has a desired-state fence that is part of
+            # its identity.  Only the transaction snapshot can define the
+            # expected fence; an old compatibility-shaped result has no such
+            # evidence and therefore receives no mutation.
+            expected_fence = (
+                target.post_mutation_snapshot.disabled
+                if target.post_mutation_snapshot is not None
+                else ()
+            )
+            if probe.registered:
+                label_errors.append(
+                    f"{target.label} restore found unexpected registration "
+                    f"in {probe.registered}; pre-disabled target was not revived"
+                )
+            elif expected_fence and set(probe.disabled) != set(expected_fence):
+                label_errors.append(
+                    f"{target.label} restore changed its pre-disabled fence from "
+                    f"{list(expected_fence)} to {list(probe.disabled)}"
+                )
+            if label_errors:
+                failures.extend(label_errors)
+                continue
             restored += 1
             continue
 
+        # The recorded domain is the only domain that may contain or receive
+        # this target.  Do not replace it with the domain observed above.
+        if restore_domain not in _launchd_candidate_domains():
+            failures.append(
+                f"{target.label} recorded restore domain is not a user domain: "
+                f"{restore_domain}"
+            )
+            continue
+        if probe.registered:
+            if probe.registered != (restore_domain,):
+                failures.append(
+                    f"{target.label} restore registration is {probe.registered}; "
+                    f"expected exactly {(restore_domain,)}"
+                )
+                continue
+            pid = probe.pid_for(restore_domain)
+            if pid is None:
+                failures.append(
+                    f"{restore_domain}/{target.label} restore has no live PID"
+                )
+                continue
+            try:
+                start_time = _launchd_process_start_time(pid)
+                if start_time is None or not _launchd_pid_is_live(pid, start_time):
+                    raise LaunchdAllOperationError(
+                        f"{restore_domain}/{target.label} restore has no live PID"
+                    )
+                _attest_launchd_runtime_identity(
+                    pid,
+                    start_time,
+                    plist_argv=target.plist_argv,
+                    hermes_home=target.hermes_home,
+                    profile=target.plist_profile,
+                )
+                restored += 1
+            except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
+                failures.append(
+                    f"{restore_domain}/{target.label} restore "
+                    f"({_launchd_all_failure_detail(exc)})"
+                )
+            continue
+
         try:
-            # This reattestation is deliberately adjacent to bootstrap after
-            # all desired-state writes have completed.
+            # Only transaction-owned desired-state bits may be cleared.  A
+            # concurrent registration is rejected before any enable/bootstrap.
+            for domain in target.changed_domains:
+                if domain not in probe.disabled:
+                    continue
+                _launchd_all_revalidate_fenced_plist(target)
+                current = _probe_launchd_label_domains(target.label)
+                _launchd_all_require_known_probe(target.label, current)
+                if current.registered:
+                    raise LaunchdAllOperationError(
+                        f"{target.label} restore registration appeared in "
+                        f"{current.registered}"
+                    )
+                _launchd_enable(domain, target.label)
+                probe = _probe_launchd_label_domains(target.label)
+                _launchd_all_require_known_probe(target.label, probe)
+            if probe.registered:
+                raise LaunchdAllOperationError(
+                    f"{target.label} restore registration appeared in "
+                    f"{probe.registered}"
+                )
+            remaining_owned = set(target.changed_domains) & set(probe.disabled)
+            if remaining_owned:
+                raise LaunchdAllOperationError(
+                    f"{target.label} restore left transaction-owned domains disabled: "
+                    f"{sorted(remaining_owned)}"
+                )
             _launchd_all_revalidate_fenced_plist(target)
             _launchctl_bootstrap(
                 restore_domain, target.plist_path, target.label, timeout=30
             )
             probe = _probe_launchd_label_domains(target.label)
-            probe, live = _restore_live_state(probe, restore_domain)
-            if not live:
-                _launchd_all_revalidate_fenced_plist(target)
-                subprocess.run(
-                    ["launchctl", "kickstart", f"{restore_domain}/{target.label}"],
-                    check=True,
-                    timeout=30,
+            _launchd_all_require_known_probe(target.label, probe)
+            if probe.registered != (restore_domain,):
+                raise LaunchdAllOperationError(
+                    f"{target.label} restored in {probe.registered}; expected "
+                    f"exactly {(restore_domain,)}"
                 )
-                probe, live = _restore_live_state(
-                    _probe_launchd_label_domains(target.label), restore_domain
-                )
-            if not live:
+            pid = probe.pid_for(restore_domain)
+            if pid is None:
                 raise LaunchdAllOperationError(
                     f"{restore_domain}/{target.label} restore produced no live PID"
                 )
+            start_time = _launchd_process_start_time(pid)
+            if start_time is None or not _launchd_pid_is_live(pid, start_time):
+                raise LaunchdAllOperationError(
+                    f"{restore_domain}/{target.label} restore produced no live PID"
+                )
+            _attest_launchd_runtime_identity(
+                pid,
+                start_time,
+                plist_argv=target.plist_argv,
+                hermes_home=target.hermes_home,
+                profile=target.plist_profile,
+            )
             restored += 1
         except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
-            label_errors.append(
+            failures.append(
                 f"{restore_domain}/{target.label} restore "
                 f"({_launchd_all_failure_detail(exc)})"
             )
-            failures.extend(label_errors)
     return restored, failures
 
 
-def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
+def launchd_restore_all(
+    result: LaunchdStopAllResult,
+) -> tuple[int, list[str]]:
+    with _all_profile_lifecycle_transaction():
+        return _launchd_restore_all_locked(result)
+
+
+def _launchd_release_all_fences_locked(result: LaunchdStopAllResult) -> list[str]:
     """Rollback desired-state writes when restart aborts before bootout/sweep."""
     failures: list[str] = []
     for target in result.fenced:
         try:
-            current = _launchd_all_capture_label_snapshot(target.label)
+            current = _launchd_all_capture_label_snapshot(target.label, target)
             expected = target.post_mutation_snapshot
             if expected is None:
                 # Missing transaction evidence is safe only when no enable is
@@ -6635,13 +7020,14 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
                 disabled=tuple(sorted(set(expected_state.disabled) - {domain})),
                 pid=expected_state.pid,
                 start_time=expected_state.start_time,
+                runtime_identity=expected_state.runtime_identity,
             )
 
         # A zero exit from launchctl enable is not proof that every desired
         # state bit changed. One post-enable probe is authoritative for the
         # complete release phase.
         try:
-            current = _launchd_all_capture_label_snapshot(target.label)
+            current = _launchd_all_capture_label_snapshot(target.label, target)
         except _LAUNCHD_ALL_OPERATIONAL_ERRORS as exc:
             failures.append(
                 f"{target.label} fence release post-enable probe "
@@ -6660,6 +7046,11 @@ def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
                 f"disabled: {sorted(remaining_owned)}"
             )
     return failures
+
+
+def launchd_release_all_fences(result: LaunchdStopAllResult) -> list[str]:
+    with _all_profile_lifecycle_transaction():
+        return _launchd_release_all_fences_locked(result)
 
 
 def _coerce_launchd_stop_all_result(value) -> LaunchdStopAllResult:
@@ -8818,7 +9209,20 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
+        subcmd = getattr(args, "gateway_command", None)
+        if subcmd in {"start", "stop", "restart"} and getattr(args, "all", False):
+            # The lock spans discovery, launchctl fences, exact process
+            # convergence, and restore—not just one helper call.  Raw
+            # launchctl invocations from another actor can still race the
+            # probe-to-bootout gap; the adjacent revalidations remain required
+            # because this lock coordinates cooperating Hermes CLIs only.
+            with _all_profile_lifecycle_transaction():
+                return _gateway_command_inner(args)
         return _gateway_command_inner(args)
+    except GatewayLifecycleLockError as e:
+        print_error(f"Could not acquire the all-profile lifecycle lock: {e}")
+        print_error("No gateway lifecycle state was changed.")
+        sys.exit(1)
     except UserSystemdUnavailableError as e:
         # Clean, actionable message instead of a traceback when the user D-Bus
         # session is unreachable (fresh SSH shell, no linger, container, etc.).
@@ -9269,15 +9673,11 @@ def _gateway_command_inner(args):
                     final_identities = find_gateway_process_identities_strict(
                         all_profiles=True
                     )
-                    captured_keys = {
-                        (item.pid, item.start_time, item.command_line)
-                        for item in captured_identities
-                    }
+                    captured_keys = {item.identity_key() for item in captured_identities}
                     new_identities = [
                         item
                         for item in final_identities
-                        if (item.pid, item.start_time, item.command_line)
-                        not in captured_keys
+                        if item.identity_key() not in captured_keys
                     ]
                     if new_identities:
                         raise GatewayProcessTerminationError(

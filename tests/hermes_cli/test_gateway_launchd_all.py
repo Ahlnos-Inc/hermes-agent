@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_cli.gateway as gateway_cli
+from gateway import status as gateway_status
 
 
 def _write_gateway_plist(path: Path, label: str, hermes_home: Path) -> None:
@@ -185,6 +186,11 @@ def launchd_env(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
     monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(
+        gateway_status,
+        "_get_all_profile_lifecycle_lock_path",
+        lambda: tmp_path / "state" / "gateway-all-lifecycle.lock",
+    )
+    monkeypatch.setattr(
         gateway_cli, "_dispatch_all_via_service_manager_if_s6", lambda action: False
     )
     return root, agents
@@ -202,6 +208,28 @@ def _patch_launchd_sim(monkeypatch, sim: _FakeLaunchd) -> None:
     monkeypatch.setattr(gateway_cli.subprocess, "run", sim.run)
     monkeypatch.setattr(gateway_cli, "_launchd_pid_is_live", sim.is_live)
     monkeypatch.setattr(gateway_cli, "_launchd_process_start_time", sim.start_time)
+
+    def attest(pid):
+        for target, job in sim.jobs.items():
+            if not job["loaded"] or job["pid"] != pid:
+                continue
+            label = target.rsplit("/", 1)[-1]
+            plist = gateway_cli._launchd_user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+            identity = gateway_cli._read_launchd_all_plist_identity(plist)
+            return (
+                gateway_cli.GatewayProcessIdentity(
+                    pid,
+                    job["start"],
+                    identity.argv,
+                    runtime_role=gateway_cli.GatewayRuntimeRole.RUNTIME,
+                    profile=identity.profile,
+                    hermes_home=identity.hermes_home,
+                ),
+                SimpleNamespace(),
+            )
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(gateway_cli, "_read_live_gateway_process_identity", attest)
 
 
 def _job(domain: str, label: str, *, pid: int | None, disabled=False, loaded=True) -> tuple[str, dict]:
@@ -541,7 +569,7 @@ def test_restart_all_passes_birth_identity_to_sigusr1_guard(launchd_env, monkeyp
     _patch_launchd_sim(monkeypatch, sim)
     observed = {}
 
-    def fake_graceful(pid, timeout, expected_start_time=None):
+    def fake_graceful(pid, timeout, expected_start_time=None, **kwargs):
         observed.update(
             pid=pid, timeout=timeout, expected_start_time=expected_start_time
         )
@@ -728,7 +756,7 @@ def test_restart_all_bootstrap_without_pid_uses_non_killing_kickstart(
     target = "gui/501/ai.hermes.gateway"
     sim = _FakeLaunchd({}, bootstrap_without_pid=(target,))
     _patch_launchd_sim(monkeypatch, sim)
-    clock = iter((0.0, 11.0, 11.0, 11.0))
+    clock = iter((0.0, 11.0, 14.0, 14.0))
     monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: next(clock, 11.0))
     monkeypatch.setattr(gateway_cli.time, "sleep", lambda _seconds: None)
 
@@ -1342,6 +1370,187 @@ def test_restore_bootstrap_exit5_preserves_concurrent_live_registration(
     assert sim.jobs[target]["loaded"] is True
     assert sim.jobs[target]["pid"] is not None
     assert not any(call[:2] == ["launchctl", "bootout"] for call in sim.calls)
+
+
+def test_restore_rejects_registration_in_wrong_recorded_domain(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    plist = agents / "ai.hermes.gateway.plist"
+    _write_gateway_plist(plist, "ai.hermes.gateway", root)
+    target = "gui/501/ai.hermes.gateway"
+    peer = "user/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1]),
+            peer: dict(_job("user/501", "ai.hermes.gateway", pid=None, loaded=False)[1]),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    stopped = gateway_cli.launchd_stop_all()
+    sim.jobs[peer] = dict(_job("user/501", "ai.hermes.gateway", pid=303)[1])
+    sim.jobs[peer]["disabled"] = True
+
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 0
+    assert failures
+    assert any("expected exactly" in failure for failure in failures)
+    assert not any(
+        call[:2] in (["launchctl", "enable"], ["launchctl", "bootstrap"], ["launchctl", "kickstart"])
+        for call in sim.calls
+    )
+
+
+def test_restore_preserves_pre_disabled_fence_when_registration_appears(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    plist = agents / "ai.hermes.gateway.plist"
+    _write_gateway_plist(plist, "ai.hermes.gateway", root)
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            target: dict(
+                _job("gui/501", "ai.hermes.gateway", pid=None, disabled=True, loaded=False)[1]
+            ),
+            "user/501/ai.hermes.gateway": dict(
+                _job("user/501", "ai.hermes.gateway", pid=None, loaded=False)[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+
+    stopped = gateway_cli.launchd_stop_all()
+    sim.jobs[target].update(loaded=True, pid=404, start=4040)
+
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 0
+    assert failures
+    assert "pre-disabled target was not revived" in failures[0]
+    assert not any(
+        call[:2] in (["launchctl", "enable"], ["launchctl", "bootstrap"], ["launchctl", "kickstart"])
+        for call in sim.calls
+    )
+
+
+def test_restore_rejects_foreign_runtime_in_recorded_domain(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    plist = agents / "ai.hermes.gateway.plist"
+    _write_gateway_plist(plist, "ai.hermes.gateway", root)
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {
+            target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1]),
+            "user/501/ai.hermes.gateway": dict(
+                _job("user/501", "ai.hermes.gateway", pid=None, loaded=False)[1]
+            ),
+        }
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    stopped = gateway_cli.launchd_stop_all()
+    sim.jobs[target].update(loaded=True, pid=505, start=5050)
+    foreign = gateway_cli.GatewayProcessIdentity(
+        505,
+        5050,
+        (
+            "/usr/bin/python3",
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--replace",
+        ),
+        runtime_role=gateway_cli.GatewayRuntimeRole.RUNTIME,
+        profile=None,
+        hermes_home=root / "foreign",
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_read_live_gateway_process_identity",
+        lambda _pid: (foreign, SimpleNamespace()),
+    )
+
+    restored, failures = gateway_cli.launchd_restore_all(stopped)
+
+    assert restored == 0
+    assert failures
+    assert not any(
+        call[:2] in (["launchctl", "enable"], ["launchctl", "bootstrap"], ["launchctl", "kickstart"])
+        for call in sim.calls
+    )
+
+
+def test_restart_preflight_rejects_foreign_runtime_identity(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    plist = agents / "ai.hermes.gateway.plist"
+    _write_gateway_plist(plist, "ai.hermes.gateway", root)
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1])}
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    foreign = gateway_cli.GatewayProcessIdentity(
+        101,
+        1010,
+        ("/usr/bin/python3", "-m", "foreign.service"),
+        runtime_role=gateway_cli.GatewayRuntimeRole.FOREIGN,
+        hermes_home=root / "foreign",
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_read_live_gateway_process_identity",
+        lambda _pid: (foreign, SimpleNamespace()),
+    )
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="foreign"):
+        gateway_cli.launchd_restart_all()
+
+    assert _mutating_launchd_calls(sim) == []
+
+
+def test_restart_rejects_foreign_successor_before_reporting_success(
+    launchd_env, monkeypatch
+):
+    root, agents = launchd_env
+    plist = agents / "ai.hermes.gateway.plist"
+    _write_gateway_plist(plist, "ai.hermes.gateway", root)
+    target = "gui/501/ai.hermes.gateway"
+    sim = _FakeLaunchd(
+        {target: dict(_job("gui/501", "ai.hermes.gateway", pid=101)[1])}
+    )
+    _patch_launchd_sim(monkeypatch, sim)
+    real_attest = gateway_cli._read_live_gateway_process_identity
+
+    def foreign_successor(pid):
+        identity, process = real_attest(pid)
+        if pid != 101:
+            identity = gateway_cli.GatewayProcessIdentity(
+                pid,
+                identity.start_time,
+                identity.argv,
+                runtime_role=gateway_cli.GatewayRuntimeRole.RUNTIME,
+                profile=identity.profile,
+                hermes_home=root / "foreign",
+            )
+        return identity, process
+
+    monkeypatch.setattr(gateway_cli, "_read_live_gateway_process_identity", foreign_successor)
+
+    def graceful(pid, _timeout, **_kwargs):
+        assert _replace_fake_pid(sim, pid)
+        return True
+
+    monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", graceful)
+
+    with pytest.raises(gateway_cli.LaunchdAllOperationError, match="foreign"):
+        gateway_cli.launchd_restart_all()
 
 
 def test_stop_all_failed_disable_stays_unsafe_even_with_valid_barrier(

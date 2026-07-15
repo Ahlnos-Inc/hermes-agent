@@ -663,11 +663,32 @@ class TestGatewayStopCleanup:
 
 class TestLaunchdServiceRecovery:
     @pytest.fixture(autouse=True)
-    def _fake_launchd_birth_identity(self, monkeypatch):
+    def _fake_launchd_birth_identity(self, tmp_path, monkeypatch):
         """Synthetic launchd PIDs still carry a deterministic birth token."""
         monkeypatch.setattr(
             gateway_cli, "_launchd_process_start_time", lambda pid: pid * 10
         )
+        monkeypatch.setattr(
+            status,
+            "_get_all_profile_lifecycle_lock_path",
+            lambda: tmp_path / "state" / "gateway-all-lifecycle.lock",
+        )
+
+        def attest(pid, start_time, *, plist_argv, hermes_home, profile):
+            return gateway_cli.GatewayProcessIdentity(
+                pid,
+                start_time,
+                tuple(plist_argv),
+                runtime_role=gateway_cli.GatewayRuntimeRole.RUNTIME,
+                profile=profile,
+                hermes_home=hermes_home,
+            )
+
+        # These tests use synthetic launchd PIDs rather than real psutil
+        # processes.  Return the exact identity requested by the plist
+        # attestation boundary so the tests exercise the transaction probes,
+        # not the host process table.
+        monkeypatch.setattr(gateway_cli, "_attest_launchd_runtime_identity", attest)
 
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
