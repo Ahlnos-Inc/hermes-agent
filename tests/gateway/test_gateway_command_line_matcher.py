@@ -22,7 +22,6 @@ ACCEPT = [
     r"C:\Users\me\hermes\venv\Scripts\pythonw.exe -m hermes_cli.main gateway run",
     "python -m hermes_cli.main --profile work gateway run",
     "python -m hermes_cli.main gateway run --replace",
-    "python -m hermes_cli/main.py gateway run",
     "python gateway/run.py",
     "hermes-gateway.exe",
     "hermes gateway",          # bare `hermes gateway` defaults to run
@@ -47,6 +46,7 @@ REJECT = [
     "python -m hermes_cli.main gateway restart",
     "python -m hermes_cli.main gateway stop",
     "python -m hermes_cli.main --profile x dashboard",    # non-gateway subcommand
+    "python -m hermes_cli/main.py gateway run",            # invalid -m spelling
     "some random python -m mygateway thing",
     "",
     None,

@@ -209,6 +209,7 @@ def test_canonical_identity_contains_runtime_profile_and_home_attestation(tmp_pa
         ("foreign", r"C:\\Program Files\\Hermes\\Hermes.EXE", "gateway", "run"),
         ("hermes", "chat", "gateway", "run"),
         ("hermes", "mcp", "servers", "gateway", "run"),
+        ("python", "-m", "hermes_cli/main.py", "gateway", "run"),
     ],
 )
 def test_canonical_classifier_rejects_decoy_entrypoint_tokens(argv):
@@ -267,7 +268,6 @@ def test_canonical_classifier_rejects_non_profile_cli_prefixes(argv):
         (("hermes", "-p", "x", "gateway", "restart"), gateway.GatewayRuntimeRole.MANAGER, "x"),
         (("python", "-m", "hermes_cli.main", "--profile=x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
         (("python", "-m", "hermes_cli.main", "-p", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
-        (("python", "-m", "hermes_cli/main.py", "--profile", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
         (("python", "hermes_cli/main.py", "--profile", "x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
         (("hermes_cli/main.py", "--profile=x", "gateway", "run"), gateway.GatewayRuntimeRole.RUNTIME, "x"),
     ],
@@ -278,7 +278,6 @@ def test_canonical_classifier_rejects_non_profile_cli_prefixes(argv):
         "hermes-short-profile-manager",
         "module-inline-profile",
         "module-spaced-profile",
-        "historical-module-spaced-profile",
         "script-spaced-profile",
         "direct-script-inline-profile",
     ],
@@ -320,14 +319,12 @@ def test_canonical_classifier_accepts_profile_selectors_after_gateway(argv):
     [
         ("hermes", "gateway"),
         ("python", "-m", "hermes_cli.main", "gateway"),
-        ("python", "-m", "hermes_cli/main.py", "gateway"),
         ("python", "hermes_cli/main.py", "gateway"),
         ("hermes_cli/main.py", "gateway"),
     ],
     ids=[
         "hermes",
         "module",
-        "historical-module",
         "python-script",
         "direct-script",
     ],

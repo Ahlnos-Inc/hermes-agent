@@ -12,6 +12,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -212,11 +213,7 @@ def _entrypoint_arguments(
         return "direct", argv[2:]
     if _is_gateway_cli_script(tokens[1]):
         return "cli", argv[2:]
-    if (
-        len(tokens) >= 3
-        and tokens[1] == "-m"
-        and tokens[2] in {"hermes_cli.main", "hermes_cli/main.py"}
-    ):
+    if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "hermes_cli.main":
         return "cli", argv[3:]
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "gateway.run":
         return "direct", argv[3:]
@@ -241,6 +238,7 @@ def _parse_legacy_wrapper_tail(args: tuple[str, ...]) -> str | None:
     return _normalized_token(parsed.command)
 
 
+@lru_cache(maxsize=1)
 def _build_cli_identity_parser():
     """Build the real top-level plus gateway parser without runtime imports."""
     from hermes_cli._parser import build_top_level_parser
@@ -266,6 +264,8 @@ def _parse_cli_command(args: tuple[str, ...]) -> tuple[str, str | None] | None:
     from hermes_cli.profile_argv import parse_profile_argv
 
     profile_parse = parse_profile_argv(args)
+    if not profile_parse.valid:
+        return None
     parser = _build_cli_identity_parser()
     try:
         parsed = parser.parse_args(profile_parse.argv)

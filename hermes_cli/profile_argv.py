@@ -14,6 +14,7 @@ _VALUE_FLAGS = frozenset({
     "-m",
     "--model",
     "--provider",
+    "--reasoning-effort",
     "-t",
     "--toolsets",
     "-r",

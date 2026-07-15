@@ -25,6 +25,17 @@ def test_profile_parser_matches_real_value_and_optional_value_bounds():
     assert parse_profile_argv(
         ("--model", "--profile=child", "gateway", "run")
     ).profile is None
+    reasoning = parse_profile_argv(
+        ("--reasoning-effort", "--profile=child", "gateway", "run")
+    )
+    assert reasoning.argv == (
+        "--reasoning-effort",
+        "--profile=child",
+        "gateway",
+        "run",
+    )
+    assert reasoning.profile is None
+    assert reasoning.valid
     parsed = parse_profile_argv(
         ("--continue", "--profile=child", "gateway", "run")
     )

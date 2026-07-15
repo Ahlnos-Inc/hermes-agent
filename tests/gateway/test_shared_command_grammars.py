@@ -12,7 +12,13 @@ from gateway.command_line import (
     build_direct_gateway_parser,
     build_legacy_gateway_parser,
 )
-from gateway.process_identity import GatewayRuntimeRole, classify_gateway_argv
+from gateway.process_identity import (
+    GatewayRuntimeRole,
+    _build_cli_identity_parser,
+    _parse_cli_command,
+    classify_gateway_argv,
+)
+from hermes_cli.profile_argv import ProfileArgvParse
 from hermes_cli._parser import build_top_level_parser
 from hermes_cli.profile_argv import parse_profile_argv
 from hermes_cli.subcommands.gateway import build_gateway_parser
@@ -112,6 +118,45 @@ def test_cli_identity_matches_canonical_gateway_parser(argv, expected):
     assert parsed is not None
     assert parsed.command == "gateway"
     assert _identity(argv) is expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (("python", "-m", "hermes_cli.main", "gateway", "run"), GatewayRuntimeRole.RUNTIME),
+        (("python", "hermes_cli/main.py", "gateway", "run"), GatewayRuntimeRole.RUNTIME),
+        (("python", "-m", "hermes_cli/main.py", "gateway", "run"), GatewayRuntimeRole.FOREIGN),
+    ],
+)
+def test_cli_identity_entrypoint_spellings_match_canonical_grammar(argv, expected):
+    assert _identity(argv) is expected
+
+
+def test_cli_identity_fails_closed_on_invalid_profile_scan(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.profile_argv.parse_profile_argv",
+        lambda _args: ProfileArgvParse(("gateway", "run"), None, False),
+    )
+
+    def unexpected_parser_build():
+        raise AssertionError("invalid profile argv must not reach argparse")
+
+    monkeypatch.setattr(
+        "gateway.process_identity._build_cli_identity_parser",
+        unexpected_parser_build,
+    )
+    assert _parse_cli_command(("gateway", "run")) is None
+
+
+def test_cached_cli_identity_parser_has_no_sequential_parse_state_leakage():
+    parser = _build_cli_identity_parser()
+    assert parser is _build_cli_identity_parser()
+    assert _parse_cli_command(("--profile", "work", "gateway", "run")) == (
+        "run",
+        "work",
+    )
+    assert _parse_cli_command(("gateway", "start")) == ("start", None)
+    assert _parse_cli_command(("gateway", "run")) == ("run", None)
 
 
 @pytest.mark.parametrize(
