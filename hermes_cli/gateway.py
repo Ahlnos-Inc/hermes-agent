@@ -5090,10 +5090,14 @@ def _launchd_start_all_target(target: LaunchdAllTarget) -> LaunchdAllTargetOutco
         if target.probe.registered:
             # An existing registration owns exactly one domain.  A disabled
             # peer is independent desired state and must not be cleared by
-            # starting the registered target.
-            domains_to_enable = (
-                (target.domain,) if target.domain in original_disabled else ()
-            )
+            # starting the registered target.  Its own disabled bit is a
+            # deliberate fence and must not be revived either.
+            if target.domain in original_disabled:
+                _launchd_all_prepare_mutation(target, expected_disabled)
+                return LaunchdAllTargetOutcome(
+                    target.label, target.domain, "preserved"
+                )
+            domains_to_enable = ()
         elif original_disabled:
             # An unloaded target with any pre-existing fence has no
             # authoritative domain.  Preserve the fence rather than choosing
