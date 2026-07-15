@@ -102,8 +102,9 @@ def build_gateway_parser(
         action="store_true",
         help=(
             "Start across profiles using platform-specific service handling; "
-            "on macOS, target installed Hermes LaunchAgents only and verify "
-            "exact launchd labels without a global PID sweep"
+            "on macOS, target installed Hermes LaunchAgents only, clear "
+            "maintenance fences, and verify exact launchd labels without a "
+            "global PID sweep"
         ),
     )
     _add_compat_platform_flag(gateway_start)

@@ -122,3 +122,64 @@ def test_strict_proc_inventory_fails_closed_on_permission_error(monkeypatch):
         match="could not inspect /proc/4242/cmdline",
     ):
         gateway.find_gateway_pids_strict(all_profiles=True)
+
+
+class _SignalRecorder:
+    def __init__(self):
+        self.terminated = 0
+        self.killed = 0
+
+    def terminate(self):
+        self.terminated += 1
+
+    def kill(self):
+        self.killed += 1
+
+
+def _identity(pid=4242, start_time=100, command_line=None):
+    return gateway.GatewayProcessIdentity(
+        pid,
+        start_time,
+        command_line
+        or "python -m hermes_cli.main gateway run --replace",
+    )
+
+
+def test_identity_aware_termination_signals_normal_exact_identity(monkeypatch):
+    captured = _identity()
+    live = _SignalRecorder()
+    monkeypatch.setattr(
+        gateway,
+        "_read_live_gateway_process_identity",
+        lambda _pid: (captured, live),
+    )
+
+    terminated = gateway.terminate_gateway_process_identities_strict([captured])
+
+    assert terminated == (captured,)
+    assert live.terminated == 1
+    assert live.killed == 0
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        _identity(start_time=101),
+        _identity(command_line="python unrelated-worker.py"),
+    ],
+    ids=["recycled-pid", "changed-gateway-command"],
+)
+def test_identity_aware_termination_never_signals_changed_identity(monkeypatch, live):
+    captured = _identity()
+    signals = _SignalRecorder()
+    monkeypatch.setattr(
+        gateway,
+        "_read_live_gateway_process_identity",
+        lambda _pid: (live, signals),
+    )
+
+    with pytest.raises(gateway.GatewayProcessTerminationError, match="signal skipped"):
+        gateway.terminate_gateway_process_identities_strict([captured])
+
+    assert signals.terminated == 0
+    assert signals.killed == 0
