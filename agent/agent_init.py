@@ -395,6 +395,15 @@ def init_agent(
     except Exception:
         pass
 
+    from agent.runtime_target import validate_claude_runtime_target
+
+    validate_claude_runtime_target(
+        provider=agent.provider,
+        model=agent.model,
+        runtime=agent.runtime,
+        base_url=agent.base_url,
+    )
+
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs

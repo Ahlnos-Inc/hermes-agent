@@ -163,6 +163,15 @@ def _format_exhausted_status(entry) -> str:
 
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
+    if provider == "anthropic":
+        from agent.runtime_target import (
+            CLAUDE_MAX_ONLY_POLICY,
+            CLAUDE_ROUTE_POLICY_ERROR,
+            claude_auth_policy,
+        )
+
+        if claude_auth_policy() == CLAUDE_MAX_ONLY_POLICY:
+            raise SystemExit(CLAUDE_ROUTE_POLICY_ERROR)
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
 

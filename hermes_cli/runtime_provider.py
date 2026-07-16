@@ -2212,6 +2212,19 @@ def resolve_runtime_provider(
         api_mode=str(effective_route.get("api_mode") or "anthropic_messages"),
         route_config=effective_route,
     )
+    from agent.runtime_target import validate_claude_runtime_target
+
+    validate_claude_runtime_target(
+        provider=provider_hint,
+        model=str(
+            target_model
+            or effective_route.get("model")
+            or effective_route.get("default")
+            or ""
+        ),
+        runtime=runtime_identity,
+        base_url=str(explicit_base_url or effective_route.get("base_url") or ""),
+    )
     if runtime_identity == CLAUDE_AGENT_SDK_RUNTIME:
         if provider_hint != "anthropic":
             raise RuntimeError(

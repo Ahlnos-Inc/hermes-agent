@@ -6,6 +6,7 @@ import base64
 import json
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -127,6 +128,34 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["source"] == "manual:hermes_pkce"
     assert entry["refresh_token"] == "refresh-token"
     assert entry["expires_at_ms"] == 1711234567000
+
+
+@pytest.mark.parametrize("auth_type", ["oauth", "api-key"])
+def test_auth_add_anthropic_rejected_by_max_only_policy(
+    tmp_path, monkeypatch, auth_type
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    auth_path = tmp_path / "hermes" / "auth.json"
+    before = auth_path.read_bytes()
+    monkeypatch.setattr(
+        "agent.runtime_target.claude_auth_policy",
+        lambda: "max_only",
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    with pytest.raises(SystemExit, match="Claude Max login via claude_agent_sdk"):
+        auth_add_command(
+            SimpleNamespace(
+                provider="anthropic",
+                auth_type=auth_type,
+                api_key="must-not-be-persisted",
+                label=None,
+            )
+        )
+
+    assert auth_path.read_bytes() == before
 
 
 def test_auth_add_qwen_oauth_sets_active_provider(tmp_path, monkeypatch):

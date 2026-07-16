@@ -1,9 +1,12 @@
+import pytest
+
 from agent.runtime_target import (
     CLAUDE_AGENT_SDK_RUNTIME,
     CODEX_APP_SERVER_RUNTIME,
     HERMES_RUNTIME,
     attach_runtime_identity,
     resolve_runtime_identity,
+    validate_claude_runtime_target,
 )
 
 
@@ -142,4 +145,61 @@ model:
 
     assert target["provider"] == "openrouter"
     assert target["runtime"] == HERMES_RUNTIME
-import pytest
+
+
+@pytest.mark.parametrize(
+    ("provider", "runtime", "base_url"),
+    [
+        ("anthropic", HERMES_RUNTIME, "https://api.anthropic.com"),
+        ("openrouter", HERMES_RUNTIME, "https://openrouter.ai/api/v1"),
+        ("bedrock", HERMES_RUNTIME, ""),
+        ("anthropic", CLAUDE_AGENT_SDK_RUNTIME, "https://proxy.example/v1"),
+    ],
+)
+def test_max_only_policy_rejects_alternate_claude_routes(provider, runtime, base_url):
+    with pytest.raises(ValueError, match="Claude Max login via claude_agent_sdk"):
+        validate_claude_runtime_target(
+            provider=provider,
+            model="claude-opus-4-8",
+            runtime=runtime,
+            base_url=base_url,
+            policy="max_only",
+        )
+
+
+def test_max_only_policy_accepts_exact_subscription_route():
+    validate_claude_runtime_target(
+        provider="anthropic",
+        model="claude-opus-4-8",
+        runtime=CLAUDE_AGENT_SDK_RUNTIME,
+        base_url="",
+        policy="max_only",
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("anthropic", "claude-sonnet-4-6"),
+        ("openrouter", "anthropic/claude-sonnet-4-6"),
+    ],
+)
+def test_provider_resolution_rejects_alternate_claude_under_max_only_policy(
+    monkeypatch, tmp_path, provider, model
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    home.joinpath("config.yaml").write_text(
+        "security:\n  claude_auth_policy: max_only\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    with pytest.raises(ValueError, match="Claude Max login via claude_agent_sdk"):
+        resolve_runtime_provider(
+            requested=provider,
+            explicit_api_key="never-used",
+            target_model=model,
+        )

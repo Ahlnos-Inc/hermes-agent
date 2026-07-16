@@ -2460,6 +2460,9 @@ DEFAULT_CONFIG = {
 
     # Pre-exec security scanning via tirith
     "security": {
+        # Optional managed-policy gate. ``max_only`` permits Claude models only
+        # through the first-party Claude Agent SDK subscription runtime.
+        "claude_auth_policy": "any",
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
         "tirith_enabled": True,
