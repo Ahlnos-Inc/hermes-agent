@@ -87,13 +87,31 @@ def test_unlinked_task_unchanged(kanban_conn):
     assert task.branch_name is None
 
 
-def test_unknown_project_id_falls_back_gracefully(kanban_conn):
-    # A project id that doesn't resolve must not crash task creation; the task
-    # is created as-is (scratch) and project_id stays unset.
-    tid = kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
-    task = kb.get_task(kanban_conn, tid)
-    assert task.workspace_kind == "scratch"
-    assert task.project_id is None
+def test_unknown_project_fails_closed_and_persists_nothing(kanban_conn):
+    # BUILD-496 invariant 3: an explicitly-requested project that doesn't
+    # resolve must fail closed with a typed error — NOT silently degrade to a
+    # scratch card (the incident's first hop). No task row or event persists.
+    with pytest.raises(kb.WorkspaceContractError) as ei:
+        kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
+    assert ei.value.code == "unknown_project"
+    assert kanban_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert kanban_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
+
+
+def test_incident_shape_project_worktree_fails_closed(kanban_conn):
+    # The exact incident: kanban_create(project=..., workspace_kind="worktree")
+    # with the project unresolvable in the creating profile. Fail closed with
+    # the typed error; persist nothing.
+    with pytest.raises(kb.WorkspaceContractError) as ei:
+        kb.create_task(
+            kanban_conn,
+            title="ship",
+            project_id="does-not-exist",
+            workspace_kind="worktree",
+        )
+    assert ei.value.code == "unknown_project"
+    assert kanban_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert kanban_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")

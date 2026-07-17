@@ -1377,6 +1377,27 @@ class WorkflowGraphError(ValueError):
     """Stable workflow-compilation conflict or topology error."""
 
 
+class WorkspaceContractError(ValueError):
+    """A task's workspace contract cannot be satisfied (BUILD-496).
+
+    Raised fail-closed at creation (no task row / compilation persisted) and
+    at dispatch for a deterministic, structurally-impossible worktree anchor
+    (invariants 1-3/7). ``code`` is a stable machine-readable classifier:
+    ``unknown_project`` (an explicitly-requested project that does not resolve
+    in the creating profile), ``worktree_no_anchor`` (worktree with no path,
+    no project repo, and no board default_workdir), or ``worktree_bad_anchor``
+    (a worktree path/anchor that is non-absolute or not a git repo). A
+    ValueError subclass so existing ``except ValueError`` surfaces (the public
+    tool handlers, the compiler handler) return it as a typed tool error.
+    Deterministic by construction: retrying the spawn can only reproduce it,
+    so dispatch blocks instead of counting a retryable spawn failure.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class CompiledWorkflowGraph:
     """Task ids produced by one atomic workflow compilation."""
@@ -4250,6 +4271,25 @@ def compile_workflow_graph(
     ).hexdigest()
     request_digest = str(request_digest or "").strip() or spec_digest
 
+    # Invariant 1 (BUILD-496), compiler surface: the compiler applies one
+    # workspace_kind/workspace_path to every step. Reject a worktree
+    # compilation with no materializable anchor BEFORE opening the write
+    # transaction, so the whole all-or-none compilation fails closed instead
+    # of persisting a graph whose every step deterministically fails at
+    # dispatch. Mirrors create_task's board-default fallback (current board
+    # when no explicit board is threaded through the compiler today).
+    if workspace_kind == "worktree" and not workspace_path:
+        board_default = (
+            read_board_metadata(get_current_board()).get("default_workdir") or ""
+        ).strip()
+        if not board_default:
+            raise WorkspaceContractError(
+                "worktree_no_anchor",
+                "workflow workspace_kind='worktree' needs an explicit "
+                "workspace_path or a board default_workdir; none is set, so "
+                "every compiled step would fail at dispatch.",
+            )
+
     with write_txn(conn):
         existing = conn.execute(
             "SELECT * FROM workflow_graph_compilations WHERE workflow_key = ?",
@@ -4889,10 +4929,18 @@ def create_task(
         except Exception:
             project_obj = None
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            # Invariant 3 (BUILD-496): an explicitly-requested project is never
+            # silently ignored. If it doesn't resolve in the creating profile's
+            # registry, fail closed rather than persist a row that quietly
+            # degraded to scratch — that silent drop is the incident's first
+            # hop (project unresolvable + no board default → worktree card with
+            # a null path that only fails at dispatch).
+            raise WorkspaceContractError(
+                "unknown_project",
+                f"project {project_id!r} does not resolve in this profile's "
+                "project registry; create or bind it (`hermes project ...`) "
+                "before linking, or omit the project reference.",
+            )
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -5026,6 +5074,22 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # Invariant 1 (BUILD-496): a committed worktree task must have a usable
+    # repository anchor at commit time — an explicit path, a resolved project
+    # repo (deferred to the insert loop as ``project_repo``), or the board's
+    # default_workdir (resolved just above). With none of these, dispatch can
+    # only fail deterministically ("worktree but no workspace_path"), so fail
+    # closed here and persist nothing.
+    if workspace_kind == "worktree" and not workspace_path and project_repo is None:
+        anchor_board = board if board else get_current_board()
+        raise WorkspaceContractError(
+            "worktree_no_anchor",
+            f"workspace_kind='worktree' needs a repository anchor: pass an "
+            f"explicit absolute workspace_path, a resolvable project, or set "
+            f"board {anchor_board!r} default_workdir "
+            f"(`hermes project bind-board`).",
+        )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -9087,23 +9151,29 @@ def _resolve_worktree_workspace(
         board_slug = board if board else get_current_board()
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
-            raise ValueError(
+            # Deterministic contract violation (BUILD-496 invariant 7): a
+            # legacy row that slipped past creation-time validation. Typed so
+            # dispatch blocks it instead of counting a retryable spawn failure.
+            raise WorkspaceContractError(
+                "worktree_no_anchor",
                 f"task {task.id} has workspace_kind=worktree but no workspace_path, "
                 f"and board {board_slug!r} has no default_workdir set. Set a board "
                 "default workdir (a git repo) or create the task with "
-                "--workspace worktree:<absolute-repo-path>."
+                "--workspace worktree:<absolute-repo-path>.",
             )
         anchor = Path(board_default).expanduser()
         if not anchor.is_absolute():
-            raise ValueError(
+            raise WorkspaceContractError(
+                "worktree_bad_anchor",
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
-                "absolute; use an absolute path to a git repo"
+                "absolute; use an absolute path to a git repo",
             )
         repo_root = _git_toplevel(anchor)
         if repo_root is None:
-            raise ValueError(
+            raise WorkspaceContractError(
+                "worktree_bad_anchor",
                 f"task {task.id} has workspace_kind=worktree but board "
-                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo",
             )
         target = repo_root / ".worktrees" / task.id
         checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
@@ -9113,9 +9183,10 @@ def _resolve_worktree_workspace(
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
-        raise ValueError(
+        raise WorkspaceContractError(
+            "worktree_bad_anchor",
             f"task {task.id} has non-absolute worktree path "
-            f"{task.workspace_path!r}; use an absolute path"
+            f"{task.workspace_path!r}; use an absolute path",
         )
     requested_resolved = requested.resolve(strict=False)
 
@@ -9133,9 +9204,10 @@ def _resolve_worktree_workspace(
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
-        raise ValueError(
+        raise WorkspaceContractError(
+            "worktree_bad_anchor",
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+            "and does not point at a git repo root",
         )
     checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
         repo_root, requested, branch_name, checkpoint_key=task.id,
@@ -12375,6 +12447,37 @@ def _record_spawn_failure(
     )
 
 
+def _block_workspace_contract_violation(
+    conn: sqlite3.Connection,
+    result: "DispatchResult",
+    task_id: str,
+    exc: WorkspaceContractError,
+) -> None:
+    """Route a deterministic worktree-contract violation straight to blocked.
+
+    BUILD-496 invariant 7: a structurally-impossible worktree anchor cannot
+    be fixed by respawning, so retrying (the default ``_record_spawn_failure``
+    path) only burns ``failure_limit`` attempts producing the identical error
+    before it finally gives up. Block now instead. ``block_task`` releases the
+    claim, ends the run, emits the ``blocked`` task_event the gateway notifier
+    already delivers (TERMINAL_KINDS), and records the normalized failure
+    signature — reusing the same terminal alert path as the BUILD-261
+    signature breaker rather than inventing a new one. Note the signature
+    breaker at ``check_failure_signature_breaker`` deliberately excludes the
+    spawn funnel; we bypass it on purpose by blocking on first occurrence.
+    The reason carries the typed ``code`` and only structural detail (task id,
+    board, path) — never credentials or unbounded stderr.
+    """
+    _log.warning(
+        "kanban dispatch: deterministic workspace contract violation "
+        "for %s [%s]: %s", task_id, exc.code, exc,
+    )
+    reason = f"workspace_contract:{exc.code}: {exc}"
+    result.spawn_errors.append((task_id, reason))
+    if block_task(conn, task_id, reason=reason, summary=reason, kind="needs_input"):
+        result.auto_blocked.append(task_id)
+
+
 def _set_worker_pid(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13253,6 +13356,12 @@ def _dispatch_once_locked(
                 ) = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except WorkspaceContractError as exc:
+            # BUILD-496: deterministic contract violation (legacy worktree row
+            # with no materializable anchor). Block once with a typed reason
+            # instead of retrying a failure that can only reproduce itself.
+            _block_workspace_contract_violation(conn, result, claimed.id, exc)
+            continue
         except Exception as exc:
             # BUILD-263: this used to be recorded on the task row (via
             # _record_spawn_failure) with no corresponding log line — a
@@ -13398,6 +13507,11 @@ def _dispatch_once_locked(
                 ) = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except WorkspaceContractError as exc:
+            # BUILD-496: deterministic contract violation — block once with a
+            # typed reason, no retry burn. See the ready-task loop above.
+            _block_workspace_contract_violation(conn, result, claimed.id, exc)
+            continue
         except Exception as exc:
             # BUILD-263: see the matching comment in the ready-task loop
             # above — log (not swallowed) + surface for cause telemetry.

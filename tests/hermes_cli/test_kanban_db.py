@@ -2620,23 +2620,139 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws != repo  # not the shared default verbatim
 
 
-def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
-    """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
+def test_worktree_no_anchor_creation_fails_closed(kanban_home, tmp_path, monkeypatch):
+    """BUILD-496 invariant 1: creating a worktree card with no explicit path,
+    no project, and no board default_workdir fails closed with the typed error
+    and persists NOTHING — the standalone shape of the incident (a card that
+    would only fail deterministically at dispatch)."""
     # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
-    # code would have "succeeded" — proving the new code does NOT use cwd.
+    # behavior would have "succeeded" — proving we reject at creation.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
-        with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+        with pytest.raises(kb.WorkspaceContractError) as ei:
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+        assert ei.value.code == "worktree_no_anchor"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
+
+
+def test_legacy_worktree_no_anchor_rejected_at_resolve_not_cwd(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A LEGACY worktree row (created before creation-time validation) with no
+    anchor is rejected by workspace resolution with a typed, deterministic
+    error — not silently materialized under the dispatcher's CWD."""
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    legacy = kb.Task(
+        id="t_legacy_worktree",
+        title="ship",
+        body=None,
+        assignee="worker",
+        status="ready",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="worktree",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        branch_name=None,
+    )
+    with pytest.raises(kb.WorkspaceContractError) as ei:
+        kb.resolve_workspace(legacy)
+    assert ei.value.code == "worktree_no_anchor"
+
+
+def test_dispatch_worktree_contract_violation_blocks_without_retry(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """BUILD-496: a legacy worktree row whose anchor is structurally
+    impossible goes straight to blocked at dispatch with a typed reason and is
+    NOT retried — the spawn_fn is never called and the retry counter never
+    climbs."""
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    # An absolute path that is NOT inside any git repo → deterministic
+    # worktree_bad_anchor at resolution. Creation succeeds (path is set), so
+    # this stands in for a legacy row / filesystem drift.
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return _owned_receipt(41_000 + len(spawns))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            workspace_path=str(non_repo / ".worktrees" / "x"),
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=5)
+        task = kb.get_task(conn, tid)
+        # Second tick must not re-pick it (blocked, not ready) — no retry burn.
+        result2 = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=5)
+        task2 = kb.get_task(conn, tid)
+        events = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+            ).fetchall()
+        ]
+
+    assert spawns == []  # deterministic contract → never spawned
+    assert task is not None and task.status == "blocked"
+    assert tid in result.auto_blocked
+    assert task2 is not None and task2.status == "blocked"
+    assert tid not in result2.auto_blocked  # not re-processed
+    assert task.consecutive_failures == 0  # blocked on first look, no retries
+    assert "blocked" in events  # the terminal event the notifier delivers
+
+
+def test_compile_workflow_worktree_no_anchor_fails_atomically(kanban_home):
+    """BUILD-496 invariant 1 (compiler): compiling a worktree workflow with no
+    workspace_path and no board default_workdir fails closed with the typed
+    error BEFORE the write transaction — no tasks, compilation ledger row, or
+    events persist."""
+    steps = [
+        {
+            "key": "final",
+            "title": "do the thing",
+            "assignee": "worker",
+            "parents": [],
+            "role": "reporter",
+            "terminal": True,
+        },
+    ]
+    with kb.connect() as conn:
+        with pytest.raises(kb.WorkspaceContractError) as ei:
+            kb.compile_workflow_graph(
+                conn,
+                workflow_key="wf-worktree-no-anchor",
+                idempotency_key="idem-1",
+                created_by="orchestrator",
+                steps=steps,
+                workspace_kind="worktree",
+            )
+        assert ei.value.code == "worktree_no_anchor"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM workflow_graph_compilations"
+            ).fetchone()[0]
+            == 0
+        )
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
