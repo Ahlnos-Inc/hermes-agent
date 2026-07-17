@@ -16,7 +16,7 @@ The client entrypoint is `src/entry.tsx`. It exits early if `stdin` is not a TTY
 python -m tui_gateway.entry
 ```
 
-Interpreter resolution order is: `HERMES_PYTHON` → `PYTHON` → `$VIRTUAL_ENV/bin/python` → `./.venv/bin/python` → `./venv/bin/python` → `python3` (or `python` on Windows).
+Interpreter resolution order is: `HERMES_PYTHON` → `PYTHON` → `$VIRTUAL_ENV/bin/python` → `./venv/bin/python` → `./.venv/bin/python` → `python3` (or `python` on Windows). `$VIRTUAL_ENV` is trusted as-is (it's the interpreter we're already running under); the `./venv` and `./.venv` fallback candidates must additionally have a python that can `import psutil` (a pinned gateway dependency) or they're skipped with a logged warning — a stray, deps-less `.venv` (e.g. left by `uv run`/`uv sync`) must not get spawned as the live gateway interpreter. `./venv` wins when both are usable.
 
 The transport is newline-delimited JSON-RPC over stdio:
 

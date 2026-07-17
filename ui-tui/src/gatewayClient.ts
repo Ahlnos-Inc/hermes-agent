@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'node:child_process'
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
 import { delimiter, resolve } from 'node:path'
@@ -47,25 +47,81 @@ const resolveSidecarUrl = () => {
   return raw ? raw : null
 }
 
-const resolvePython = (root: string) => {
+const VENV_PROBE_TIMEOUT_MS = 5000
+
+// psutil is a pinned, non-optional gateway dependency (pyproject.toml) used
+// throughout tui_gateway for PID liveness, so it's the cheapest reliable
+// signal that a candidate venv is a real, installed gateway environment
+// rather than a stray/partial one — BUILD-412 hit exactly this: a
+// uv-created `.venv` with no deps was silently selected. Mirrors
+// hermes_cli/gateway.py::_venv_has_sentinel_dependency (BUILD-505).
+const canImportPsutil = (pythonPath: string): boolean => {
+  try {
+    const result = spawnSync(pythonPath, ['-c', 'import psutil'], { timeout: VENV_PROBE_TIMEOUT_MS })
+
+    return result.status === 0
+  } catch {
+    return false
+  }
+}
+
+// Resolves the usable python executable for PROJECT_ROOT/<name>, or null if
+// the directory is absent/unusable. Every candidate is probed (not just the
+// first found) so an unusable one is always warned about, even when the
+// other candidate is fine.
+const resolveVenvCandidate = (root: string, name: 'venv' | '.venv'): string | null => {
+  const dir = resolve(root, name)
+
+  if (!existsSync(dir)) {
+    return null
+  }
+
+  const pythonPath = [resolve(dir, 'bin/python'), resolve(dir, 'bin/python3')].find(existsSync)
+
+  if (!pythonPath) {
+    console.warn(`[venv] skipping candidate ${dir}: no python executable found`)
+
+    return null
+  }
+
+  if (!canImportPsutil(pythonPath)) {
+    console.warn(`[venv] skipping candidate ${dir}: ${pythonPath} cannot import psutil (stale/broken venv)`)
+
+    return null
+  }
+
+  return pythonPath
+}
+
+export const resolvePython = (root: string) => {
   const configured = process.env.HERMES_PYTHON?.trim() || process.env.PYTHON?.trim()
 
   if (configured) {
     return configured
   }
 
+  // Already-running virtualenv (`VIRTUAL_ENV` set by the shell/launcher) is
+  // known-good — it's the interpreter environment we were launched from, no
+  // extra probe needed.
   const venv = process.env.VIRTUAL_ENV?.trim()
+  const activeVenvPython = venv && [resolve(venv, 'bin/python'), resolve(venv, 'Scripts/python.exe')].find(existsSync)
 
-  const hit = [
-    venv && resolve(venv, 'bin/python'),
-    venv && resolve(venv, 'Scripts/python.exe'),
-    resolve(root, '.venv/bin/python'),
-    resolve(root, '.venv/bin/python3'),
-    resolve(root, 'venv/bin/python'),
-    resolve(root, 'venv/bin/python3')
-  ].find(p => p && existsSync(p))
+  if (activeVenvPython) {
+    return activeVenvPython
+  }
 
-  return hit || (process.platform === 'win32' ? 'python' : 'python3')
+  // Probe both fallback dirs (not short-circuiting) so an unusable one is
+  // always warned about, then prefer `venv` (the documented install layout,
+  // ui-tui/README.md) over `.venv` (a common uv/tooling artifact) when both
+  // are usable — a stray `.venv` left by `uv run`/`uv sync` must not shadow
+  // the real install and get spawned as the live gateway interpreter
+  // (BUILD-412 / BUILD-507). Mirrors hermes_cli/gateway.py::_detect_venv_dir
+  // (BUILD-505).
+  const canonical = resolveVenvCandidate(root, 'venv')
+  const dotVenv = resolveVenvCandidate(root, '.venv')
+  const fallback = canonical ?? dotVenv
+
+  return fallback || (process.platform === 'win32' ? 'python' : 'python3')
 }
 
 const asGatewayEvent = (value: unknown): GatewayEvent | null =>
