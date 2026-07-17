@@ -4639,7 +4639,7 @@ def _read_secure_launchd_plist(path: Path) -> _SecureLaunchdPlist:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise LaunchdInventoryError(f"Refusing non-regular launchd plist: {path}")
-        if metadata.st_uid not in {os.getuid(), 0}:
+        if metadata.st_uid not in {os.getuid(), 0}:  # windows-footgun: ok — launchd is macOS-only
             raise LaunchdInventoryError(f"Refusing non-owned launchd plist: {path}")
         if metadata.st_mode & 0o022:
             raise LaunchdInventoryError(
@@ -5788,7 +5788,7 @@ def _installed_launchd_gateway_plists() -> list[tuple[str, Path]]:
 
 
 def _launchd_candidate_domains() -> tuple[str, str]:
-    uid = os.getuid()  # windows-footgun: POSIX launchd helper
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd helper
     return (f"gui/{uid}", f"user/{uid}")
 
 
@@ -7535,7 +7535,9 @@ def _wait_for_gateway_exit(
             and time.monotonic() >= force_deadline
         ):
             # Grace period expired — force-kill only the retained identity.
-            signal_result = _signal_gateway_process_identity(identity, signal.SIGKILL)
+            signal_result = _signal_gateway_process_identity(
+        identity, getattr(signal, "SIGKILL", signal.SIGTERM)
+    )
             if signal_result == "gone":
                 return True
             if signal_result != "signalled":
@@ -7571,7 +7573,9 @@ def _wait_for_launchd_target_exit(
     graceful_timeout = min(5.0, max(0.0, timeout))
     if _wait_for_exact_gateway_identity_exit(identity, graceful_timeout):
         return True
-    signal_result = _signal_gateway_process_identity(identity, signal.SIGKILL)
+    signal_result = _signal_gateway_process_identity(
+        identity, getattr(signal, "SIGKILL", signal.SIGTERM)
+    )
     if signal_result == "gone":
         return True
     if signal_result != "signalled":

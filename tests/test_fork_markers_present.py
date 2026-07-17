@@ -29,7 +29,9 @@ def _read(rel: str) -> str | None:
 PRESENT = [
     ("credential-pool backoff (BUILD-262)", "consecutive_429_count", "agent/credential_pool.py"),
     ("credential-pool parking (BUILD-262/342)", "CredentialPoolExhausted", "agent/credential_pool.py"),
-    ("quota-origin memory (BUILD-343)", "quota_origin_reason", "agent/turn_retry_state.py"),
+    # e907db13d refactored quota_origin_reason into the RouteFailureLedger
+    # (reasons list + quota-preserving resolve()) — feature intact, new symbol.
+    ("quota-origin memory (BUILD-343)", "RouteFailureLedger", "agent/turn_retry_state.py"),
     ("quota-exhaustion classifier (BUILD-343)", "is_quota_exhaustion", "agent/error_classifier.py"),
     ("min_effort fallback guard", "min_effort", "agent/chat_completion_helpers.py"),
     ("cron per-job fallback resolution", "_effective_fallback_chain", "cron/scheduler.py"),

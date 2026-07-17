@@ -38,6 +38,11 @@ def _make_cli(quiet=False, session_id="20260524_111111_xyz", db=None):
     cli._install_tool_callbacks = lambda: None
     cli._ensure_tirith_security = lambda: None
     cli._ensure_runtime_credentials = lambda: True
+    # preflight_kanban_cli_route (5e7515a33) reads these before the resume
+    # block; no active kanban run spec in tests, so it no-ops.
+    cli.model = "test-model"
+    cli.requested_provider = None
+    cli.reasoning_config = None
     return cli
 
 
