@@ -929,7 +929,10 @@ class GatewayKanbanWatchersMixin:
                         len(events), all_delivered,
                     )
             except Exception as exc:
-                logger.warning("kanban notifier tick failed: %s", exc)
+                # exc_info: this tick has failed persistently before with only
+                # str(exc) ("'int' object has no attribute 'lower'"), which is
+                # undiagnosable without the frame — keep the traceback.
+                logger.warning("kanban notifier tick failed: %s", exc, exc_info=True)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
