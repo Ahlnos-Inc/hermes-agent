@@ -1,9 +1,12 @@
 import asyncio
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 
-from gateway.config import Platform
+from gateway.config import HomeChannel, Platform
 from gateway.run import GatewayRunner
+from gateway import kanban_watchers as kw
 from hermes_cli import kanban_db as kb
 
 
@@ -558,5 +561,187 @@ def _unseen_terminal_events_for(tid, chat_id):
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
         )
         return events
+    finally:
+        conn.close()
+
+
+# --- BUILD-506: orphaned tui-subscription sweep, end-to-end through a full
+# notifier tick. Unit-level coverage of the sweep primitives themselves
+# (age gate, liveness snapshot, CAS race) lives in
+# tests/gateway/test_kanban_tui_orphan_sweep.py; the tui-poller-vs-sweep
+# race lives in tests/tui_gateway/test_kanban_notify_poller.py.
+
+
+def _make_runner_with_home(adapter, home_chat_id="home-1"):
+    """A runner wired for the Telegram home fallback (BUILD-503/506): the
+    same adapter is both the (unused, in these tests) messaging-platform
+    adapter and the home-channel destination, mirroring how one Telegram
+    adapter instance serves both roles in the real gateway."""
+    runner = _make_runner(adapter)
+    home = HomeChannel(platform=Platform.TELEGRAM, chat_id=home_chat_id, name="Home")
+    runner.config = SimpleNamespace(
+        get_home_channel=lambda p: home if p is Platform.TELEGRAM else None
+    )
+    return runner
+
+
+def _create_orphaned_tui_sub(chat_id="dead-session", kind="crashed", age_seconds=None):
+    """Seed a tui subscription with one failure-kind event, optionally
+    backdated so it clears the default age gate without a real 15-minute
+    wait."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="desktop worker task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat_id)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kind=kind, payload={"error": "boom"})
+        if age_seconds is not None:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                    (int(time.time()) - age_seconds, tid),
+                )
+        return tid
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_sweeps_orphaned_tui_sub_to_home_channel(tmp_path, monkeypatch):
+    """Regression (BUILD-506): a tui subscription whose desktop is gone
+    used to sit unclaimed forever (the exact silent-failure shape BUILD-503
+    fixed for reachable-but-dead chats, reopened for tui). Past the age
+    gate with no live session, the failure event must reach the Telegram
+    home channel with a notify_deliveries row."""
+    db_path = tmp_path / "tui-orphan-swept.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.active_session_registry_snapshot", lambda: [],
+    )
+
+    tid = _create_orphaned_tui_sub(
+        chat_id="dead-session", kind="crashed",
+        age_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS + 60,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, adapter.sent
+    assert adapter.sent[0]["chat_id"] == "home-1"
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "crashed" in text.lower()
+
+    conn = kb.connect()
+    try:
+        deliveries = kb.list_notify_deliveries(conn, task_id=tid)
+        assert len(deliveries) == 1
+        assert deliveries[0]["status"] == "delivered"
+        assert deliveries[0]["platform"] == "tui"
+        # The subscription itself must survive — the desktop may come back.
+        assert len(kb.list_notify_subs(conn, task_id=tid)) == 1
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_skips_tui_sub_with_live_session(tmp_path, monkeypatch):
+    """THE RACE THAT MATTERS: an active desktop poller must never have its
+    deliveries stolen. A live registry entry for the sub's session must
+    make the sweep skip it — even though the event is well past the age
+    gate."""
+    db_path = tmp_path / "tui-live-session.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.active_session_registry_snapshot",
+        lambda: [{"session_id": "live-session", "pid": 999,
+                   "metadata": {"live_session_id": "sid-1"}}],
+    )
+
+    tid = _create_orphaned_tui_sub(
+        chat_id="live-session", kind="blocked",
+        age_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS + 3600,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        "an active desktop session's failure event must not be swept to "
+        f"the home channel; got {adapter.sent!r}"
+    )
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_deliveries(conn, task_id=tid) == []
+        # Cursor untouched — the (still-live, per the registry) desktop
+        # poller owns this event.
+        subs = kb.list_notify_subs(conn, task_id=tid)
+        assert int(subs[0]["last_event_id"]) == 0
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_skips_fresh_tui_orphan_under_age_gate(tmp_path, monkeypatch):
+    """A tui sub with no live session AND a fresh failure event (well under
+    the age gate) must not be swept yet — this is the "normal desktop
+    restart in progress" window the age gate exists to protect."""
+    db_path = tmp_path / "tui-fresh-orphan.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.active_session_registry_snapshot", lambda: [],
+    )
+
+    tid = _create_orphaned_tui_sub(chat_id="restarting-session", kind="spawn_failed")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_deliveries(conn, task_id=tid) == []
+        subs = kb.list_notify_subs(conn, task_id=tid)
+        assert int(subs[0]["last_event_id"]) == 0
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_tui_sweep_idempotent_across_restarts(tmp_path, monkeypatch):
+    """A fresh runner/tick (simulating a gateway restart) must not
+    re-deliver an already-swept orphaned tui sub — the cursor, not any
+    in-memory watcher state, is the dedup authority (BUILD-503 pattern)."""
+    db_path = tmp_path / "tui-orphan-restart-dedup.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.active_session_registry_snapshot", lambda: [],
+    )
+
+    tid = _create_orphaned_tui_sub(
+        chat_id="dead-session-2", kind="gave_up",
+        age_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS + 60,
+    )
+
+    first = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner_with_home(first)))
+    assert len(first.sent) == 1
+
+    # A brand-new runner instance (nothing carried over in memory) ticking
+    # again must find nothing left to claim.
+    second = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner_with_home(second)))
+    assert second.sent == []
+
+    conn = kb.connect()
+    try:
+        deliveries = kb.list_notify_deliveries(conn, task_id=tid)
+        assert len(deliveries) == 1, (
+            "restart must not create a second delivery ledger row"
+        )
     finally:
         conn.close()

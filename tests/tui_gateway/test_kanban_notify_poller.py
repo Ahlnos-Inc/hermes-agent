@@ -4,11 +4,13 @@ from __future__ import annotations
 import sys
 import contextlib
 import threading
+import time
 import types
 from pathlib import Path
 
 import pytest
 
+from gateway import kanban_watchers as kw
 from hermes_cli import kanban_db as kb
 from tui_gateway import server
 
@@ -260,3 +262,97 @@ def test_tui_poller_delivers_block_loop_detected(kanban_home, monkeypatch):
     assert len(submitted) == 1
     assert "triage" in submitted[0][0][-1].lower()
     assert _cursor(task_id, "sess-key-1") > 0
+
+
+# --- BUILD-506: gateway orphan-sweep vs. the live tui poller ---------------
+#
+# THE RACE THAT MATTERS: an active desktop poller must never have a
+# delivery stolen out from under it, and the gateway's orphan sweep must
+# never double-deliver alongside a live poller. Both sides claim through
+# the SAME `claim_unseen_events_for_sub` BEGIN IMMEDIATE + CAS
+# (`expected_old_cursor`), so whichever runs first wins and the other's
+# claim is a guaranteed no-op — these tests drive the real
+# `_poll_kanban_tui_subs` production code path against
+# `gateway.kanban_watchers.sweep_orphaned_tui_sub` on the same DB row to
+# prove that in both orderings.
+
+
+def _seed_backdated_failure_sub(chat_id: str, kind: str = "blocked") -> str:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Desktop worker task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id=chat_id)
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, kind=kind, payload={"reason": "x"})
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (int(time.time()) - kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS - 60, task_id),
+            )
+    return task_id
+
+
+def _sub_row(task_id: str, chat_id: str) -> dict:
+    with kb.connect() as conn:
+        return next(
+            s for s in kb.list_notify_subs(conn, task_id=task_id)
+            if s["chat_id"] == chat_id
+        )
+
+
+def test_gateway_sweep_wins_race_tui_poller_finds_nothing_left(kanban_home, monkeypatch):
+    """Gateway sweep claims first; the (later, real) tui poller must see no
+    unclaimed events left — no double delivery."""
+    task_id = _seed_backdated_failure_sub("dead-session", kind="crashed")
+
+    conn = kb.connect()
+    try:
+        sub = next(
+            s for s in kb.list_notify_subs(conn, task_id=task_id)
+            if s["chat_id"] == "dead-session"
+        )
+        result = kw.sweep_orphaned_tui_sub(
+            kb, conn, sub, live_session_ids=set(),
+            age_gate_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS,
+        )
+    finally:
+        conn.close()
+    assert result is not None and result["events"], "setup: sweep should have claimed it"
+
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
+
+    _poll(_session(session_key="dead-session"))
+
+    assert submitted == [], "tui poller must not re-deliver what the sweep already claimed"
+    assert _cursor(task_id, "dead-session") == result["events"][-1].id
+
+
+def test_tui_poller_wins_race_gateway_sweep_loses_cas(kanban_home, monkeypatch):
+    """Live tui poller claims first via the real production path; a sweep
+    holding a STALE pre-race sub snapshot (the actual race window — the
+    sweep read subs at the top of its tick before the poller's claim
+    landed) must lose the CAS and back off rather than double-deliver."""
+    task_id = _seed_backdated_failure_sub("sess-key-1", kind="gave_up")
+    stale_sub = _sub_row(task_id, "sess-key-1")  # last_event_id == 0
+
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
+
+    _poll(_session())
+
+    assert len(submitted) == 1, "setup: tui poller should have claimed it"
+    assert _cursor(task_id, "sess-key-1") > 0
+
+    conn = kb.connect()
+    try:
+        result = kw.sweep_orphaned_tui_sub(
+            kb, conn, stale_sub, live_session_ids=set(),
+            age_gate_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS,
+        )
+    finally:
+        conn.close()
+
+    assert result is None, "sweep must lose the CAS against the poller's prior claim"
+    # Exactly one delivery happened across both consumers, not two.
+    assert len(submitted) == 1

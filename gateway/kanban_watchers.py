@@ -33,6 +33,137 @@ def _architecture_delivery_withheld(event: Any) -> bool:
     return bool(isinstance(payload, dict) and payload.get("delivery_withheld"))
 
 
+# Failure-kind events (BUILD-503): these are the ones that must reach the
+# operator via the Telegram home fallback when the origin is unreachable.
+# `completed` / `status` / `archived` / `unblocked` are not failures and are
+# not worth waking the home channel for. Module-level so both the telegram
+# send-failure fallback and the tui orphan sweep (BUILD-506) share one
+# definition instead of drifting apart.
+FAILURE_KINDS = frozenset(
+    {"blocked", "spawn_failed", "gave_up", "crashed",
+     "timed_out", "block_loop_detected"}
+)
+
+# BUILD-506: orphaned tui-subscription sweep age gate. A tui subscription's
+# oldest unclaimed failure event must be at least this old, AND have no live
+# session lease matching it (see _live_tui_session_ids), before the gateway
+# will claim it and redeliver to the Telegram home channel. Env-overridable
+# for ops tuning without a code change.
+TUI_ORPHAN_AGE_ENV = "HERMES_KANBAN_TUI_ORPHAN_AGE_SECONDS"
+DEFAULT_TUI_ORPHAN_AGE_SECONDS = 15 * 60
+
+
+def tui_orphan_age_seconds() -> int:
+    """Resolve the tui-orphan-sweep age gate (seconds), env-overridable."""
+    raw = os.environ.get(TUI_ORPHAN_AGE_ENV, "").strip()
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            val = 0
+        if val > 0:
+            return val
+    return DEFAULT_TUI_ORPHAN_AGE_SECONDS
+
+
+def _live_tui_session_ids() -> "set[str]":
+    """Cross-process liveness snapshot (BUILD-506).
+
+    tui_gateway/server.py's own poller knows its live sessions from an
+    in-process ``_sessions`` dict this (separate) gateway process can never
+    see. The one liveness signal that DOES cross the process boundary is
+    ``hermes_cli.active_sessions``' pid-checked lease file
+    (``~/.hermes/runtime/active_sessions.json``): a tui session claims a
+    lease keyed by its ``session_key`` (the same value stored as a tui
+    subscription's ``chat_id``), and reading the registry prunes any lease
+    whose pid is no longer alive.
+
+    A match here is trusted immediately (see :func:`sweep_orphaned_tui_sub`).
+    Absence is NOT proof of death: ``max_concurrent_sessions`` (the setting
+    that gates whether leases are written at all) defaults to unset, so on
+    most installs this set is empty even while a desktop session is very
+    much alive. That is exactly why the age gate — not this set — is the
+    actual safety backstop against stealing an active desktop's delivery.
+    """
+    try:
+        from hermes_cli.active_sessions import active_session_registry_snapshot
+        entries = active_session_registry_snapshot()
+    except Exception:
+        return set()
+    return {
+        str(entry.get("session_id"))
+        for entry in entries
+        if entry.get("session_id")
+    }
+
+
+def sweep_orphaned_tui_sub(
+    kb,
+    conn,
+    sub: dict,
+    *,
+    live_session_ids: "set[str]",
+    age_gate_seconds: int,
+    now: Optional[float] = None,
+) -> Optional[dict]:
+    """Claim one orphaned tui subscription's unclaimed failure events (BUILD-506).
+
+    A tui subscription is orphaned when no live session lease matches its
+    ``chat_id`` (see :func:`_live_tui_session_ids`) AND its oldest unclaimed
+    failure-kind event is older than ``age_gate_seconds``. Both conditions
+    must hold — the live-lease check alone can't be trusted (see above), and
+    the age gate alone would misfire on every normal desktop restart, which
+    completes in seconds, and on a desktop that's merely mid-turn, whose own
+    poller (``_poll_kanban_tui_subs``) claims within a ~2s cadence the
+    instant it goes idle — both comfortably inside the default 15-minute
+    gate.
+
+    The claim reuses ``claim_unseen_events_for_sub``'s BEGIN IMMEDIATE + CAS
+    (``expected_old_cursor``), the same exactly-once mechanism every other
+    consumer of this cursor uses. THIS is what makes stealing an active
+    desktop's delivery *impossible*, not just unlikely: if a live tui poller
+    (or another gateway's sweep tick) claims the same range first, this call
+    loses the CAS and returns ``None`` — never a duplicate delivery.
+
+    Returns ``None`` when there is nothing to sweep (live owner, too fresh,
+    no failure events, or lost the claim race). On success returns
+    ``{"sub": sub, "task": task, "events": [...]}`` for the caller to render
+    and deliver; the cursor has already moved past ``events`` at that point.
+    """
+    if (sub.get("platform") or "").lower() != "tui":
+        return None
+    chat_id = str(sub.get("chat_id") or "")
+    if chat_id and chat_id in live_session_ids:
+        return None  # active desktop owns this sub; never steal its events.
+    old_cursor = int(sub.get("last_event_id") or 0)
+    _peek_cursor, events = kb.unseen_events_for_sub(
+        conn,
+        task_id=sub["task_id"], platform=sub["platform"],
+        chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+        kinds=FAILURE_KINDS,
+    )
+    if not events:
+        return None
+    now = time.time() if now is None else now
+    if (now - events[0].created_at) < age_gate_seconds:
+        return None  # too fresh — could be an in-progress desktop restart.
+    _old, _new, claimed_events = kb.claim_unseen_events_for_sub(
+        conn,
+        task_id=sub["task_id"], platform=sub["platform"],
+        chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+        kinds=FAILURE_KINDS, expected_old_cursor=old_cursor,
+    )
+    if not claimed_events:
+        # Lost the CAS race: a live tui poller or a concurrent sweep already
+        # claimed this range between our peek and our claim.
+        return None
+    return {
+        "sub": sub,
+        "task": kb.get_task(conn, sub["task_id"]),
+        "events": claimed_events,
+    }
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -280,14 +411,6 @@ class GatewayKanbanWatchersMixin:
         # hermes_cli/kanban_db.py::TERMINAL_KINDS (BUILD-443) so the two
         # can't drift out of sync.
         TERMINAL_KINDS = _kb.TERMINAL_KINDS
-        # Failure-kind events (BUILD-503): these are the ones that must reach
-        # the operator via the Telegram home fallback when the origin chat is
-        # unreachable. `completed` / `status` / `archived` / `unblocked` are
-        # not failures and are not worth waking the home channel for.
-        _FAILURE_KINDS = frozenset(
-            {"blocked", "spawn_failed", "gave_up", "crashed",
-             "timed_out", "block_loop_detected"}
-        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -358,13 +481,19 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    # BUILD-506: orphaned tui subs claimed this tick — a
+                    # separate bucket because they're delivered via the
+                    # Telegram home fallback, not a `platform`-keyed adapter.
+                    tui_sweeps: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        return deliveries, tui_sweeps
+                    live_tui_ids = _live_tui_session_ids()
+                    tui_age_gate = tui_orphan_age_seconds()
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -478,11 +607,28 @@ class GatewayKanbanWatchersMixin:
                                     "board": slug,
                                     "db_path": resolved_db_path,
                                 })
+
+                            # BUILD-506: sweep orphaned tui subs on this same
+                            # open connection. tui subs never appear above —
+                            # "tui" is never a key in self.adapters — so they
+                            # would otherwise sit unclaimed forever whenever
+                            # the desktop process that owned them is gone.
+                            for sub in subs:
+                                swept = sweep_orphaned_tui_sub(
+                                    _kb, conn, sub,
+                                    live_session_ids=live_tui_ids,
+                                    age_gate_seconds=tui_age_gate,
+                                )
+                                if swept is None:
+                                    continue
+                                swept["board"] = slug
+                                swept["db_path"] = resolved_db_path
+                                tui_sweeps.append(swept)
                         finally:
                             conn.close()
-                    return deliveries
+                    return deliveries, tui_sweeps
 
-                deliveries = await asyncio.to_thread(_collect)
+                deliveries, tui_sweeps = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -607,7 +753,7 @@ class GatewayKanbanWatchersMixin:
                                     d["events"][0].id, d["events"][-1].id,
                                     "failed", board_slug,
                                 )
-                                if kind in _FAILURE_KINDS and msg:
+                                if kind in FAILURE_KINDS and msg:
                                     await self._kanban_notify_home_fallback(msg)
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
@@ -723,6 +869,43 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+
+                # BUILD-506: deliver orphaned-tui-sub failure events claimed
+                # this tick to the Telegram home channel. The cursor already
+                # moved (sweep_orphaned_tui_sub claimed via the same CAS as
+                # every other consumer) — never rewound here, matching the
+                # existing MAX_SEND_FAILURES path above: once claimed, the
+                # ledger row is the record of what happened, not a retry
+                # queue. The subscription itself is never removed — the
+                # desktop may come back, and its cursor will simply be past
+                # what the sweep already delivered.
+                for sweep in tui_sweeps:
+                    sub = sweep["sub"]
+                    task = sweep["task"]
+                    events = sweep["events"]
+                    board_slug = sweep.get("board")
+                    all_delivered = True
+                    for ev in events:
+                        msg = render_kanban_event(
+                            task_id=sub["task_id"], task=task, event=ev,
+                            board_slug=board_slug,
+                        )
+                        if not msg:
+                            continue
+                        ok = await self._kanban_notify_home_fallback(msg)
+                        all_delivered = all_delivered and ok
+                    await asyncio.to_thread(
+                        self._kanban_record_delivery,
+                        sub, sweep.get("db_path") or board_slug or "",
+                        events[0].id, events[-1].id,
+                        "delivered" if all_delivered else "failed", board_slug,
+                    )
+                    logger.info(
+                        "kanban notifier: swept orphaned tui sub %s (chat=%s) on "
+                        "board %s — %d failure event(s) routed to Telegram home (ok=%s)",
+                        sub["task_id"], sub.get("chat_id"), board_slug,
+                        len(events), all_delivered,
+                    )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
