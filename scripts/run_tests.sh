@@ -38,16 +38,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
+# Probe order: repo-local .venv, repo-local venv, then the canonical venv
+# shared by worktrees. A candidate that exists but lacks pytest, or whose
+# python major.minor doesn't match the canonical venv's, is rejected loudly
+# and skipped — a stray/stale venv here otherwise silently produces "0
+# tests, 100% complete" green runs or phantom failures from a divergent
+# dependency set (BUILD-412).
+CANONICAL_VENV="$HOME/.hermes/hermes-agent/venv"
+CANONICAL_PYVER=""
+if [ -x "$CANONICAL_VENV/bin/python" ]; then
+  CANONICAL_PYVER="$("$CANONICAL_VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+fi
+
+CANDIDATES=("$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$CANONICAL_VENV")
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
-    break
+for candidate in "${CANDIDATES[@]}"; do
+  if [ ! -f "$candidate/bin/activate" ]; then
+    continue
   fi
+  cand_python="$candidate/bin/python"
+  if [ ! -x "$cand_python" ]; then
+    echo "warning: skipping venv candidate $candidate: no python executable at $cand_python" >&2
+    continue
+  fi
+  if ! "$cand_python" -c 'import pytest' >/dev/null 2>&1; then
+    echo "warning: skipping venv candidate $candidate: pytest not importable" >&2
+    continue
+  fi
+  if [ -n "$CANONICAL_PYVER" ] && [ "$candidate" != "$CANONICAL_VENV" ]; then
+    cand_pyver="$("$cand_python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    if [ "$cand_pyver" != "$CANONICAL_PYVER" ]; then
+      echo "warning: skipping venv candidate $candidate: python $cand_pyver != canonical $CANONICAL_PYVER ($CANONICAL_VENV)" >&2
+      continue
+    fi
+  fi
+  VENV="$candidate"
+  break
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no usable virtualenv found (needs a python executable + importable pytest, and non-canonical candidates must match the canonical python version). tried: ${CANDIDATES[*]}" >&2
   exit 1
 fi
 

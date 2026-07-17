@@ -955,6 +955,25 @@ def main() -> int:
                 print(f"  {_format_file(file, repo_root)}")
         return 1
 
+    # Guard against the "0 tests passed, 0 failed, 100% complete" lie: exit 5
+    # (no tests collected) is forced to rc=0 above per-file, since a single
+    # file legitimately collecting nothing (marker-filtered) isn't a failure.
+    # But if this is the default full-suite invocation (no explicit
+    # path/file narrowing) and grep found test functions yet pytest
+    # collected literally none of them anywhere, every file hit exit 5 —
+    # that's a broken interpreter/venv, not an empty suite. Don't report
+    # green (BUILD-412).
+    is_full_run = not args.paths_positional and not args.files
+    if is_full_run and approx_total_tests > 0 and tests_passed + tests_failed == 0:
+        print(
+            f"error: full-suite run collected 0 tests across {len(files)} file(s) "
+            f"(~{approx_total_tests} test(s) found by grep) — every file exited "
+            f"pytest with 'no tests collected'. This is almost certainly a broken "
+            f"interpreter/venv, not an empty suite. Refusing to report success.",
+            file=sys.stderr,
+        )
+        return 1
+
     return 0
 
 
