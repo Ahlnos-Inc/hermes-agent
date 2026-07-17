@@ -2036,7 +2036,14 @@ def _wait_for_exact_gateway_identity_exit(
             if _launchd_process_start_time(identity.pid) != identity.start_time:
                 return True
             if time.monotonic() >= deadline:
-                raise
+                # Still alive and unreadable at the deadline: report "not
+                # exited" rather than raising — a busy session can drain
+                # longer than the graceful window with its argv already torn
+                # down (observed live on a mid-turn gateway). The launchd
+                # flow has already booted the job out, and the SIGKILL
+                # escalation path independently fail-closes on unreadable
+                # identity, so no signal is ever sent on this information.
+                return False
         if time.monotonic() >= deadline:
             return False
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
