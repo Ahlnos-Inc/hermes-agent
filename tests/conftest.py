@@ -910,3 +910,19 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_browser(monkeypatch):
+    """Never open a real browser from the test suite.
+
+    Multiple code paths (OAuth flows, portal, web_server) call
+    ``webbrowser.open``; on an interactive machine an unmocked call opens
+    actual Chrome tabs (observed live 2026-07-17 during a full-suite run).
+    Tests that assert browser behavior install their own mocks, which
+    override this default within their scope.
+    """
+    import webbrowser
+
+    for name in ("open", "open_new", "open_new_tab"):
+        monkeypatch.setattr(webbrowser, name, lambda *a, **k: True)

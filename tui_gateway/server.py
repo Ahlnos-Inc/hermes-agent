@@ -8331,10 +8331,20 @@ def _(rid, params: dict) -> dict:
             updated = _dt(meta.get(field), created)
             break
 
+    # Blend (2026-07 upstream sync): fork route lines below, upstream's
+    # mirror-aware sourcing — a dead/absent agent must not zero the numbers
+    # when the session's metadata mirror has them.
+    mirror = _metadata_mirror(session)
     route = _agent_route_info(agent) if agent is not None else {}
-    usage = _get_usage(agent) if agent is not None else {}
-    provider = route.get("provider") or getattr(agent, "provider", None) or "unknown"
-    model = route.get("model") or getattr(agent, "model", None) or "(unknown)"
+    usage = _session_usage_snapshot(session)
+    provider = (
+        route.get("provider") or getattr(agent, "provider", None)
+        or mirror.get("provider") or "unknown"
+    )
+    model = (
+        route.get("model") or getattr(agent, "model", None)
+        or mirror.get("model") or "(unknown)"
+    )
     effort = route.get("reasoning_effort") or "default"
     execution_mode = route.get("execution_mode") or "inline"
     target_profile = route.get("target_profile") or "default"

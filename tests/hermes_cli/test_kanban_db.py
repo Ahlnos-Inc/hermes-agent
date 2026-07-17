@@ -4486,13 +4486,16 @@ def test_review_claim_snapshots_its_own_run_spec(kanban_home):
 
 
 def test_create_rejects_reasoning_effort_the_cli_cannot_honor(kanban_home):
+    # "max"/"ultra" became honorable with the 2026-07 upstream sync
+    # (VALID_REASONING_EFFORTS expanded); the invariant under test is
+    # unchanged — an effort outside the CLI's set must fail creation.
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="model_reasoning_effort"):
             kb.create_task(
                 conn,
                 title="invalid route",
                 assignee="coder",
-                model_reasoning_effort="max",
+                model_reasoning_effort="turbo",
             )
 
 
