@@ -43,6 +43,7 @@ from gateway.restart import (
     parse_restart_drain_timeout,
 )
 from hermes_cli.config import (
+    get_env_path,
     get_env_value,
     get_hermes_home,
     is_managed,
@@ -8576,6 +8577,14 @@ def _setup_standard_platform(platform: dict):
     existing_token = get_env_value(token_var)
     if existing_token:
         print()
+        # get_env_value() checks os.environ before the profile's .env file —
+        # name which one this came from so a value inherited from the parent
+        # process's environment (a different profile's shell/service env,
+        # BUILD-396) isn't mistaken for this profile's own credential.
+        if token_var in os.environ:
+            print_info(f"  {token_var} is set from the environment (not this profile's .env).")
+        else:
+            print_info(f"  {token_var} is set in {get_env_path()}.")
         print_success(f"{label} is already configured.")
         if not prompt_yes_no(f"  Reconfigure {label}?", False):
             return
@@ -9368,6 +9377,14 @@ def gateway_setup():
             Colors.MAGENTA,
         )
     )
+
+    # Name the target profile + credentials file up front (BUILD-396): this
+    # wizard writes via save_env_value() into get_env_path(), which is
+    # scoped to the process's active HERMES_HOME. Surfacing that here lets
+    # the operator catch a wrong-profile invocation before entering secrets.
+    from hermes_cli.profiles import get_active_profile_name
+
+    print_info(f"  Profile: {get_active_profile_name()}  ({get_env_path()})")
 
     # ── Gateway service status ──
     print()

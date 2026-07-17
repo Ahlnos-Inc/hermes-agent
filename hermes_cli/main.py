@@ -378,6 +378,43 @@ def _apply_profile_override() -> None:
             return None
         return None
 
+    hermes_home_env = os.environ.get("HERMES_HOME", "")
+
+    # 1a. HERMES_PROFILE env var — the operational analog of -p/--profile for
+    # supervisors/wrappers that set env instead of argv (e.g.
+    # ``HERMES_PROFILE=dross hermes gateway setup``). An explicit -p/--profile
+    # flag always wins (profile_name is already set above in that case).
+    # BUILD-396: previously never consulted here — a HERMES_PROFILE-scoped
+    # invocation silently fell through to whatever HERMES_HOME/active_profile
+    # resolved to (the shared default profile), and a wizard run under it
+    # clobbered the default/shared profile's credentials instead of the
+    # intended profile's.
+    hermes_profile_env = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile_name is None and hermes_profile_env:
+        if hermes_home_env:
+            # Both set — they must resolve to the same profile home. Silently
+            # preferring one would repeat the BUILD-396 ambiguity, so fail
+            # loudly instead of guessing.
+            try:
+                from hermes_cli.profiles import resolve_profile_env
+
+                expected_home = Path(resolve_profile_env(hermes_profile_env)).resolve()
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if Path(hermes_home_env).resolve() != expected_home:
+                print(
+                    f"Error: HERMES_PROFILE={hermes_profile_env!r} resolves to "
+                    f"{expected_home}, but HERMES_HOME={hermes_home_env!r} points "
+                    "elsewhere. Set only one, or make them agree.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # They agree — HERMES_HOME is already correct; fall through to
+            # step 1.5 below, which trusts it as-is.
+        else:
+            profile_name = hermes_profile_env
+
     # 1.5 If HERMES_HOME is already set and no explicit flag was given, trust it
     # only when it already points to a specific profile directory.  The
     # distinguishing heuristic: a profile path has "profiles" as its immediate
@@ -387,7 +424,6 @@ def _apply_profile_override() -> None:
     # still read active_profile — the user may have switched profiles via
     # `hermes profile use` and the gateway should honour that choice.
     # See issue #22502.
-    hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
             return

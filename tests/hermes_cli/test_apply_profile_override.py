@@ -15,12 +15,15 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
-    argv: list[str] | None = None,
+    argv: list[str] | None = None, hermes_profile: str | None = None,
 ):
     """Run _apply_profile_override in isolation.
 
@@ -41,6 +44,11 @@ def _run_apply_profile_override(
         monkeypatch.setenv("HERMES_HOME", hermes_home)
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    if hermes_profile is not None:
+        monkeypatch.setenv("HERMES_PROFILE", hermes_profile)
+    else:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
 
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
@@ -102,6 +110,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
 
         from hermes_cli.main import _apply_profile_override
@@ -136,6 +145,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         monkeypatch.setattr(Path, "home", lambda: root_home)
         monkeypatch.setenv("SUDO_USER", "hermes")
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
         monkeypatch.setattr(sys, "argv", ["hermes", "-p", "elias", "gateway", "install", "--system"])
 
@@ -156,6 +166,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
         (hermes_root / "active_profile").write_text("default")
 
@@ -191,6 +202,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setattr(sys, "argv", list(argv))
 
         from hermes_cli.main import _apply_profile_override
@@ -274,6 +286,7 @@ class TestSupervisedChildIgnoresStickyProfile:
         # Container root HERMES_HOME: parent dir is NOT "profiles", so the
         # #22502 guard does not short-circuit — step 2 (active_profile) runs.
         monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
 
@@ -313,6 +326,7 @@ class TestSupervisedChildIgnoresStickyProfile:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
         monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
         monkeypatch.setattr(sys, "argv", ["hermes", "-p", "coder", "gateway", "run"])
 
@@ -322,4 +336,184 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+
+
+class TestHermesProfileEnvVar:
+    """Regression tests for BUILD-396: HERMES_PROFILE was never consumed at
+    CLI startup, so ``HERMES_PROFILE=dross hermes gateway setup`` silently
+    operated on whatever HERMES_HOME/active_profile resolved to instead of
+    the ``dross`` profile — in the real incident, the shared default/
+    orchestrator profile.
+    """
+
+    def test_hermes_profile_maps_to_profile_home(self, tmp_path, monkeypatch):
+        """HERMES_PROFILE=dross + HERMES_HOME unset must resolve HERMES_HOME
+        to .../profiles/dross, the same way an explicit HERMES_HOME would be
+        trusted."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "dross").mkdir(parents=True, exist_ok=True)
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile=None,
+            hermes_profile="dross",
+        )
+
+        assert result is not None
+        assert Path(result) == hermes_root / "profiles" / "dross"
+
+    def test_hermes_profile_ignores_sticky_active_profile(self, tmp_path, monkeypatch):
+        """HERMES_PROFILE must win over the sticky active_profile file — it is
+        an explicit selector, just like -p/--profile."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "dross").mkdir(parents=True, exist_ok=True)
+        (hermes_root / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile="coder",
+            hermes_profile="dross",
+        )
+
+        assert result is not None
+        assert Path(result) == hermes_root / "profiles" / "dross"
+
+    def test_hermes_profile_missing_dir_fails_loudly(self, tmp_path, monkeypatch, capsys):
+        """A HERMES_PROFILE naming a profile that doesn't exist must abort
+        with an error naming the profile, not silently fall back to default."""
+        with pytest.raises(SystemExit) as exc_info:
+            _run_apply_profile_override(
+                tmp_path,
+                monkeypatch,
+                hermes_home=None,
+                active_profile=None,
+                hermes_profile="dross",
+            )
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "dross" in err
+        assert "does not exist" in err
+
+    def test_hermes_profile_and_hermes_home_agree_is_not_an_error(
+        self, tmp_path, monkeypatch
+    ):
+        """HERMES_PROFILE and HERMES_HOME both set, pointing at the same
+        profile, must not be treated as a conflict."""
+        hermes_root = tmp_path / ".hermes"
+        profile_dir = hermes_root / "profiles" / "dross"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(profile_dir),
+            active_profile=None,
+            hermes_profile="dross",
+        )
+
+        assert result == str(profile_dir)
+
+    def test_hermes_profile_and_hermes_home_disagree_fails_loudly(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """HERMES_PROFILE=dross + HERMES_HOME pointing at a DIFFERENT profile
+        must abort loudly rather than silently pick one — this ambiguity is
+        exactly what produced the BUILD-396 incident."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "dross").mkdir(parents=True, exist_ok=True)
+        other_profile_dir = hermes_root / "profiles" / "orchestrator"
+        other_profile_dir.mkdir(parents=True, exist_ok=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_apply_profile_override(
+                tmp_path,
+                monkeypatch,
+                hermes_home=str(other_profile_dir),
+                active_profile=None,
+                hermes_profile="dross",
+            )
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "HERMES_PROFILE" in err and "dross" in err
+        assert "HERMES_HOME" in err and str(other_profile_dir) in err
+
+    def test_explicit_flag_wins_over_hermes_profile_env(self, tmp_path, monkeypatch):
+        """An explicit -p/--profile flag takes precedence over HERMES_PROFILE
+        — no conflict check is performed against the flag's target."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "dross").mkdir(parents=True, exist_ok=True)
+        (hermes_root / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=None,
+            active_profile=None,
+            hermes_profile="dross",
+            argv=["hermes", "-p", "coder", "gateway", "setup"],
+        )
+
+        assert result is not None
+        assert Path(result) == hermes_root / "profiles" / "coder"
+
+
+class TestHermesProfileWizardEnvWriteIsolation:
+    """End-to-end regression for the actual BUILD-396 incident: a credential
+    save under ``HERMES_PROFILE=<p>`` must land only in that profile's own
+    ``.env`` — never the shared default ``.env`` nor a sibling profile's.
+    """
+
+    def test_save_env_value_under_hermes_profile_stays_in_that_profiles_env(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_root = tmp_path / ".hermes"
+        dross_dir = hermes_root / "profiles" / "dross"
+        orchestrator_dir = hermes_root / "profiles" / "orchestrator"
+        dross_dir.mkdir(parents=True, exist_ok=True)
+        orchestrator_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pre-seed the shared/default .env and a sibling profile's .env, both
+        # holding a value that must NOT be touched by a dross-scoped write —
+        # this reproduces the real incident, where the orchestrator profile's
+        # .env was a symlink onto the same file the default profile wrote to.
+        (hermes_root / ".env").write_text("TELEGRAM_BOT_TOKEN=shared-token\n")
+        (orchestrator_dir / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=orchestrator-real-token\n"
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            monkeypatch.setattr(Path, "home", lambda: tmp_path)
+            monkeypatch.setenv("HERMES_PROFILE", "dross")
+            monkeypatch.delenv("HERMES_HOME", raising=False)
+            monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "setup"])
+
+            from hermes_cli.main import _apply_profile_override
+
+            _apply_profile_override()
+            assert os.environ.get("HERMES_HOME") == str(dross_dir)
+
+            import hermes_cli.config as config
+
+            config.invalidate_env_cache()
+            config.save_env_value("TELEGRAM_BOT_TOKEN", "dross-new-token")
+
+            assert (dross_dir / ".env").read_text().strip() == (
+                "TELEGRAM_BOT_TOKEN=dross-new-token"
+            )
+            assert (
+                orchestrator_dir / ".env"
+            ).read_text() == "TELEGRAM_BOT_TOKEN=orchestrator-real-token\n", (
+                "sibling profile's .env must be untouched"
+            )
+            assert (
+                hermes_root / ".env"
+            ).read_text() == "TELEGRAM_BOT_TOKEN=shared-token\n", (
+                "shared/default .env must be untouched"
+            )
 
