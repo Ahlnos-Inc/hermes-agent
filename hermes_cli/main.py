@@ -4719,7 +4719,12 @@ def _nixos_build_env() -> dict[str, str] | None:
     if shutil.which("python3"):
         return None
 
-    # Tier 1: fast path — hermes venv python3, no nix-shell overhead
+    # Tier 1: fast path — hermes venv python3, no nix-shell overhead.
+    # BUILD-505: order is already canonical-first (venv before .venv) and
+    # this whole function only runs on NixOS as a node-gyp PATH shim for
+    # native addon compilation — it never selects the GATEWAY interpreter
+    # (that's get_python_path() in gateway.py, hardened separately), so the
+    # sentinel-dependency check added there doesn't apply here.
     for venv_name in ("venv", ".venv"):
         venv_python = PROJECT_ROOT / venv_name / "bin" / "python3"
         if venv_python.exists():

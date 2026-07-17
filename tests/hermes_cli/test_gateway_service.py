@@ -3704,8 +3704,24 @@ class TestGatewaySystemServiceRouting:
         assert run_calls == []
 
 
+def _write_fake_venv_python(venv_dir: Path, *, importable: bool = True) -> Path:
+    """Write a fake `<venv_dir>/bin/python` that exits 0 (or 1) for any `-c` script.
+
+    Stands in for a real venv's python for _venv_has_sentinel_dependency()'s
+    subprocess probe: exit 0 simulates `import psutil` succeeding (healthy
+    venv), exit 1 simulates it raising ImportError (stale/broken venv, the
+    BUILD-412 case).
+    """
+    bin_dir = venv_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    python_path = bin_dir / "python"
+    python_path.write_text(f"#!/bin/sh\nexit {0 if importable else 1}\n")
+    python_path.chmod(0o755)
+    return python_path
+
+
 class TestDetectVenvDir:
-    """Tests for _detect_venv_dir() virtualenv detection."""
+    """Tests for _detect_venv_dir() virtualenv detection (BUILD-505)."""
 
     def test_detects_active_virtualenv_via_sys_prefix(self, tmp_path, monkeypatch):
         venv_path = tmp_path / "my-custom-venv"
@@ -3716,7 +3732,7 @@ class TestDetectVenvDir:
         result = gateway_cli._detect_venv_dir()
         assert result == venv_path
 
-    def test_falls_back_to_dot_venv_directory(self, tmp_path, monkeypatch):
+    def test_only_dot_venv_healthy_is_selected(self, tmp_path, monkeypatch):
         # Not inside a virtualenv
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
@@ -3724,34 +3740,73 @@ class TestDetectVenvDir:
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
 
         dot_venv = tmp_path / ".venv"
-        dot_venv.mkdir()
+        _write_fake_venv_python(dot_venv, importable=True)
 
         result = gateway_cli._detect_venv_dir()
         assert result == dot_venv
 
-    def test_falls_back_to_venv_directory(self, tmp_path, monkeypatch):
+    def test_only_venv_healthy_is_selected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
 
         venv = tmp_path / "venv"
-        venv.mkdir()
+        _write_fake_venv_python(venv, importable=True)
 
         result = gateway_cli._detect_venv_dir()
         assert result == venv
 
-    def test_prefers_dot_venv_over_venv(self, tmp_path, monkeypatch):
+    def test_prefers_venv_over_dot_venv_when_both_usable(self, tmp_path, monkeypatch):
+        # BUILD-505: canonical `venv` now wins over `.venv` (flipped from the
+        # old .venv-first order) when both are usable.
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
 
-        (tmp_path / ".venv").mkdir()
-        (tmp_path / "venv").mkdir()
+        _write_fake_venv_python(tmp_path / ".venv", importable=True)
+        _write_fake_venv_python(tmp_path / "venv", importable=True)
 
         result = gateway_cli._detect_venv_dir()
-        assert result == tmp_path / ".venv"
+        assert result == tmp_path / "venv"
+
+    def test_broken_dot_venv_skipped_in_favor_of_healthy_venv(self, tmp_path, monkeypatch, caplog):
+        # BUILD-412/505: a stray .venv missing a hard dependency (e.g. a
+        # bare `uv venv` with no packages installed) must not be silently
+        # selected as the gateway interpreter — the healthy `venv` wins and
+        # the broken candidate is logged.
+        monkeypatch.setattr("sys.prefix", "/usr")
+        monkeypatch.setattr("sys.base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+
+        broken_dot_venv = _write_fake_venv_python(tmp_path / ".venv", importable=False).parent.parent
+        _write_fake_venv_python(tmp_path / "venv", importable=True)
+
+        with caplog.at_level("WARNING", logger="hermes_cli.gateway"):
+            result = gateway_cli._detect_venv_dir()
+
+        assert result == tmp_path / "venv"
+        assert any(
+            str(broken_dot_venv) in record.getMessage() and "psutil" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_venv_missing_python_executable_skipped_with_warning(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr("sys.prefix", "/usr")
+        monkeypatch.setattr("sys.base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+
+        empty_venv = tmp_path / "venv"
+        empty_venv.mkdir()  # dir exists, no bin/python inside
+
+        with caplog.at_level("WARNING", logger="hermes_cli.gateway"):
+            result = gateway_cli._detect_venv_dir()
+
+        assert result is None
+        assert any(str(empty_venv) in record.getMessage() for record in caplog.records)
 
     def test_returns_none_when_no_virtualenv(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.prefix", "/usr")
@@ -3761,6 +3816,22 @@ class TestDetectVenvDir:
 
         result = gateway_cli._detect_venv_dir()
         assert result is None
+
+
+class TestVenvHasSentinelDependency:
+    """Tests for _venv_has_sentinel_dependency() (BUILD-505)."""
+
+    def test_true_when_import_succeeds(self, tmp_path):
+        python_path = _write_fake_venv_python(tmp_path / "venv", importable=True)
+        assert gateway_cli._venv_has_sentinel_dependency(python_path) is True
+
+    def test_false_when_import_fails(self, tmp_path):
+        python_path = _write_fake_venv_python(tmp_path / "venv", importable=False)
+        assert gateway_cli._venv_has_sentinel_dependency(python_path) is False
+
+    def test_false_when_executable_missing(self, tmp_path):
+        missing = tmp_path / "venv" / "bin" / "python"
+        assert gateway_cli._venv_has_sentinel_dependency(missing) is False
 
 
 class TestSystemUnitHermesHome:

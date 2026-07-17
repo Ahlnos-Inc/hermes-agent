@@ -3105,16 +3105,45 @@ def get_launchd_plist_path() -> Path:
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
+def _venv_python_path(venv: Path) -> Path:
+    return venv / "Scripts" / "python.exe" if is_windows() else venv / "bin" / "python"
+
+
+def _venv_has_sentinel_dependency(venv_python: Path, timeout: float = 5.0) -> bool:
+    """Return whether *venv_python* can import ``psutil``.
+
+    ``psutil`` is a pinned, non-optional gateway dependency (pyproject.toml)
+    used throughout gateway.py for PID liveness / process-tree management,
+    so it's the cheapest reliable signal that a candidate venv is a real,
+    installed gateway environment rather than a stray/partial one (BUILD-412
+    hit exactly this: a uv-created venv with no pytest — and by extension no
+    guarantee of any other dep — was silently selected).
+    """
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-c", "import psutil"],
+            capture_output=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
 
     Checks ``sys.prefix`` first (works regardless of the directory name),
     then ``VIRTUAL_ENV`` env var (covers uv-managed environments where
     sys.prefix == sys.base_prefix), then falls back to probing common
-    directory names under PROJECT_ROOT.
+    directory names under PROJECT_ROOT. Fallback candidates are only trusted
+    if their python executable can import a hard gateway dependency
+    (``psutil``); unusable candidates are skipped with a logged warning.
     Returns ``None`` when no virtualenv can be found.
     """
-    # If we're running inside a virtualenv, sys.prefix points to it.
+    # If we're running inside a virtualenv, sys.prefix points to it. This is
+    # the interpreter already executing this code, so it's known-good — no
+    # extra probe needed.
     if sys.prefix != sys.base_prefix:
         venv = Path(sys.prefix)
         if venv.is_dir():
@@ -3122,29 +3151,44 @@ def _detect_venv_dir() -> Path | None:
 
     # uv and some other tools set VIRTUAL_ENV without changing sys.prefix.
     # This catches `uv run` where sys.prefix == sys.base_prefix but the
-    # environment IS a venv.  (#8620)
+    # environment IS a venv.  (#8620)  Also already-running -> known-good.
     _virtual_env = os.environ.get("VIRTUAL_ENV")
     if _virtual_env:
         venv = Path(_virtual_env)
         if venv.is_dir():
             return venv
 
-    # Fallback: check common virtualenv directory names under the project root.
-    for candidate in (".venv", "venv"):
+    # Fallback: probe both common virtualenv directory names under the
+    # project root (not short-circuiting on the first match) so an unusable
+    # candidate is always warned about, even when the other candidate is
+    # fine. `venv` (the documented install layout) is preferred over `.venv`
+    # (a common uv/tooling artifact) for the final pick when both are usable
+    # — a stray `.venv` left by `uv run`/`uv sync` must not shadow the real
+    # install (BUILD-412: a broken, pytest-less .venv was silently picked as
+    # the test-runner venv; the same class of bug here would pick it as the
+    # live GATEWAY interpreter). Each candidate must have a python
+    # executable that actually imports psutil before it's trusted (BUILD-505).
+    usable: dict[str, Path] = {}
+    for candidate in ("venv", ".venv"):
         venv = PROJECT_ROOT / candidate
-        if venv.is_dir():
-            return venv
+        if not venv.is_dir():
+            continue
+        venv_python = _venv_python_path(venv)
+        if not venv_python.exists():
+            logger.warning("Skipping venv candidate %s: no python executable at %s", venv, venv_python)
+            continue
+        if not _venv_has_sentinel_dependency(venv_python):
+            logger.warning("Skipping venv candidate %s: %s cannot import psutil (stale/broken venv)", venv, venv_python)
+            continue
+        usable[candidate] = venv
 
-    return None
+    return usable.get("venv") or usable.get(".venv")
 
 
 def get_python_path() -> str:
     venv = _detect_venv_dir()
     if venv is not None:
-        if is_windows():
-            venv_python = venv / "Scripts" / "python.exe"
-        else:
-            venv_python = venv / "bin" / "python"
+        venv_python = _venv_python_path(venv)
         if venv_python.exists():
             return str(venv_python)
     return sys.executable

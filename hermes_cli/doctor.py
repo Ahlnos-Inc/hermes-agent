@@ -1359,7 +1359,12 @@ def run_doctor(args):
 
     if sys.platform != "win32":
         _section("Command Installation")
-        # Determine the venv entry point location
+        # Determine the venv entry point location.
+        # BUILD-505: order is already canonical-first (venv before .venv);
+        # this is a read-only diagnostic display (does it exist, for the
+        # doctor report) and never spawns/selects a live interpreter, so the
+        # sentinel-dependency hardening in gateway.py's get_python_path()
+        # doesn't apply here.
         _venv_bin = None
         for _venv_name in ("venv", ".venv"):
             _candidate = PROJECT_ROOT / _venv_name / "bin" / "hermes"
