@@ -819,24 +819,45 @@ def run_conversation(
                 original_user_message=original_user_message,
                 messages=messages,
                 effective_task_id=effective_task_id,
-                should_review_memory=_should_review_memory,
             )
             attempt_calls = max(int(result.get("api_calls") or 0), 1)
-            if result.get("completed"):
-                result["api_calls"] = attempt_calls + api_call_count
-                return result
+            # Route every terminal return (completed or failed) through
+            # finalize_turn instead of returning the raw dict, mirroring the
+            # BUILD-392 claude_agent_sdk fix (agent/turn_finalizer.py). Without
+            # this, a Kanban worker on the codex_app_server runtime could
+            # deliver raw model prose past an unresolved architecture gate —
+            # finalize_turn is what applies `_kanban_delivery_policy`
+            # withholding and closes the final_response -> assistant-row
+            # transcript invariant (BUILD-407).
             api_call_count += attempt_calls
+            if result.get("completed"):
+                return finalize_external_turn(
+                    result.get("final_response"),
+                    failed=False,
+                    exit_reason="codex_app_server_success",
+                    error=result.get("error"),
+                    partial=result.get("partial", False),
+                    agent_persisted=result.get("agent_persisted", True),
+                    codex_thread_id=result.get("codex_thread_id"),
+                    codex_turn_id=result.get("codex_turn_id"),
+                )
             new_messages = messages[message_count_before:]
             completed_effect, unresolved_call = _external_tool_effect_state(new_messages)
             if unresolved_call:
-                result["api_calls"] = api_call_count
-                result["failed"] = True
-                result["error"] = (
-                    "Codex failed with an unresolved tool call; automatic fallback "
-                    "was blocked to avoid replaying an uncertain action. "
-                    + str(result.get("error") or "")
+                return finalize_external_turn(
+                    result.get("final_response"),
+                    failed=True,
+                    exit_reason="codex_unresolved_tool_call",
+                    error=(
+                        "Codex failed with an unresolved tool call; automatic fallback "
+                        "was blocked to avoid replaying an uncertain action. "
+                        + str(result.get("error") or "")
+                    ),
+                    partial=result.get("partial", False),
+                    agent_persisted=result.get("agent_persisted", True),
+                    codex_thread_id=result.get("codex_thread_id"),
+                    codex_turn_id=result.get("codex_turn_id"),
                 )
-                return result
             classified = classify_api_error(
                 RuntimeError(str(result.get("error") or "Codex runtime failed")),
                 provider=str(getattr(agent, "provider", "") or ""),
@@ -869,10 +890,17 @@ def run_conversation(
                         + str(original_user_message)
                     )
                 continue
-            result["api_calls"] = api_call_count
-            result["failed"] = True
-            result["failure_reason"] = route_failures.resolve(classified.reason)
-            return result
+            return finalize_external_turn(
+                result.get("final_response"),
+                failed=True,
+                exit_reason="codex_fallback_exhausted",
+                error=result.get("error"),
+                failure_reason=route_failures.resolve(classified.reason),
+                partial=result.get("partial", False),
+                agent_persisted=result.get("agent_persisted", True),
+                codex_thread_id=result.get("codex_thread_id"),
+                codex_turn_id=result.get("codex_turn_id"),
+            )
 
         if active_runtime != CLAUDE_AGENT_SDK_RUNTIME:
             error = f"Unsupported agent runtime: {active_runtime}"

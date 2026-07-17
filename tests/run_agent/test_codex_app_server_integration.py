@@ -12,6 +12,8 @@ Verifies that:
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -455,6 +457,45 @@ class TestRunConversationCodexPath:
         routing = captured["request_routing"]
         assert routing.auto_approve_exec is True
         assert routing.auto_approve_apply_patch is True
+
+
+class TestKanbanDeliveryWithholding:
+    """BUILD-407: the codex_app_server early-return path bypassed
+    finalize_turn (agent/turn_finalizer.py), so a completed Kanban worker
+    turn on this runtime could deliver raw model prose past an unresolved
+    architecture gate. The claude_agent_sdk runtime had the identical bug,
+    fixed in BUILD-392 (see test_claude_success_honors_kanban_delivery_withholding
+    in tests/run_agent/test_claude_conversation_runtime.py) by routing every
+    terminal return through finalize_turn. This mirrors that test for codex.
+    """
+
+    def test_codex_success_honors_kanban_delivery_withholding(self, fake_session):
+        agent = _make_codex_agent()
+        agent._kanban_delivery_policy = SimpleNamespace(
+            withholding=True,
+            receipt="Kanban receipt",
+            final=lambda _response: "Kanban receipt",
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("do the card")
+
+        assert result["final_response"] == "Kanban receipt"
+        assert result["completed"] is True
+        # Transcript invariant (turn_finalizer.py): no raw model prose
+        # survives anywhere in the persisted/returned messages, and the
+        # trailing turn is the receipt itself, not "echo: ...".
+        assert "echo: do the card" not in json.dumps(result["messages"])
+        assert result["messages"][-1]["role"] == "assistant"
+        assert result["messages"][-1]["content"] == "Kanban receipt"
+
+    def test_codex_success_no_policy_no_behavior_change(self, fake_session):
+        """No _kanban_delivery_policy set at all -> unchanged behavior."""
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("do the card")
+
+        assert result["final_response"] == "echo: do the card"
+        assert result["completed"] is True
 
 
 class TestReviewForkApiModeDowngrade:
