@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from agent.redact import redact_sensitive_text
+
+
+def _redact(text: Any) -> str:
+    # force=True: an operator notification is a safety boundary — never leak a
+    # credential from a spawn/provider/auth failure reason regardless of the
+    # global redaction preference.
+    return redact_sensitive_text(str(text), force=True)
+
 
 def render_kanban_event(
     *,
@@ -27,13 +36,17 @@ def render_kanban_event(
             or payload.get("summary")
             or getattr(task, "result", None)
         )
-        handoff = f"\n{str(handoff_text).strip()}" if handoff_text and str(handoff_text).strip() else ""
+        handoff = f"\n{_redact(handoff_text).strip()}" if handoff_text and str(handoff_text).strip() else ""
         return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
     if kind == "blocked":
-        reason = str(payload.get("reason") or "").strip()
+        reason = _redact(payload.get("reason") or "").strip()
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked" + (f": {reason}" if reason else "")
+    if kind == "spawn_failed":
+        error = _redact(payload.get("error") or "").strip()
+        suffix = f"\n{error}" if error else ""
+        return f"✖ {board_tag}{tag}Kanban {task_id} failed to spawn; dispatcher will retry{suffix}"
     if kind == "gave_up":
-        error = str(payload.get("error") or "").strip()
+        error = _redact(payload.get("error") or "").strip()
         suffix = f"\n{error}" if error else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{suffix}"
     if kind == "crashed":
@@ -50,7 +63,7 @@ def render_kanban_event(
         limit = int(payload.get("limit_seconds") or 0)
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
     if kind == "block_loop_detected":
-        reason = str(payload.get("reason") or "").strip()
+        reason = _redact(payload.get("reason") or "").strip()
         recurrences = payload.get("recurrences")
         return (
             f"🔁 {board_tag}{tag}Kanban {task_id} escalated to triage after "

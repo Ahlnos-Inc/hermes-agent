@@ -8586,6 +8586,24 @@ def _finish_tui_kanban_claim(session: dict, *, persisted: bool) -> None:
     conn = _kb.connect(board=claim["board"])
     try:
         sub = claim["sub"]
+        # BUILD-503: record the origin-session delivery outcome so it is
+        # verifiable, not just inferred from the advanced cursor. Idempotent
+        # on the delivery_key; best-effort so it never wedges the claim.
+        if claim.get("first_event_id") is not None:
+            try:
+                _kb.record_notify_delivery(
+                    conn, delivery_key=claim["delivery_key"],
+                    task_id=sub["task_id"], platform=sub["platform"],
+                    chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                    first_event_id=claim["first_event_id"],
+                    last_event_id=claim["last_event_id"],
+                    status="delivered" if persisted else "failed",
+                )
+            except Exception:
+                logger.debug(
+                    "kanban tui notifier: delivery ledger write failed for %s",
+                    sub.get("task_id"), exc_info=True,
+                )
         if persisted:
             task = _kb.get_task(conn, sub["task_id"])
             rows = [sub, *(claim.get("shadows") or [])]
@@ -8772,6 +8790,7 @@ def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
                 "board": candidate["board"], "claimed_cursor": cursor,
                 "delivery_key": delivery_key, "old_cursor": old_cursor,
                 "shadows": candidate["shadows"], "sub": sub, "token": token,
+                "first_event_id": events[0].id, "last_event_id": events[-1].id,
             }
             try:
                 _emit("status.update", sid, {"kind": "process", "text": rendered[0]})

@@ -182,6 +182,69 @@ def test_kanban_notifier_sends_full_blocked_reason(tmp_path, monkeypatch):
     assert reason in text
 
 
+def test_workflow_nonterminal_step_blocked_notifies_origin_with_recorded_delivery(
+    tmp_path, monkeypatch
+):
+    """BUILD-503 regression: the exact 2026-07-16 silent failure.
+
+    A workflow-compiled graph subscribed only its terminal task, so a
+    NONTERMINAL step that went blocked(review-required) fired no origin
+    notification and the workflow sat silent. Assert the origin subscriber now
+    receives the rendered blocked event for the STEP task, that the delivery is
+    recorded in the ledger (subscription-exists is NOT proof of delivery), and
+    that a watcher restart does not re-deliver (cursor dedup).
+    """
+    db_path = tmp_path / "workflow-silent-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    reason = "review-required: needs human sign-off on the migration plan"
+    conn = kb.connect()
+    try:
+        compiled = kb.compile_workflow_graph(
+            conn,
+            workflow_key="silent-block-2026-07-16",
+            idempotency_key="req-503",
+            created_by="orchestrator",
+            steps=[
+                {"key": "step", "title": "Implement", "assignee": "coder",
+                 "parents": []},
+                {"key": "final", "title": "Report", "assignee": "writer",
+                 "parents": ["step"], "role": "reporter", "terminal": True},
+            ],
+            notification={"platform": "telegram", "chat_id": "chat-1"},
+        )
+        step_id = compiled.task_ids["step"]
+        # The nonterminal step blocks for review — the stranding transition.
+        kb.block_task(conn, step_id, reason=reason)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, adapter.sent
+    text = adapter.sent[0]["text"]
+    assert step_id in text
+    assert "blocked" in text.lower()
+    assert reason in text
+
+    conn = kb.connect()
+    try:
+        deliveries = kb.list_notify_deliveries(conn, task_id=step_id)
+        assert len(deliveries) == 1
+        assert deliveries[0]["status"] == "delivered"
+        assert deliveries[0]["platform"] == "telegram"
+    finally:
+        conn.close()
+
+    # Watcher restart: a fresh runner/tick must not re-deliver (cursor dedup).
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+    restarted = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(restarted)))
+    assert restarted.sent == []
+
+
 def test_kanban_db_path_is_test_isolated_from_real_home():
     hermes_home = Path(kb.kanban_home())
     production_db = Path.home() / ".hermes" / "kanban.db"

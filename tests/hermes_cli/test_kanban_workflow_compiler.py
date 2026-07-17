@@ -9,7 +9,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
-def test_compile_workflow_graph_creates_one_terminal_subscription(tmp_path):
+def test_compile_workflow_graph_subscribes_every_step(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
         compiled = kb.compile_workflow_graph(
@@ -61,10 +61,17 @@ def test_compile_workflow_graph_creates_one_terminal_subscription(tmp_path):
             "market-brief-2026-07-13"
         }
 
+        # BUILD-503: every step (not just the terminal) is subscribed so a
+        # nonterminal step that blocks/gives up/fails-to-spawn still notifies
+        # the origin instead of stranding the workflow silently.
         subscriptions = kb.list_notify_subs(conn)
-        assert [(sub["task_id"], sub["platform"], sub["chat_id"]) for sub in subscriptions] == [
-            (terminal.id, "telegram", "chat-123")
-        ]
+        assert {
+            (sub["task_id"], sub["platform"], sub["chat_id"]) for sub in subscriptions
+        } == {
+            (market.id, "telegram", "chat-123"),
+            (customer.id, "telegram", "chat-123"),
+            (terminal.id, "telegram", "chat-123"),
+        }
     finally:
         conn.close()
 

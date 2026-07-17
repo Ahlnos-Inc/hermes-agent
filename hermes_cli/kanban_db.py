@@ -148,7 +148,7 @@ BLOCK_RECURRENCE_LIMIT = 2
 # _set_status_direct``), not by anything in this module.
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "block_loop_detected", "status", "archived", "unblocked",
+    "spawn_failed", "block_loop_detected", "status", "archived", "unblocked",
 )
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1610,6 +1610,26 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- BUILD-503: delivery accounting for notification events. The cursor in
+-- kanban_notify_subs proves a subscription EXISTS and dedupes replays, but a
+-- present subscription is not proof a message was ever delivered (the
+-- 2026-07-16 incident). This ledger records the queued→consumed→delivered
+-- trail keyed by the stable notify_delivery_key() range so delivery is
+-- verifiable and re-recording on watcher restart is idempotent.
+CREATE TABLE IF NOT EXISTS notify_deliveries (
+    delivery_key   TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    platform       TEXT NOT NULL,
+    chat_id        TEXT NOT NULL,
+    thread_id      TEXT NOT NULL DEFAULT '',
+    first_event_id INTEGER NOT NULL,
+    last_event_id  INTEGER NOT NULL,
+    status         TEXT NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 1,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+
 -- Authoritative authorization projection for Architecture-First workflows.
 -- The accepted snapshot is canonical JSON, not mutable task metadata.
 CREATE TABLE IF NOT EXISTS architecture_gates (
@@ -1740,6 +1760,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_deliveries_task ON notify_deliveries(task_id, last_event_id);
 CREATE INDEX IF NOT EXISTS idx_architecture_gates_architect
     ON architecture_gates(architect_task_id);
 CREATE INDEX IF NOT EXISTS idx_architecture_gates_workflow
@@ -4423,22 +4444,44 @@ def compile_workflow_graph(
                 )
 
         terminal_task_id = task_ids[terminal_key]
+        # BUILD-503 / ADR invariant 10-11: subscribe the origin to EVERY step
+        # task, not just the terminal one. A nonterminal step that blocks,
+        # gives up, or fails to spawn used to strand the workflow silently
+        # because only the terminal task carried a subscription and its events
+        # never fired (2026-07-16 incident). Each step gets its own
+        # subscription row so the existing per-task cursor/claim machinery
+        # (claim_unseen_events_for_sub) delivers and dedupes it exactly-once —
+        # the only storage model consistent with that per-task cursor. Skip
+        # pre-`done` steps: they already succeeded and re-subscribing would
+        # replay their `completed` event as noise. INSERT OR IGNORE keeps the
+        # terminal row idempotent.
+        # ponytail: delivers intermediate `completed` pings too (progress
+        # visibility, not silence). Add a per-sub kind filter column if
+        # failure-only delivery is wanted.
+        # A step is persisted `done` only when it was explicitly seeded that
+        # way (the ready/todo fallback above never yields `done`).
+        subscribe_task_ids = [
+            task_ids[step["key"]]
+            for step in normalized_steps
+            if step["initial_status"] != "done"
+        ]
         for normalized_notification in normalized_notifications:
-            conn.execute(
-                """INSERT OR IGNORE INTO kanban_notify_subs
-                    (task_id, platform, chat_id, thread_id, user_id,
-                     notifier_profile, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    terminal_task_id,
-                    normalized_notification["platform"],
-                    normalized_notification["chat_id"],
-                    normalized_notification["thread_id"],
-                    normalized_notification["user_id"],
-                    normalized_notification["notifier_profile"],
-                    now,
-                ),
-            )
+            for sub_task_id in subscribe_task_ids:
+                conn.execute(
+                    """INSERT OR IGNORE INTO kanban_notify_subs
+                        (task_id, platform, chat_id, thread_id, user_id,
+                         notifier_profile, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        sub_task_id,
+                        normalized_notification["platform"],
+                        normalized_notification["chat_id"],
+                        normalized_notification["thread_id"],
+                        normalized_notification["user_id"],
+                        normalized_notification["notifier_profile"],
+                        now,
+                    ),
+                )
         conn.execute(
             """INSERT INTO workflow_graph_compilations
                 (workflow_key, idempotency_key, spec_digest, request_digest,
@@ -15150,6 +15193,65 @@ def notify_delivery_key(
             str(int(last_event_id)),
         )
     )
+
+
+def record_notify_delivery(
+    conn: sqlite3.Connection,
+    *,
+    delivery_key: str,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    first_event_id: int,
+    last_event_id: int,
+    status: str,
+) -> None:
+    """Record the outcome of one bounded notification delivery range.
+
+    Keyed on the stable ``notify_delivery_key`` so a watcher restart (which
+    replays nothing past the cursor anyway) re-recording the same range is a
+    no-op update rather than a duplicate row. This is an audit/telemetry
+    ledger — the ``kanban_notify_subs`` cursor remains the exactly-once dedup
+    authority; this table just makes "was it actually delivered?" verifiable,
+    which a ``session_subscription_exists`` check cannot answer.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO notify_deliveries
+                (delivery_key, task_id, platform, chat_id, thread_id,
+                 first_event_id, last_event_id, status, attempts,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(delivery_key) DO UPDATE SET
+                status = excluded.status,
+                attempts = notify_deliveries.attempts + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                delivery_key, task_id, platform, chat_id, thread_id or "",
+                int(first_event_id), int(last_event_id), status, now, now,
+            ),
+        )
+
+
+def list_notify_deliveries(
+    conn: sqlite3.Connection, task_id: Optional[str] = None,
+) -> list[dict]:
+    """Return recorded deliveries (all, or for one task), newest first."""
+    if task_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM notify_deliveries WHERE task_id = ? "
+            "ORDER BY updated_at DESC",
+            (task_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM notify_deliveries ORDER BY updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def rewind_notify_cursor(

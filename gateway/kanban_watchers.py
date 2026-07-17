@@ -280,6 +280,14 @@ class GatewayKanbanWatchersMixin:
         # hermes_cli/kanban_db.py::TERMINAL_KINDS (BUILD-443) so the two
         # can't drift out of sync.
         TERMINAL_KINDS = _kb.TERMINAL_KINDS
+        # Failure-kind events (BUILD-503): these are the ones that must reach
+        # the operator via the Telegram home fallback when the origin chat is
+        # unreachable. `completed` / `status` / `archived` / `unblocked` are
+        # not failures and are not worth waking the home channel for.
+        _FAILURE_KINDS = frozenset(
+            {"blocked", "spawn_failed", "gave_up", "crashed",
+             "timed_out", "block_loop_detected"}
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -468,6 +476,7 @@ class GatewayKanbanWatchersMixin:
                                     "event_runs": event_runs,
                                     "task": task,
                                     "board": slug,
+                                    "db_path": resolved_db_path,
                                 })
                         finally:
                             conn.close()
@@ -587,6 +596,19 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
+                                # BUILD-503: origin chat is unreachable. Record
+                                # the failed delivery and, for failure-kind
+                                # events, route to the Telegram home channel so
+                                # a stranded worker failure still reaches the
+                                # operator before we drop the dead subscription.
+                                await asyncio.to_thread(
+                                    self._kanban_record_delivery,
+                                    sub, d.get("db_path") or board_slug or "",
+                                    d["events"][0].id, d["events"][-1].id,
+                                    "failed", board_slug,
+                                )
+                                if kind in _FAILURE_KINDS and msg:
+                                    await self._kanban_notify_home_fallback(msg)
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
@@ -607,6 +629,15 @@ class GatewayKanbanWatchersMixin:
                         # of the same event on subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
+                        )
+                        # BUILD-503: record the delivered range in the ledger
+                        # so delivery is verifiable (subscription-exists != it
+                        # was delivered). Idempotent on the delivery_key range.
+                        await asyncio.to_thread(
+                            self._kanban_record_delivery,
+                            sub, d.get("db_path") or board_slug or "",
+                            d["events"][0].id, d["events"][-1].id,
+                            "delivered", board_slug,
                         )
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
@@ -758,6 +789,91 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_record_delivery(
+        self,
+        sub: dict,
+        db_path: str,
+        first_event_id: int,
+        last_event_id: int,
+        status: str,
+        board: Optional[str] = None,
+    ) -> None:
+        """Sync helper (BUILD-503): append to the delivery ledger. Runs in
+        to_thread. Best-effort — a ledger write failure must never wedge the
+        notifier tick, so callers wrap this and the cursor advance stays the
+        exactly-once authority regardless."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            delivery_key = _kb.notify_delivery_key(
+                resolved_db_path=db_path,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                first_event_id=first_event_id,
+                last_event_id=last_event_id,
+            )
+            _kb.record_notify_delivery(
+                conn,
+                delivery_key=delivery_key,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                first_event_id=first_event_id,
+                last_event_id=last_event_id,
+                status=status,
+            )
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: delivery ledger write failed for %s: %s",
+                sub.get("task_id"), exc,
+            )
+        finally:
+            conn.close()
+
+    async def _kanban_notify_home_fallback(self, message: str) -> bool:
+        """Last-resort delivery of a failure notification to the Telegram home
+        channel when the origin subscription is unreachable (BUILD-503).
+
+        Reuses the same home-channel path as the dispatcher-stuck escalation
+        (``config.get_home_channel`` / ``/sethome``) so a stranded worker
+        failure still surfaces to the operator instead of vanishing when the
+        originating chat is gone. Returns True only on a confirmed send."""
+        from gateway.config import Platform as _Platform
+        try:
+            home = self.config.get_home_channel(_Platform.TELEGRAM)
+        except Exception:
+            home = None
+        if home is None:
+            logger.warning(
+                "kanban notifier: origin unreachable and no Telegram home "
+                "channel configured; failure notification dropped. Run "
+                "/sethome in Telegram to enable the fallback."
+            )
+            return False
+        adapter = self.adapters.get(_Platform.TELEGRAM)
+        if adapter is None:
+            return False
+        metadata: dict[str, Any] = {}
+        if home.thread_id:
+            metadata["thread_id"] = home.thread_id
+        try:
+            result = await adapter.send(home.chat_id, message, metadata=metadata)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: Telegram home fallback send failed: %s", exc,
+            )
+            return False
+        if result is not None and getattr(result, "success", True) is False:
+            return False
+        logger.info(
+            "kanban notifier: delivered failure notification to Telegram home "
+            "(origin unreachable)",
+        )
+        return True
 
     async def _deliver_kanban_artifacts(
         self,
