@@ -296,6 +296,7 @@ def test_default_spawn_uses_claimed_run_spec_not_mutated_task_route(
         "design_digest": None,
     }
 
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

@@ -6,7 +6,8 @@ import { runInTerminal } from '@/app/right-sidebar/store'
 import {
   FEATURED_ID,
   FeaturedProviderRow,
-  KeyProviderRow,
+  FireworksProviderRow,
+  OpenRouterProviderRow,
   ProviderRow,
   providerTitle,
   sortProviders
@@ -17,6 +18,7 @@ import { SearchField } from '@/components/ui/search-field'
 import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
+import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualProviderOAuth } from '@/store/onboarding'
@@ -113,11 +115,12 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
 
 // Deliberately a near-1:1 replica of the first-run onboarding picker
 // (`Picker` in desktop-onboarding-overlay): same recommended card, same
-// provider rows, same "Other providers" disclosure, same OpenRouter quick-key
-// row, and the same bottom-right "I have an API key" affordance. The leaf cards
-// are the exact shared components, so the two surfaces stay visually identical.
-// Selecting a provider hands off to the shared onboarding overlay, which runs
-// that provider's real sign-in flow; the key affordances open the API-key
+// Fireworks #2 quick-key row, same provider rows, same "Other providers"
+// disclosure, same OpenRouter quick-key row, and the same bottom-right
+// "I have an API key" affordance. The leaf cards are the exact shared
+// components, so the two surfaces stay visually identical. Selecting a
+// provider hands off to the shared onboarding overlay, which runs that
+// provider's real sign-in flow; the key affordances open the API-key
 // catalog below.
 function OAuthPicker({
   disconnecting,
@@ -171,6 +174,8 @@ function OAuthPicker({
         {p.intro}
       </p>
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
+      {/* Slot #2 — always visible, matching onboarding / CANONICAL_PROVIDERS. */}
+      <FireworksProviderRow onClick={onWantApiKey} />
       {connected.length > 0 && (
         <>
           <GroupLabel>{p.connected}</GroupLabel>
@@ -192,7 +197,7 @@ function OAuthPicker({
           {others.map(p => (
             <ProviderRow key={p.id} onSelect={select} provider={p} />
           ))}
-          <KeyProviderRow onClick={onWantApiKey} />
+          <OpenRouterProviderRow onClick={onWantApiKey} />
         </>
       )}
       {collapsible && (
@@ -400,7 +405,7 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
   const keyGroups = buildProviderKeyGroups(vars)
 
   if (showApiKeys) {
-    const q = keyQuery.trim().toLowerCase()
+    const q = normalize(keyQuery)
 
     const visibleGroups = q
       ? keyGroups.filter(group => {

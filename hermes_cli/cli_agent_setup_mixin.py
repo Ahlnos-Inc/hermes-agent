@@ -58,11 +58,23 @@ class CLIAgentSetupMixin:
                     if not _fb_provider or not _fb_model:
                         continue
                     try:
-                        runtime = resolve_runtime_provider(
-                            requested=_fb_provider,
-                            target_model=_fb_model,
-                            route_config=_fb,
-                        )
+                        from hermes_cli.fallback_config import resolve_entry_api_key
+
+                        # route_config carries the fallback route's runtime
+                        # identity (Claude Max closed-world / runtime-target
+                        # validation); explicit key_env/base_url resolution
+                        # honors the fallback entry's own credentials (#... 998e35313).
+                        _fb_kwargs = {
+                            "requested": _fb_provider,
+                            "target_model": _fb_model,
+                            "route_config": _fb,
+                        }
+                        if _fb.get("base_url"):
+                            _fb_kwargs["explicit_base_url"] = _fb["base_url"]
+                        _fb_api_key = resolve_entry_api_key(_fb)
+                        if _fb_api_key:
+                            _fb_kwargs["explicit_api_key"] = _fb_api_key
+                        runtime = resolve_runtime_provider(**_fb_kwargs)
                         logger.warning(
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
@@ -361,7 +373,9 @@ class CLIAgentSetupMixin:
                 resolved_meta = self._session_db.get_session(self.session_id)
                 if resolved_meta:
                     session_meta = resolved_meta
-            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            restored = self._session_db.get_messages_as_conversation(
+                self.session_id, repair_alternation=True
+            )
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
                 self.conversation_history = restored
@@ -492,6 +506,7 @@ class CLIAgentSetupMixin:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
+                reaction_callback=self._on_reaction,
             )
             # Project the resolved route budgets onto the concrete agent and
             # its primary-runtime snapshot. These limits are control-plane
@@ -620,7 +635,9 @@ class CLIAgentSetupMixin:
             if resolved_meta:
                 session_meta = resolved_meta
 
-        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        restored = self._session_db.get_messages_as_conversation(
+            self.session_id, repair_alternation=True
+        )
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
             self.conversation_history = restored
@@ -666,6 +683,7 @@ class CLIAgentSetupMixin:
         an indicator for earlier hidden messages.
         """
         from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
+        from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
         if not self.conversation_history:
             return
 
@@ -706,13 +724,18 @@ class CLIAgentSetupMixin:
                         elif isinstance(part, dict) and part.get("type") == "image_url":
                             parts.append("[image]")
                     text = " ".join(parts)
+                # Stored history is untrusted for display: strip escape
+                # sequences/control chars so replaying a message can't
+                # clear the screen, retitle the window, or restyle the
+                # recap panel (see tools/ansi_strip.sanitize_display_text).
+                text = _sanitize_display_text(text)
                 if len(text) > MAX_USER_LEN:
                     text = text[:MAX_USER_LEN] + "..."
                 entries.append(("user", text))
 
             elif role == "assistant":
                 text = "" if content is None else str(content)
-                text = _strip_reasoning_tags(text)
+                text = _sanitize_display_text(_strip_reasoning_tags(text))
                 parts = []
                 full_parts = []  # un-truncated version
                 if text:

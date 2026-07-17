@@ -71,6 +71,7 @@ Examples:
     hermes logs errors            View errors.log
     hermes logs --since 1h        Lines from the last hour
     hermes debug share             Upload debug report for support
+    hermes console                Open the safe Hermes command console
     hermes update                 Update to latest version
     hermes dashboard              Start web UI dashboard (port 9119)
     hermes dashboard --stop       Stop running dashboard processes
@@ -121,6 +122,17 @@ def build_top_level_parser(parser_class=None, parser_factory=None):
             "auto-bypassed. Intended for scripts / pipes."
         ),
     )
+    parser.add_argument(
+        "--usage-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "One-shot mode only: after the run, write a JSON usage report "
+            "(estimated cost, token counts, model, api_calls) to PATH. "
+            "The report is written even when the run fails, so pipelines "
+            "can always account for spend. No effect outside -z/--oneshot."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.
@@ -166,6 +178,12 @@ def build_top_level_parser(parser_class=None, parser_factory=None):
         metavar="SESSION",
         default=None,
         help="Resume a previous session by ID or title",
+    )
+    parser.add_argument(
+        "--no-restore-cwd",
+        action="store_true",
+        default=False,
+        help="Don't cd into a resumed session's recorded working directory.",
     )
     parser.add_argument(
         "--continue",
@@ -345,6 +363,12 @@ def build_top_level_parser(parser_class=None, parser_factory=None):
         metavar="SESSION_ID",
         default=argparse.SUPPRESS,
         help="Resume a previous session by ID (shown on exit)",
+    )
+    chat_parser.add_argument(
+        "--no-restore-cwd",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Don't cd into a resumed session's recorded working directory.",
     )
     chat_parser.add_argument(
         "--continue",

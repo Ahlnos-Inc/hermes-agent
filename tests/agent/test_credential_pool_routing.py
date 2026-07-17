@@ -159,6 +159,9 @@ class TestPoolRotationCycle:
 
         pool = MagicMock()
         pool.has_credentials.return_value = True
+        # Must be set explicitly — MagicMock.provider returns a truthy
+        # child mock, which would trigger the provider-mismatch guard.
+        pool.provider = ""
 
         # mark_exhausted_and_rotate_or_raise returns next entry until
         # exhausted, then raises CredentialPoolExhausted (BUILD-262) —
@@ -166,7 +169,7 @@ class TestPoolRotationCycle:
         # spinning caller can't mistake exhaustion for silence.
         self._rotation_index = 0
 
-        def rotate(status_code=None, error_context=None):
+        def rotate(status_code=None, error_context=None, api_key_hint=None):
             self._rotation_index += 1
             if self._rotation_index < pool_entries:
                 return entries[self._rotation_index]
@@ -234,7 +237,9 @@ class TestPoolRotationCycle:
         assert recovered is True
         assert has_retried is False
         pool.mark_exhausted_and_rotate_or_raise.assert_called_once_with(
-            status_code=402, error_context=None,
+            status_code=402,
+            error_context=None,
+            api_key_hint=None,
         )
 
     def test_no_pool_returns_false(self):

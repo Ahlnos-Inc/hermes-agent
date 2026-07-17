@@ -43,7 +43,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # python major.minor doesn't match the canonical venv's, is rejected loudly
 # and skipped — a stray/stale venv here otherwise silently produces "0
 # tests, 100% complete" green runs or phantom failures from a divergent
-# dependency set (BUILD-412).
+# dependency set (BUILD-412). If none qualifies, we fall back to the Nix
+# devShell's editable venv via HERMES_PYTHON (see the selection block below).
 CANONICAL_VENV="$HOME/.hermes/hermes-agent/venv"
 CANONICAL_PYVER=""
 if [ -x "$CANONICAL_VENV/bin/python" ]; then
@@ -76,12 +77,20 @@ for candidate in "${CANDIDATES[@]}"; do
   break
 done
 
-if [ -z "$VENV" ]; then
+if [ -n "$VENV" ]; then
+  PYTHON="$VENV/bin/python"
+elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
+    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
+  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
+  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
+  # than the devShell hook.
+  PYTHON="$HERMES_PYTHON"
+  echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
+else
   echo "error: no usable virtualenv found (needs a python executable + importable pytest, and non-canonical candidates must match the canonical python version). tried: ${CANDIDATES[*]}" >&2
+  echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2
   exit 1
 fi
-
-PYTHON="$VENV/bin/python"
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
@@ -101,6 +110,15 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+# ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
+# Each test file runs in its own subprocess via run_tests_parallel.py.
+# Pre-building the bytecode cache once here (instead of each subprocess
+# compiling on first import) avoids redundant work across ~2000 processes.
+# Uses git to list tracked .py files (skips venv, node_modules, etc).
+echo "▶ pre-compiling bytecode cache"
+"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+
+echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
@@ -108,7 +126,6 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
-  PYTHONDONTWRITEBYTECODE=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
