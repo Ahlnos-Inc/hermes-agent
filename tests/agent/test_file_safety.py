@@ -79,12 +79,20 @@ class TestEnvFileReadBlocking:
             error = get_read_block_error(path)
             assert error is None, f"{path} should be allowed"
 
-    def test_allowed_hermes_env(self):
+    def test_allowed_hermes_env(self, tmp_path, monkeypatch):
         """Hermes' own .env inside HERMES_HOME is NOT blocked by this rule
         (it's handled by other mechanisms). Only project-local .env is blocked."""
         # Note: hermes internal .env is in ~/.hermes/.env which is NOT a project-local
         # path, but the basename check applies to ANY .env. This is intentional —
         # even ~/.hermes/.env should not be readable via read_file.
+        #
+        # Redirect HOME to an empty tmp dir before computing the literal
+        # "~/.hermes/.env" path below (BUILD-416): os.path.expanduser reads
+        # the real $HOME, and on a host where ~/.hermes/.env happens to be a
+        # symlink to a differently-named file (e.g. a dotfile-secrets setup),
+        # Path.resolve() would follow it and change the basename away from
+        # ".env", defeating the very check this test exists to verify.
+        monkeypatch.setenv("HOME", str(tmp_path))
         error = get_read_block_error(os.path.expanduser("~/.hermes/.env"))
         assert error is not None
 

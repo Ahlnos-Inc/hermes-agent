@@ -507,7 +507,12 @@ class TestResolveAnthropicToken:
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self):
+    def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
+        # Isolate the ~/.claude/.credentials.json fallback (BUILD-416): the
+        # conftest guard only stubs the Keychain read, so on a host with a
+        # real ~/.claude/.credentials.json this would otherwise adopt that
+        # file's live token instead of hitting the "no refresh token" path.
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
@@ -544,7 +549,9 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self):
+    def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
+        # See test_returns_none_without_refresh_token (BUILD-416).
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",
@@ -643,6 +650,22 @@ class TestResolveWithRefresh:
         assert result == "refreshed-token"
 
 
+def _setup_token_subprocess_run(argv, *args, **kwargs):
+    """subprocess.run stub for TestRunOauthSetupToken.
+
+    On a Darwin host, run_oauth_setup_token() -> read_claude_code_credentials()
+    also issues the macOS Keychain `security find-generic-password` lookup
+    (BUILD-416) — a blanket `MagicMock(returncode=0)` here would hand that
+    call a MagicMock stdout that _read_claude_code_credentials_from_keychain()
+    can't json.loads(), crashing before it ever reaches the "no creds" path.
+    Answer "not found" for that one call; success for everything else
+    (the `claude setup-token` invocation these tests actually target).
+    """
+    if list(argv[:2]) == ["security", "find-generic-password"]:
+        return MagicMock(returncode=1, stdout="", stderr="")
+    return MagicMock(returncode=0)
+
+
 class TestRunOauthSetupToken:
     def test_raises_when_claude_not_installed(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: None)
@@ -667,8 +690,7 @@ class TestRunOauthSetupToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_setup_token_subprocess_run) as mock_run:
             token = run_oauth_setup_token()
 
         assert token == "from-cred-file"
@@ -685,8 +707,7 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_setup_token_subprocess_run) as mock_run:
             token = run_oauth_setup_token()
 
         assert token == "from-env-var"
@@ -698,8 +719,7 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_setup_token_subprocess_run) as mock_run:
             token = run_oauth_setup_token()
 
         assert token is None
