@@ -842,6 +842,7 @@ def _read_live_gateway_process_identity(
             "psutil is required for strict gateway process identity checks"
         ) from exc
 
+    process = None
     try:
         process = _psutil_process(pid)
         start_time = _launchd_process_start_time(pid)
@@ -859,6 +860,16 @@ def _read_live_gateway_process_identity(
     except (psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
         raise ProcessLookupError(pid) from exc
     except (PermissionError, psutil.AccessDenied):
+        # macOS reports EINVAL->AccessDenied for KERN_PROCARGS2 argv/env
+        # reads of zombie (exited, unreaped) processes. A zombie is dead,
+        # not protected: report it as gone rather than unreadable.
+        try:
+            if process is not None and process.status() == psutil.STATUS_ZOMBIE:
+                raise ProcessLookupError(pid) from None
+        except psutil.NoSuchProcess:
+            raise ProcessLookupError(pid) from None
+        except psutil.Error:
+            pass
         raise PermissionError(pid)
     except Exception as exc:
         raise GatewayProcessEnumerationError(

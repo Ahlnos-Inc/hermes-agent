@@ -1150,6 +1150,48 @@ def test_build_472_windows_prefix_and_home_consistency():
     assert home is None
 
 
+def test_read_identity_reports_zombie_argv_denial_as_gone(monkeypatch):
+    # macOS KERN_PROCARGS2 returns EINVAL (psutil AccessDenied) for zombie
+    # processes; a zombie has exited and must read as gone, not unreadable.
+    import psutil
+
+    class _ZombieProcess:
+        def cmdline(self):
+            raise psutil.AccessDenied(4242)
+
+        def environ(self):
+            raise psutil.AccessDenied(4242)
+
+        def status(self):
+            return psutil.STATUS_ZOMBIE
+
+    monkeypatch.setattr(gateway, "_psutil_process", lambda _pid: _ZombieProcess())
+    monkeypatch.setattr(gateway, "_launchd_process_start_time", lambda _pid: 42)
+
+    with pytest.raises(ProcessLookupError):
+        gateway._read_live_gateway_process_identity(4242)
+
+
+def test_read_identity_still_reports_live_argv_denial_as_permission(monkeypatch):
+    import psutil
+
+    class _ProtectedProcess:
+        def cmdline(self):
+            raise psutil.AccessDenied(4242)
+
+        def environ(self):
+            raise psutil.AccessDenied(4242)
+
+        def status(self):
+            return "running"
+
+    monkeypatch.setattr(gateway, "_psutil_process", lambda _pid: _ProtectedProcess())
+    monkeypatch.setattr(gateway, "_launchd_process_start_time", lambda _pid: 42)
+
+    with pytest.raises(PermissionError):
+        gateway._read_live_gateway_process_identity(4242)
+
+
 def _raise_unreadable_identity(_identity):
     raise gateway.GatewayProcessIdentityUnreadableError(
         ["PID 4242: permission denied while revalidating identity"]
