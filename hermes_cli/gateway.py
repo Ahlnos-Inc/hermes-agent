@@ -109,6 +109,15 @@ class GatewayProcessTerminationError(RuntimeError):
         super().__init__("; ".join(self.failures))
 
 
+class GatewayProcessIdentityUnreadableError(GatewayProcessTerminationError):
+    """A previously attested PID's identity became unreadable mid-transaction.
+
+    Distinct from a *changed* identity: on macOS a draining PID's argv read
+    can fail with sysctl(KERN_PROCARGS2) EINVAL before the PID disappears, so
+    exit-wait loops may tolerate this state while the birth identity settles.
+    """
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -1885,7 +1894,7 @@ def _revalidate_gateway_process_identity(
     except ProcessLookupError:
         return None
     except PermissionError as exc:
-        raise GatewayProcessTerminationError(
+        raise GatewayProcessIdentityUnreadableError(
             [f"PID {identity.pid}: permission denied while revalidating identity"]
         ) from exc
     except GatewayProcessEnumerationError as exc:
@@ -1946,9 +1955,19 @@ def _wait_for_exact_gateway_identity_exit(
     while True:
         if not _pid_exists(identity.pid):
             return True
-        current = _revalidate_gateway_process_identity(identity)
-        if current is None:
-            return True
+        try:
+            if _revalidate_gateway_process_identity(identity) is None:
+                return True
+        except GatewayProcessIdentityUnreadableError:
+            # macOS teardown race: a draining PID's argv read can fail with
+            # sysctl(KERN_PROCARGS2) EINVAL before the PID disappears. The
+            # birth identity is the anchor: if it no longer matches, the
+            # exact process is gone; if it still matches, keep waiting and
+            # stay red only once the deadline expires.
+            if _launchd_process_start_time(identity.pid) != identity.start_time:
+                return True
+            if time.monotonic() >= deadline:
+                raise
         if time.monotonic() >= deadline:
             return False
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))

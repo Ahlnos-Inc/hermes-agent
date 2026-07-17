@@ -1148,3 +1148,53 @@ def test_build_472_windows_prefix_and_home_consistency():
     assert role.value == "foreign"
     assert profile is None
     assert home is None
+
+
+def _raise_unreadable_identity(_identity):
+    raise gateway.GatewayProcessIdentityUnreadableError(
+        ["PID 4242: permission denied while revalidating identity"]
+    )
+
+
+def test_wait_for_exit_treats_unreadable_gone_birth_identity_as_exited(monkeypatch):
+    # macOS teardown race: a draining PID's argv read fails with
+    # sysctl(KERN_PROCARGS2) EINVAL before the PID disappears.
+    identity = _identity()
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        gateway, "_revalidate_gateway_process_identity", _raise_unreadable_identity
+    )
+    monkeypatch.setattr(gateway, "_launchd_process_start_time", lambda _pid: None)
+
+    assert gateway._wait_for_exact_gateway_identity_exit(identity, 1.0) is True
+
+
+def test_wait_for_exit_treats_unreadable_reused_pid_as_exited(monkeypatch):
+    identity = _identity()
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        gateway, "_revalidate_gateway_process_identity", _raise_unreadable_identity
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_launchd_process_start_time",
+        lambda _pid: identity.start_time + 1,
+    )
+
+    assert gateway._wait_for_exact_gateway_identity_exit(identity, 1.0) is True
+
+
+def test_wait_for_exit_stays_red_when_unreadable_live_identity_persists(monkeypatch):
+    identity = _identity()
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(
+        gateway, "_revalidate_gateway_process_identity", _raise_unreadable_identity
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_launchd_process_start_time",
+        lambda _pid: identity.start_time,
+    )
+
+    with pytest.raises(gateway.GatewayProcessTerminationError, match="permission denied"):
+        gateway._wait_for_exact_gateway_identity_exit(identity, 0.0)
