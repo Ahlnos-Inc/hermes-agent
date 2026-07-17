@@ -1238,5 +1238,7 @@ def test_wait_for_exit_stays_red_when_unreadable_live_identity_persists(monkeypa
         lambda _pid: identity.start_time,
     )
 
-    with pytest.raises(gateway.GatewayProcessTerminationError, match="permission denied"):
-        gateway._wait_for_exact_gateway_identity_exit(identity, 0.0)
+    # Deadline with a live-but-unreadable identity reports "not exited"
+    # (False) — never raises, never signals; the KILL path fail-closes
+    # independently on unreadable identity.
+    assert gateway._wait_for_exact_gateway_identity_exit(identity, 0.0) is False
