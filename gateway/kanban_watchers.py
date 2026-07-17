@@ -276,9 +276,10 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        # Shared with tui_gateway/server.py's consumer — see
+        # hermes_cli/kanban_db.py::TERMINAL_KINDS (BUILD-443) so the two
+        # can't drift out of sync.
+        TERMINAL_KINDS = _kb.TERMINAL_KINDS
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that

@@ -139,6 +139,17 @@ CONTINUATION_NONPROGRESS_LIMIT = 3
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Event kinds the notify-sub consumers (gateway/kanban_watchers.py,
+# tui_gateway/server.py) poll ``task_events`` for. Shared here so the two
+# consumers can't drift out of sync (BUILD-443) — each imports this tuple
+# instead of keeping its own copy. ``status`` is emitted by the dashboard's
+# direct status writes (``plugins/kanban/dashboard/plugin_api.py::
+# _set_status_direct``), not by anything in this module.
+TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "block_loop_detected", "status", "archived", "unblocked",
+)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -9979,7 +9990,7 @@ def _process_group_alive(pgid: int) -> bool:
         return False
     except Exception:
         try:
-            os.killpg(int(pgid), 0)
+            os.killpg(int(pgid), 0)  # windows-footgun: ok — pgid probe, POSIX-only fallback
             return True
         except ProcessLookupError:
             return False
@@ -10080,7 +10091,7 @@ def _terminate_reclaimed_worker(
     signal_target = (
         signal_fn
         if signal_fn is not None
-        else (os.killpg if use_process_group else kill)
+        else (os.killpg if use_process_group else kill)  # windows-footgun: ok — pgroups are POSIX-only
     )
     target_id = int(worker_pgid) if use_process_group else int(pid)
     try:
@@ -14195,7 +14206,7 @@ def _default_spawn(
             if not _IS_WINDOWS and os.getpgid(proc.pid) == proc.pid:
                 import signal
 
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — _IS_WINDOWS-gated
             else:
                 proc.terminate()
             try:
@@ -14204,7 +14215,7 @@ def _default_spawn(
                 if not _IS_WINDOWS and os.getpgid(proc.pid) == proc.pid:
                     import signal
 
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — _IS_WINDOWS-gated
                 else:
                     proc.kill()
         except (ProcessLookupError, PermissionError, OSError):

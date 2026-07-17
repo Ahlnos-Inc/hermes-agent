@@ -234,3 +234,29 @@ def test_tui_poller_leaves_foreign_subscription_unclaimed(kanban_home, monkeypat
 
     assert emitted == []
     assert _cursor(task_id, "other-sess") == 0
+
+
+def test_tui_poller_delivers_block_loop_detected(kanban_home, monkeypatch):
+    """BUILD-443: block_loop_detected must reach TUI subscribers.
+
+    Before this fix the kind was absent from TERMINAL_KINDS, so a task that
+    hit the block-recurrence limit and dropped to triage never notified the
+    operator — exactly the stall a human needs to hear about.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="loopy task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=task_id, platform="tui", chat_id="sess-key-1")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, task_id, kind="block_loop_detected",
+                payload={"reason": "needs decision", "kind": "needs_input", "recurrences": 2, "limit": 2},
+            )
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
+
+    _poll(_session())
+
+    assert len(submitted) == 1
+    assert "triage" in submitted[0][0][-1].lower()
+    assert _cursor(task_id, "sess-key-1") > 0

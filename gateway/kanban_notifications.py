@@ -49,6 +49,13 @@ def render_kanban_event(
     if kind == "timed_out":
         limit = int(payload.get("limit_seconds") or 0)
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "block_loop_detected":
+        reason = str(payload.get("reason") or "").strip()
+        recurrences = payload.get("recurrences")
+        return (
+            f"🔁 {board_tag}{tag}Kanban {task_id} escalated to triage after "
+            f"{recurrences} repeated blocks" + (f": {reason}" if reason else "")
+        )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None

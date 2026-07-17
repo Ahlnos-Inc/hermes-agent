@@ -393,6 +393,38 @@ def test_crashed_message_falls_back_to_pid_gone_when_classification_unknown(tmp_
     assert "pid gone" in adapter.sent[0]["text"].lower()
 
 
+def test_kanban_notifier_delivers_block_loop_detected(tmp_path, monkeypatch):
+    """BUILD-443: block_loop_detected must reach messaging subscribers.
+
+    Before this fix the kind was absent from TERMINAL_KINDS, so a task that
+    hit the block-recurrence limit and dropped to triage never notified the
+    operator — exactly the stall a human needs to hear about.
+    """
+    db_path = tmp_path / "block-loop-detected.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loopy task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn, tid, kind="block_loop_detected",
+            payload={"reason": "needs decision", "kind": "needs_input", "recurrences": 2, "limit": 2},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "triage" in text.lower()
+    assert "needs decision" in text
+
+
 def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypatch):
     """A subscription owned by a secondary profile whose profile-adapter
     registry entry EXISTS but lacks this platform must NOT fall back to the

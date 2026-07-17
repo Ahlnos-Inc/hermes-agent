@@ -28,6 +28,7 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from gateway.kanban_notifications import render_kanban_event
+from hermes_cli.kanban_db import TERMINAL_KINDS
 from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
@@ -8465,12 +8466,6 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
     return (evt_sid, evt_type)
-
-
-TERMINAL_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
-    "archived", "unblocked",
-)
 
 
 def _resolve_tui_kanban_owner(
