@@ -150,6 +150,17 @@ TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "spawn_failed", "block_loop_detected", "status", "archived", "unblocked",
 )
+# The subset of TERMINAL_KINDS that represents a step actually going wrong,
+# as opposed to progressing normally (``completed``) or being administratively
+# reclassified (``status`` / ``archived`` / ``unblocked``). Defined ONCE here
+# (BUILD-508) so it can't drift from TERMINAL_KINDS by construction; consumed
+# by compile_workflow_graph's per-step kinds_json filter and aliased by
+# gateway/kanban_watchers.py::FAILURE_KINDS for its Telegram-home-fallback and
+# tui-orphan-sweep routing — the same anti-drift move BUILD-443 used for
+# TERMINAL_KINDS itself.
+FAILURE_KINDS = frozenset(TERMINAL_KINDS) - {
+    "completed", "status", "archived", "unblocked",
+}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -1607,6 +1618,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    -- BUILD-508: per-subscription event-kind filter, a sorted JSON array
+    -- (e.g. '["blocked","crashed",...]') or NULL. NULL means "all kinds" —
+    -- the behavior every subscription had before this column existed, so
+    -- every pre-BUILD-508 row keeps working unchanged. See
+    -- add_notify_sub()/notify_sub_kinds() below.
+    kinds_json    TEXT,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2666,6 +2683,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "kinds_json" not in notify_cols:
+            # BUILD-508: additive, nullable. NULL = all kinds (back-compat).
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "kinds_json", "kinds_json TEXT"
+            )
 
     workflow_compilation_table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -2858,7 +2880,7 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, kinds_json TEXT,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -4455,9 +4477,12 @@ def compile_workflow_graph(
         # pre-`done` steps: they already succeeded and re-subscribing would
         # replay their `completed` event as noise. INSERT OR IGNORE keeps the
         # terminal row idempotent.
-        # ponytail: delivers intermediate `completed` pings too (progress
-        # visibility, not silence). Add a per-sub kind filter column if
-        # failure-only delivery is wanted.
+        # BUILD-508: non-terminal step subs are narrowed to FAILURE_KINDS —
+        # the terminal task's own `completed` event is the real "workflow
+        # finished" signal, so a step merely completing on schedule no longer
+        # pings the origin (this is the upgrade path BUILD-503 named in its
+        # ponytail comment). The terminal task keeps kinds_json=NULL (all
+        # kinds), unchanged from pre-BUILD-508 behavior.
         # A step is persisted `done` only when it was explicitly seeded that
         # way (the ready/todo fallback above never yields `done`).
         subscribe_task_ids = [
@@ -4465,13 +4490,17 @@ def compile_workflow_graph(
             for step in normalized_steps
             if step["initial_status"] != "done"
         ]
+        failure_kinds_json = json.dumps(sorted(FAILURE_KINDS))
         for normalized_notification in normalized_notifications:
             for sub_task_id in subscribe_task_ids:
+                kinds_json = (
+                    None if sub_task_id == terminal_task_id else failure_kinds_json
+                )
                 conn.execute(
                     """INSERT OR IGNORE INTO kanban_notify_subs
                         (task_id, platform, chat_id, thread_id, user_id,
-                         notifier_profile, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                         notifier_profile, created_at, kinds_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         sub_task_id,
                         normalized_notification["platform"],
@@ -4480,6 +4509,7 @@ def compile_workflow_graph(
                         normalized_notification["user_id"],
                         normalized_notification["notifier_profile"],
                         now,
+                        kinds_json,
                     ),
                 )
         conn.execute(
@@ -14964,18 +14994,38 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    ``kinds`` (BUILD-508), if given, must be a subset of TERMINAL_KINDS —
+    the only kinds either consumer ever claims. Stored as a sorted JSON
+    array; omitted/None (the default) means "all kinds", matching every
+    subscription's behavior before this filter existed.
+    """
+    kinds_json: Optional[str] = None
+    if kinds is not None:
+        kind_set = {str(k) for k in kinds}
+        invalid = kind_set - set(TERMINAL_KINDS)
+        if invalid:
+            raise ValueError(
+                f"kinds must be a subset of TERMINAL_KINDS, got invalid: {sorted(invalid)}"
+            )
+        kinds_json = json.dumps(sorted(kind_set))
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
+                 created_at, kinds_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, now, kinds_json,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
@@ -14989,6 +15039,20 @@ def add_notify_sub(
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
+        if kinds_json is not None:
+            # Same self-heal shape as notifier_profile above: only backfills
+            # a row that predates this filter (kinds_json still NULL). An
+            # already-filtered row's intent isn't silently overwritten by a
+            # later re-subscribe.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET kinds_json = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND kinds_json IS NULL
+                """,
+                (kinds_json, task_id, platform, chat_id, thread_id or ""),
+            )
 
 
 def list_notify_subs(
@@ -15001,6 +15065,23 @@ def list_notify_subs(
     else:
         rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
     return [dict(r) for r in rows]
+
+
+def notify_sub_kinds(sub: dict) -> Optional["frozenset[str]"]:
+    """Return a subscription row's event-kind filter, or ``None`` for "all
+    kinds" (BUILD-508). ``None`` covers every pre-BUILD-508 row (NULL
+    ``kinds_json``) as well as any unparseable value, which fails open to
+    the pre-existing behavior rather than silently dropping events."""
+    raw = sub.get("kinds_json")
+    if not raw:
+        return None
+    try:
+        kinds = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(kinds, list):
+        return None
+    return frozenset(str(k) for k in kinds)
 
 
 def remove_notify_sub(

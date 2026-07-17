@@ -188,7 +188,7 @@ def test_compile_workflow_is_orchestrator_only_and_hidden_from_workers(
     assert "orchestrator-only" in refused["error"]
 
 
-def test_compile_workflow_atomically_subscribes_only_terminal_gateway_target(
+def test_compile_workflow_atomically_subscribes_gateway_target_on_every_step(
     monkeypatch, worker_env,
 ):
     from gateway.session_context import reset_session_vars
@@ -225,10 +225,13 @@ def test_compile_workflow_atomically_subscribes_only_terminal_gateway_target(
     assert first["ok"] is True
     assert first["workflow_key"] == args["workflow_key"]
     assert first["terminal_task_id"] == first["task_ids"]["verify"]
+    # BUILD-503: terminal gets an all-kinds sub, every step a failure-kinds
+    # sub (BUILD-508), all bound to the originating gateway target.
     assert first["notification"] == {
         "subscribed": True,
-        "count": 1,
-        "terminal_only": True,
+        "count": 2,
+        "terminal_count": 1,
+        "terminal_only": False,
     }
     with kb.connect() as conn:
         implementation = kb.get_task(conn, first["task_ids"]["implement"])
@@ -240,10 +243,14 @@ def test_compile_workflow_atomically_subscribes_only_terminal_gateway_target(
         assert verification.model_override == "deepseek/deepseek-v4-flash:free"
         assert verification.model_reasoning_effort == "low"
         subscriptions = kb.list_notify_subs(conn)
-        assert len(subscriptions) == 1
-        assert subscriptions[0]["task_id"] == first["terminal_task_id"]
-        assert subscriptions[0]["platform"] == "telegram"
-        assert subscriptions[0]["chat_id"] == "chat-472"
+        assert len(subscriptions) == 2
+        by_task = {row["task_id"]: row for row in subscriptions}
+        assert set(by_task) == set(first["task_ids"].values())
+        assert all(row["platform"] == "telegram" for row in subscriptions)
+        assert all(row["chat_id"] == "chat-472" for row in subscriptions)
+        assert by_task[first["terminal_task_id"]]["kinds_json"] is None
+        step_kinds = json.loads(by_task[first["task_ids"]["implement"]]["kinds_json"])
+        assert step_kinds == sorted(kb.FAILURE_KINDS)
 
 
 def test_compile_workflow_invalid_graph_rolls_back_without_partial_cards(
@@ -362,9 +369,11 @@ def test_compile_workflow_retry_ignores_new_session_route_and_delivery_context(
     assert retry["task_ids"] == first["task_ids"]
     with kb.connect() as conn:
         subscriptions = kb.list_notify_subs(conn)
-        assert len(subscriptions) == 1
-        assert subscriptions[0]["platform"] == "telegram"
-        assert subscriptions[0]["chat_id"] == "first-chat"
+        # terminal + step sub from the FIRST compile only (BUILD-503 fan-out);
+        # the retry's new session/delivery context adds nothing.
+        assert len(subscriptions) == 2
+        assert all(row["platform"] == "telegram" for row in subscriptions)
+        assert all(row["chat_id"] == "first-chat" for row in subscriptions)
 
 
 def test_compile_workflow_atomically_subscribes_configured_home_channels(
@@ -398,17 +407,19 @@ def test_compile_workflow_atomically_subscribes_configured_home_channels(
     }))
 
     assert result["ok"] is True
+    # 2 home channels × (terminal all-kinds + 1 step failure-kinds) = 4 subs
     assert result["notification"] == {
         "subscribed": True,
-        "count": 2,
-        "terminal_only": True,
+        "count": 4,
+        "terminal_count": 2,
+        "terminal_only": False,
     }
     with kb.connect() as conn:
         subscriptions = kb.list_notify_subs(conn)
-        assert len(subscriptions) == 2
-        assert {row["task_id"] for row in subscriptions} == {
-            result["terminal_task_id"]
-        }
+        assert len(subscriptions) == 4
+        assert {row["task_id"] for row in subscriptions} == set(
+            result["task_ids"].values()
+        )
         assert {row["platform"] for row in subscriptions} == {
             "telegram", "discord"
         }

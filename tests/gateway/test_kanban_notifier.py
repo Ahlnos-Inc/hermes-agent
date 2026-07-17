@@ -248,6 +248,85 @@ def test_workflow_nonterminal_step_blocked_notifies_origin_with_recorded_deliver
     assert restarted.sent == []
 
 
+# --- BUILD-508: per-subscription event-kind filter --------------------------
+
+
+def test_workflow_step_completion_is_silent_only_terminal_notifies(tmp_path, monkeypatch):
+    """BUILD-508: the named upgrade path from BUILD-503's ponytail comment.
+
+    A non-terminal step's own `completed` event is progress noise, not the
+    "workflow finished" signal — its subscription is narrowed to
+    FAILURE_KINDS by compile_workflow_graph, so it must NOT ping the origin.
+    The terminal task's subscription stays NULL (all kinds) and DOES notify
+    on completion, unchanged from pre-BUILD-508 behavior.
+    """
+    db_path = tmp_path / "workflow-step-progress.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        compiled = kb.compile_workflow_graph(
+            conn,
+            workflow_key="progress-2026-07-17",
+            idempotency_key="req-508",
+            created_by="orchestrator",
+            steps=[
+                {"key": "step", "title": "Implement", "assignee": "coder",
+                 "parents": []},
+                {"key": "final", "title": "Report", "assignee": "writer",
+                 "parents": ["step"], "role": "reporter", "terminal": True},
+            ],
+            notification={"platform": "telegram", "chat_id": "chat-1"},
+        )
+        step_id = compiled.task_ids["step"]
+        terminal_id = compiled.terminal_task_id
+        # A raw `completed`-kind event on the step task, independent of its
+        # actual status transition (which would unsub it anyway once truly
+        # done) — isolates the kind filter from the separate done/archived
+        # unsub mechanism so the cursor assertion below is meaningful.
+        with kb.write_txn(conn):
+            kb._append_event(conn, step_id, kind="completed", payload={"summary": "noise"})
+    finally:
+        conn.close()
+
+    # Tick 1: the step's completed event is claimed-and-skipped.
+    tick1 = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(tick1)))
+    assert tick1.sent == [], "a non-terminal step's completion must not ping the origin"
+
+    # The cursor must have advanced past the filtered event anyway — the
+    # claim (not the per-kind filter) is what owns exactly-once delivery.
+    conn = kb.connect()
+    try:
+        step_sub = next(
+            s for s in kb.list_notify_subs(conn, task_id=step_id)
+            if s["chat_id"] == "chat-1"
+        )
+        assert int(step_sub["last_event_id"]) > 0
+    finally:
+        conn.close()
+
+    # Tick 2 (restart): nothing replays.
+    tick2 = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(tick2)))
+    assert tick2.sent == []
+
+    # The terminal task's own completion (kinds_json=NULL) DOES notify.
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, step_id) is not None
+        assert kb.complete_task(conn, step_id, summary="step done")
+        assert kb.complete_task(conn, terminal_id, summary="workflow done")
+    finally:
+        conn.close()
+
+    tick3 = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(tick3)))
+    assert len(tick3.sent) == 1
+    assert terminal_id in tick3.sent[0]["text"]
+
+
 def test_kanban_db_path_is_test_isolated_from_real_home():
     hermes_home = Path(kb.kanban_home())
     production_db = Path.home() / ".hermes" / "kanban.db"

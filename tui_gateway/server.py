@@ -8749,8 +8749,19 @@ def _poll_kanban_tui_subs(sid: str, session: dict) -> None:
                 _release_tui_turn(session, token)
                 return
             task = _kb.get_task(conn, sub["task_id"])
+            # BUILD-508: per-subscription event-kind filter. None (every
+            # pre-BUILD-508 sub, and a workflow terminal task's own sub)
+            # means "all kinds" — unchanged behavior.
+            sub_kinds = _kb.notify_sub_kinds(sub)
             rendered: list[str] = []
             for event in events:
+                if sub_kinds is not None and event.kind not in sub_kinds:
+                    # Claimed-and-skipped: claim_unseen_events_for_sub above
+                    # already moved the cursor past this event, so dropping
+                    # it here can't stall or replay it — same shape as an
+                    # unrendered kind falling through render_kanban_event
+                    # returning None just below.
+                    continue
                 run = _kb.get_run(conn, int(event.run_id)) if event.run_id is not None else None
                 message = render_kanban_event(
                     task_id=sub["task_id"], task=task, event=event, run=run,

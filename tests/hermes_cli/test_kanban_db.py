@@ -5994,3 +5994,72 @@ def test_record_task_failure_does_not_emit_failure_signature_event(kanban_home):
         trip = kb.check_failure_signature_breaker(conn, t)
     assert rows == []
     assert trip is None
+
+
+# ---------------------------------------------------------------------------
+# Notify-sub per-subscription kind filter (BUILD-508)
+# ---------------------------------------------------------------------------
+
+def test_add_notify_sub_defaults_to_all_kinds(kanban_home):
+    """No ``kinds`` argument -> NULL kinds_json -> notify_sub_kinds() is
+    None, matching every subscription's behavior before this filter existed."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="t", assignee="worker")
+        kb.add_notify_sub(conn, task_id=t, platform="telegram", chat_id="c1")
+        sub = kb.list_notify_subs(conn, task_id=t)[0]
+    assert sub["kinds_json"] is None
+    assert kb.notify_sub_kinds(sub) is None
+
+
+def test_add_notify_sub_stores_sorted_kinds_json(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="t", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=t, platform="telegram", chat_id="c1",
+            kinds=["crashed", "blocked"],
+        )
+        sub = kb.list_notify_subs(conn, task_id=t)[0]
+    assert sub["kinds_json"] == '["blocked", "crashed"]'
+    assert kb.notify_sub_kinds(sub) == frozenset({"blocked", "crashed"})
+
+
+def test_add_notify_sub_rejects_kinds_outside_terminal_kinds(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="t", assignee="worker")
+        with pytest.raises(ValueError):
+            kb.add_notify_sub(
+                conn, task_id=t, platform="telegram", chat_id="c1",
+                kinds=["blocked", "not-a-real-kind"],
+            )
+        # The rejected call must not have partially written the row.
+        assert kb.list_notify_subs(conn, task_id=t) == []
+
+
+def test_add_notify_sub_kinds_self_heals_only_when_unset(kanban_home):
+    """Mirrors the notifier_profile self-heal: a re-subscribe backfills a
+    NULL kinds_json (a pre-BUILD-508 row) but never overwrites a filter that
+    is already set — an existing subscription's declared intent sticks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="t", assignee="worker")
+        kb.add_notify_sub(conn, task_id=t, platform="telegram", chat_id="c1")
+        kb.add_notify_sub(
+            conn, task_id=t, platform="telegram", chat_id="c1", kinds=["crashed"],
+        )
+        sub = kb.list_notify_subs(conn, task_id=t)[0]
+        assert kb.notify_sub_kinds(sub) == frozenset({"crashed"})
+
+        # A later add_notify_sub with a different filter must NOT narrow/widen
+        # the already-set row.
+        kb.add_notify_sub(
+            conn, task_id=t, platform="telegram", chat_id="c1", kinds=["blocked"],
+        )
+        sub = kb.list_notify_subs(conn, task_id=t)[0]
+        assert kb.notify_sub_kinds(sub) == frozenset({"crashed"})
+
+
+def test_notify_sub_kinds_fails_open_on_unparseable_value(kanban_home):
+    """A malformed kinds_json must fail open to 'all kinds', not silently
+    drop events."""
+    assert kb.notify_sub_kinds({"kinds_json": "not json"}) is None
+    assert kb.notify_sub_kinds({"kinds_json": '"a string, not a list"'}) is None
+    assert kb.notify_sub_kinds({}) is None

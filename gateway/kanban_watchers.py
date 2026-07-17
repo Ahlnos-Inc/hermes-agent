@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 from gateway.kanban_notifications import render_kanban_event
+from hermes_cli.kanban_db import FAILURE_KINDS
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -36,13 +37,22 @@ def _architecture_delivery_withheld(event: Any) -> bool:
 # Failure-kind events (BUILD-503): these are the ones that must reach the
 # operator via the Telegram home fallback when the origin is unreachable.
 # `completed` / `status` / `archived` / `unblocked` are not failures and are
-# not worth waking the home channel for. Module-level so both the telegram
-# send-failure fallback and the tui orphan sweep (BUILD-506) share one
-# definition instead of drifting apart.
-FAILURE_KINDS = frozenset(
-    {"blocked", "spawn_failed", "gave_up", "crashed",
-     "timed_out", "block_loop_detected"}
-)
+# not worth waking the home channel for. Aliased from hermes_cli/kanban_db.py
+# (BUILD-508) rather than redefined here — both the telegram send-failure
+# fallback below and the tui orphan sweep (BUILD-506) use this name, and
+# compile_workflow_graph's per-step kinds_json filter needs the identical set,
+# so one definition avoids the three drifting apart (BUILD-443 pattern).
+#
+# sweep_orphaned_tui_sub() below claims with this exact set regardless of a
+# swept subscription's own kinds_json (verified BUILD-508): every real
+# subscription's filter is either NULL ("all kinds", a superset) or this same
+# FAILURE_KINDS set (compile_workflow_graph's step-task subs), so intersecting
+# with a per-sub filter here would never change what gets claimed. Treating a
+# dead/orphaned session's failure events as always-escalate — irrespective of
+# a hypothetical narrower per-sub filter — is also the correct safety-net
+# behavior: a subscriber who scoped themselves out of failure pings while
+# their desktop was alive shouldn't also lose the "your session died with a
+# task stuck" escalation.
 
 # BUILD-506: orphaned tui-subscription sweep age gate. A tui subscription's
 # oldest unclaimed failure event must be at least this old, AND have no live
@@ -668,8 +678,20 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     event_runs = d.get("event_runs") or {}
+                    # BUILD-508: per-subscription event-kind filter. None
+                    # (every pre-BUILD-508 sub, and the workflow terminal
+                    # task's own sub) means "all kinds" — unchanged behavior.
+                    sub_kinds = _kb.notify_sub_kinds(sub)
                     for ev in d["events"]:
                         kind = ev.kind
+                        if sub_kinds is not None and kind not in sub_kinds:
+                            # Claimed-and-skipped: the cursor already moved
+                            # past this event in the claim_unseen_events_for_sub
+                            # call inside _collect() above, so dropping it here
+                            # can never stall or replay it — exactly how
+                            # archived/unblocked already fall through
+                            # render_kanban_event returning None just below.
+                            continue
                         run = event_runs.get(ev.id)
                         msg = render_kanban_event(
                             task_id=sub["task_id"], task=task, event=ev,

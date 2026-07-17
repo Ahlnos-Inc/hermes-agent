@@ -2230,7 +2230,15 @@ def _workflow_request_digest(args: dict[str, Any]) -> str:
 
 
 def _compiled_workflow_response(kb: Any, conn: Any, compiled: Any) -> str:
-    subscription_count = conn.execute(
+    # BUILD-503 fans subscriptions out to every non-done step task (failure
+    # kinds only per BUILD-508); report the whole set, not just the terminal.
+    task_ids = list(compiled.task_ids.values())
+    placeholders = ",".join("?" * len(task_ids))
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id IN ({placeholders})",
+        tuple(task_ids),
+    ).fetchone()[0]
+    terminal_count = conn.execute(
         "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
         (compiled.terminal_task_id,),
     ).fetchone()[0]
@@ -2239,9 +2247,10 @@ def _compiled_workflow_response(kb: Any, conn: Any, compiled: Any) -> str:
         task_ids=compiled.task_ids,
         terminal_task_id=compiled.terminal_task_id,
         notification={
-            "subscribed": bool(subscription_count),
-            "count": int(subscription_count),
-            "terminal_only": True,
+            "subscribed": bool(terminal_count),
+            "count": int(total),
+            "terminal_count": int(terminal_count),
+            "terminal_only": int(total) == int(terminal_count),
         },
     )
 

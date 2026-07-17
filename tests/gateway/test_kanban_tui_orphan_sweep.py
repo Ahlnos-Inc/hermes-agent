@@ -236,3 +236,85 @@ def test_sweep_loses_cas_race_to_concurrent_claimer(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert result is None, "sweep must lose the CAS, not double-claim"
+
+
+# --- BUILD-508: interaction with the per-subscription kinds_json filter ----
+#
+# sweep_orphaned_tui_sub() claims with its own hardcoded FAILURE_KINDS (see
+# gateway/kanban_watchers.py's module comment) rather than consulting the
+# swept subscription's kinds_json at all. For every subscription
+# compile_workflow_graph ever creates that is either NULL (all kinds — a
+# superset) or exactly FAILURE_KINDS (step-task subs), so this can never
+# under- or over-claim relative to what the sub would already allow. These
+# tests pin that down directly, including the deliberate edge case: a sub
+# manually narrowed to exclude failure kinds is still escalated, because a
+# dead desktop session with a stuck task is exactly the silence this sweep
+# exists to prevent.
+
+
+def test_sweep_ignores_a_subs_own_kinds_json_narrower_than_failure_kinds(
+    tmp_path, monkeypatch,
+):
+    """A sub explicitly filtered to a kind OUTSIDE FAILURE_KINDS (here,
+    ``completed`` only) must still have its failure event swept — the sweep
+    never consults kinds_json, by design (see the module comment above
+    FAILURE_KINDS in gateway/kanban_watchers.py)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="narrow filter", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="tui", chat_id="sess-key-1",
+            kinds=["completed"],
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kind="crashed", payload={"reason": "x"})
+    finally:
+        conn.close()
+    _backdate_events(tid, seconds_ago=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS + 60)
+    sub = _sub_for(tid)
+    assert kb.notify_sub_kinds(sub) == frozenset({"completed"})
+
+    conn = kb.connect()
+    try:
+        result = kw.sweep_orphaned_tui_sub(
+            kb, conn, sub, live_session_ids=set(),
+            age_gate_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS,
+        )
+    finally:
+        conn.close()
+    assert result is not None, "the failure event must still be swept"
+    assert [ev.kind for ev in result["events"]] == ["crashed"]
+
+
+def test_sweep_claims_step_task_sub_with_failure_kinds_json(tmp_path, monkeypatch):
+    """A step-task sub as compile_workflow_graph now creates it (kinds_json
+    == exactly FAILURE_KINDS) sweeps identically to a legacy NULL sub — the
+    common real-world case, not just the adversarial narrower one above."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="step sub", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="tui", chat_id="sess-key-1",
+            kinds=sorted(kb.FAILURE_KINDS),
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kind="timed_out", payload={"reason": "x"})
+    finally:
+        conn.close()
+    _backdate_events(tid, seconds_ago=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS + 60)
+    sub = _sub_for(tid)
+
+    conn = kb.connect()
+    try:
+        result = kw.sweep_orphaned_tui_sub(
+            kb, conn, sub, live_session_ids=set(),
+            age_gate_seconds=kw.DEFAULT_TUI_ORPHAN_AGE_SECONDS,
+        )
+    finally:
+        conn.close()
+    assert result is not None
+    assert [ev.kind for ev in result["events"]] == ["timed_out"]

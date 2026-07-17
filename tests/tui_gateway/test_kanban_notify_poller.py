@@ -264,6 +264,58 @@ def test_tui_poller_delivers_block_loop_detected(kanban_home, monkeypatch):
     assert _cursor(task_id, "sess-key-1") > 0
 
 
+# --- BUILD-508: per-subscription event-kind filter --------------------------
+
+
+def test_tui_poller_kind_filter_claims_and_skips_non_matching_kind(
+    kanban_home, monkeypatch,
+):
+    """A subscription narrowed to failure kinds must not surface a
+    `completed` event to the user — but the claim must still advance the
+    cursor exactly once (no stall, no replay on the next poll)."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="step task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="tui", chat_id="sess-key-1",
+            kinds=["blocked", "crashed"],
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, kind="completed")
+
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
+
+    _poll(_session())
+
+    assert submitted == [], "completed is outside the sub's kind filter"
+    assert _cursor(task_id, "sess-key-1") > 0, "the claim must still advance the cursor"
+
+    # Next poll (simulating the following tick): nothing left to resurface.
+    _poll(_session())
+    assert submitted == []
+
+
+def test_tui_poller_kind_filter_delivers_matching_kind(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="step task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="tui", chat_id="sess-key-1",
+            kinds=["blocked", "crashed"],
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, kind="blocked", payload={"reason": "x"})
+
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _capture_persisted_submit(submitted))
+
+    _poll(_session())
+
+    assert len(submitted) == 1
+    assert _cursor(task_id, "sess-key-1") > 0
+
+
 # --- BUILD-506: gateway orphan-sweep vs. the live tui poller ---------------
 #
 # THE RACE THAT MATTERS: an active desktop poller must never have a
