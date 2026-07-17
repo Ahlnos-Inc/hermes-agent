@@ -7163,6 +7163,7 @@ def _login_xai_oauth(
         timeout_seconds=timeout_seconds,
         open_browser=open_browser,
         manual_paste=manual_paste,
+        interactive=True,
     )
     _save_xai_oauth_tokens(
         creds["tokens"],
@@ -7332,6 +7333,7 @@ def _xai_oauth_loopback_login(
     timeout_seconds: float = 20.0,
     open_browser: bool = True,
     manual_paste: bool = False,
+    interactive: bool = False,
 ) -> Dict[str, Any]:
     """Run the xAI OAuth PKCE flow.
 
@@ -7342,7 +7344,24 @@ def _xai_oauth_loopback_login(
     Connect, where the laptop's browser can't reach 127.0.0.1 on the
     remote VM).  The same PKCE verifier, ``state``, and ``nonce`` are
     used for both paths so the upstream-side OAuth flow is identical.
+
+    ``interactive`` must be explicitly set by the caller (threaded from
+    a real CLI login command such as ``hermes auth add xai-oauth`` or
+    ``hermes model``) AND both stdin/stdout must be TTYs.  This is a
+    hard fail-closed gate: automated callers (runtime credential
+    resolution, status probes, tests) that reach this function without
+    ``interactive=True`` in a real terminal must never trigger a
+    browser open or block waiting for a callback (BUILD-456 — a
+    non-interactive path popped a real xAI OAuth consent tab).
     """
+    if not interactive or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise AuthError(
+            "xAI OAuth login requires an interactive terminal and was not "
+            "explicitly requested. Run `hermes auth add xai-oauth` to sign in.",
+            provider="xai-oauth",
+            code="xai_oauth_interactive_required",
+        )
+
     def _stdin_supports_manual_paste() -> bool:
         try:
             return bool(getattr(sys.stdin, "isatty", lambda: False)())

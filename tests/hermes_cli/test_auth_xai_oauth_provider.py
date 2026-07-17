@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import auth as auth_mod
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_XAI_OAUTH_BASE_URL,
@@ -826,6 +827,29 @@ def test_get_xai_oauth_auth_status_logged_out(tmp_path, monkeypatch):
     status = get_xai_oauth_auth_status()
     assert status["logged_in"] is False
     assert "error" in status
+
+
+def test_get_xai_oauth_auth_status_never_opens_browser_when_logged_out(tmp_path, monkeypatch):
+    """BUILD-456 regression: an automated status probe (e.g. a health check
+    or test) with no stored credentials must report ``logged_in: False``
+    and must never fall through to an interactive login / browser open.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("webbrowser.open must not be called"),
+    )
+
+    status = get_xai_oauth_auth_status()
+    assert status["logged_in"] is False
+    assert "error" in status
+
+    with pytest.raises(AuthError):
+        resolve_xai_oauth_runtime_credentials()
 
 
 # ---------------------------------------------------------------------------

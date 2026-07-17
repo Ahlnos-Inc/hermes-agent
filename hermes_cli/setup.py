@@ -902,7 +902,7 @@ def _run_xai_oauth_login_from_setup() -> bool:
     print()
     print_info("Signing in to xAI Grok OAuth (SuperGrok / Premium+)...")
     try:
-        creds = _xai_oauth_loopback_login(open_browser=open_browser)
+        creds = _xai_oauth_loopback_login(open_browser=open_browser, interactive=True)
         _save_xai_oauth_tokens(
             creds["tokens"],
             discovery=creds.get("discovery"),

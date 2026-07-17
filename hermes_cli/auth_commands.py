@@ -358,6 +358,7 @@ def auth_add_command(args) -> None:
             timeout_seconds=getattr(args, "timeout", None) or 20.0,
             open_browser=not getattr(args, "no_browser", False),
             manual_paste=bool(getattr(args, "manual_paste", False)),
+            interactive=True,
         )
         auth_mod._save_xai_oauth_tokens(
             creds["tokens"],

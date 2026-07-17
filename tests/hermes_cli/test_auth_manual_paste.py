@@ -33,6 +33,34 @@ from hermes_cli import auth as auth_mod
 
 
 # ---------------------------------------------------------------------------
+# Interactive-gate test helpers (BUILD-456)
+#
+# ``_xai_oauth_loopback_login`` now hard-fails unless the caller passes
+# ``interactive=True`` AND both stdin/stdout report as TTYs — this is the
+# fix for a non-interactive/test path popping a real xAI OAuth consent tab.
+# These stubs let the below tests keep exercising the real interactive flow
+# (loopback server, manual-paste prompt, timeout fallback, ...) by presenting
+# as an interactive terminal, without ever needing a real one.
+# ---------------------------------------------------------------------------
+
+
+class _TTYStdin:
+    """Stub stdin that reports itself as an interactive TTY."""
+
+    def isatty(self):
+        return True
+
+
+class _TTYStringIO(io.StringIO):
+    """``io.StringIO`` that also reports itself as a TTY, so tests can keep
+    capturing printed output via ``contextlib.redirect_stdout`` while still
+    satisfying the interactive-terminal gate."""
+
+    def isatty(self):
+        return True
+
+
+# ---------------------------------------------------------------------------
 # _is_remote_session — broadened detection (#26923)
 # ---------------------------------------------------------------------------
 
@@ -293,8 +321,9 @@ def test_xai_loopback_login_manual_paste_skips_http_server(monkeypatch):
 
     monkeypatch.setattr(auth_mod.httpx, "post", _fake_token_post)
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        creds = auth_mod._xai_oauth_loopback_login(manual_paste=True)
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    with contextlib.redirect_stdout(_TTYStringIO()):
+        creds = auth_mod._xai_oauth_loopback_login(manual_paste=True, interactive=True)
 
     assert creds["tokens"]["access_token"] == "at"
     assert creds["tokens"]["refresh_token"] == "rt"
@@ -324,9 +353,10 @@ def test_xai_loopback_login_manual_paste_state_mismatch_raises(monkeypatch):
         },
     )
 
-    with contextlib.redirect_stdout(io.StringIO()):
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    with contextlib.redirect_stdout(_TTYStringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=True)
+            auth_mod._xai_oauth_loopback_login(manual_paste=True, interactive=True)
     assert exc.value.code == "xai_state_mismatch"
 
 
@@ -371,8 +401,9 @@ def test_xai_loopback_login_manual_paste_bare_code_succeeds(monkeypatch):
 
     monkeypatch.setattr(auth_mod.httpx, "post", _fake_token_post)
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        creds = auth_mod._xai_oauth_loopback_login(manual_paste=True)
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    with contextlib.redirect_stdout(_TTYStringIO()):
+        creds = auth_mod._xai_oauth_loopback_login(manual_paste=True, interactive=True)
 
     assert creds["tokens"]["access_token"] == "at"
     assert creds["tokens"]["refresh_token"] == "rt"
@@ -425,9 +456,12 @@ def test_xai_loopback_login_loopback_path_rejects_missing_state(monkeypatch):
     monkeypatch.setattr(auth_mod, "_xai_validate_loopback_redirect_uri", lambda _u: None)
     monkeypatch.setattr(auth_mod, "_print_loopback_ssh_hint", lambda *_a, **_k: None)
 
-    with contextlib.redirect_stdout(io.StringIO()):
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    with contextlib.redirect_stdout(_TTYStringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=False, open_browser=False)
+            auth_mod._xai_oauth_loopback_login(
+                manual_paste=False, open_browser=False, interactive=True
+            )
     assert exc.value.code == "xai_state_mismatch"
 
 
@@ -458,9 +492,10 @@ def test_xai_loopback_login_manual_paste_missing_code_raises(monkeypatch):
         },
     )
 
-    with contextlib.redirect_stdout(io.StringIO()):
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    with contextlib.redirect_stdout(_TTYStringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=True)
+            auth_mod._xai_oauth_loopback_login(manual_paste=True, interactive=True)
     assert exc.value.code == "xai_code_missing"
 
 
@@ -529,9 +564,7 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
         }
 
     monkeypatch.setattr(auth_mod, "_prompt_manual_callback_paste", _fake_prompt)
-    monkeypatch.setattr(
-        auth_mod.sys, "stdin", type("StubStdin", (), {"isatty": lambda self: True})()
-    )
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
     monkeypatch.setattr(
         auth_mod.httpx,
         "post",
@@ -545,10 +578,23 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
             }
         ),
     )
+    # BUILD-456: this test previously left ``open_browser`` at its default
+    # (True) with no ``webbrowser.open`` mock, so on a real interactive
+    # macOS/Linux-desktop dev machine it popped a genuine xAI OAuth consent
+    # tab in Chrome. This test only exercises the timeout->manual-paste
+    # fallback, not the browser-open step, so open_browser=False is the
+    # correct fix; the webbrowser.open guard below is defense in depth.
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("webbrowser.open must not be called here"),
+    )
 
-    buf = io.StringIO()
+    buf = _TTYStringIO()
     with contextlib.redirect_stdout(buf):
-        creds = auth_mod._xai_oauth_loopback_login(manual_paste=False)
+        creds = auth_mod._xai_oauth_loopback_login(
+            manual_paste=False, open_browser=False, interactive=True
+        )
 
     rendered = buf.getvalue()
     assert "xAI loopback callback timed out." in rendered
@@ -601,7 +647,15 @@ def test_xai_wait_for_callback_accepts_ready_stdin_code(monkeypatch):
 
 
 def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
-    """Non-interactive stdin must keep the original timeout error."""
+    """Non-interactive stdin must keep the original timeout error.
+
+    Uses a stdin stub that reports itself as a TTY on the *first* isatty()
+    check (satisfying the interactive-terminal entry gate, BUILD-456, so we
+    can reach the code under test at all) but non-TTY on the *second* check
+    — the internal ``_stdin_supports_manual_paste()`` decision made when the
+    loopback callback times out. That models a session that was interactive
+    at login time but has no usable stdin left for the fallback paste.
+    """
     monkeypatch.setattr(
         auth_mod, "_xai_oauth_discovery",
         lambda *_a, **_k: {
@@ -648,19 +702,85 @@ def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(
-        auth_mod.sys, "stdin", type("StubStdin", (), {"isatty": lambda self: False})()
-    )
+    class _FirstCallTTYStdin:
+        """isatty() is True once (the entry gate), False afterward (the
+        internal manual-paste-fallback decision)."""
+
+        def __init__(self):
+            self._calls = 0
+
+        def isatty(self):
+            self._calls += 1
+            return self._calls == 1
+
+    monkeypatch.setattr(auth_mod.sys, "stdin", _FirstCallTTYStdin())
     monkeypatch.setattr(
         auth_mod,
         "_prompt_manual_callback_paste",
         lambda *_a, **_k: pytest.fail("manual-paste fallback should not run"),
     )
+    # BUILD-456: same real-browser-open exposure as the timeout-fallback
+    # test above — this reaches the webbrowser.open call site before the
+    # mocked _xai_wait_for_callback ever raises. open_browser=False is the
+    # correct fix (this test isn't exercising the browser-open step); the
+    # webbrowser.open guard is defense in depth.
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("webbrowser.open must not be called here"),
+    )
 
-    with contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.redirect_stdout(_TTYStringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=False)
+            auth_mod._xai_oauth_loopback_login(
+                manual_paste=False, open_browser=False, interactive=True
+            )
     assert exc.value.code == "xai_callback_timeout"
+
+
+# ---------------------------------------------------------------------------
+# Interactive-only gate (BUILD-456) — automated/test/non-TTY callers must
+# fail closed before any network call or browser open, never open a real
+# xAI OAuth consent tab.
+# ---------------------------------------------------------------------------
+
+
+def test_xai_oauth_loopback_login_default_noninteractive_fails_closed(monkeypatch):
+    """The default (no ``interactive=True``) call must refuse to run at all.
+
+    Fails the test if ``webbrowser.open`` OR the OAuth discovery HTTP call
+    is ever reached — the guard must reject before any side effect, not
+    just before the browser-open line.
+    """
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("webbrowser.open must not be called"),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_xai_oauth_discovery",
+        lambda *_a, **_k: pytest.fail("OAuth discovery must not be reached"),
+    )
+
+    with pytest.raises(auth_mod.AuthError) as exc:
+        auth_mod._xai_oauth_loopback_login()
+    assert exc.value.code == "xai_oauth_interactive_required"
+    assert exc.value.provider == "xai-oauth"
+
+
+def test_xai_oauth_loopback_login_interactive_flag_alone_is_not_enough(monkeypatch):
+    """``interactive=True`` without real TTYs must still fail closed."""
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("webbrowser.open must not be called"),
+    )
+    monkeypatch.setattr(auth_mod.sys, "stdin", _TTYStdin())
+    # stdout intentionally left as pytest's default (non-TTY) capture target.
+    with pytest.raises(auth_mod.AuthError) as exc:
+        auth_mod._xai_oauth_loopback_login(interactive=True)
+    assert exc.value.code == "xai_oauth_interactive_required"
 
 
 # ---------------------------------------------------------------------------
