@@ -2,7 +2,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
+import { createRequire } from 'node:module'
 
+// electron-builder 26.15 resolves ALL hook modules eagerly at packager init
+// (previously afterSign only loaded during mac signing), so this file now
+// executes on Linux CI too — bare require in ESM scope throws there.
+const require = createRequire(import.meta.url)
 const { signAndVerify } = require('./codesign-mac.cjs')
 const { build: BUILD_CONFIG } = require('../package.json')
 
