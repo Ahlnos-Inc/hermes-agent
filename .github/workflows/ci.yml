@@ -224,7 +224,9 @@ jobs:
 
       - name: Collect timings and generate report
         env:
-          GITHUB_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          # Fork: AUTOFIX_BOT_PAT is an upstream-only secret; the ambient
+          # token reads run timings fine on our own repo.
+          GITHUB_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
         run: |
           python3 scripts/ci/timings_report.py \
             --baseline ci-timings-baseline.json \
