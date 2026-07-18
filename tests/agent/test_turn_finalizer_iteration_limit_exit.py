@@ -294,5 +294,20 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         outcome="timed_out",
         release_claim=True,
         end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        # Fork carries a recovery handoff alongside the budget counters so a
+        # timed-out worker's final summary survives into the failure event.
+        event_payload_extra={
+            "budget_used": 60,
+            "budget_max": 60,
+            "recovery_summary": "composed report",
+            "recovery_handoff": {
+                "failure_code": "iteration_budget_exhausted",
+                "iterations": {"used": 60, "max": 60},
+                "turn_exit_reason": "max_iterations_reached(60/60)",
+                "provider": "test-provider",
+                "model": "test-model",
+                "handoff_text": "composed report",
+                "recovery_recommendation": "retry with narrower scope / split task",
+            },
+        },
     )

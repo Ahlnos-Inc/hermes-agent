@@ -306,8 +306,9 @@ class TestDriverCmdResolution:
              patch("sys.stdout", new_callable=StringIO):
             doctor.run_doctor(driver_cmd="/custom/path/cua-driver")
         # shutil.which should have been called with the explicit arg, not
-        # the env-var / default resolver.
-        which_mock.assert_called_with("/custom/path/cua-driver")
+        # the env-var / default resolver. (Spawn-env sanitization makes its
+        # own later which() calls, so match any call, not just the last.)
+        which_mock.assert_any_call("/custom/path/cua-driver")
 
     def test_env_var_used_when_no_arg_given(self, monkeypatch):
         from tools.computer_use import doctor
@@ -321,5 +322,6 @@ class TestDriverCmdResolution:
              patch("subprocess.Popen", return_value=proc), \
              patch("sys.stdout", new_callable=StringIO):
             doctor.run_doctor()
-        # First (and only) which call should have used the env var.
-        which_mock.assert_called_with("/env/path/cua-driver")
+        # The driver-cmd resolution must have used the env var. (Later which()
+        # calls come from spawn-env sanitization and are unrelated.)
+        which_mock.assert_any_call("/env/path/cua-driver")
