@@ -1048,7 +1048,8 @@ describe('createGatewayEventHandler', () => {
   it('surfaces delegated child route metadata in the CLI-visible turn trail and final transcript', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
-    const expectedNotice = 'delegated · leaf · deepseek/deepseek v4 pro · effort low · reason delegation provider override'
+    const expectedNotice =
+      'delegated · leaf · deepseek/deepseek v4 pro · effort low · reason delegation provider override'
 
     onEvent({ payload: {}, type: 'message.start' } as any)
     onEvent({

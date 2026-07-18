@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { providerModelLabel, sessionRouteLabel, subagentDelegationNoticeLabel, subagentRouteLabel } from '../lib/route.js'
+import {
+  providerModelLabel,
+  sessionRouteLabel,
+  subagentDelegationNoticeLabel,
+  subagentRouteLabel
+} from '../lib/route.js'
 
 describe('route labels', () => {
   it('formats provider/model labels compactly', () => {

@@ -209,6 +209,7 @@ describe('StatusRule session count click target', () => {
 
   it('renders native quota when present in usage', () => {
     const quotaLabel = 'cdx 5h 12%\u21bb2h 7d 4%\u21bb5d'
+
     const element = StatusRule({
       bgCount: 0,
       busy: false,

@@ -54,7 +54,12 @@ export const sessionRouteLabel = (info?: Partial<SessionInfo> | null) => {
 export const subagentRouteLabel = (
   item: Pick<SubagentProgress, 'executionMode' | 'model' | 'provider' | 'reasoningEffort' | 'role'>
 ) =>
-  [routeModeLabel(item.executionMode), providerModelLabel(item.provider, item.model), `effort ${normalizedEffortLabel(item.reasoningEffort)}`, item.role]
+  [
+    routeModeLabel(item.executionMode),
+    providerModelLabel(item.provider, item.model),
+    `effort ${normalizedEffortLabel(item.reasoningEffort)}`,
+    item.role
+  ]
     .filter(Boolean)
     .join(' · ')
 

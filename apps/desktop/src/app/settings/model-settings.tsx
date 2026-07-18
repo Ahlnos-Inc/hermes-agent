@@ -407,10 +407,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     // filters same-value changes, but programmatic callers may not.
     if (patch.provider && patch.provider !== slot.provider) {
       next.model = ''
+
       if (patch.provider.toLowerCase() !== 'anthropic') {
         delete next.runtime
       }
     }
+
     if (patch.runtime === 'hermes' || patch.runtime === '') {
       delete next.runtime
     }
