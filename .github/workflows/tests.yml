@@ -149,10 +149,16 @@ jobs:
         run: |
           python3 -c "
           import json, glob, os
+          # Durations are advisory slice-scheduling hints — one corrupt
+          # slice artifact (seen live: 'Extra data' from a truncated
+          # write) must never fail CI; skip it and merge the rest.
           merged = {}
           for f in glob.glob('durations/*test_durations.json'):
-            with open(f) as fh:
-              merged.update(json.load(fh))
+            try:
+              with open(f) as fh:
+                merged.update(json.load(fh))
+            except (json.JSONDecodeError, OSError) as exc:
+              print(f'::warning::skipping unparseable durations file {f}: {exc}')
           with open('test_durations.json', 'w') as fh:
             json.dump(merged, fh, indent=2, sort_keys=True)
           print(f'Merged {len(merged)} file durations')
