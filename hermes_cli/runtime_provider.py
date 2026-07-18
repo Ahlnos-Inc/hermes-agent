@@ -2250,13 +2250,21 @@ def resolve_runtime_provider(
     external_moa_config: dict[str, Any] | None = None
     if provider_hint == "moa":
         from agent.runtime_target import HERMES_RUNTIME
+        from agent.errors import MoAPresetNotFoundError
         from hermes_cli.moa_config import normalize_moa_config, resolve_moa_preset
 
         moa = normalize_moa_config((load_config().get("moa") or {}))
         preset_name = str(target_model or moa.get("default_preset") or "default")
         try:
             preset = resolve_moa_preset(moa, preset_name)
-        except KeyError:
+        except (KeyError, MoAPresetNotFoundError):
+            # An unknown preset (e.g. a virtual `--provider moa --model <name>`
+            # request with no matching preset in config) is not fatal here:
+            # fall through to the virtual `moa://local` endpoint and let the
+            # MoA loop resolve/validate the preset at call time. Upstream's
+            # resolve_moa_preset raises MoAPresetNotFoundError (a ValueError,
+            # not a KeyError) — catch both so this blend keeps fork's
+            # tolerant behavior.
             preset = None
         aggregator = dict((preset or {}).get("aggregator") or {})
         aggregator_runtime = str(aggregator.get("runtime") or "").strip().lower()

@@ -331,7 +331,15 @@ def test_auth_failure_activates_fallback():
     assert agent.runtime == "codex_app_server"
 
 
-def test_rate_limit_falls_through_to_native_hermes_in_same_worker():
+def test_rate_limit_falls_through_to_native_hermes_in_same_worker(monkeypatch):
+    # This test isolates the rate-limit → native-hermes fallthrough call
+    # accounting (1 failed runtime attempt + 1 fallback call = 2). The autouse
+    # `_kanban_worker` fixture sets HERMES_KANBAN_TASK, which arms the upstream
+    # kanban-stop nudge (agent/kanban_stop.py) — it correctly nudges the
+    # plain-text "native recovered" exit twice before letting the worker stop,
+    # but that orthogonal behavior would inflate api_calls to 4. Disable the
+    # nudge here so the assertion measures the fallthrough alone.
+    monkeypatch.setenv("HERMES_KANBAN_STOP_NUDGE", "off")
     fallback_client = MagicMock()
     fallback_client.base_url = "https://fallback.invalid/v1"
     fallback_client.api_key = "fallback-key"

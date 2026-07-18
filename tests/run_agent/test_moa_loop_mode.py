@@ -131,9 +131,16 @@ moa:
                 "model": "claude-fable-5",
                 "runtime": "claude_agent_sdk",
             },
-            "reference_temperature": 0.6,
-            "aggregator_temperature": 0.4,
+            # Upstream's normalize_moa_config: unset temperatures resolve to
+            # None ("omit the parameter — provider default applies"), and the
+            # preset carries the reference_max_tokens (uncapped) + fanout
+            # cadence fields. This superseded the fork's old 0.6/0.4 hardcoded
+            # defaults after the upstream sync.
+            "reference_temperature": None,
+            "aggregator_temperature": None,
             "max_tokens": 4096,
+            "reference_max_tokens": None,
+            "fanout": "per_iteration",
             "enabled": True,
         },
     }

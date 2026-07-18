@@ -664,6 +664,17 @@ class GatewayKanbanWatchersMixin:
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if adapter is None and (sub_profile or None) not in (None, notifier_profile):
+                        # Cross-profile delivery authorized via
+                        # notification_sources: the owner profile isn't
+                        # registered with its own adapter in this gateway, so
+                        # deliver through the current (notifier) profile's
+                        # adapter. Upstream's _authorization_adapter fail-closes
+                        # for a stamped-but-unregistered profile (correct for the
+                        # inbound authz gate), but the notifier's outbound path
+                        # must fall through to this gateway's bot — the behavior
+                        # the cross-profile notification_sources feature relies on.
+                        adapter = self._authorization_adapter(plat, notifier_profile)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",

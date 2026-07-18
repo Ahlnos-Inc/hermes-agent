@@ -7033,11 +7033,6 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
-    # Capture one immutable runtime snapshot for keying, resolution, retries,
-    # and fallbacks. Reading ambient state independently in each phase lets a
-    # concurrent /model switch produce a key for one runtime and a client for
-    # another.
-    main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     _guard_auto_auxiliary_runtime(
@@ -7693,9 +7688,6 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
-    # Keep every async phase on the same runtime identity, even if another
-    # session switches models while this task is awaiting network I/O.
-    main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     _guard_auto_auxiliary_runtime(

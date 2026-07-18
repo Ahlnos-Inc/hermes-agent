@@ -760,7 +760,7 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
-        def mark_exhausted_and_rotate(
+        def mark_exhausted_and_rotate_or_raise(
             self,
             *,
             status_code,
