@@ -6094,14 +6094,27 @@ def _force_close_async_httpx(client: Any) -> None:
 
 
 def _close_cached_client(client: Any) -> None:
-    """Apply the canonical best-effort close policy to one cached client."""
+    """Best-effort teardown of an evicted cached client — WITHOUT the
+    fd-recycle race.
+
+    #29507 / BUILD-531: a full sync ``close()`` here released raw fds while
+    an ``asyncio.to_thread`` worker could still be inside the same client's
+    pooled TLS socket (aux sync adapters run their ``create`` calls in
+    threads). The kernel recycled the freed fd to the next ``open()`` —
+    repeatedly a kanban board DB, whose hottest pages then received stray
+    TLS records (confirmed again in the 2026-07-19 hermes-infra forensic
+    image: 0x17 0x03 0x03 at page 4). Aux worker threads are untracked, so
+    NO thread can ever safely release these fds: shutdown the sockets
+    (fd-safe from any thread, unblocks stuck readers) and let the fds park
+    until process exit. Eviction is rare and RLIMIT_NOFILE is 4096 — the
+    bounded leak is the correct trade.
+    """
     if client is None:
         return
     _force_close_async_httpx(client)
     try:
-        close_fn = getattr(client, "close", None)
-        if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
-            close_fn()
+        from agent.agent_runtime_helpers import force_close_tcp_sockets
+        force_close_tcp_sockets(client)
     except Exception:
         pass
 
