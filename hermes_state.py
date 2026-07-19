@@ -5730,6 +5730,33 @@ class SessionDB:
             )
             return cursor.fetchone() is not None
 
+    def stamp_platform_message_id(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Backfill the platform id onto the session's latest user row.
+
+        BUILD-532: the agent runtime persists the turn's user message itself
+        and knows nothing about platform message ids, so those rows land with
+        an empty ``platform_message_id`` and the redelivery guard
+        (``has_platform_message_id``) has nothing to match — the 2026-07-18
+        duplicate-turn incident. The gateway calls this at turn end (every
+        exit path) to stamp the id after the fact. Only ever fills an EMPTY
+        id on the newest active user row — never overwrites an id another
+        persist path already recorded — so a stale double-call is a no-op.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET platform_message_id = ? "
+                "WHERE id = (SELECT max(id) FROM messages "
+                "            WHERE session_id = ? AND role = 'user' "
+                "            AND active = 1) "
+                "AND (platform_message_id IS NULL OR platform_message_id = '')",
+                (platform_message_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

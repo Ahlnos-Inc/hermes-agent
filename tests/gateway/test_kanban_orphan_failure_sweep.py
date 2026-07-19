@@ -71,3 +71,14 @@ def test_completed_events_are_not_swept(tmp_path):
     task_id = _mktask(conn)
     kb._append_event(conn, task_id, "completed", {})
     assert _collect_unsubscribed_failure_events(kb, conn) == []
+
+
+def test_archived_task_history_is_not_swept(tmp_path):
+    # First live deploy flooded home with failure events from tasks long
+    # since archived (2026-07-18) — a resolved task's history is not an
+    # actionable failure.
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    kb._append_event(conn, task_id, "blocked", {"reason": "x"})
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+    assert _collect_unsubscribed_failure_events(kb, conn) == []

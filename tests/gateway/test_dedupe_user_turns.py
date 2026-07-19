@@ -105,3 +105,44 @@ class TestDedupeOnTransientFailure:
             platform_message_id="msg-002",
         )
         assert db.has_platform_message_id("s1", "msg-002")
+
+
+class TestStampPlatformMessageId:
+    """BUILD-532: post-turn backfill of the platform id onto agent-persisted
+    user rows, so the pre-dispatch redelivery guard has a key to match."""
+
+    def _make_db(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("s1", "telegram")
+        return db
+
+    def test_stamps_latest_empty_user_row(self, tmp_path):
+        db = self._make_db(tmp_path)
+        # Agent runtime persists the user turn without a platform id.
+        db.append_message(session_id="s1", role="user", content="hi")
+        db.append_message(session_id="s1", role="assistant", content="yo")
+        assert db.stamp_platform_message_id("s1", "msg-1") is True
+        assert db.has_platform_message_id("s1", "msg-1")
+
+    def test_never_overwrites_existing_id(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.append_message(
+            session_id="s1", role="user", content="hi",
+            platform_message_id="msg-1",
+        )
+        assert db.stamp_platform_message_id("s1", "msg-2") is False
+        assert db.has_platform_message_id("s1", "msg-1")
+        assert not db.has_platform_message_id("s1", "msg-2")
+
+    def test_only_touches_user_rows(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.append_message(session_id="s1", role="assistant", content="only")
+        assert db.stamp_platform_message_id("s1", "msg-1") is False
+
+    def test_enables_redelivery_guard_round_trip(self, tmp_path):
+        # The incident shape: turn persisted without id, redelivery arrives.
+        db = self._make_db(tmp_path)
+        db.append_message(session_id="s1", role="user", content="do the thing")
+        assert not db.has_platform_message_id("s1", "msg-7")  # guard misses
+        db.stamp_platform_message_id("s1", "msg-7")           # turn-end stamp
+        assert db.has_platform_message_id("s1", "msg-7")      # guard now hits

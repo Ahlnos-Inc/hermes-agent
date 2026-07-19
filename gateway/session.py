@@ -2663,6 +2663,24 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def stamp_platform_message_id(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Backfill the platform id onto the session's latest user row.
+
+        Thin wrapper over SessionDB.stamp_platform_message_id() (BUILD-532).
+        No-op without a DB; never raises.
+        """
+        if not self._db:
+            return False
+        try:
+            return self._db.stamp_platform_message_id(
+                session_id, platform_message_id
+            )
+        except Exception:
+            logger.debug("stamp_platform_message_id failed", exc_info=True)
+            return False
+
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
         """Replace the entire transcript for a session with new messages.
 

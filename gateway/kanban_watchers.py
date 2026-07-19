@@ -182,7 +182,7 @@ def sweep_orphaned_tui_sub(
 # channel in one burst. Retry backoff applies when the home channel is
 # missing/unreachable so the 5s tick doesn't warn-spam.
 ORPHAN_FAILURE_LOOKBACK_SECONDS = 72 * 3600
-ORPHAN_FAILURE_BATCH_PER_TICK = 10
+ORPHAN_FAILURE_BATCH_PER_TICK = 5
 ORPHAN_FAILURE_RETRY_SECONDS = 900
 
 
@@ -201,8 +201,10 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
     rows = conn.execute(
         f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
             FROM task_events e
+            JOIN tasks t ON t.id = e.task_id
             WHERE e.kind IN ({placeholders})
               AND e.created_at >= ?
+              AND t.status NOT IN ('done', 'archived')
               AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s
                               WHERE s.task_id = e.task_id)
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
@@ -240,6 +242,58 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
             "delivery_key": f"home-sweep/{row['task_id']}/{row['kind']}",
         })
     return out
+
+
+def _snapshot_process_fds(db_path: Path, out_path: Path) -> "Optional[str]":
+    """Dump this process's open-fd table next to a corruption backup.
+
+    BUILD-531: the recurring board corruption is stray in-process writes
+    through recycled file descriptors (PR #29 found TLS record bytes in
+    page one; the three archived corruption images show three unrelated
+    random-offset structural signatures, and every legitimate writer path
+    audits clean). The missing evidence at each event is WHICH fd aliased
+    the DB file — capture the whole table at detection time so the next
+    occurrence identifies the offender instead of just the victim.
+
+    Returns a one-line summary (or None on failure). Any fd whose inode
+    matches the corrupt DB is flagged ``**DB-ALIAS**``.
+    """
+    try:
+        db_stat = os.stat(db_path)
+    except OSError:
+        db_stat = None
+    lines = [f"# fd map at corruption detection for {db_path}"]
+    aliases = 0
+    try:
+        fd_names = sorted(int(n) for n in os.listdir("/dev/fd") if n.isdigit())
+    except OSError as exc:
+        return f"fd snapshot unavailable: {exc}"
+    for fd in fd_names:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            continue
+        try:
+            target = os.readlink(f"/dev/fd/{fd}")
+        except OSError:
+            target = "?"
+        flag = ""
+        if (
+            db_stat is not None
+            and st.st_dev == db_stat.st_dev
+            and st.st_ino == db_stat.st_ino
+        ):
+            flag = " **DB-ALIAS**"
+            aliases += 1
+        lines.append(
+            f"fd={fd} mode={oct(st.st_mode)} ino={st.st_ino} "
+            f"size={st.st_size} -> {target}{flag}"
+        )
+    try:
+        out_path.write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        return f"fd snapshot write failed: {exc}"
+    return f"{len(lines) - 1} fds captured, {aliases} aliasing the DB, at {out_path}"
 
 
 def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
@@ -1800,6 +1854,25 @@ class GatewayKanbanWatchersMixin:
             """
             if fingerprint not in corrupt_recovery_attempted:
                 corrupt_recovery_attempted.add(fingerprint)
+                # BUILD-531 forensics: capture the fd table BEFORE recovery
+                # swaps files around, while the stray-writing fd (if any)
+                # may still alias the corrupt image.
+                try:
+                    db_path = Path(_kb.kanban_db_path(slug))
+                    fd_note = _snapshot_process_fds(
+                        db_path,
+                        db_path.with_name(
+                            db_path.name
+                            + f".fdmap-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+                        ),
+                    )
+                    if fd_note:
+                        logger.warning(
+                            "kanban dispatcher: board %s corruption fd "
+                            "snapshot: %s", slug, fd_note,
+                        )
+                except Exception:
+                    logger.debug("fd snapshot failed", exc_info=True)
                 ok, detail = _attempt_board_db_recovery(_kb, slug)
                 if ok:
                     logger.warning(

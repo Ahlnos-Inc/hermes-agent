@@ -10796,6 +10796,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
             self._restore_moa_one_shot(event, _quick_key)
+            # BUILD-532: stamp this turn's platform message id onto the user
+            # row the agent runtime persisted (it never sees platform ids, so
+            # the row lands with an empty platform_message_id and the
+            # pre-dispatch redelivery guard has nothing to match). Runs on
+            # every exit path — success, failure, exception — because failed
+            # turns are exactly the ones Telegram redelivers.
+            if getattr(event, "message_id", None) and not getattr(event, "internal", False):
+                try:
+                    _stamp_entry = await self.async_session_store.get_or_create_session(source)
+                    if _stamp_entry is not None:
+                        await self.async_session_store.stamp_platform_message_id(
+                            _stamp_entry.session_id, str(event.message_id)
+                        )
+                except Exception:
+                    logger.debug("platform message id stamp failed", exc_info=True)
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -11349,6 +11364,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                 )
         self._cache_session_source(session_key, source)
+        # BUILD-532: drop platform redeliveries before they become a turn.
+        # Telegram re-serves an update whenever its getUpdates offset wasn't
+        # advanced (handler died mid-turn, polling restart) — the 2026-07-18
+        # incident inserted the same user message twice in one second and
+        # session restore had to repair the alternation. The #47237 guard
+        # only covered one post-turn persist branch; this is the single
+        # pre-dispatch chokepoint, and it also saves the duplicate agent
+        # turn, not just the duplicate row. Adapters without stable message
+        # ids (event.message_id unset) are unaffected.
+        if (
+            event.message_id
+            and not getattr(event, "internal", False)
+            and await self.async_session_store.has_platform_message_id(
+                session_entry.session_id, str(event.message_id)
+            )
+        ):
+            logger.warning(
+                "Dropping redelivered %s update message_id=%s for session %s "
+                "(already persisted); no new turn started",
+                _platform_name, event.message_id, session_entry.session_id,
+            )
+            return
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
