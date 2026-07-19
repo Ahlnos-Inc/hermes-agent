@@ -247,7 +247,10 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
 # Block kinds that resolve WITHOUT a human: 'dependency' waits on parents,
 # 'transient' is retried by the dispatcher. Everything else lands blocked for
 # a person, so it belongs on the operator's Kanban console topic.
-HUMAN_BLOCK_EVENT_KINDS = ("blocked", "block_loop_detected")
+# gave_up: the dispatcher exhausted retries and parked the task blocked
+# WITHOUT emitting a blocked event — it is the clearest "human needed"
+# state of all (2026-07-19: two architect tasks sat silent this way).
+HUMAN_BLOCK_EVENT_KINDS = ("blocked", "block_loop_detected", "gave_up")
 HUMAN_BLOCK_AUTO_KINDS = ("transient", "dependency")
 
 

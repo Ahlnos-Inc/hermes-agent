@@ -70,6 +70,14 @@ def test_ledger_dedups_per_event_but_reblock_realerts(tmp_path):
     assert again[0]["event"].payload["reason"] == "again"
 
 
+def test_gave_up_events_alert_the_console(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    kb._append_event(conn, task_id, "gave_up", {"error": "pid gone", "failures": 2})
+    out = _collect_human_blocked_events(kb, conn)
+    assert [o["event"].kind for o in out] == ["gave_up"]
+
+
 def test_done_and_archived_tasks_are_skipped(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
