@@ -3455,7 +3455,8 @@ def _evict_cached_clients(provider: str) -> None:
         for key in stale_keys:
             client = _client_cache.get(key, (None, None, None))[0]
             if client is not None:
-                _close_cached_client(client)
+                # Credential rotation: full close (stale creds unusable).
+                _close_cached_client(client, at_exit=True)
             _client_cache.pop(key, None)
 
 
@@ -6093,9 +6094,14 @@ def _force_close_async_httpx(client: Any) -> None:
         pass
 
 
-def _close_cached_client(client: Any) -> None:
+def _close_cached_client(client: Any, *, at_exit: bool = False) -> None:
     """Best-effort teardown of an evicted cached client — WITHOUT the
     fd-recycle race.
+
+    ``at_exit=True`` (process shutdown) keeps the legacy full ``close()``:
+    the process is ending, no thread will touch the pool again, and the
+    test contract expects it. Every other caller (evictions) is
+    shutdown-only.
 
     #29507 / BUILD-531: a full sync ``close()`` here released raw fds while
     an ``asyncio.to_thread`` worker could still be inside the same client's
@@ -6112,6 +6118,23 @@ def _close_cached_client(client: Any) -> None:
     if client is None:
         return
     _force_close_async_httpx(client)
+    if at_exit:
+        # Full close: process exit, or credential rotation (stale-cred
+        # clients must die — test contract). shutdown first so any stuck
+        # reader unwinds before the fds are released, narrowing the race
+        # to the rare rotation case instead of the constant-churn evictions.
+        try:
+            from agent.agent_runtime_helpers import force_close_tcp_sockets
+            force_close_tcp_sockets(client)
+        except Exception:
+            pass
+        try:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
+                close_fn()
+        except Exception:
+            pass
+        return
     try:
         from agent.agent_runtime_helpers import force_close_tcp_sockets
         force_close_tcp_sockets(client)
@@ -6130,7 +6153,7 @@ def shutdown_cached_clients() -> None:
             client = entry[0]
             if client is None:
                 continue
-            _close_cached_client(client)
+            _close_cached_client(client, at_exit=True)
         _client_cache.clear()
 
 
