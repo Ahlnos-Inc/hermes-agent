@@ -3022,6 +3022,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
+        # Raise the file-descriptor ceiling before anything opens sockets or
+        # DBs. launchd user agents inherit a 256 soft limit on macOS; a
+        # dispatcher spawn burst (a dozen SQLite opens per worker) overlapping
+        # provider-socket churn transiently exhausts it and SQLite surfaces
+        # EMFILE as "disk I/O error" — the recurring spawn_failed class of
+        # 2026-07-19 (BUILD-567). Best-effort: never fatal.
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            want = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+            if soft < want:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+                logger.info(
+                    "Raised RLIMIT_NOFILE soft limit %d -> %d (hard=%s)",
+                    soft, want, hard,
+                )
+        except Exception as exc:
+            logger.warning("Could not raise RLIMIT_NOFILE: %s", exc)
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
