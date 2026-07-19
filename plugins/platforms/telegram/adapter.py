@@ -422,6 +422,9 @@ def check_telegram_requirements() -> bool:
 # when it appears outside a code span or fenced code block.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 
+# Ahlnos Jira base for linkifying bare ticket ids in outgoing messages.
+JIRA_BROWSE_URL = "https://ahlnos.atlassian.net/browse/"
+
 
 def _escape_mdv2(text: str) -> str:
     """Escape Telegram MarkdownV2 special characters with a preceding backslash."""
@@ -7097,6 +7100,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return _ph(f'[{display}]({url})')
 
         text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
+
+        # 3.5) Linkify bare Jira ticket ids (BUILD-123, OPS-45) so operator
+        #      alerts carry a clickable link. Runs after step 3 so ids inside
+        #      explicit markdown links, and after 1-2 so ids inside code, are
+        #      already placeholder-protected and never double-wrapped.
+        def _convert_ticket(m):
+            tid = m.group(1)
+            return _ph(
+                f'[{_escape_mdv2(tid)}]({JIRA_BROWSE_URL}{tid})'
+            )
+
+        text = re.sub(r'\b((?:BUILD|OPS)-\d+)\b', _convert_ticket, text)
 
         # 4) Convert markdown headers (## Title) → bold *Title*
         def _convert_header(m):
