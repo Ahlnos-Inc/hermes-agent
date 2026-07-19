@@ -11195,11 +11195,23 @@ def prepare_run_continuation(
             max_total_bytes=max_total,
         )
         manifest_digest = content_digest(manifest_value)
+        # Idempotent on run_id: a bootstrap retried after a partial earlier
+        # attempt (worker respawn on the same run, crash between manifest
+        # write and the rest of bootstrap) must refresh the manifest, not
+        # die on the UNIQUE constraint — that IntegrityError blocked
+        # workflows on two boards (2026-07-18/19: t_24314039, t_91fe35b0).
         conn.execute(
             "INSERT INTO continuation_manifests "
             "(run_id, task_id, version, manifest_digest, manifest_json, "
             " context_digest, compiled_context_json, created_at) "
-            "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, 1, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET "
+            " task_id=excluded.task_id, version=excluded.version, "
+            " manifest_digest=excluded.manifest_digest, "
+            " manifest_json=excluded.manifest_json, "
+            " context_digest=excluded.context_digest, "
+            " compiled_context_json=excluded.compiled_context_json, "
+            " created_at=excluded.created_at",
             (
                 int(run_id), task_id, manifest_digest,
                 json.dumps(manifest_value, ensure_ascii=False, sort_keys=True),
