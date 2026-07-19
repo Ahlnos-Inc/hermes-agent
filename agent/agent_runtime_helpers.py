@@ -680,6 +680,27 @@ def strip_think_blocks(agent, content: str) -> str:
     """
     if not content:
         return ""
+    if not isinstance(content, str):
+        # Multimodal content is a LIST of parts. 2026-07-18: a vision turn
+        # put list-form content into history and every later interim-text
+        # extraction raised TypeError from re.sub, crash-looping the kanban
+        # worker until it hit its failure limit (89 consecutive dead API
+        # calls). Visible text = the joined text parts; images contribute
+        # none.
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+                elif isinstance(part, str):
+                    texts.append(part)
+            content = "\n".join(texts)
+        else:
+            content = str(content)
+        if not content:
+            return ""
     # 1. Closed tag pairs — case-insensitive for all variants so
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.

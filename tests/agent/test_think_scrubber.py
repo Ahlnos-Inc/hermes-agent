@@ -253,3 +253,23 @@ class TestRealisticStreaming:
         s = StreamingThinkScrubber()
         deltas = ["Hello ", "world ", "how ", "are ", "you?"]
         assert _drive(s, deltas) == "Hello world how are you?"
+
+
+def test_multimodal_list_content_does_not_crash():
+    """2026-07-18: a vision turn put list-form (multimodal) content into
+    history and strip_think_blocks raised TypeError from re.sub on every
+    subsequent interim-text extraction, crash-looping the kanban worker.
+    List content must yield its think-stripped text parts."""
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    parts = [
+        {"type": "text", "text": "<think>secret</think>answer"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+        "tail",
+    ]
+    out = strip_think_blocks(None, parts)
+    assert "answer" in out
+    assert "tail" in out
+    assert "secret" not in out
+    assert strip_think_blocks(None, []) == ""
+    assert strip_think_blocks(None, [{"type": "image_url"}]) == ""
