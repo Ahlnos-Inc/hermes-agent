@@ -244,6 +244,68 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
     return out
 
 
+# Block kinds that resolve WITHOUT a human: 'dependency' waits on parents,
+# 'transient' is retried by the dispatcher. Everything else lands blocked for
+# a person, so it belongs on the operator's Kanban console topic.
+HUMAN_BLOCK_EVENT_KINDS = ("blocked", "block_loop_detected")
+HUMAN_BLOCK_AUTO_KINDS = ("transient", "dependency")
+
+
+def _collect_human_blocked_events(kb, conn) -> "list[dict]":
+    """Blocked events that need a human, for the Kanban console topic.
+
+    Unlike the home sweep this fires regardless of subscriptions — the
+    console topic is the operator's single queue of "waiting on me" items.
+    Dedup is per event id (a re-block after an unblock is a NEW ask and
+    alerts again), recorded in the ``notify_deliveries`` ledger under a
+    ``human-block/`` key so it survives restarts. Same lookback/batch caps
+    as the home sweep so an old board can't flood the topic.
+    """
+    kinds = HUMAN_BLOCK_EVENT_KINDS
+    placeholders = ",".join("?" for _ in kinds)
+    auto_placeholders = ",".join("?" for _ in HUMAN_BLOCK_AUTO_KINDS)
+    cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
+    rows = conn.execute(
+        f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
+            FROM task_events e
+            JOIN tasks t ON t.id = e.task_id
+            WHERE e.kind IN ({placeholders})
+              AND e.created_at >= ?
+              AND t.status NOT IN ('done', 'archived')
+              AND COALESCE(json_extract(e.payload, '$.kind'), '')
+                  NOT IN ({auto_placeholders})
+              AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
+                              WHERE nd.delivery_key =
+                                  'human-block/' || e.task_id || '/' || e.id)
+            ORDER BY e.id
+            LIMIT ?""",
+        (*kinds, cutoff, *HUMAN_BLOCK_AUTO_KINDS, ORPHAN_FAILURE_BATCH_PER_TICK),
+    ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        payload = None
+        if row["payload"]:
+            try:
+                payload = json.loads(row["payload"])
+            except Exception:
+                payload = None
+        try:
+            task = kb.get_task(conn, row["task_id"])
+        except Exception:
+            task = None
+        out.append({
+            "task_id": row["task_id"],
+            "task": task,
+            "event": kb.Event(
+                id=int(row["id"]), task_id=row["task_id"], kind=row["kind"],
+                payload=payload, created_at=int(row["created_at"] or 0),
+                run_id=row["run_id"],
+            ),
+            "delivery_key": f"human-block/{row['task_id']}/{int(row['id'])}",
+        })
+    return out
+
+
 def _snapshot_process_fds(db_path: Path, out_path: Path) -> "Optional[str]":
     """Dump this process's open-fd table next to a corruption backup.
 
@@ -854,10 +916,35 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: orphan failure sweep "
                                     "failed for board %s: %s", slug, exc,
                                 )
+                            if human_block_target is not None:
+                                try:
+                                    blocked = _collect_human_blocked_events(
+                                        _kb, conn,
+                                    )
+                                    for b in blocked:
+                                        b["board"] = slug
+                                    human_blocked.extend(blocked)
+                                except Exception as exc:
+                                    logger.debug(
+                                        "kanban notifier: human-block sweep "
+                                        "failed for board %s: %s", slug, exc,
+                                    )
                         finally:
                             conn.close()
                     return deliveries, tui_sweeps, orphan_failures
 
+                human_blocked: list = []
+                raw_target = kanban_cfg.get("human_block_alerts")
+                human_block_target = None
+                if isinstance(raw_target, dict):
+                    _hb_chat = str(raw_target.get("chat_id") or "").strip()
+                    if _hb_chat:
+                        human_block_target = {
+                            "chat_id": _hb_chat,
+                            "thread_id": str(
+                                raw_target.get("thread_id") or ""
+                            ).strip(),
+                        }
                 deliveries, tui_sweeps, orphan_failures = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
@@ -1198,6 +1285,49 @@ class GatewayKanbanWatchersMixin:
                             orphan["event"].kind, orphan["task_id"],
                             orphan.get("board"),
                         )
+
+                # Human-gated blocks → the operator's Kanban console topic,
+                # regardless of subscriptions. Same backoff/ledger discipline
+                # as the home sweep; dedup is per event id so a re-block
+                # after an unblock alerts again.
+                hb_attempts: dict[str, float] = getattr(
+                    self, "_kanban_human_block_attempts", {}
+                )
+                self._kanban_human_block_attempts = hb_attempts
+                for item in human_blocked:
+                    key = item["delivery_key"]
+                    last = hb_attempts.get(key, 0.0)
+                    if time.monotonic() - last < ORPHAN_FAILURE_RETRY_SECONDS:
+                        continue
+                    hb_attempts[key] = time.monotonic()
+                    msg = render_kanban_event(
+                        task_id=item["task_id"],
+                        task=item.get("task"),
+                        event=item["event"],
+                        board_slug=item.get("board"),
+                    )
+                    if not msg:
+                        continue
+                    msg = (
+                        "🧑‍🔧 Human input needed — reply here to unblock:\n"
+                        + msg
+                    )
+                    ok = await self._kanban_notify_channel(
+                        msg,
+                        chat_id=human_block_target["chat_id"],
+                        thread_id=human_block_target["thread_id"],
+                    )
+                    if ok:
+                        await asyncio.to_thread(
+                            self._kanban_record_human_block_delivery,
+                            item, human_block_target,
+                        )
+                        hb_attempts.pop(key, None)
+                        logger.info(
+                            "kanban notifier: human-block alert for %s on "
+                            "board %s delivered to Kanban console topic",
+                            item["task_id"], item.get("board"),
+                        )
             except Exception as exc:
                 # exc_info: this tick has failed persistently before with only
                 # str(exc) ("'int' object has no attribute 'lower'"), which is
@@ -1343,6 +1473,31 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    async def _kanban_notify_channel(
+        self, message: str, *, chat_id: str, thread_id: str = "",
+    ) -> bool:
+        """Deliver a notifier message to an explicit Telegram chat/topic.
+
+        Returns True only on a confirmed send."""
+        from gateway.config import Platform as _Platform
+        adapter = self.adapters.get(_Platform.TELEGRAM)
+        if adapter is None:
+            return False
+        metadata: dict[str, Any] = {}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        try:
+            result = await adapter.send(chat_id, message, metadata=metadata)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: Telegram send to %s/%s failed: %s",
+                chat_id, thread_id or "-", exc,
+            )
+            return False
+        if result is not None and getattr(result, "success", True) is False:
+            return False
+        return True
+
     async def _kanban_notify_home_fallback(self, message: str) -> bool:
         """Last-resort delivery of a failure notification to the Telegram home
         channel when the origin subscription is unreachable (BUILD-503).
@@ -1363,26 +1518,43 @@ class GatewayKanbanWatchersMixin:
                 "/sethome in Telegram to enable the fallback."
             )
             return False
-        adapter = self.adapters.get(_Platform.TELEGRAM)
-        if adapter is None:
-            return False
-        metadata: dict[str, Any] = {}
-        if home.thread_id:
-            metadata["thread_id"] = home.thread_id
+        ok = await self._kanban_notify_channel(
+            message,
+            chat_id=home.chat_id,
+            thread_id=str(home.thread_id or ""),
+        )
+        if ok:
+            logger.info(
+                "kanban notifier: delivered failure notification to Telegram "
+                "home (origin unreachable)",
+            )
+        return ok
+
+    def _kanban_record_human_block_delivery(
+        self, item: dict, target: dict,
+    ) -> None:
+        """Sync helper: durable ledger row for a delivered human-block alert."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=item.get("board"))
         try:
-            result = await adapter.send(home.chat_id, message, metadata=metadata)
+            _kb.record_notify_delivery(
+                conn,
+                delivery_key=item["delivery_key"],
+                task_id=item["task_id"],
+                platform="telegram",
+                chat_id=target.get("chat_id") or "",
+                thread_id=target.get("thread_id") or "",
+                first_event_id=item["event"].id,
+                last_event_id=item["event"].id,
+                status="delivered",
+            )
         except Exception as exc:
             logger.warning(
-                "kanban notifier: Telegram home fallback send failed: %s", exc,
+                "kanban notifier: human-block ledger write failed for %s: %s",
+                item.get("task_id"), exc,
             )
-            return False
-        if result is not None and getattr(result, "success", True) is False:
-            return False
-        logger.info(
-            "kanban notifier: delivered failure notification to Telegram home "
-            "(origin unreachable)",
-        )
-        return True
+        finally:
+            conn.close()
 
     async def _deliver_kanban_artifacts(
         self,
