@@ -716,6 +716,12 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    # Identical-error circuit breaker (2026-07-18: a worker burned 89
+    # consecutive identical TypeErrors — 55 API calls of pure failure —
+    # before max_iterations ended it). Same error text N times in a row
+    # means retrying cannot help; abort the turn early and loudly.
+    _identical_error_streak = {"msg": None, "count": 0}
+    _IDENTICAL_ERROR_ABORT = 5
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -6348,6 +6354,25 @@ def run_conversation(
             # the retry loop continues.  Injecting a fake user/assistant
             # message pollutes history, burns tokens, and risks violating
             # role-alternation invariants.
+
+            # Identical-error circuit breaker: the same exception text on
+            # consecutive calls means the loop is wedged on a deterministic
+            # bug, not a transient — abort in bounded time instead of
+            # grinding to max_iterations.
+            _err_key = str(e)[:200]
+            if _identical_error_streak["msg"] == _err_key:
+                _identical_error_streak["count"] += 1
+            else:
+                _identical_error_streak = {"msg": _err_key, "count": 1}
+            if _identical_error_streak["count"] >= _IDENTICAL_ERROR_ABORT:
+                _turn_exit_reason = f"identical_error_streak({_err_key[:80]})"
+                final_response = (
+                    f"I hit the same error {_identical_error_streak['count']} times in a row "
+                    f"and am stopping this turn: {error_msg}"
+                )
+                messages.append({"role": "assistant", "content": final_response})
+                failed = True
+                break
 
             # If we're near the limit, break to avoid infinite loops
             if api_call_count >= agent.max_iterations - 1:
