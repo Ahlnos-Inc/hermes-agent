@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import threading
+import time
 from typing import Any
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
 
 from hermes_cli.timeouts import (
     get_provider_first_event_timeout,
@@ -154,6 +158,64 @@ def provider_route_is_quarantined(agent: Any) -> bool:
     route_key = provider_route_key(agent, {})
     with _orphaned_route_threads_lock:
         return bool(_live_orphan_threads_locked(route_key))
+
+
+def _any_orphaned_route_thread_alive() -> bool:
+    with _orphaned_route_threads_lock:
+        return any(
+            thread.is_alive()
+            for threads in _orphaned_route_threads.values()
+            for thread in threads
+        )
+
+
+def close_when_routes_quiet(
+    label: str,
+    closer: Any,
+    *,
+    poll_seconds: float = 2.0,
+    max_wait_seconds: float = 600.0,
+) -> None:
+    """Run ``closer()`` once no orphaned route worker threads remain.
+
+    #29507 / BUILD-531: ``client.close()`` releases raw fds. If an abandoned
+    (quarantined) worker thread is still unwinding inside one of the client's
+    pooled TLS sockets, the kernel can recycle a just-freed fd number to the
+    next ``open()`` — historically the kanban dispatcher opening kanban.db —
+    and the worker's SSL layer then flushes TLS records into that file,
+    corrupting it at a random offset. ``shutdown()`` is fd-safe from any
+    thread; ``close()`` is only safe once every thread that might touch the
+    pool has exited. Callers abort sockets immediately (unblocking the
+    worker) and hand the fd-releasing close here; with no orphans alive the
+    close runs at once, otherwise a daemon thread parks the client — holding
+    its fds allocated, which is exactly what makes recycling impossible —
+    until the orphans exit or ``max_wait_seconds`` passes.
+    """
+    if not _any_orphaned_route_thread_alive():
+        try:
+            closer()
+        except Exception:
+            logger.debug("deferred close (%s) failed", label, exc_info=True)
+        return
+
+    def _wait_then_close() -> None:
+        deadline = time.monotonic() + max_wait_seconds
+        while time.monotonic() < deadline:
+            if not _any_orphaned_route_thread_alive():
+                break
+            time.sleep(poll_seconds)
+        try:
+            closer()
+        except Exception:
+            logger.debug("deferred close (%s) failed", label, exc_info=True)
+        else:
+            logger.info("deferred client close completed (%s)", label)
+
+    threading.Thread(
+        target=_wait_then_close,
+        name=f"deferred-client-close-{label}"[:60],
+        daemon=True,
+    ).start()
 
 
 def _reset_provider_route_quarantine_for_tests() -> None:

@@ -47,3 +47,33 @@ def test_dead_worker_never_quarantines():
     worker.join(timeout=5)
     assert quarantine_provider_route(agent, {}, worker) is False
     assert provider_route_is_quarantined(agent) is False
+
+
+def test_close_when_routes_quiet_defers_until_worker_exits():
+    from agent.request_budgets import close_when_routes_quiet
+
+    _reset_provider_route_quarantine_for_tests()
+    agent = _agent()
+    release = threading.Event()
+    closed = threading.Event()
+    worker = threading.Thread(target=release.wait, daemon=True)
+    worker.start()
+    try:
+        assert quarantine_provider_route(agent, {}, worker) is True
+        close_when_routes_quiet("test", closed.set, poll_seconds=0.05)
+        # Orphan alive: the close must NOT have run yet.
+        assert not closed.wait(0.3)
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    # Orphan gone: deferred close runs promptly.
+    assert closed.wait(5)
+
+
+def test_close_when_routes_quiet_immediate_when_no_orphans():
+    from agent.request_budgets import close_when_routes_quiet
+
+    _reset_provider_route_quarantine_for_tests()
+    closed = threading.Event()
+    close_when_routes_quiet("test-immediate", closed.set)
+    assert closed.is_set()

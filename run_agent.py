@@ -4213,6 +4213,26 @@ class AIAgent:
         # Force-close TCP sockets first to prevent CLOSE-WAIT accumulation,
         # then do the graceful SDK-level close.
         force_closed = self._force_close_tcp_sockets(client)
+        if shared:
+            # #29507 / BUILD-531: a SHARED client's pooled connections can be
+            # owned by other live threads — most notably a quarantined worker
+            # still unwinding after a transport abort, which is exactly when
+            # fallback activation replaces this client. client.close() frees
+            # raw fds under that worker and the recycled fd number becomes the
+            # next open()'s file (kanban.db has been the repeated victim).
+            # shutdown() above is fd-safe; defer the fd-releasing close until
+            # no orphaned route workers remain.
+            from agent.request_budgets import close_when_routes_quiet
+
+            close_when_routes_quiet(f"openai-shared:{reason}", client.close)
+            logger.info(
+                "OpenAI client close scheduled (%s, shared=True, "
+                "tcp_force_closed=%d, deferred_until=routes_quiet) %s",
+                reason,
+                force_closed,
+                self._client_log_context(),
+            )
+            return
         try:
             client.close()
             logger.info(
@@ -4230,6 +4250,36 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+
+    def _abort_anthropic_client_for_stranger_thread(self, *, reason: str) -> None:
+        """Cross-thread Anthropic client teardown without the fd-recycle race.
+
+        The stale-call kill and interrupt paths used to call
+        ``_anthropic_client.close()`` from the monitor thread — the same
+        unsafe shape #29507 fixed for per-request OpenAI clients: close()
+        frees raw fds while the owning worker thread may still be inside the
+        pool's TLS socket, and the recycled fd corrupts whatever file opens
+        next (BUILD-531: recurring kanban board corruption). Same remedy:
+        shutdown() the sockets now (fd-safe, unblocks the worker), defer the
+        fd-releasing close until orphaned route workers are gone.
+        """
+        client = getattr(self, "_anthropic_client", None)
+        if client is None:
+            return
+        try:
+            force_closed = self._force_close_tcp_sockets(client)
+        except Exception:
+            force_closed = -1
+        from agent.request_budgets import close_when_routes_quiet
+
+        close_when_routes_quiet(f"anthropic:{reason}", client.close)
+        logger.info(
+            "Anthropic client aborted (%s, tcp_force_closed=%d, "
+            "deferred_close=routes_quiet) %s",
+            reason,
+            force_closed,
+            self._client_log_context(),
+        )
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():

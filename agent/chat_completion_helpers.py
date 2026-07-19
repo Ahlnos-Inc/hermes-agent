@@ -872,7 +872,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # #29507/BUILD-531: never close() the Anthropic client from a
+                    # thread that may not own its pooled sockets — abort + deferred
+                    # close avoids the fd-recycle corruption race.
+                    agent._abort_anthropic_client_for_stranger_thread(
+                        reason="anthropic_pool_cleanup")
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("absolute_attempt_deadline")
@@ -1053,7 +1057,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # #29507/BUILD-531: never close() the Anthropic client from a
+                    # thread that may not own its pooled sockets — abort + deferred
+                    # close avoids the fd-recycle corruption race.
+                    agent._abort_anthropic_client_for_stranger_thread(
+                        reason="anthropic_pool_cleanup")
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("stale_call_kill")
@@ -1100,7 +1108,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             def _abort_interrupted_request() -> None:
                 try:
                     if agent.api_mode == "anthropic_messages":
-                        agent._anthropic_client.close()
+                        # #29507/BUILD-531: never close() the Anthropic client from a
+                        # thread that may not own its pooled sockets — abort + deferred
+                        # close avoids the fd-recycle corruption race.
+                        agent._abort_anthropic_client_for_stranger_thread(
+                            reason="anthropic_pool_cleanup")
                         agent._rebuild_anthropic_client()
                     else:
                         _close_request_client_once("interrupt_abort")
@@ -3678,7 +3690,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
                         if agent.api_mode == "anthropic_messages":
                             try:
-                                agent._anthropic_client.close()
+                                # #29507/BUILD-531: never close() the Anthropic client from a
+                                # thread that may not own its pooled sockets — abort + deferred
+                                # close avoids the fd-recycle corruption race.
+                                agent._abort_anthropic_client_for_stranger_thread(
+                                    reason="anthropic_pool_cleanup")
                                 agent._rebuild_anthropic_client()
                             except Exception:
                                 pass
@@ -3744,7 +3760,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # any dead connections from the pool.
                             if agent.api_mode == "anthropic_messages":
                                 try:
-                                    agent._anthropic_client.close()
+                                    # #29507/BUILD-531: never close() the Anthropic client from a
+                                    # thread that may not own its pooled sockets — abort + deferred
+                                    # close avoids the fd-recycle corruption race.
+                                    agent._abort_anthropic_client_for_stranger_thread(
+                                        reason="anthropic_pool_cleanup")
                                     agent._rebuild_anthropic_client()
                                 except Exception:
                                     pass
@@ -3963,7 +3983,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # #29507/BUILD-531: never close() the Anthropic client from a
+                    # thread that may not own its pooled sockets — abort + deferred
+                    # close avoids the fd-recycle corruption race.
+                    agent._abort_anthropic_client_for_stranger_thread(
+                        reason="anthropic_pool_cleanup")
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once(str(_deadline_reason))
@@ -4039,7 +4063,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # may hold dead sockets from the same provider outage.
             if agent.api_mode == "anthropic_messages":
                 try:
-                    agent._anthropic_client.close()
+                    # #29507/BUILD-531: never close() the Anthropic client from a
+                    # thread that may not own its pooled sockets — abort + deferred
+                    # close avoids the fd-recycle corruption race.
+                    agent._abort_anthropic_client_for_stranger_thread(
+                        reason="anthropic_pool_cleanup")
                     agent._rebuild_anthropic_client()
                 except Exception:
                     pass
@@ -4074,7 +4102,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             def _abort_interrupted_stream() -> None:
                 try:
                     if agent.api_mode == "anthropic_messages":
-                        agent._anthropic_client.close()
+                        # #29507/BUILD-531: never close() the Anthropic client from a
+                        # thread that may not own its pooled sockets — abort + deferred
+                        # close avoids the fd-recycle corruption race.
+                        agent._abort_anthropic_client_for_stranger_thread(
+                            reason="anthropic_pool_cleanup")
                         agent._rebuild_anthropic_client()
                     else:
                         _close_request_client_once("stream_interrupt_abort")
