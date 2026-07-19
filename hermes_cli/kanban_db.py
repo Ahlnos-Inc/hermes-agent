@@ -15659,7 +15659,26 @@ def list_notify_subs(
         ).fetchall()
     else:
         rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        sub = dict(r)
+        # Malformed rows have been observed live (2026-07-18: five rows whose
+        # task_id was a TABLE NAME and platform an integer row count wedged
+        # the notifier tick for every board with "'int' object has no
+        # attribute 'lower'"). One bad row must degrade to a warning, not
+        # kill every consumer of this list — skip anything whose routing
+        # fields aren't strings.
+        if not isinstance(sub.get("task_id"), str) or not isinstance(
+            sub.get("platform"), str
+        ):
+            logger.warning(
+                "kanban: skipping malformed notify sub row (task_id=%r "
+                "platform=%r) — delete it from kanban_notify_subs",
+                sub.get("task_id"), sub.get("platform"),
+            )
+            continue
+        out.append(sub)
+    return out
 
 
 def notify_sub_kinds(sub: dict) -> Optional["frozenset[str]"]:
