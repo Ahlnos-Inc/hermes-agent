@@ -2826,6 +2826,84 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    _backfill_workflow_step_notify_subs(conn)
+
+
+def _backfill_workflow_step_notify_subs(conn: sqlite3.Connection) -> None:
+    """Give every unfinished step of a compiled workflow the terminal task's
+    notify subscription, narrowed to FAILURE_KINDS.
+
+    Workflows compiled before BUILD-503 (2026-07-16) subscribed only their
+    terminal task, so a nonterminal step that blocked never notified anyone
+    (2026-07-18 gsthst-q2 incident: t_a43ae5e2 sat `blocked` for 2.5h in
+    silence). ``compile_workflow_graph`` now subscribes every step at
+    creation; this pass heals workflows that already existed. Idempotent via
+    the (task_id, platform, chat_id, thread_id) primary key.
+
+    Cursor policy: a step currently `blocked` starts at 0 so its pending
+    failure event is delivered on the next notifier tick; any other step
+    subscribes go-forward only (cursor = its latest event id) so historical,
+    already-resolved failures don't replay as noise.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT workflow_key, task_ids, terminal_step_key"
+            " FROM workflow_graph_compilations"
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    if not rows:
+        return
+    failure_kinds_json = json.dumps(sorted(FAILURE_KINDS))
+    now = int(time.time())
+    for row in rows:
+        try:
+            task_ids = json.loads(row["task_ids"])
+        except Exception:
+            continue
+        if not isinstance(task_ids, dict):
+            continue
+        terminal_id = task_ids.get(row["terminal_step_key"])
+        if not terminal_id:
+            continue
+        terminal_subs = conn.execute(
+            "SELECT platform, chat_id, thread_id, user_id, notifier_profile"
+            " FROM kanban_notify_subs WHERE task_id = ?",
+            (terminal_id,),
+        ).fetchall()
+        if not terminal_subs:
+            continue
+        for step_task_id in task_ids.values():
+            if step_task_id == terminal_id:
+                continue
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (step_task_id,)
+            ).fetchone()
+            if task_row is None or task_row["status"] in ("done", "archived"):
+                continue
+            if task_row["status"] == "blocked":
+                cursor = 0
+            else:
+                cur_row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS max_id FROM task_events"
+                    " WHERE task_id = ?",
+                    (step_task_id,),
+                ).fetchone()
+                cursor = int(cur_row["max_id"]) if cur_row else 0
+            for sub in terminal_subs:
+                conn.execute(
+                    """INSERT OR IGNORE INTO kanban_notify_subs
+                        (task_id, platform, chat_id, thread_id, user_id,
+                         notifier_profile, created_at, last_event_id, kinds_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        step_task_id, sub["platform"], sub["chat_id"],
+                        sub["thread_id"] or "", sub["user_id"],
+                        sub["notifier_profile"], now, cursor,
+                        failure_kinds_json,
+                    ),
+                )
+
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current

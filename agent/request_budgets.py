@@ -142,6 +142,20 @@ def quarantine_provider_route(
     return True
 
 
+def provider_route_is_quarantined(agent: Any) -> bool:
+    """Non-raising probe: is ``agent``'s current route still quarantined?
+
+    Lets retry backoff wait on the actual release condition (the orphaned
+    worker thread exiting) instead of sleeping a fixed jitter and slamming
+    into ``ensure_provider_route_available`` again — the 2026-07-18 cascade
+    burned all three retries in ~8s against a quarantine that releases on
+    thread exit, then failed the turn terminally.
+    """
+    route_key = provider_route_key(agent, {})
+    with _orphaned_route_threads_lock:
+        return bool(_live_orphan_threads_locked(route_key))
+
+
 def _reset_provider_route_quarantine_for_tests() -> None:
     with _orphaned_route_threads_lock:
         _orphaned_route_threads.clear()

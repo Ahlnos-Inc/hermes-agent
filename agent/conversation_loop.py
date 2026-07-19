@@ -4908,6 +4908,30 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                # Route quarantine releases when the orphaned worker thread
+                # exits — a condition, not a duration. With fallback providers
+                # still available a short backoff is right (fail over fast);
+                # with the chain exhausted, a jittered 2-5s sleep just burns
+                # the remaining retries against a route that cannot admit
+                # requests yet (2026-07-18: all 3 retries spent in ~8s, turn
+                # failed terminally, route freed moments later). So wait on
+                # the release itself, bounded, and break out early below the
+                # moment the route frees.
+                from agent.request_budgets import (
+                    ProviderRouteQuarantined as _RouteQuarantined,
+                    provider_route_is_quarantined as _route_still_quarantined,
+                )
+                _is_route_quarantined_wait = isinstance(
+                    api_error, _RouteQuarantined
+                ) and agent._fallback_index >= len(agent._fallback_chain or [])
+                if _is_route_quarantined_wait:
+                    wait_time = 90.0
+                    _backoff_policy = "route_quarantine_release_wait"
+                    agent._buffer_status(
+                        "⏳ Provider is still unwinding a timed-out request — "
+                        f"waiting up to {wait_time:.0f}s for the route to free "
+                        f"(attempt {retry_count}/{max_retries})..."
+                    )
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -4961,6 +4985,16 @@ def run_conversation(
                             "interrupted": True,
                         }
                     time.sleep(0.2)  # Check interrupt every 200ms
+                    if (
+                        _is_route_quarantined_wait
+                        and _backoff_touch_counter % 10 == 0  # probe every ~2s
+                        and not _route_still_quarantined(agent)
+                    ):
+                        logger.info(
+                            "%sprovider route released after quarantine wait; "
+                            "retrying immediately", agent.log_prefix,
+                        )
+                        break
                     # Touch activity every ~30s so the gateway's inactivity
                     # monitor knows we're alive during backoff waits.
                     _backoff_touch_counter += 1

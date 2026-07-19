@@ -14,7 +14,9 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -172,6 +174,137 @@ def sweep_orphaned_tui_sub(
         "task": kb.get_task(conn, sub["task_id"]),
         "events": claimed_events,
     }
+
+
+# Catch-all sweep bounds: only look back this far for unsubscribed failure
+# events (an upgrade onto a months-old board must not replay ancient
+# history), and cap per tick so a pathological board can't flood the home
+# channel in one burst. Retry backoff applies when the home channel is
+# missing/unreachable so the 5s tick doesn't warn-spam.
+ORPHAN_FAILURE_LOOKBACK_SECONDS = 72 * 3600
+ORPHAN_FAILURE_BATCH_PER_TICK = 10
+ORPHAN_FAILURE_RETRY_SECONDS = 900
+
+
+def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
+    """Recent failure-kind events on tasks with NO notify subscription.
+
+    Dedup is one home delivery per (task, kind), recorded in the
+    ``notify_deliveries`` ledger under a ``home-sweep/`` key — a task that
+    crashes five times in a retry loop pings home once, and the ledger row
+    survives restarts (unlike a subscription cursor, which unsubscribed
+    tasks don't have).
+    """
+    kinds = sorted(FAILURE_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
+    rows = conn.execute(
+        f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
+            FROM task_events e
+            WHERE e.kind IN ({placeholders})
+              AND e.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s
+                              WHERE s.task_id = e.task_id)
+              AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
+                              WHERE nd.delivery_key =
+                                  'home-sweep/' || e.task_id || '/' || e.kind)
+            ORDER BY e.id
+            LIMIT ?""",
+        (*kinds, cutoff, ORPHAN_FAILURE_BATCH_PER_TICK),
+    ).fetchall()
+    out: list[dict] = []
+    seen_task_kinds: set[tuple] = set()
+    for row in rows:
+        tk = (row["task_id"], row["kind"])
+        if tk in seen_task_kinds:
+            continue
+        seen_task_kinds.add(tk)
+        payload = None
+        if row["payload"]:
+            try:
+                payload = json.loads(row["payload"])
+            except Exception:
+                payload = None
+        try:
+            task = kb.get_task(conn, row["task_id"])
+        except Exception:
+            task = None
+        out.append({
+            "task_id": row["task_id"],
+            "task": task,
+            "event": kb.Event(
+                id=int(row["id"]), task_id=row["task_id"], kind=row["kind"],
+                payload=payload, created_at=int(row["created_at"] or 0),
+                run_id=row["run_id"],
+            ),
+            "delivery_key": f"home-sweep/{row['task_id']}/{row['kind']}",
+        })
+    return out
+
+
+def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
+    """Try to rebuild a corrupt board DB in place via ``sqlite3 .recover``.
+
+    The 2026-07-18 vault-v2 incident: index-level corruption paused dispatch
+    for 16+ hours while the dispatcher quietly re-logged every 5 minutes —
+    yet the very first manual ``.recover`` produced a clean DB. Corruption
+    of this class is mechanically recoverable, so the dispatcher does it
+    itself instead of waiting for a human to notice log spam.
+
+    Safety: the corrupt original (and its -wal/-shm sidecars) are renamed to
+    ``.corrupt-<ts>.bak`` before the recovered file is moved in, so nothing
+    is ever destroyed; the swap uses ``os.replace`` (atomic on POSIX). The
+    recovered DB must pass ``PRAGMA integrity_check`` before the swap.
+    Returns (ok, detail).
+    """
+    sqlite3_cli = shutil.which("sqlite3")
+    if not sqlite3_cli:
+        return False, "sqlite3 CLI not on PATH"
+    path = Path(kb.kanban_db_path(slug))
+    if not path.exists():
+        return False, f"{path} does not exist"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    recovered_tmp = path.with_name(path.name + f".recovered-{ts}.tmp")
+    corrupt_bak = path.with_name(path.name + f".corrupt-{ts}.bak")
+    try:
+        dump = subprocess.run(
+            [sqlite3_cli, f"file:{path}?immutable=1", ".recover"],
+            capture_output=True, timeout=300,
+        )
+        if dump.returncode != 0 or not dump.stdout.strip():
+            return False, f".recover failed: {dump.stderr.decode(errors='replace')[:200]}"
+        load = subprocess.run(
+            [sqlite3_cli, str(recovered_tmp)],
+            input=dump.stdout, capture_output=True, timeout=300,
+        )
+        if load.returncode != 0:
+            return False, f"reload failed: {load.stderr.decode(errors='replace')[:200]}"
+        check = subprocess.run(
+            [sqlite3_cli, str(recovered_tmp), "PRAGMA integrity_check"],
+            capture_output=True, timeout=120,
+        )
+        if check.stdout.decode(errors="replace").strip() != "ok":
+            return False, (
+                "recovered DB failed integrity_check: "
+                + check.stdout.decode(errors="replace")[:200]
+            )
+        os.replace(path, corrupt_bak)
+        for suffix in ("-wal", "-shm"):
+            sidecar = path.with_name(path.name + suffix)
+            if sidecar.exists():
+                os.replace(sidecar, corrupt_bak.with_name(corrupt_bak.name + suffix))
+        os.replace(recovered_tmp, path)
+        return True, f"corrupt original preserved at {corrupt_bak}"
+    except subprocess.TimeoutExpired:
+        return False, "recovery subprocess timed out"
+    except OSError as exc:
+        return False, f"recovery swap failed: {exc}"
+    finally:
+        try:
+            if recovered_tmp.exists() and path.exists() and not recovered_tmp.samefile(path):
+                recovered_tmp.unlink()
+        except OSError:
+            pass
 
 
 def _resolve_auto_decompose_settings(
@@ -495,13 +628,15 @@ class GatewayKanbanWatchersMixin:
                     # separate bucket because they're delivered via the
                     # Telegram home fallback, not a `platform`-keyed adapter.
                     tui_sweeps: list[dict] = []
+                    # Failure events on unsubscribed tasks, routed to home.
+                    orphan_failures: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries, tui_sweeps
+                        return deliveries, tui_sweeps, orphan_failures
                     live_tui_ids = _live_tui_session_ids()
                     tui_age_gate = tui_orphan_age_seconds()
 
@@ -634,11 +769,36 @@ class GatewayKanbanWatchersMixin:
                                 swept["board"] = slug
                                 swept["db_path"] = resolved_db_path
                                 tui_sweeps.append(swept)
+
+                            # Catch-all: failure events on tasks NOBODY
+                            # subscribed to. Subscription wiring has failed
+                            # silently before (pre-BUILD-503 workflows only
+                            # subscribed their terminal task — the 2026-07-18
+                            # gsthst-q2 incident where t_a43ae5e2 sat blocked
+                            # for 2.5h unnoticed). This sweep is the invariant
+                            # that no failure event goes unseen regardless of
+                            # how the task was created; delivery is deduped
+                            # per (task, kind) via the notify_deliveries
+                            # ledger so a crash-retry loop pings home once,
+                            # not once per recurrence.
+                            try:
+                                orphans = _collect_unsubscribed_failure_events(
+                                    _kb, conn,
+                                )
+                                for o in orphans:
+                                    o["board"] = slug
+                                    o["db_path"] = resolved_db_path
+                                orphan_failures.extend(orphans)
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban notifier: orphan failure sweep "
+                                    "failed for board %s: %s", slug, exc,
+                                )
                         finally:
                             conn.close()
-                    return deliveries, tui_sweeps
+                    return deliveries, tui_sweeps, orphan_failures
 
-                deliveries, tui_sweeps = await asyncio.to_thread(_collect)
+                deliveries, tui_sweeps, orphan_failures = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -939,6 +1099,45 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub.get("chat_id"), board_slug,
                         len(events), all_delivered,
                     )
+
+                # Catch-all delivery of failure events on unsubscribed tasks
+                # (collected above). Per-key monotonic backoff so a missing
+                # home channel doesn't retry-warn every 5s tick; the ledger
+                # row written on success is the permanent dedup.
+                orphan_attempts: dict[str, float] = getattr(
+                    self, "_kanban_orphan_attempts", {}
+                )
+                self._kanban_orphan_attempts = orphan_attempts
+                for orphan in orphan_failures:
+                    key = orphan["delivery_key"]
+                    last = orphan_attempts.get(key, 0.0)
+                    if time.monotonic() - last < ORPHAN_FAILURE_RETRY_SECONDS:
+                        continue
+                    orphan_attempts[key] = time.monotonic()
+                    msg = render_kanban_event(
+                        task_id=orphan["task_id"],
+                        task=orphan.get("task"),
+                        event=orphan["event"],
+                        board_slug=orphan.get("board"),
+                    )
+                    if not msg:
+                        continue
+                    msg = (
+                        "⚠️ Unrouted workflow failure — no chat is subscribed "
+                        "to this task, delivering to home:\n" + msg
+                    )
+                    ok = await self._kanban_notify_home_fallback(msg)
+                    if ok:
+                        await asyncio.to_thread(
+                            self._kanban_record_orphan_delivery, orphan,
+                        )
+                        orphan_attempts.pop(key, None)
+                        logger.info(
+                            "kanban notifier: routed unsubscribed %s event for "
+                            "%s on board %s to Telegram home",
+                            orphan["event"].kind, orphan["task_id"],
+                            orphan.get("board"),
+                        )
             except Exception as exc:
                 # exc_info: this tick has failed persistently before with only
                 # str(exc) ("'int' object has no attribute 'lower'"), which is
@@ -1049,6 +1248,37 @@ class GatewayKanbanWatchersMixin:
             logger.debug(
                 "kanban notifier: delivery ledger write failed for %s: %s",
                 sub.get("task_id"), exc,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_record_orphan_delivery(self, orphan: dict) -> None:
+        """Sync helper: ledger row for a home-swept unsubscribed failure.
+
+        The ``home-sweep/<task>/<kind>`` key is the dedup authority for the
+        catch-all sweep (there is no subscription cursor for these tasks),
+        so unlike ``_kanban_record_delivery`` this write is NOT best-effort
+        garnish — a failure here just means the same event is re-delivered
+        on a later tick, which the per-key in-memory backoff rate-limits.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=orphan.get("board"))
+        try:
+            _kb.record_notify_delivery(
+                conn,
+                delivery_key=orphan["delivery_key"],
+                task_id=orphan["task_id"],
+                platform="telegram",
+                chat_id="home",
+                thread_id="",
+                first_event_id=orphan["event"].id,
+                last_event_id=orphan["event"].id,
+                status="delivered",
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: home-sweep ledger write failed for %s: %s",
+                orphan.get("task_id"), exc,
             )
         finally:
             conn.close()
@@ -1523,6 +1753,14 @@ class GatewayKanbanWatchersMixin:
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
+        # One recovery attempt and one operator alert per distinct corrupt
+        # fingerprint; re-detections of the same fingerprint log at INFO so
+        # a still-corrupt board doesn't ERROR-spam every quarantine expiry
+        # (the 2026-07-18 vault-v2 incident logged the identical ERROR every
+        # 5 minutes for 16 hours and never told the operator).
+        corrupt_recovery_attempted: set = set()
+        corrupt_alerted: set = set()
+        corrupt_alerts: list[str] = []
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -1547,6 +1785,59 @@ class GatewayKanbanWatchersMixin:
                 "file is not a database" in msg
                 or "database disk image is malformed" in msg
             )
+
+        def _handle_corrupt_board(
+            slug: str,
+            fingerprint: "tuple[str, int | None, int | None]",
+            exc: Exception,
+        ) -> None:
+            """Corrupt board DB: attempt one in-place recovery, alert the
+            operator once, and quarantine without ERROR-spamming.
+
+            Runs in the dispatcher tick thread. Alerts are queued on
+            ``corrupt_alerts`` and flushed to the Telegram home channel by
+            the async loop after the tick returns.
+            """
+            if fingerprint not in corrupt_recovery_attempted:
+                corrupt_recovery_attempted.add(fingerprint)
+                ok, detail = _attempt_board_db_recovery(_kb, slug)
+                if ok:
+                    logger.warning(
+                        "kanban dispatcher: board %s database was corrupt (%s); "
+                        "auto-recovered in place. %s",
+                        slug, exc, detail,
+                    )
+                    corrupt_alerts.append(
+                        f"🛠 Kanban board `{slug}` database was corrupt and has "
+                        f"been auto-recovered; dispatch resumes next tick. "
+                        f"{detail}."
+                    )
+                    # Fingerprint changed on swap, so the normal
+                    # changed-fingerprint path re-enables dispatch.
+                    disabled_corrupt_boards.pop(slug, None)
+                    return
+                logger.error(
+                    "kanban dispatcher: board %s database %s is corrupt and "
+                    "auto-recovery failed (%s); pausing dispatch until the file "
+                    "changes or the quarantine timer expires. Restore the file, "
+                    "then run `hermes kanban init` if you need a fresh board.",
+                    slug, fingerprint[0], detail,
+                )
+            else:
+                logger.info(
+                    "kanban dispatcher: board %s still corrupt (fingerprint "
+                    "unchanged); dispatch remains paused.", slug,
+                )
+            disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            if fingerprint not in corrupt_alerted:
+                corrupt_alerted.add(fingerprint)
+                corrupt_alerts.append(
+                    f"🚨 Kanban board `{slug}` database is corrupt "
+                    f"({fingerprint[0]}) and auto-recovery failed — dispatch "
+                    f"for this board is PAUSED. Tasks on it will not run until "
+                    f"the file is restored (`hermes kanban init` for a fresh "
+                    f"board)."
+                )
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
@@ -1600,33 +1891,9 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     signature_repeat_threshold=signature_repeat_threshold,
                 )
-            except sqlite3.DatabaseError as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
-                    return None
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
-                return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _handle_corrupt_board(slug, fingerprint, exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
@@ -1810,6 +2077,19 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
+                # Flush corrupt-board operator alerts queued by the tick
+                # thread. Send failures are dropped (the alert re-queues
+                # only on a new fingerprint) — alerting must never wedge
+                # dispatch.
+                while corrupt_alerts:
+                    alert = corrupt_alerts.pop(0)
+                    try:
+                        await self._kanban_notify_home_fallback(alert)
+                    except Exception as alert_exc:
+                        logger.warning(
+                            "kanban dispatcher: corrupt-board alert send "
+                            "failed: %s", alert_exc,
+                        )
                 any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
