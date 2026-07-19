@@ -8882,9 +8882,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if fp is not None:
                 claimed[(_plat, fp)] = active
 
+        allowlist = getattr(self.config, "multiplex_profile_allowlist", None)
         for profile_name, profile_home in profiles_to_serve(multiplex=True):
             if profile_name == active:
                 continue  # handled by the primary startup loop
+            if allowlist is not None and profile_name not in allowlist:
+                # BUILD-554: allowlisted multiplex — don't probe profiles
+                # that were never meant to run their own adapters (the
+                # source of the per-boot empty-token / duplicate-credential
+                # refusal spam).
+                continue
             try:
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed

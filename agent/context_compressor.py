@@ -1122,6 +1122,16 @@ class ContextCompressor(ContextEngine):
             base_url != self.base_url,
             api_mode != self.api_mode,
         ))
+        if runtime_changed:
+            # BUILD-533 (AC2): defer-preflight evidence is provider-scoped.
+            # "The last real prompt fit under threshold" was proven against
+            # the OLD provider's window — after a swap to a smaller-context
+            # fallback that stale proof deferred compression and the first
+            # fallback request 400'd at 176k tokens against a 131k window
+            # (2026-07-18). Reset so preflight re-evaluates against the new
+            # window with no inherited benefit of the doubt.
+            self.last_real_prompt_tokens = 0
+            self.last_rough_tokens_when_real_prompt_fit = 0
         self.model = model
         self.base_url = base_url
         self.api_key = api_key

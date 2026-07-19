@@ -836,6 +836,11 @@ class GatewayConfig:
     # phases) per-profile adapters/credentials are resolved. When False, the
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
+    # BUILD-554: optional allowlist form. `multiplex_profiles: [a, b]` in
+    # config means "multiplex ON, but only these profiles get secondary
+    # adapters/scopes" — ends the boot-scan refusal noise from probing every
+    # profile dir. None = scan all (bool-true legacy behavior).
+    multiplex_profile_allowlist: "tuple[str, ...] | None" = None
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
@@ -958,6 +963,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -1033,6 +1039,14 @@ class GatewayConfig:
         # unrecognized env value falls through to config (the empty-secret trap:
         # a provisioned-but-unpopulated Fly secret must not shadow config), so
         # this is a genuine 3-tier chain: env > config.yaml > default False.
+        # BUILD-554: list form = allowlisted multiplex. Parse before the env
+        # override so a hosted force-ON still honors a config allowlist.
+        multiplex_allowlist = None
+        if isinstance(multiplex_profiles, (list, tuple)):
+            multiplex_allowlist = tuple(
+                str(x).strip() for x in multiplex_profiles if str(x).strip()
+            )
+            multiplex_profiles = bool(multiplex_allowlist)
         env_multiplex = _env_multiplex_profiles_override()
         if env_multiplex is not None:
             multiplex_profiles = env_multiplex
@@ -1079,6 +1093,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            multiplex_profile_allowlist=multiplex_allowlist,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
