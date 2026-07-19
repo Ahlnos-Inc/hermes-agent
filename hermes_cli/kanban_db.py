@@ -2032,6 +2032,42 @@ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     )
 
 
+# Never-closed read-only descriptors for header validation, one per DB path.
+# BUILD-575: closing ANY fd that references a file releases every POSIX fcntl
+# lock the whole process holds on it (SQLite "How To Corrupt", §2.2). SQLite's
+# unix VFS defends against that only for descriptors it owns, so the previous
+# ``path.open("rb")`` here — running on EVERY fast-path connect() — silently
+# unlocked mid-checkpoint databases for other processes and let two
+# checkpointers backfill WAL frames concurrently (the 2026-07-19 notify-page
+# corruption). Reading through a descriptor that is never closed cannot drop
+# locks. Cache is keyed by realpath; a swapped file (board recovery uses
+# os.replace) is detected by dev/ino mismatch and reopened — closing the stale
+# descriptor then only touches the abandoned inode.
+_HEADER_FD_LOCK = threading.Lock()
+_HEADER_FD_CACHE: "dict[str, tuple[int, int, int]]" = {}
+
+
+def _read_db_header(path: Path, size: int = 64) -> bytes:
+    if os.name == "nt":
+        # Windows has no POSIX fcntl close-drops-locks hazard; plain read.
+        with path.open("rb") as handle:
+            return handle.read(size)
+    key = os.path.realpath(str(path))
+    with _HEADER_FD_LOCK:
+        st = os.stat(key)
+        cached = _HEADER_FD_CACHE.get(key)
+        if cached is not None and (cached[1], cached[2]) != (st.st_dev, st.st_ino):
+            os.close(cached[0])
+            del _HEADER_FD_CACHE[key]
+            cached = None
+        if cached is None:
+            fd = os.open(key, os.O_RDONLY)
+            fst = os.fstat(fd)
+            cached = (fd, fst.st_dev, fst.st_ino)
+            _HEADER_FD_CACHE[key] = cached
+        return os.pread(cached[0], size, 0)
+
+
 def _validate_sqlite_header(path: Path) -> None:
     """Fail early with an actionable error for non-SQLite Kanban DB files.
 
@@ -2040,6 +2076,9 @@ def _validate_sqlite_header(path: Path) -> None:
     hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
     being collapsed into a generic PRAGMA error and lets the gateway's corrupt
     board handling identify the board by fingerprint.
+
+    Must never open-and-close the DB file with an ordinary descriptor — see
+    :func:`_read_db_header`.
     """
     try:
         stat = path.stat()
@@ -2050,8 +2089,7 @@ def _validate_sqlite_header(path: Path) -> None:
     if stat.st_size == 0:
         return
     try:
-        with path.open("rb") as handle:
-            head = handle.read(64)
+        head = _read_db_header(path)
     except OSError:
         return
     if head.startswith(_SQLITE_HEADER):
@@ -15683,7 +15721,7 @@ def list_notify_subs(
         if not isinstance(sub.get("task_id"), str) or not isinstance(
             sub.get("platform"), str
         ):
-            logger.warning(
+            _log.warning(
                 "kanban: skipping malformed notify sub row (task_id=%r "
                 "platform=%r) — delete it from kanban_notify_subs",
                 sub.get("task_id"), sub.get("platform"),

@@ -321,8 +321,14 @@ def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
     recovered_tmp = path.with_name(path.name + f".recovered-{ts}.tmp")
     corrupt_bak = path.with_name(path.name + f".corrupt-{ts}.bak")
     try:
+        # No immutable=1: it tells SQLite the file cannot change, so the
+        # .recover pass skips locks AND the live WAL — the 2026-07-18 ROOT
+        # board corruption was WAL-resident first and an immutable scan
+        # missed it, and a moving file read without locks can enshrine a
+        # torn snapshot as the "recovered" DB. A normal open takes shared
+        # locks and includes WAL content; writers just block briefly.
         dump = subprocess.run(
-            [sqlite3_cli, f"file:{path}?immutable=1", ".recover"],
+            [sqlite3_cli, str(path), ".recover"],
             capture_output=True, timeout=300,
         )
         if dump.returncode != 0 or not dump.stdout.strip():
