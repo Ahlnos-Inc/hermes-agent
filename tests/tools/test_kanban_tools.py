@@ -4037,3 +4037,86 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def _jira_scoped_steps(implement_key, verify_key):
+    steps = _compiled_workflow_steps()
+    steps[0]["jira_key"] = implement_key
+    steps[1]["jira_key"] = verify_key
+    return steps
+
+
+def _compile_workflow_env(monkeypatch):
+    from gateway.session_context import reset_session_vars
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-jira-scope")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+
+
+def test_compile_workflow_rejects_divergent_jira_scope_without_mapping(
+    monkeypatch, worker_env,
+):
+    """BUILD-580: verifier scoped to BUILD-567 while the fix landed under
+    BUILD-575 left the remediation unverifiable. Divergent step jira_key
+    values without an explicit jira_scope_mapping must be refused."""
+    from tools import kanban_tools as kt
+
+    _compile_workflow_env(monkeypatch)
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "sig-mismatch-test",
+        "idempotency_key": "sig-mismatch-test:v1",
+        "steps": _jira_scoped_steps("BUILD-575", "BUILD-567"),
+    }))
+    assert result.get("ok") is not True
+    assert "jira" in json.dumps(result).lower()
+
+
+def test_compile_workflow_accepts_divergent_jira_scope_with_mapping(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    _compile_workflow_env(monkeypatch)
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "sig-mapped-test",
+        "idempotency_key": "sig-mapped-test:v1",
+        "steps": _jira_scoped_steps("BUILD-575", "BUILD-567"),
+        "jira_scope_mapping": {"BUILD-567": "BUILD-575"},
+    }))
+    assert result.get("ok") is True
+
+
+def test_compile_workflow_uniform_jira_scope_needs_no_mapping(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    _compile_workflow_env(monkeypatch)
+    result = json.loads(kt._handle_compile_workflow({
+        "workflow_key": "sig-uniform-test",
+        "idempotency_key": "sig-uniform-test:v1",
+        "steps": _jira_scoped_steps("BUILD-575", "BUILD-575"),
+    }))
+    assert result.get("ok") is True
+
+
+def test_compile_workflow_signature_retry_is_idempotent(
+    monkeypatch, worker_env,
+):
+    """BUILD-580 AC: signature-keyed remediation graphs never duplicate on
+    retry — the exact sentinel signature from the incident."""
+    from tools import kanban_tools as kt
+
+    _compile_workflow_env(monkeypatch)
+    args = {
+        "workflow_key": "sig-55f8324523b0a573",
+        "idempotency_key": "sig-55f8324523b0a573:v1",
+        "steps": _jira_scoped_steps("BUILD-575", "BUILD-575"),
+    }
+    first = json.loads(kt._handle_compile_workflow(args))
+    second = json.loads(kt._handle_compile_workflow(args))
+    assert first["ok"] is True
+    assert first == second

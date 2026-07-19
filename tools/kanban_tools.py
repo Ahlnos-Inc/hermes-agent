@@ -2214,6 +2214,8 @@ def _workflow_request_digest(args: dict[str, Any]) -> str:
         for key in (
             "workflow_key", "idempotency_key", "steps", "tenant",
             "workspace_kind", "workspace_path", "priority",
+            # Presence-gated, so requests predating BUILD-580 hash unchanged.
+            "jira_scope_mapping",
         )
         if key in args
     }
@@ -2344,6 +2346,35 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
                 raise kb.WorkflowGraphError(
                     "unknown assignee profile(s): " + ", ".join(unknown_profiles)
                 )
+            # BUILD-580: divergent per-step Jira scopes without an explicit
+            # mapping produced an unverifiable handoff (verifier scoped to
+            # BUILD-567 while the fix landed under BUILD-575). Steps may
+            # declare `jira_key`; when they diverge, the request must carry
+            # `jira_scope_mapping` accounting for every non-canonical key.
+            # Keys are validated here and stripped before graph compilation
+            # (the step schema downstream is strict).
+            step_jira_keys = {
+                str(step.get("jira_key") or "").strip()
+                for step in resolved_steps
+                if isinstance(step, dict)
+            }
+            step_jira_keys.discard("")
+            if len(step_jira_keys) > 1:
+                mapping = args.get("jira_scope_mapping")
+                mapped: set = set()
+                if isinstance(mapping, dict):
+                    mapped = {str(k).strip() for k in mapping} | {
+                        str(v).strip() for v in mapping.values()
+                    }
+                unmapped = sorted(step_jira_keys - mapped)
+                if unmapped:
+                    raise kb.WorkflowGraphError(
+                        "divergent step jira_key values need an explicit "
+                        "jira_scope_mapping; unmapped: " + ", ".join(unmapped)
+                    )
+            for step in resolved_steps:
+                if isinstance(step, dict):
+                    step.pop("jira_key", None)
             compiled = kb.compile_workflow_graph(
                 conn,
                 workflow_key=workflow_key,
