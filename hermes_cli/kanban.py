@@ -2572,9 +2572,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 "      dispatch_interval_seconds: 60\n"
                 "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
                 "\n"
-                "Running both the gateway AND this standalone daemon will\n"
-                "race for claims. If you truly need the old standalone\n"
-                "daemon (no gateway available), rerun with --force.",
+                "The gateway and this standalone daemon share one singleton\n"
+                "dispatcher lock, so only one can dispatch at a time. If you\n"
+                "truly need the old standalone daemon (no gateway available),\n"
+                "rerun with --force.",
                 file=sys.stderr,
             )
             return 2
