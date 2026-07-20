@@ -94,7 +94,7 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     monkeypatch.setenv("GH_TOKEN_SECRET_WRITE", "ambient-action-token")
 
     def fetch(**_kwargs):
-        return FetchResult(secrets={wc.GITHUB_WRITE_SOURCE_KEY: SENTINEL})
+        return FetchResult(secrets={wc.GITHUB_WRITE_RESOLVE_KEY: SENTINEL})
 
     monkeypatch.setattr(wc, "_fetch_bitwarden_result", fetch)
     with caplog.at_level(logging.INFO, logger=wc._log.name):
@@ -415,10 +415,10 @@ def test_action_value_present_only_in_dotenv_is_not_used(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     _enable_bitwarden(tmp_path)
     (tmp_path / ".env").write_text(
-        f"{wc.GITHUB_WRITE_SOURCE_KEY}={SENTINEL}\n", encoding="utf-8"
+        f"{wc.GITHUB_WRITE_RESOLVE_KEY}={SENTINEL}\n", encoding="utf-8"
     )
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
-    monkeypatch.setenv(wc.GITHUB_WRITE_SOURCE_KEY, SENTINEL)
+    monkeypatch.setenv(wc.GITHUB_WRITE_RESOLVE_KEY, SENTINEL)
     monkeypatch.setattr(
         wc,
         "_fetch_bitwarden_result",
@@ -472,7 +472,7 @@ def test_existing_bitwarden_cache_is_used_and_failures_do_not_become_credentials
 
     def run_bws(*_args):
         calls.append(True)
-        return {wc.GITHUB_WRITE_SOURCE_KEY: SENTINEL}, []
+        return {wc.GITHUB_WRITE_RESOLVE_KEY: SENTINEL}, []
 
     monkeypatch.setattr(bw, "_run_bws_list", run_bws)
     bw._reset_cache_for_tests(tmp_path)

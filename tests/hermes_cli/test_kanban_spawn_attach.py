@@ -322,7 +322,7 @@ def test_default_spawn_preflights_and_handoffs_only_authorized_action(
     monkeypatch.setattr(
         wc,
         "_fetch_bitwarden_result",
-        lambda **_kwargs: FetchResult(secrets={wc.GITHUB_WRITE_SOURCE_KEY: sentinel}),
+        lambda **_kwargs: FetchResult(secrets={wc.GITHUB_WRITE_RESOLVE_KEY: sentinel}),
     )
     captured = {}
 

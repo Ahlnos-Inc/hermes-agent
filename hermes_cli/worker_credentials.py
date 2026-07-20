@@ -36,7 +36,16 @@ CONTRACT_VERSION = 1
 MANIFEST_FILENAME = "worker-credential-contract.yaml"
 
 BWS_BOOTSTRAP_ENV = "BWS_ACCESS_TOKEN"
+# Ambient name that must always be STRIPPED from workers (kept in
+# UNCONDITIONAL_STRIP_ENV below). It is NOT the resolve source anymore.
 GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
+# The BWS secret github_write actually RESOLVES from. The fine-grained
+# GH_TOKEN_SECRET_WRITE PAT is not authorized for the release-target repos
+# (contents + pull_requests both 403 on Ahlnos-Inc/aldnoah), so github_write
+# is sourced from the classic GITHUB_TOKEN (repo scope) per Nicholas's call
+# 2026-07-20. Tradeoff: classic token is broad-scoped; migrate back to a
+# properly-scoped fine-grained PAT under BUILD-602 to restore least-privilege.
+GITHUB_WRITE_RESOLVE_KEY = "GITHUB_TOKEN"
 
 # These names are intentionally explicit.  The list is also used when a
 # caller provides an environment mapping rather than os.environ, so a worker
@@ -106,7 +115,7 @@ class CapabilityDefinition:
 CAPABILITIES: Mapping[str, CapabilityDefinition] = {
     "github_write": CapabilityDefinition(
         name="github_write",
-        source_key=GITHUB_WRITE_SOURCE_KEY,
+        source_key=GITHUB_WRITE_RESOLVE_KEY,
         handoff_env=GITHUB_WRITE_HANDOFF_ENV,
         projection_env=("GH_TOKEN",),
     ),
@@ -745,7 +754,7 @@ def resolve_worker_credentials(
             access_token=bootstrap,
             source_config=source_config,
         )
-        github_value, failure = _safe_source_result(result, GITHUB_WRITE_SOURCE_KEY)
+        github_value, failure = _safe_source_result(result, GITHUB_WRITE_RESOLVE_KEY)
         if github_value is None:
             statuses.append("github_write=missing")
             plan = WorkerCredentialPlan(
