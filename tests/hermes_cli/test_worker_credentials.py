@@ -120,6 +120,57 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     assert child_env[wc.MANIFEST_DIGEST_ENV] == plan.manifest_digest
 
 
+def test_releaser_bootstrap_strips_ambient_credentials(tmp_path, monkeypatch):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-bootstrap-releaser")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "11")
+    monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, SENTINEL)
+    monkeypatch.setenv("GH_TOKEN", "dotenv-value")
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "dotenv-value")
+    monkeypatch.setenv("GH_TOKEN_SECRET_WRITE", "dotenv-value")
+    monkeypatch.setenv(
+        wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest
+    )
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert "GH_TOKEN" not in os.environ
+    assert "BWS_ACCESS_TOKEN" not in os.environ
+    assert "GH_TOKEN_SECRET_WRITE" not in os.environ
+    assert wc.has_trusted_worker_action("github_write")
+
+
+def test_marketing_bootstrap_reprojects_only_granted_bws_value(tmp_path, monkeypatch):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "marketing-operator")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-bootstrap-marketing")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "12")
+    monkeypatch.setenv(wc.BWS_BOOTSTRAP_HANDOFF_ENV, "handoff-value")
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "ambient-value")
+    monkeypatch.setenv(
+        wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest
+    )
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.capabilities == ("bws_bootstrap",)
+    assert os.environ[wc.BWS_BOOTSTRAP_ENV] == "handoff-value"
+
+
+def test_non_worker_bootstrap_keeps_ambient_credentials(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "controller-token")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    assert wc.bootstrap_worker_credential_context() is None
+    assert os.environ["GH_TOKEN"] == "controller-token"
+
+
 def test_trusted_worker_state_is_visible_to_terminal_thread(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -190,6 +241,25 @@ def test_manifest_digest_mismatch_admits_nothing(tmp_path, monkeypatch, caplog):
     assert not wc.has_trusted_worker_action("github_write")
     assert "worker credential manifest digest mismatch" in caplog.text
     assert SENTINEL not in caplog.text
+
+
+def test_manifest_digest_missing_admits_nothing(tmp_path, monkeypatch, caplog):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-digest-missing")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "13")
+    monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, SENTINEL)
+    monkeypatch.delenv(wc.MANIFEST_DIGEST_ENV, raising=False)
+
+    with caplog.at_level(logging.WARNING, logger=wc._log.name):
+        runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.capabilities == ()
+    assert not wc.has_trusted_worker_action("github_write")
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in os.environ
+    assert "worker credential manifest digest mismatch" in caplog.text
 
 
 def test_empty_or_unknown_profile_receives_no_capability_or_secret(tmp_path, monkeypatch):

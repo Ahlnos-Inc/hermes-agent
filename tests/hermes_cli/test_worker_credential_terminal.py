@@ -34,6 +34,9 @@ def worker_contract(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "releaser")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-terminal-contract")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "91")
+    monkeypatch.setenv(
+        wc.MANIFEST_DIGEST_ENV, wc.load_manifest(hermes_home).digest
+    )
     wc.reset_worker_credential_context_for_tests()
     yield hermes_home
     wc.cleanup_worker_terminal_artifacts()

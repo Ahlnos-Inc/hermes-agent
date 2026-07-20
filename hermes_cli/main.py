@@ -513,6 +513,28 @@ def _bootstrap_worker_credentials_early() -> None:
 
         bootstrap_worker_credential_context()
     except Exception:
+        try:
+            if (
+                "HERMES_KANBAN_TASK" in os.environ
+                and "HERMES_KANBAN_RUN_ID" in os.environ
+            ):
+                ambient_credential_names = (
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN_SECRET_WRITE",
+                    "BWS_ACCESS_TOKEN",
+                    "GH_ENTERPRISE_TOKEN",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "COPILOT_GITHUB_TOKEN",
+                )
+                for name in list(os.environ):
+                    if (
+                        name.startswith("HERMES_WORKER_CREDENTIAL_")
+                        or name in ambient_credential_names
+                    ):
+                        os.environ.pop(name, None)
+        except Exception:
+            pass
         import logging as _logging
 
         _logging.getLogger(__name__).debug(

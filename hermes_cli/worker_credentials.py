@@ -418,7 +418,7 @@ def bootstrap_worker_credential_context(
                 path=None,
             )
 
-        if expected_digest is not None and expected_digest != manifest.digest:
+        if expected_digest != manifest.digest:
             _log.warning(
                 "worker credential manifest digest mismatch; no capabilities admitted"
             )
@@ -432,6 +432,12 @@ def bootstrap_worker_credential_context(
                 for definition in (CAPABILITIES[capability],)
                 if definition.handoff_env in handoff
             }
+
+        for key in UNCONDITIONAL_STRIP_ENV:
+            target.pop(key, None)
+        if "bws_bootstrap" in admitted:
+            target[BWS_BOOTSTRAP_ENV] = admitted["bws_bootstrap"]
+
         runtime = TrustedWorkerCredentialRuntime(
             profile=profile,
             task_id=task_id,
