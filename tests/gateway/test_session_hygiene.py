@@ -20,7 +20,7 @@ import pytest
 from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import AsyncSessionStore, SessionEntry, SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +49,26 @@ def _make_large_history_tokens(target_tokens: int) -> list:
     n_msgs = 50
     content_size = max(10, (target_chars // n_msgs) - msg_overhead)
     return _make_history(n_msgs, content_size=content_size)
+
+
+@pytest.fixture(autouse=True)
+def _disable_platform_message_dedupe_for_mock_stores(monkeypatch):
+    """The hygiene tests use MagicMock stores without a backing SessionDB."""
+    original_getattr = AsyncSessionStore.__getattr__
+
+    async def _not_duplicate(*_args, **_kwargs):
+        return False
+
+    def _getattr(self, name):
+        if name == "has_platform_message_id":
+            return _not_duplicate
+        return original_getattr(self, name)
+
+    monkeypatch.setattr(
+        AsyncSessionStore,
+        "__getattr__",
+        _getattr,
+    )
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
@@ -393,6 +413,173 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     assert FakeCompressAgent.last_instance is not None
     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
     FakeCompressAgent.last_instance.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_scopes_profile_config_secrets_and_executor(
+    monkeypatch, tmp_path
+):
+    """Multiplexed hygiene carries the routed home and secret into its worker."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    import gateway.run as gateway_run
+    from agent import secret_scope as ss
+    from hermes_constants import get_hermes_home
+
+    root_home = tmp_path / "root"
+    selected_home = tmp_path / "profiles" / "selected"
+    other_home = tmp_path / "profiles" / "other"
+    for home in (root_home, selected_home, other_home):
+        home.mkdir(parents=True)
+
+    (root_home / "config.yaml").write_text(
+        "model:\n  default: openai/root-model\n  context_length: 100\n",
+        encoding="utf-8",
+    )
+    (selected_home / "config.yaml").write_text(
+        "model:\n  default: openai/selected-model\n  context_length: 100\n"
+        "compression:\n  enabled: true\n  hygiene_hard_message_limit: 4\n",
+        encoding="utf-8",
+    )
+    (selected_home / ".env").write_text(
+        "OPENAI_API_KEY=selected-provider-key\n",
+        encoding="utf-8",
+    )
+    (other_home / ".env").write_text(
+        "OPENAI_API_KEY=other-provider-key\n",
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    class ScopedCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.api_key = kwargs.get("api_key")
+            self.session_id = kwargs.get("session_id", "sess-1")
+            self._last_compaction_in_place = True
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            self._print_fn = None
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            # This is the actual worker-thread assertion: both contextvars
+            # must be carried by _run_in_executor_with_context().
+            seen["home"] = str(get_hermes_home())
+            seen["key"] = ss.get_secret("OPENAI_API_KEY")
+            seen["model"] = self.model
+            seen["api_key"] = self.api_key
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = ScopedCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")},
+    )
+    runner._resolve_profile_home_for_source = lambda _source: selected_home
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:selected:telegram:group:-1001",
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
+    runner.session_store.get_model_override.return_value = None
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", root_home)
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-provider-key")
+
+    def resolve_runtime():
+        return {
+            "api_key": ss.get_secret("OPENAI_API_KEY"),
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+        }
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", resolve_runtime)
+    async def _context_length(*_args, **_kwargs):
+        return 100
+
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async", _context_length
+    )
+
+    loaded_configs = []
+    real_load_gateway_config = gateway_run._load_gateway_config
+
+    def load_gateway_config_recording_scope():
+        cfg = real_load_gateway_config()
+        loaded_configs.append((str(get_hermes_home()), cfg))
+        return cfg
+
+    monkeypatch.setattr(
+        gateway_run, "_load_gateway_config", load_gateway_config_recording_scope
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="12345",
+        profile="selected",
+    )
+    event = MessageEvent(text="hello", source=source, message_id="1")
+
+    assert ss.current_secret_scope() is None
+    ss.set_multiplex_active(True)
+    try:
+        result = await runner._handle_message(event)
+    finally:
+        ss.set_multiplex_active(False)
+        runner._shutdown_executor()
+
+    assert result == "ok"
+    assert seen == {
+        "home": str(selected_home),
+        "key": "selected-provider-key",
+        "model": "openai/selected-model",
+        "api_key": "selected-provider-key",
+    }
+    assert not any(value in seen.values() for value in ("other-provider-key", "environment-provider-key"))
+    selected_configs = [
+        cfg for home, cfg in loaded_configs if home == str(selected_home)
+    ]
+    assert selected_configs
+    assert selected_configs[0]["model"]["default"] == "openai/selected-model"
+    assert ScopedCompressAgent.last_instance is not None
 
 
 @pytest.mark.asyncio
