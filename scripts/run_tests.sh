@@ -105,8 +105,10 @@ fi
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
+BOOTSTRAP_HERMES_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-pytest-bootstrap.XXXXXX")"
+trap 'rm -rf "$BOOTSTRAP_HERMES_HOME"' EXIT
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (HERMES_HOME=$BOOTSTRAP_HERMES_HOME; TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
@@ -119,9 +121,11 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+# No exec: the EXIT trap must run to clean the bootstrap dir.
+env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_HOME="$BOOTSTRAP_HERMES_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
@@ -130,3 +134,4 @@ exec env -i \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+exit $?

@@ -138,7 +138,18 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+_DEFAULT_DB_PATH_AT_IMPORT = get_hermes_home().resolve() / "state.db"
+# Compatibility surface for callers/tests that intentionally pin the default
+# database. SessionDB() resolves the active home unless this value changes.
+DEFAULT_DB_PATH = _DEFAULT_DB_PATH_AT_IMPORT
+
+
+def _default_db_path() -> Path:
+    """Resolve the default session database at construction time."""
+    configured = Path(DEFAULT_DB_PATH)
+    if configured.resolve() != _DEFAULT_DB_PATH_AT_IMPORT:
+        return configured
+    return get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 22
 
@@ -1035,7 +1046,7 @@ class SessionDB:
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
         self.read_only = read_only
 
         self._lock = threading.Lock()

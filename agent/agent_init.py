@@ -805,7 +805,10 @@ def init_agent(
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    # Resolve the active profile when the agent is initialized. The module-level
+    # run_agent home is only an import-time dotenv bootstrap value and may be
+    # stale after a test or multiplexed profile changes HERMES_HOME.
+    setup_logging()
 
     if agent.verbose_logging:
         setup_verbose_logging()
