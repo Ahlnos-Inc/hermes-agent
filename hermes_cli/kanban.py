@@ -2351,23 +2351,25 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
-def _cmd_dispatch(args: argparse.Namespace) -> int:
-    """Run one dispatcher pass, guarded by the machine-wide singleton lock.
+@contextlib.contextmanager
+def _dispatcher_singleton_guard(*, command: str, force: bool):
+    """Guard a dispatcher lifetime with the gateway's singleton lock.
 
-    BUILD-263: always attempts the exact lock held by the gateway's embedded
-    dispatcher (``kanban.dispatch_in_gateway``, default true). It refuses
-    (clear stderr message, nonzero exit) when another dispatcher already holds
-    that lock. ``--force`` is only an explicit opt-in for the narrower case
-    where the locking mechanism is genuinely unavailable; it never overrides
-    OS-level lock contention.
+    ``force`` is deliberately limited to the unavailable-lock case. A held
+    lock always wins, so the gateway, one-shot CLI dispatch, and the legacy
+    daemon cannot bypass each other by choosing a different entry point.
+    Yields ``False`` when the caller must refuse to run and ``True`` when the
+    caller may proceed. A forced unavailable lock yields ``True`` without a
+    handle, while a held lock is released when the context exits.
     """
-    force = bool(getattr(args, "force", False))
     lock_handle = None
     lock_path = None
+    lock_state = "unavailable"
     try:
         from gateway.kanban_watchers import (
             _acquire_singleton_lock,
             _read_singleton_lock_holder_pid,
+            _release_singleton_lock,
             dispatcher_singleton_lock_path,
         )
         lock_path = dispatcher_singleton_lock_path()
@@ -2379,13 +2381,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # The normal policy is fail closed; --force is the explicit, narrow
         # escape hatch for environments where the lock cannot be used.
         lock_handle, lock_state = None, "unavailable"
+
     if lock_state == "contended":
         holder_pid = (
             _read_singleton_lock_holder_pid(lock_path) if lock_path else None
         )
         holder_desc = f" (pid {holder_pid})" if holder_pid else ""
         print(
-            f"hermes kanban dispatch: refusing — another dispatcher"
+            f"hermes kanban {command}: refusing — another dispatcher"
             f"{holder_desc} already holds the singleton lock at "
             f"{lock_path}.\n"
             "This is almost always the gateway's embedded dispatcher "
@@ -2396,32 +2399,52 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "singleton lock.",
             file=sys.stderr,
         )
-        return 3
+        yield False
+        return
+
     if lock_state == "unavailable":
         if not force:
             print(
-                "hermes kanban dispatch: refusing — the single-dispatcher "
+                f"hermes kanban {command}: refusing — the single-dispatcher "
                 "lock is unavailable on this platform/filesystem. "
                 "Use --force only if you have verified that no other "
                 "dispatcher can be running.",
                 file=sys.stderr,
             )
-            return 3
+            yield False
+            return
         print(
-            "hermes kanban dispatch: warning — the single-dispatcher lock "
+            f"hermes kanban {command}: warning — the single-dispatcher lock "
             "is unavailable on this platform/filesystem; proceeding only "
             "because --force was specified.",
             file=sys.stderr,
         )
+
     try:
-        return _cmd_dispatch_run(args)
+        yield True
     finally:
         if lock_handle is not None:
             try:
-                from gateway.kanban_watchers import _release_singleton_lock
                 _release_singleton_lock(lock_handle)
             except Exception:
                 pass
+
+
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    """Run one dispatcher pass, guarded by the machine-wide singleton lock.
+
+    BUILD-263: always attempts the exact lock held by the gateway's embedded
+    dispatcher (``kanban.dispatch_in_gateway``, default true). It refuses
+    (clear stderr message, nonzero exit) when another dispatcher already holds
+    that lock. ``--force`` is only an explicit opt-in for the narrower case
+    where the locking mechanism is genuinely unavailable; it never overrides
+    OS-level lock contention.
+    """
+    force = bool(getattr(args, "force", False))
+    with _dispatcher_singleton_guard(command="dispatch", force=force) as allowed:
+        if not allowed:
+            return 3
+        return _cmd_dispatch_run(args)
 
 
 def _cmd_dispatch_run(args: argparse.Namespace) -> int:
@@ -2553,31 +2576,35 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     with guidance so nobody accidentally keeps running two dispatchers
     against the same kanban.db.
     """
-    # --force lets power users keep the standalone loop for one more
-    # release cycle. Undocumented in `--help` so nobody discovers it
-    # casually — intentional.
-    if not getattr(args, "force", False):
-        print(
-            "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
-            "inside the gateway. To use kanban:\n"
-            "\n"
-            "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
-            "\n"
-            "Ready tasks will be picked up on the next dispatcher tick\n"
-            "(default: every 60 seconds). Configure via config.yaml:\n"
-            "\n"
-            "    kanban:\n"
-            "      dispatch_in_gateway: true      # default\n"
-            "      dispatch_interval_seconds: 60\n"
-            "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
-            "\n"
-            "Running both the gateway AND this standalone daemon will\n"
-            "race for claims. If you truly need the old standalone\n"
-            "daemon (no gateway available), rerun with --force.",
-            file=sys.stderr,
-        )
-        return 2
+    force = bool(getattr(args, "force", False))
+    with _dispatcher_singleton_guard(command="daemon", force=force) as allowed:
+        if not allowed:
+            return 3
+        if not force:
+            print(
+                "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
+                "inside the gateway. To use kanban:\n"
+                "\n"
+                "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
+                "\n"
+                "Ready tasks will be picked up on the next dispatcher tick\n"
+                "(default: every 60 seconds). Configure via config.yaml:\n"
+                "\n"
+                "    kanban:\n"
+                "      dispatch_in_gateway: true      # default\n"
+                "      dispatch_interval_seconds: 60\n"
+                "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
+                "\n"
+                "Running both the gateway AND this standalone daemon will\n"
+                "race for claims. If you truly need the old standalone\n"
+                "daemon (no gateway available), rerun with --force.",
+                file=sys.stderr,
+            )
+            return 2
+        return _cmd_daemon_run(args)
 
+
+def _cmd_daemon_run(args: argparse.Namespace) -> int:
     # Legacy path — same logic as before, kept behind --force.
     # Make sure the DB exists before printing "started" so the user sees the
     # correct DB path and any init error surfaces immediately.

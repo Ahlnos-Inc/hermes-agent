@@ -124,6 +124,96 @@ def test_dispatch_force_does_not_bypass_a_held_lock(
     assert "cannot override" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_daemon_refuses_when_another_dispatcher_holds_the_lock(
+    kanban_home, monkeypatch, capsys, force,
+):
+    """The legacy daemon must share dispatch's non-bypassable lock guard."""
+    calls = []
+    monkeypatch.setattr(kb, "run_daemon", lambda **_kwargs: calls.append(True))
+
+    lock_path = dispatcher_singleton_lock_path()
+    holder_handle, holder_state = _acquire_singleton_lock(lock_path)
+    assert holder_state == "held"
+    try:
+        rc = kb_cli._cmd_daemon(_args(force=force, interval=0.01))
+    finally:
+        _release_singleton_lock(holder_handle)
+
+    assert rc == 3
+    assert calls == [], "daemon must not start its loop on lock contention"
+    err = capsys.readouterr().err
+    assert "hermes kanban daemon: refusing" in err
+    assert "--force" in err
+
+
+def test_daemon_holds_lock_while_running(kanban_home, monkeypatch):
+    """A running legacy daemon blocks a concurrent one-shot dispatch."""
+    dispatch_results = []
+
+    def fake_run_daemon(**_kwargs):
+        dispatch_results.append(kb_cli._cmd_dispatch(_args()))
+
+    monkeypatch.setattr(kb, "run_daemon", fake_run_daemon)
+
+    rc = kb_cli._cmd_daemon(_args(force=True, interval=0.01))
+
+    assert rc == 0
+    assert dispatch_results == [3]
+
+
+def test_gateway_skips_dispatcher_when_lock_acquisition_raises(
+    kanban_home, monkeypatch, caplog,
+):
+    """A broken lock mechanism must not silently enable gateway dispatch."""
+    import asyncio
+    import logging
+
+    from gateway.run import GatewayRunner
+    import gateway.kanban_watchers as watchers_mod
+    import hermes_cli.config as config_mod
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+
+    lock_path = dispatcher_singleton_lock_path()
+
+    def raise_lock(path):
+        assert path == lock_path
+        raise OSError("simulated lock filesystem failure")
+
+    monkeypatch.setattr(watchers_mod, "_acquire_singleton_lock", raise_lock)
+    dispatch_threads = []
+
+    async def unexpected_dispatch_thread(*_args, **_kwargs):
+        dispatch_threads.append(True)
+        raise AssertionError("dispatcher loop must not start without its lock")
+
+    monkeypatch.setattr(watchers_mod.asyncio, "to_thread", unexpected_dispatch_thread)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    assert dispatch_threads == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        str(lock_path) in message
+        and "kanban.dispatch_in_gateway" in message
+        and "refusing" in message.lower()
+        for message in messages
+    )
+
+
 def test_dispatch_reports_holder_pid_when_available(kanban_home, monkeypatch, capsys):
     """The lock file is stamped with the holder's pid (diagnostics only) —
     the refusal message should surface it when present."""
