@@ -12140,7 +12140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                     ):
                         context_prompt += profile_build_directive()
-                        mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+                        mark_seen(get_hermes_home() / "config.yaml", PROFILE_BUILD_FLAG)
                     else:
                         context_prompt += _intro_note
                 except Exception as _pb_err:
