@@ -37,12 +37,23 @@ class CLIAgentSetupMixin:
 
         _primary_exc = None
         runtime = None
+        # BUILD-589: re-resolution for a moa route must use the preset
+        # identity, not the aggregator wire-model a prior resolution wrote
+        # onto self.model (see the write-back below).
+        _target_model = self.model or None
+        if (self.requested_provider or "").strip().lower() == "moa":
+            # Substitute ONLY when self.model is exactly the wire-model our
+            # own write-back stored — a fresh user/preset/fallback choice
+            # (any other value) always wins, so a stale identity can never
+            # override an intentional route change (Sol review 2a/2b/2c).
+            if self.model and self.model == getattr(self, "_moa_wire_model", None):
+                _target_model = getattr(self, "_moa_route_model", None) or _target_model
         try:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
-                target_model=self.model or None,
+                target_model=_target_model,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -89,6 +100,16 @@ class CLIAgentSetupMixin:
 
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
+            # BUILD-589: this exit used to be silent in worker logs — the
+            # dispatcher only saw "pid gone" after 'Goodbye!'. Always log the
+            # full resolution failure with inputs so a dead lane is
+            # diagnosable from errors.log alone.
+            logger.error(
+                "provider resolution failed (fatal for this run): "
+                "requested_provider=%r model=%r exc=%r",
+                self.requested_provider, self.model, _primary_exc,
+                exc_info=_primary_exc,
+            )
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
 
@@ -192,6 +213,17 @@ class CLIAgentSetupMixin:
                 self.model == runtime.get("name")  # Model matches provider display name
             )
             if should_use_runtime_model or resolved_moa_config is not None:
+                if resolved_moa_config is not None:
+                    # BUILD-589: for moa routes, self.model must carry the
+                    # aggregator's wire-model for the API call, but the ROUTE
+                    # identity stays the preset. Remember it — re-resolving
+                    # with (provider=moa, model=<aggregator's claude-*>) loses
+                    # the preset, skips aggregator promotion, and trips the
+                    # Claude Max route policy fatally on the second call
+                    # (kanban workers resolve at least twice; this killed the
+                    # whole architect lane).
+                    self._moa_route_model = self.model
+                    self._moa_wire_model = runtime_model
                 self.model = runtime_model
 
         # If model is still empty (e.g. user ran `hermes auth add openai-codex`

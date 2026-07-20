@@ -3738,6 +3738,7 @@ def save_config_value(key_path: str, value: any) -> bool:
 # ============================================================================
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+
     """
     Interactive CLI for the Hermes Agent.
     

@@ -2266,6 +2266,24 @@ def resolve_runtime_provider(
             # not a KeyError) — catch both so this blend keeps fork's
             # tolerant behavior.
             preset = None
+        if preset is None and target_model:
+            # BUILD-589 (Sol review 2d): a session/process restored with
+            # (provider=moa, model=<promoted aggregator wire-model>) has lost
+            # its preset identity — the pre-fix write-back persisted the
+            # aggregator model as the route model. Recover NARROWLY: only
+            # when the unknown name is exactly some preset's aggregator
+            # model. Arbitrary unknown preset names still fall through to
+            # the virtual-endpoint behavior above.
+            for _pname, _p in (moa.get("presets") or {}).items():
+                _agg_model = str(((_p or {}).get("aggregator") or {}).get("model") or "")
+                if _agg_model and _agg_model == str(target_model):
+                    logger.warning(
+                        "moa route restored with aggregator wire-model %r; "
+                        "recovering preset identity %r", target_model, _pname,
+                    )
+                    preset = _p
+                    preset_name = _pname
+                    break
         aggregator = dict((preset or {}).get("aggregator") or {})
         aggregator_runtime = str(aggregator.get("runtime") or "").strip().lower()
         kanban_worker_authorized = bool(
