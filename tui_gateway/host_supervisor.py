@@ -23,7 +23,33 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from tools.environments.local import hermes_subprocess_env
+from tools.environments.local import _ALWAYS_STRIP_KEYS, hermes_subprocess_env
+
+try:
+    from hermes_cli.worker_credentials import (
+        PRIVATE_HANDOFF_PREFIX,
+        UNCONDITIONAL_STRIP_ENV,
+    )
+except ImportError:
+    # Task A/B's worker_credentials module is not present on this branch.
+    # Activation merges will replace this fallback with the shared contract.
+    PRIVATE_HANDOFF_PREFIX = "HERMES_WORKER_CREDENTIAL_"
+    UNCONDITIONAL_STRIP_ENV = frozenset(
+        {
+            "BWS_ACCESS_TOKEN",
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_TOKEN",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_APP_ID",
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            "GITHUB_APP_INSTALLATION_ID",
+            "GH_TOKEN_SECRET_WRITE",
+            "HERMES_WORKER_CREDENTIAL_GITHUB_WRITE",
+            "HERMES_WORKER_CREDENTIAL_BWS_BOOTSTRAP",
+        }
+    )
 
 logger = logging.getLogger(__name__)
 _Thread = threading.Thread
@@ -305,19 +331,30 @@ class HostSupervisor:
             with self._lock:
                 self._pending_controls.pop(request_id, None)
 
+    def _build_spawn_env(self) -> dict[str, str]:
+        """Build the sanitized environment for a compute-host child."""
+        env = hermes_subprocess_env(inherit_credentials=True)
+        if self.env:
+            env.update(self.env)
+        env = {
+            key: value
+            for key, value in env.items()
+            if key not in _ALWAYS_STRIP_KEYS
+            and key not in UNCONDITIONAL_STRIP_ENV
+            and not key.startswith(PRIVATE_HANDOFF_PREFIX)
+        }
+        env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
+        env.setdefault("PYTHONPATH", str(_repo_root()))
+        if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
+            env["PYTHONPATH"] = str(_repo_root()) + os.pathsep + env["PYTHONPATH"]
+        return env
+
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
-        env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
-        if self.env:
-            env.update(self.env)
-        env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
-        env.setdefault("PYTHONPATH", str(_repo_root()))
-        if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
-            env["PYTHONPATH"] = str(_repo_root()) + os.pathsep + env["PYTHONPATH"]
+        env = self._build_spawn_env()
         proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),
