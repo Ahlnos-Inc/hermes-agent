@@ -458,6 +458,43 @@ def test_read_only_workspace_terminal_builds_read_only_inspection_profile(
     )
 
 
+@pytest.mark.parametrize("use_extra", [False, True])
+def test_read_only_workspace_terminal_extra_readable_roots_plumb_through(
+    tmp_path, use_extra
+):
+    """BUILD-581: `extra_readable_roots` grants extra Seatbelt reads for the
+    read-only worker terminal path (reviewer/verifier), absent when unset."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    extra_root = tmp_path / "extra-readable"
+    extra_root.mkdir()
+    captured = {}
+
+    def dispatch(name, arguments, *, task_id):
+        # Read the Seatbelt profile now: the disposable scratch root (and
+        # its profile file) is removed once this call returns.
+        argv = shlex.split(arguments["command"])
+        captured["profile"] = Path(argv[argv.index("-f") + 1]).read_text(
+            encoding="utf-8"
+        )
+        return "ok"
+
+    dispatch_read_only_workspace_terminal(
+        {"command": "cat missing.txt"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"HOME": str(tmp_path / "host"), "PATH": os.environ["PATH"]},
+        dispatch=dispatch,
+        task_id="worker-task",
+        platform_name="Darwin",
+        scratch_parent=tmp_path / "scratch",
+        extra_readable_roots=[extra_root] if use_extra else None,
+    )
+
+    rule = f'(allow file-read* (subpath "{extra_root.resolve()}"))'
+    assert (rule in captured["profile"]) is use_extra
+
+
 @pytest.mark.parametrize(
     "command",
     [
