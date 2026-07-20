@@ -293,6 +293,13 @@ def test_supervisor_spawn_env_does_not_restore_stripped_credentials(tmp_path, mo
     supervisor = HostSupervisor(
         registry_path=tmp_path / "dashboard-compute-host.json",
         argv=[sys.executable, "-c", ""],
+        env={
+            "GH_TOKEN": "overlay-gh-token",
+            "GITHUB_TOKEN": "overlay-github-token",
+            "BWS_ACCESS_TOKEN": "overlay-bws-token",
+            "HERMES_WORKER_CREDENTIAL_X": "overlay-private-handoff",
+            "MY_FEATURE_FLAG": "1",
+        },
         heartbeat_secs=23,
         autostart=False,
     )
@@ -301,8 +308,14 @@ def test_supervisor_spawn_env_does_not_restore_stripped_credentials(tmp_path, mo
 
     assert env["PATH"] == "/required/bin"
     assert env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] == "23"
-    assert "GH_TOKEN" not in env
-    assert "GITHUB_TOKEN" not in env
+    assert {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "BWS_ACCESS_TOKEN",
+        "HERMES_WORKER_CREDENTIAL_X",
+    }.isdisjoint(env)
+    assert env["MY_FEATURE_FLAG"] == "1"
+    assert str(Path(__file__).resolve().parents[2]) in env["PYTHONPATH"].split(os.pathsep)
 
 
 def test_supervisor_crash_emits_turn_error_and_respawns(tmp_path):
