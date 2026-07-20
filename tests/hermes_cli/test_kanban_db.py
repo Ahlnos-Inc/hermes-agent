@@ -6155,11 +6155,17 @@ def test_successful_completion_resets_failure_signature_history(kanban_home):
         assert kb.check_failure_signature_breaker(conn, task_id) is not None
         assert kb.complete_task(conn, task_id, result="recovered")
         assert kb.check_failure_signature_breaker(conn, task_id) is None
+        # The event log is the audit trail: completion closes the breaker
+        # window but never deletes failure-signature history.
         assert conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? "
             "AND kind = 'failure_signature' LIMIT 1",
             (task_id,),
-        ).fetchone() is None
+        ).fetchone() is not None
+        # And pre-completion signatures cannot trip a later run: a fresh
+        # equivalent failure after the reset counts from 1, not 3.
+        _record_signature_failure(conn, task_id, _SMOKE_CHECK_SAMPLE)
+        assert kb.check_failure_signature_breaker(conn, task_id) is None
 
 
 def test_block_task_with_no_usable_reason_text_records_nothing(kanban_home):

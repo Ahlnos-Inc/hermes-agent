@@ -7782,14 +7782,11 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-        # A successful completion starts a fresh breaker window. Keep the
-        # ordinary task-event audit trail, but remove only the derived
-        # failure-signature samples so an old dependency wall cannot trip a
-        # later, unrelated run.
-        conn.execute(
-            "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
-            (task_id, _FAILURE_SIGNATURE_EVENT_KIND),
-        )
+        # A successful completion starts a fresh breaker window. The event
+        # log is the audit trail and is never deleted; the breaker query
+        # instead ignores failure signatures recorded at or before the
+        # latest ``completed`` event across the saga (see
+        # _recent_failure_signatures).
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -12693,11 +12690,27 @@ def _recent_failure_signatures(
     """
     ids = [task_id] + child_ids(conn, task_id)
     placeholders = ",".join("?" for _ in ids)
+    # A ``completed`` event anywhere in the saga closes the breaker window:
+    # signatures recorded at or before the latest success must not trip a
+    # later, unrelated run. History stays in the event log for audit.
+    reset_row = conn.execute(
+        f"SELECT created_at, id FROM task_events "
+        f"WHERE task_id IN ({placeholders}) AND kind = 'completed' "
+        f"ORDER BY created_at DESC, id DESC LIMIT 1",
+        (*ids,),
+    ).fetchone()
+    reset_clause = ""
+    reset_params: tuple = ()
+    if reset_row is not None:
+        reset_clause = " AND (created_at > ? OR (created_at = ? AND id > ?))"
+        reset_params = (
+            reset_row["created_at"], reset_row["created_at"], reset_row["id"],
+        )
     rows = conn.execute(
         f"SELECT task_id, run_id, payload, created_at FROM task_events "
-        f"WHERE task_id IN ({placeholders}) AND kind = ? "
+        f"WHERE task_id IN ({placeholders}) AND kind = ?{reset_clause} "
         f"ORDER BY created_at DESC, id DESC LIMIT ?",
-        (*ids, _FAILURE_SIGNATURE_EVENT_KIND, limit),
+        (*ids, _FAILURE_SIGNATURE_EVENT_KIND, *reset_params, limit),
     ).fetchall()
     out = []
     for r in rows:
