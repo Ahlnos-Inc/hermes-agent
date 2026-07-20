@@ -433,7 +433,15 @@ def bootstrap_worker_credential_context(
                 if definition.handoff_env in handoff
             }
 
-        for key in UNCONDITIONAL_STRIP_ENV:
+        source_config = _bitwarden_config(get_default_hermes_root()) or {}
+        configured_access_token_env = (
+            source_config.get("access_token_env") or BWS_BOOTSTRAP_ENV
+        )
+        strip_env = set(UNCONDITIONAL_STRIP_ENV)
+        if isinstance(configured_access_token_env, str) and configured_access_token_env:
+            strip_env.add(configured_access_token_env)
+
+        for key in strip_env:
             target.pop(key, None)
         if "bws_bootstrap" in admitted:
             target[BWS_BOOTSTRAP_ENV] = admitted["bws_bootstrap"]

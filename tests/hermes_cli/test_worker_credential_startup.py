@@ -38,6 +38,9 @@ def test_early_startup_exception_scrubs_worker_credentials(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "14")
     monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, "private-handoff")
     monkeypatch.setenv("GH_TOKEN", "ambient-token")
+    monkeypatch.setenv("GITHUB_APP_ID", "app-id")
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", "/tmp/private-key")
+    monkeypatch.setenv("GITHUB_APP_INSTALLATION_ID", "installation-id")
 
     def fail_bootstrap():
         raise RuntimeError("bootstrap failure")
@@ -48,6 +51,16 @@ def test_early_startup_exception_scrubs_worker_credentials(monkeypatch):
 
     assert wc.GITHUB_WRITE_HANDOFF_ENV not in os.environ
     assert "GH_TOKEN" not in os.environ
+    assert "GITHUB_APP_ID" not in os.environ
+    assert "GITHUB_APP_PRIVATE_KEY_PATH" not in os.environ
+    assert "GITHUB_APP_INSTALLATION_ID" not in os.environ
+
+
+def test_startup_fallback_strip_set_covers_unconditional_deny_set():
+    from hermes_cli import main as main_mod
+    from hermes_cli import worker_credentials as wc
+
+    assert wc.UNCONDITIONAL_STRIP_ENV <= main_mod._WORKER_CREDENTIAL_FALLBACK_STRIP_ENV
 
 
 def test_early_startup_exception_keeps_non_worker_credentials(monkeypatch):

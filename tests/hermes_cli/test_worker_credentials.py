@@ -143,6 +143,64 @@ def test_releaser_bootstrap_strips_ambient_credentials(tmp_path, monkeypatch):
     assert wc.has_trusted_worker_action("github_write")
 
 
+def test_worker_bootstrap_strips_custom_bitwarden_bootstrap_name(
+    tmp_path, monkeypatch
+):
+    _write_manifest(tmp_path, "version: 1\nprofiles:\n  verifier:\n    actions: []\n")
+    monkeypatch.setattr(
+        wc,
+        "_bitwarden_config",
+        lambda _root: {
+            "enabled": True,
+            "access_token_env": "CUSTOM_BWS_TOKEN",
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-custom-bws")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "15")
+    monkeypatch.setenv("CUSTOM_BWS_TOKEN", "custom-bootstrap")
+    monkeypatch.setenv(wc.BWS_BOOTSTRAP_ENV, "canonical-bootstrap")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest)
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert "CUSTOM_BWS_TOKEN" not in os.environ
+    assert wc.BWS_BOOTSTRAP_ENV not in os.environ
+
+
+def test_worker_bootstrap_default_bitwarden_name_strips_canonical(
+    tmp_path, monkeypatch
+):
+    _write_manifest(tmp_path, "version: 1\nprofiles:\n  verifier:\n    actions: []\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-default-bws")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "16")
+    monkeypatch.setenv(wc.BWS_BOOTSTRAP_ENV, "canonical-bootstrap")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest)
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert wc.BWS_BOOTSTRAP_ENV not in os.environ
+
+
+def test_controller_bootstrap_keeps_custom_bitwarden_bootstrap_name(monkeypatch):
+    monkeypatch.setattr(
+        wc,
+        "_bitwarden_config",
+        lambda _root: {"access_token_env": "CUSTOM_BWS_TOKEN"},
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("CUSTOM_BWS_TOKEN", "controller-bootstrap")
+
+    assert wc.bootstrap_worker_credential_context() is None
+    assert os.environ["CUSTOM_BWS_TOKEN"] == "controller-bootstrap"
+
+
 def test_marketing_bootstrap_reprojects_only_granted_bws_value(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
