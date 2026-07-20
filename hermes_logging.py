@@ -302,6 +302,12 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
+    # Once per process (unless force): logging handlers are global root
+    # state. Re-running under a different HERMES_HOME (multiplexed profile
+    # turn, per-test home) would ACCUMULATE handlers and broadcast every
+    # record into each previously seen home's log directory.
+    if _logging_initialized and not force:
+        return log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Read config defaults (best-effort — config may not be loaded yet).
@@ -360,9 +366,6 @@ def setup_logging(
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
-
-    if _logging_initialized and not force:
-        return log_dir
 
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:

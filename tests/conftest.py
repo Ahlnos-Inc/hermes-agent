@@ -33,6 +33,13 @@ _BOOTSTRAP_HERMES_HOME = Path(
 ).resolve()
 os.environ["HERMES_HOME"] = str(_BOOTSTRAP_HERMES_HOME)
 
+# Per-file subprocess runs create one bootstrap dir each — clean up on
+# process exit or a full run leaves hundreds behind.
+import atexit
+import shutil
+
+atexit.register(shutil.rmtree, str(_BOOTSTRAP_HERMES_HOME), True)
+
 import pytest
 
 # Ensure project root is importable
