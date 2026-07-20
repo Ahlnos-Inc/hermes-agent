@@ -216,6 +216,35 @@ class TestProviderEnvBlocklist:
         for var in leaked_vars:
             assert var not in result_env, f"{var} leaked into subprocess env"
 
+    def test_worker_credential_aliases_and_handoffs_are_always_stripped(self):
+        leaked_vars = {
+            "BWS_ACCESS_TOKEN": "bws-bootstrap",
+            "GH_TOKEN": "gh-token",
+            "GH_ENTERPRISE_TOKEN": "gh-enterprise-token",
+            "GITHUB_TOKEN": "github-token",
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "github-personal-token",
+            "COPILOT_GITHUB_TOKEN": "copilot-token",
+            "GH_TOKEN_SECRET_WRITE": "source-secret",
+            "HERMES_WORKER_CREDENTIAL_GITHUB_WRITE": "handoff-secret",
+            "HERMES_WORKER_CREDENTIAL_BWS_BOOTSTRAP": "handoff-bootstrap",
+            "HERMES_WORKER_CREDENTIAL_UNKNOWN": "future-secret",
+        }
+        result_env = _run_with_env(extra_os_env=leaked_vars)
+
+        for var in leaked_vars:
+            assert var not in result_env, f"{var} leaked into subprocess env"
+
+    def test_worker_credential_aliases_cannot_use_force_prefix(self):
+        result_env = _run_with_env(self_env={
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BWS_ACCESS_TOKEN": "bws",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}GH_TOKEN": "github",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}HERMES_WORKER_CREDENTIAL_GITHUB_WRITE": "handoff",
+        })
+
+        assert "BWS_ACCESS_TOKEN" not in result_env
+        assert "GH_TOKEN" not in result_env
+        assert "HERMES_WORKER_CREDENTIAL_GITHUB_WRITE" not in result_env
+
     def test_safe_vars_are_preserved(self):
         """Standard env vars (PATH, HOME, USER) must still be passed through."""
         result_env = _run_with_env()

@@ -20,6 +20,9 @@ import hashlib
 import json
 import logging
 import os
+import secrets
+import shutil
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,11 +45,35 @@ PRIVATE_HANDOFF_PREFIX = "HERMES_WORKER_CREDENTIAL_"
 GITHUB_WRITE_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}GITHUB_WRITE"
 BWS_BOOTSTRAP_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}BWS_BOOTSTRAP"
 
+# Terminal-only artifacts live below the machine-global Kanban runtime root,
+# never in a profile home.  The directory names are generated locally; task
+# and profile values are not interpolated into paths.
+WORKER_CREDENTIAL_RUNTIME_RELATIVE = Path(
+    "kanban", "runtime", "worker-credentials"
+)
+WORKER_CREDENTIAL_ARTIFACT_MAX_AGE_SECONDS = 24 * 60 * 60
+
+# This helper is installed at Git's command-scope so repository-local helpers
+# cannot re-add Keychain or a hosts-file-backed helper.  It is deliberately
+# token-free; the only secret it reads is the already-projected GH_TOKEN.
+GIT_ENV_TOKEN_HELPER = (
+    "!f() { "
+    "host=; "
+    "while IFS= read -r line; do "
+    "case \"$line\" in host=*) host=\"${line#host=}\";; esac; "
+    "done; "
+    "[ \"$host\" = github.com ] || return 0; "
+    "printf 'username=x-access-token\\npassword=%s\\n' \"$GH_TOKEN\"; "
+    "}; f"
+)
+
 UNCONDITIONAL_STRIP_ENV = frozenset(
     {
         BWS_BOOTSTRAP_ENV,
         "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
         "GITHUB_TOKEN",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
         "COPILOT_GITHUB_TOKEN",
         "GITHUB_APP_ID",
         "GITHUB_APP_PRIVATE_KEY_PATH",
@@ -180,6 +207,37 @@ _TRUSTED_WORKER_CREDENTIALS: contextvars.ContextVar[dict[str, str]] = (
 )
 
 
+@dataclass(frozen=True)
+class TrustedWorkerCredentialRuntime:
+    """Process-local identity and values admitted at worker bootstrap.
+
+    The private handoff is consumed once.  Terminal projection consults this
+    object rather than re-reading an environment marker, then checks the
+    current Kanban identity before every projection.  This prevents a later
+    shell export from becoming an authorization grant.
+    """
+
+    profile: str
+    task_id: str
+    run_id: str
+    manifest_digest: str
+    capabilities: tuple[str, ...]
+    _values: tuple[tuple[str, str], ...] = field(
+        default=(), repr=False, compare=False
+    )
+
+    def value_for(self, capability: str) -> str | None:
+        return dict(self._values).get(capability)
+
+
+_TRUSTED_WORKER_RUNTIME: contextvars.ContextVar[
+    TrustedWorkerCredentialRuntime | None
+] = contextvars.ContextVar("_TRUSTED_WORKER_RUNTIME", default=None)
+_TERMINAL_ARTIFACT_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "_TERMINAL_ARTIFACT_DIR", default=None
+)
+
+
 def _normalize_profile(profile: str) -> str:
     try:
         from hermes_cli.profile_contract import normalize_and_validate_profile_name
@@ -256,6 +314,239 @@ def load_manifest(root: Path | str | None = None) -> WorkerCredentialManifest:
             path=None,
         )
     return _normalize_manifest(_load_yaml(path), path)
+
+
+def worker_credential_runtime_root(root: Path | str | None = None) -> Path:
+    """Return the machine-global runtime directory for terminal artifacts."""
+    base = Path(root) if root is not None else get_default_hermes_root()
+    return base / WORKER_CREDENTIAL_RUNTIME_RELATIVE
+
+
+def cleanup_stale_worker_credential_artifacts(
+    root: Path | str | None = None,
+    *,
+    max_age_seconds: int = WORKER_CREDENTIAL_ARTIFACT_MAX_AGE_SECONDS,
+) -> int:
+    """Remove old run directories without failing worker startup.
+
+    Terminal cleanup removes the current directory eagerly.  This bounded
+    sweep handles crashes and dispatcher restarts.  Only generated ``run-``
+    children below the exact runtime root are eligible.
+    """
+    runtime_root = worker_credential_runtime_root(root)
+    if not runtime_root.is_dir() or runtime_root.is_symlink():
+        return 0
+    cutoff = time.time() - max(0, int(max_age_seconds))
+    removed = 0
+    try:
+        children = list(runtime_root.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        if not child.name.startswith("run-"):
+            continue
+        try:
+            if child.stat().st_mtime >= cutoff:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _worker_identity(environ: Mapping[str, str]) -> tuple[str, str, str] | None:
+    """Extract the immutable worker identity needed for action projection."""
+    raw_profile = str(environ.get("HERMES_PROFILE") or "").strip()
+    task_id = str(environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = str(environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not raw_profile or not task_id or not run_id:
+        return None
+    try:
+        profile = _normalize_profile(raw_profile)
+    except WorkerCredentialError:
+        return None
+    return profile, task_id, run_id
+
+
+def bootstrap_worker_credential_context(
+    environ: dict[str, str] | None = None,
+) -> TrustedWorkerCredentialRuntime | None:
+    """Consume the initial handoff and lock the worker's trusted state.
+
+    A worker identity is required before any action value is admitted.  Once
+    a Kanban worker has bootstrapped, later mutations of ``os.environ`` cannot
+    create a new grant because this context is never rebuilt in-process.
+    Non-worker processes remain uninitialized and therefore cannot project an
+    action credential.
+    """
+    existing = _TRUSTED_WORKER_RUNTIME.get()
+    if existing is not None:
+        return existing
+
+    target = os.environ if environ is None else environ
+    identity = _worker_identity(target)
+    handoff = {
+        name: target.get(name)
+        for name in (GITHUB_WRITE_HANDOFF_ENV, BWS_BOOTSTRAP_HANDOFF_ENV)
+        if isinstance(target.get(name), str) and target.get(name)
+    }
+    if identity is None:
+        # No Kanban worker identity means this is an ordinary Hermes process.
+        # Do not consume a marker here; the unconditional child scrubbing
+        # still removes it, and ordinary processes can never project it.
+        return None
+
+    # Consume every private handoff name, including an unknown future name,
+    # before any terminal or hook subprocess can inherit it.
+    for key in list(target):
+        if key.startswith(PRIVATE_HANDOFF_PREFIX):
+            target.pop(key, None)
+
+    profile, task_id, run_id = identity
+    try:
+        manifest = load_manifest()
+    except WorkerCredentialError:
+        manifest = WorkerCredentialManifest(
+            version=CONTRACT_VERSION,
+            profiles={},
+            digest=_manifest_digest({}),
+            path=None,
+        )
+    granted = manifest.actions_for(profile)
+    admitted = {
+        capability: handoff[definition.handoff_env]
+        for capability in granted
+        if capability in CAPABILITIES
+        for definition in (CAPABILITIES[capability],)
+        if definition.handoff_env in handoff
+    }
+    runtime = TrustedWorkerCredentialRuntime(
+        profile=profile,
+        task_id=task_id,
+        run_id=run_id,
+        manifest_digest=manifest.digest,
+        capabilities=tuple(sorted(admitted)),
+        _values=tuple(sorted(admitted.items())),
+    )
+    _TRUSTED_WORKER_RUNTIME.set(runtime)
+    return runtime
+
+
+def _runtime_matches_current_worker(
+    runtime: TrustedWorkerCredentialRuntime,
+    environ: Mapping[str, str],
+) -> bool:
+    current = _worker_identity(environ)
+    if current != (runtime.profile, runtime.task_id, runtime.run_id):
+        return False
+    try:
+        return load_manifest().digest == runtime.manifest_digest
+    except WorkerCredentialError:
+        return False
+
+
+def get_trusted_worker_credential(
+    capability: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return an action value only at the matching trusted worker boundary."""
+    runtime = bootstrap_worker_credential_context()
+    if runtime is None:
+        return None
+    current_env = os.environ if environ is None else environ
+    if not _runtime_matches_current_worker(runtime, current_env):
+        return None
+    return runtime.value_for(capability)
+
+
+def has_trusted_worker_action(
+    capability: str, *, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Return whether *capability* is currently trusted for this worker."""
+    return get_trusted_worker_credential(capability, environ=environ) is not None
+
+
+def _terminal_artifacts() -> tuple[Path, Path, Path]:
+    """Create (run_dir, gh_config_dir, global_git_config) atomically enough."""
+    existing = _TERMINAL_ARTIFACT_DIR.get()
+    if existing is not None:
+        gh_dir = existing / "gh-config"
+        git_config = existing / "gitconfig"
+        if existing.is_dir() and gh_dir.is_dir() and git_config.is_file():
+            return existing, gh_dir, git_config
+
+    runtime_root = worker_credential_runtime_root()
+    runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_root.chmod(0o700)
+    run_dir = runtime_root / f"run-{secrets.token_hex(16)}"
+    run_dir.mkdir(mode=0o700)
+    run_dir.chmod(0o700)
+    gh_dir = run_dir / "gh-config"
+    gh_dir.mkdir(mode=0o700)
+    gh_dir.chmod(0o700)
+    git_config = run_dir / "gitconfig"
+    git_config.write_text("[credential]\n\thelper =\n", encoding="utf-8")
+    git_config.chmod(0o600)
+    _TERMINAL_ARTIFACT_DIR.set(run_dir)
+    return run_dir, gh_dir, git_config
+
+
+def project_github_write_terminal_environment(
+    environ: dict[str, str],
+) -> bool:
+    """Project ``github_write`` after sanitization for an authorized terminal."""
+    token = get_trusted_worker_credential("github_write", environ=os.environ)
+    if token is None:
+        return False
+
+    _run_dir, gh_config_dir, git_config = _terminal_artifacts()
+    # Remove ambient command-scope config knobs before installing the exact
+    # two entries below.  This is configuration isolation, not a credential
+    # source, so it belongs after the general environment sanitization.
+    for key in list(environ):
+        if (
+            key in {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM"}
+            or key == "GIT_CONFIG_COUNT"
+            or key.startswith("GIT_CONFIG_KEY_")
+            or key.startswith("GIT_CONFIG_VALUE_")
+        ):
+            environ.pop(key, None)
+    environ["GH_TOKEN"] = token
+    environ["GH_CONFIG_DIR"] = str(gh_config_dir)
+    environ["GIT_CONFIG_NOSYSTEM"] = "1"
+    environ["GIT_CONFIG_GLOBAL"] = str(git_config)
+    environ["GIT_CONFIG_COUNT"] = "2"
+    environ["GIT_CONFIG_KEY_0"] = "credential.helper"
+    environ["GIT_CONFIG_VALUE_0"] = ""
+    environ["GIT_CONFIG_KEY_1"] = "credential.helper"
+    environ["GIT_CONFIG_VALUE_1"] = GIT_ENV_TOKEN_HELPER
+    return True
+
+
+def cleanup_worker_terminal_artifacts() -> bool:
+    """Remove the current terminal run directory; safe to call repeatedly."""
+    run_dir = _TERMINAL_ARTIFACT_DIR.get()
+    _TERMINAL_ARTIFACT_DIR.set(None)
+    if run_dir is None:
+        return False
+    try:
+        if run_dir.is_dir() and not run_dir.is_symlink():
+            shutil.rmtree(run_dir)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def reset_worker_credential_context_for_tests() -> None:
+    """Reset process-local state for isolated unit tests."""
+    _TRUSTED_WORKER_RUNTIME.set(None)
+    _TERMINAL_ARTIFACT_DIR.set(None)
 
 
 @contextmanager
@@ -345,6 +636,7 @@ def resolve_worker_credentials(
     never considered valid action sources.  ``github_write`` is satisfied only
     by the selected value returned by the Bitwarden source adapter.
     """
+    cleanup_stale_worker_credential_artifacts()
     normalized_profile = _normalize_profile(profile)
     loaded_manifest = manifest or load_manifest(root)
     capabilities = loaded_manifest.actions_for(normalized_profile)

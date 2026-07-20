@@ -224,6 +224,16 @@ def register_from_config(
     if not isinstance(cfg, dict):
         return []
 
+    # CLI startup calls this before the first agent turn.  Consume the
+    # dispatcher handoff here so hooks and every later child start from the
+    # same process-local trusted contract state.
+    try:
+        from hermes_cli.worker_credentials import bootstrap_worker_credential_context
+
+        bootstrap_worker_credential_context()
+    except Exception:
+        logger.debug("worker credential bootstrap unavailable", exc_info=True)
+
     # Safe mode (--safe-mode / HERMES_SAFE_MODE=1): shell hooks are user
     # customizations too — skip registration entirely so a troubleshooting
     # run fires zero user-configured code (plugins, MCP, AND hooks).
@@ -459,6 +469,8 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     t0 = time.monotonic()
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
+        from tools.environments.local import _sanitize_subprocess_env
+
         proc = subprocess.run(
             argv,
             input=stdin_json,
@@ -466,6 +478,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             timeout=spec.timeout,
             text=True,
             shell=False,
+            env=_sanitize_subprocess_env(os.environ),
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:

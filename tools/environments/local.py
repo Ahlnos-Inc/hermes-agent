@@ -15,10 +15,21 @@ from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.worker_credentials import (
+    PRIVATE_HANDOFF_PREFIX as _WORKER_CREDENTIAL_PRIVATE_PREFIX,
+    UNCONDITIONAL_STRIP_ENV as _WORKER_CREDENTIAL_STRIP_ENV,
+)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+
+def _is_worker_credential_env(key: str) -> bool:
+    """Match current and future private worker handoff names."""
+    return key in _WORKER_CREDENTIAL_STRIP_ENV or key.startswith(
+        _WORKER_CREDENTIAL_PRIVATE_PREFIX
+    )
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -316,6 +327,10 @@ def _build_provider_env_blocklist() -> frozenset:
         "GATEWAY_RELAY_SECRET",
         "GATEWAY_RELAY_DELIVERY_KEY",
     })
+    # Worker action handoffs and all ambient GitHub/BWS aliases are always
+    # protected.  env_passthrough must not be able to re-add them on any raw
+    # terminal, cron, hook, or execute_code path.
+    blocked.update(_WORKER_CREDENTIAL_STRIP_ENV)
     # CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT stripped.  It is set and
     # owned by the user's Claude Code install (subscription OAuth), not a
     # Hermes-managed inference credential — Claude subscription auth is not a
@@ -450,6 +465,12 @@ def _inject_session_context_env(env: dict) -> None:
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
+    # Consume the private handoff before a hook/cron/background child can
+    # inherit it.  This function deliberately never projects action values;
+    # only the local terminal path below has that authority.
+    from hermes_cli.worker_credentials import bootstrap_worker_credential_context
+
+    bootstrap_worker_credential_context()
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -460,6 +481,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
+        if _is_worker_credential_env(key):
+            continue
         if _is_hermes_internal_secret(key):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -468,9 +491,13 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            if _is_worker_credential_env(real_key):
+                continue
             if _is_hermes_internal_secret(real_key):
                 continue
             sanitized[real_key] = value
+        elif _is_worker_credential_env(key):
+            continue
         elif _is_hermes_internal_secret(key):
             continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -542,7 +569,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
     "DAYTONA_API_KEY",
-})
+}) | _WORKER_CREDENTIAL_STRIP_ENV
 
 
 def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
@@ -577,6 +604,9 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``inherit_credentials=False`` and copy just those keys back from
     ``os.environ`` into the returned dict.
     """
+    from hermes_cli.worker_credentials import bootstrap_worker_credential_context
+
+    bootstrap_worker_credential_context()
     env = os.environ.copy()
 
     # Tier 1 — always strip.
@@ -589,6 +619,8 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # legitimate use for them. See :func:`_is_hermes_internal_secret`.
     for key in list(env):
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            env.pop(key, None)
+        elif _is_worker_credential_env(key):
             env.pop(key, None)
         elif _is_hermes_internal_secret(key):
             env.pop(key, None)
@@ -1136,6 +1168,12 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
+    from hermes_cli.worker_credentials import (
+        bootstrap_worker_credential_context,
+        project_github_write_terminal_environment,
+    )
+
+    bootstrap_worker_credential_context()
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -1146,9 +1184,13 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            if _is_worker_credential_env(real_key):
+                continue
             if _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
+        elif _is_worker_credential_env(k):
+            continue
         elif _is_hermes_internal_secret(k):
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
@@ -1191,6 +1233,10 @@ def _make_run_env(env: dict) -> dict:
         pass
 
     _apply_windows_msys_bash_env_defaults(run_env)
+
+    # The only raw terminal projection.  Hooks, cron, execute_code, browser,
+    # and MCP children use the sanitizers above and never call this function.
+    project_github_write_terminal_environment(run_env)
 
     return run_env
 
@@ -1534,6 +1580,14 @@ class LocalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Clean up temp files."""
+        try:
+            from hermes_cli.worker_credentials import cleanup_worker_terminal_artifacts
+
+            cleanup_worker_terminal_artifacts()
+        except Exception:
+            # Credential artifact cleanup is best-effort and must not hide the
+            # normal terminal snapshot cleanup path.
+            pass
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)
