@@ -44,7 +44,7 @@ GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
 # (contents + pull_requests both 403 on Ahlnos-Inc/aldnoah), so github_write
 # is sourced from the classic GITHUB_TOKEN (repo scope) per Nicholas's call
 # 2026-07-20. Tradeoff: classic token is broad-scoped; migrate back to a
-# properly-scoped fine-grained PAT under BUILD-602 to restore least-privilege.
+# properly-scoped fine-grained PAT under BUILD-603 to restore least-privilege.
 GITHUB_WRITE_RESOLVE_KEY = "GITHUB_TOKEN"
 
 # These names are intentionally explicit.  The list is also used when a
