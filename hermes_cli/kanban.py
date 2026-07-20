@@ -2599,9 +2599,9 @@ def _cmd_daemon_run(args: argparse.Namespace) -> int:
     print(
         f"Kanban dispatcher running STANDALONE via --force "
         f"(interval={args.interval}s, pid={os.getpid()}). "
-        f"Ctrl-C to stop. NOTE: if a gateway is also running with "
-        f"dispatch_in_gateway=true (default), you have two dispatchers "
-        f"racing for claims.",
+        f"Ctrl-C to stop. Holding the machine-wide singleton dispatcher "
+        f"lock, so a gateway's embedded dispatcher cannot also run while "
+        f"this is active.",
         file=sys.stderr,
     )
 
