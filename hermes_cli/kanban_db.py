@@ -2157,8 +2157,73 @@ def _file_sha256(path: Path) -> Optional[str]:
     return digest.hexdigest()
 
 
+def _copy_off_lock(source: Path, destination: Path) -> bool:
+    """Copy ``source`` to ``destination`` without ever holding an in-process fd
+    to ``source``.
+
+    BUILD-567: POSIX fcntl locks are per-process — closing ANY descriptor to an
+    inode releases every lock the whole process holds on it (SQLite "How To
+    Corrupt", §2.2). ``_backup_corrupt_db`` runs inside the long-lived gateway,
+    which concurrently holds SQLite write/checkpoint locks on the same board DB
+    from other (notifier) threads. Reading the live DB in-process
+    (``path.open`` / ``shutil.copy2``) would drop those locks mid-checkpoint and
+    let a second checkpointer backfill the notifier btrees concurrently — the
+    exact stale-generation corruption of ``kanban_notify_subs`` /
+    ``notify_deliveries`` seen on 2026-07-19. A *separate* process's
+    open()/close() cannot touch this process's locks, so shell out to ``cp``.
+    Same rationale as the never-closed fd in :func:`_read_db_header`.
+    """
+    if os.name == "nt":
+        # Windows has no POSIX close-drops-locks hazard (see _read_db_header);
+        # a plain in-process copy is safe there.
+        try:
+            shutil.copy2(source, destination)
+            return True
+        except OSError:
+            return False
+    try:
+        result = subprocess.run(  # noqa: S603,S607 -- fixed argv, no shell
+            ["cp", str(source), str(destination)],
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _stage_off_lock(source: Path) -> Optional[Path]:
+    """Copy a live (possibly SQLite-locked) file to a private temp beside it via
+    a subprocess, returning the temp path (caller unlinks) or ``None``.
+
+    The temp is a fresh inode, so the in-process ``mkstemp`` open/close cannot
+    drop any lock on ``source``. See :func:`_copy_off_lock`.
+    """
+    parent = source.parent
+    try:
+        fd, name = tempfile.mkstemp(
+            dir=str(parent), prefix=f".{source.name}.staging.", suffix=".tmp"
+        )
+        os.close(fd)
+    except OSError:
+        return None
+    staged = Path(name)
+    if not _copy_off_lock(source, staged):
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        return None
+    return staged
+
+
 def _atomic_copy2(source: Path, destination: Path) -> bool:
-    """Copy ``source`` to ``destination`` without publishing partial bytes."""
+    """Copy ``source`` to ``destination`` without publishing partial bytes.
+
+    ``source`` must be a file no other thread holds a SQLite lock on (a private
+    staged copy or an existing backup) — it is read with an in-process fd. Never
+    pass the live board DB here; use :func:`_stage_off_lock` first (BUILD-567).
+    """
     temp_fd = -1
     staged: Optional[Path] = None
     try:
@@ -2210,43 +2275,66 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
-    source_digest = _file_sha256(resolved)
-    if source_digest is None:
+    # BUILD-567: stage the LIVE DB through a subprocess copy FIRST. Every
+    # subsequent read (digest, dedup, backup copy) then touches only this
+    # private staged inode — never the live DB — so no in-process close() can
+    # drop the gateway's fcntl locks on the board file. See _copy_off_lock.
+    staged = _stage_off_lock(resolved)
+    if staged is None:
         return None
-    token = source_digest[:16]
-    candidate = parent / f"{base_name}.corrupt.{token}.bak"
-    # Defensive: candidate must still be inside parent after construction.
-    if candidate.parent != parent:
-        return None
-    if candidate.exists():
-        candidate_digest = _file_sha256(candidate)
-        if candidate_digest is None:
+    try:
+        source_digest = _file_sha256(staged)
+        if source_digest is None:
             return None
-        if candidate_digest != source_digest:
-            incomplete = parent / (
-                f"{candidate.name}.incomplete.{candidate_digest[:16]}.bak"
-            )
-            if incomplete.parent != parent:
+        token = source_digest[:16]
+        candidate = parent / f"{base_name}.corrupt.{token}.bak"
+        # Defensive: candidate must still be inside parent after construction.
+        if candidate.parent != parent:
+            return None
+        if candidate.exists():
+            candidate_digest = _file_sha256(candidate)
+            if candidate_digest is None:
                 return None
-            if incomplete.exists():
-                if _file_sha256(incomplete) != candidate_digest:
+            if candidate_digest != source_digest:
+                incomplete = parent / (
+                    f"{candidate.name}.incomplete.{candidate_digest[:16]}.bak"
+                )
+                if incomplete.parent != parent:
                     return None
-            elif not _atomic_copy2(candidate, incomplete):
+                if incomplete.exists():
+                    if _file_sha256(incomplete) != candidate_digest:
+                        return None
+                elif not _atomic_copy2(candidate, incomplete):
+                    return None
+                if not _atomic_copy2(staged, candidate):
+                    return None
+        else:
+            if not _atomic_copy2(staged, candidate):
                 return None
-            if not _atomic_copy2(resolved, candidate):
-                return None
-    else:
-        if not _atomic_copy2(resolved, candidate):
-            return None
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        if sidecar.parent != parent or not sidecar.exists():
-            continue
-        sidecar_backup = parent / (candidate.name + suffix)
-        if sidecar_backup.parent != parent or sidecar_backup.exists():
-            continue
-        _atomic_copy2(sidecar, sidecar_backup)
-    return candidate
+        for suffix in ("-wal", "-shm"):
+            sidecar = parent / (base_name + suffix)
+            if sidecar.parent != parent or not sidecar.exists():
+                continue
+            sidecar_backup = parent / (candidate.name + suffix)
+            if sidecar_backup.parent != parent or sidecar_backup.exists():
+                continue
+            # Live sidecar too — stage off-lock before the in-process copy.
+            staged_sidecar = _stage_off_lock(sidecar)
+            if staged_sidecar is None:
+                continue
+            try:
+                _atomic_copy2(staged_sidecar, sidecar_backup)
+            finally:
+                try:
+                    staged_sidecar.unlink()
+                except OSError:
+                    pass
+        return candidate
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:

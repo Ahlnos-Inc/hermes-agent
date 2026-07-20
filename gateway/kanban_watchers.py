@@ -355,7 +355,7 @@ def _snapshot_process_fds(db_path: Path, out_path: Path) -> "Optional[str]":
             f"size={st.st_size} -> {target}{flag}"
         )
     try:
-        out_path.write_text("\n".join(lines) + "\n")
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except OSError as exc:
         return f"fd snapshot write failed: {exc}"
     return f"{len(lines) - 1} fds captured, {aliases} aliasing the DB, at {out_path}"
@@ -385,6 +385,35 @@ def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
     ts = time.strftime("%Y%m%d-%H%M%S")
     recovered_tmp = path.with_name(path.name + f".recovered-{ts}.tmp")
     corrupt_bak = path.with_name(path.name + f".corrupt-{ts}.bak")
+
+    def _dev_ino(p: Path) -> "tuple[int, int] | None":
+        try:
+            st = os.stat(p)
+            return (st.st_dev, st.st_ino)
+        except OSError:
+            return None
+
+    # BUILD-567 writer-safe swap. Hold ONE connection open from before the
+    # .recover snapshot through the swap: ``PRAGMA data_version`` read on the
+    # SAME connection changes iff another connection commits in between. It is
+    # the right signal here because it is immune to checkpoint churn (a reader
+    # moving WAL frames into the DB is not a new commit) and because
+    # data_version is only meaningful within a single connection — comparing it
+    # across the separate opens a stat-based token would need is useless. The
+    # DB's dev/ino guards against an *external* replacement of the file (another
+    # recovery) that this connection could not observe. A raw sqlite3 connection
+    # is used (not kb.connect) precisely because the health guard would refuse
+    # to open the corrupt file; the idle connection holds no lock during the
+    # slow .recover.
+    ino_before = _dev_ino(path)
+    guard = None
+    try:
+        guard = sqlite3.connect(str(path), timeout=5.0)
+        dv_before = guard.execute("PRAGMA data_version").fetchone()[0]
+    except sqlite3.Error as exc:
+        if guard is not None:
+            guard.close()
+        return False, f"could not open board to guard the swap: {exc}"
     try:
         # No immutable=1: it tells SQLite the file cannot change, so the
         # .recover pass skips locks AND the live WAL — the 2026-07-18 ROOT
@@ -413,6 +442,24 @@ def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
                 "recovered DB failed integrity_check: "
                 + check.stdout.decode(errors="replace")[:200]
             )
+        # Take the write lock (BEGIN IMMEDIATE only acquires the RESERVED lock —
+        # it does not read user btrees, so it still succeeds on an index-corrupt
+        # DB) and re-verify nothing committed since the .recover snapshot.
+        # Holding the lock across the os.replace sequence also stops a fresh
+        # connect() from landing mid-swap and binding a stale -wal to the
+        # recovered inode.
+        try:
+            guard.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            return False, f"could not acquire write lock for swap: {exc}"
+        if _dev_ino(path) != ino_before:
+            return False, "board file was replaced during recovery; aborting swap (retry next tick)"
+        dv_after = guard.execute("PRAGMA data_version").fetchone()[0]
+        if dv_after != dv_before:
+            return False, (
+                "board changed during recovery; aborting swap "
+                "(a writer committed since the .recover snapshot; retry next tick)"
+            )
         os.replace(path, corrupt_bak)
         for suffix in ("-wal", "-shm"):
             sidecar = path.with_name(path.name + suffix)
@@ -425,6 +472,16 @@ def _attempt_board_db_recovery(kb, slug: str) -> "tuple[bool, str]":
     except OSError as exc:
         return False, f"recovery swap failed: {exc}"
     finally:
+        # guard's fd references the pre-swap inode; closing it drops locks only
+        # on the discarded corrupt_bak, never on the freshly-installed DB.
+        try:
+            guard.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            guard.close()
+        except sqlite3.Error:
+            pass
         try:
             if recovered_tmp.exists() and path.exists() and not recovered_tmp.samefile(path):
                 recovered_tmp.unlink()
