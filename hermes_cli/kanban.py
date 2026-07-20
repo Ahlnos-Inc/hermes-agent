@@ -708,10 +708,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # footgun something you have to reach for, not fall into.
     p_disp.add_argument(
         "--force", action="store_true",
-        help="Bypass the single-dispatcher lock and dispatch even while "
-             "another dispatcher (typically the gateway's embedded one) "
-             "holds it. Dangerous: races the other dispatcher on the same "
-             "kanban.db. Prefer stopping the other dispatcher instead.",
+        help="Proceed only when the single-dispatcher lock is unavailable; "
+             "never override a lock held by another dispatcher.",
     )
 
     # --- daemon (deprecated) ---
@@ -2356,62 +2354,65 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     """Run one dispatcher pass, guarded by the machine-wide singleton lock.
 
-    BUILD-263: refuses (clear stderr message, nonzero exit) when another
-    dispatcher already holds the lock — typically the gateway's embedded
-    dispatcher (``kanban.dispatch_in_gateway``, default true), which holds
-    this exact same lock (:func:`gateway.kanban_watchers._acquire_singleton_lock`
-    at :func:`gateway.kanban_watchers.dispatcher_singleton_lock_path`) for
-    its entire process lifetime. Without this guard a manually-run — or
-    worse, forgotten-in-a-shell-loop — ``hermes kanban dispatch`` races the
-    gateway on the same ``kanban.db`` with no mutual exclusion: exactly the
-    2026-07-08 incident, where two such orphaned loops ran unnoticed for 6
-    and 19 days. ``--force`` bypasses the guard for the rare legitimate case
-    (e.g. the gateway is intentionally not running dispatch).
+    BUILD-263: always attempts the exact lock held by the gateway's embedded
+    dispatcher (``kanban.dispatch_in_gateway``, default true). It refuses
+    (clear stderr message, nonzero exit) when another dispatcher already holds
+    that lock. ``--force`` is only an explicit opt-in for the narrower case
+    where the locking mechanism is genuinely unavailable; it never overrides
+    OS-level lock contention.
     """
     force = bool(getattr(args, "force", False))
     lock_handle = None
-    if not force:
-        lock_path = None
-        try:
-            from gateway.kanban_watchers import (
-                _acquire_singleton_lock,
-                _read_singleton_lock_holder_pid,
-                dispatcher_singleton_lock_path,
-            )
-            lock_path = dispatcher_singleton_lock_path()
-            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
-        except Exception:
-            # Fail OPEN — same posture as the gateway side when locking
-            # can't be performed at all (non-POSIX filesystem without
-            # flock, or gateway.kanban_watchers unimportable in a stripped
-            # install). Mutual exclusion is best-effort; it must never be
-            # the reason a legitimate dispatch can't run.
-            lock_handle, lock_state = None, "unavailable"
-        if lock_state == "contended":
-            holder_pid = (
-                _read_singleton_lock_holder_pid(lock_path) if lock_path else None
-            )
-            holder_desc = f" (pid {holder_pid})" if holder_pid else ""
+    lock_path = None
+    try:
+        from gateway.kanban_watchers import (
+            _acquire_singleton_lock,
+            _read_singleton_lock_holder_pid,
+            dispatcher_singleton_lock_path,
+        )
+        lock_path = dispatcher_singleton_lock_path()
+        # Always ask the OS for the shared lock, including under --force.
+        # --force only changes the policy for a genuinely unavailable lock.
+        lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+    except Exception:
+        # Treat an import, path, or platform locking failure as unavailable.
+        # The normal policy is fail closed; --force is the explicit, narrow
+        # escape hatch for environments where the lock cannot be used.
+        lock_handle, lock_state = None, "unavailable"
+    if lock_state == "contended":
+        holder_pid = (
+            _read_singleton_lock_holder_pid(lock_path) if lock_path else None
+        )
+        holder_desc = f" (pid {holder_pid})" if holder_pid else ""
+        print(
+            f"hermes kanban dispatch: refusing — another dispatcher"
+            f"{holder_desc} already holds the singleton lock at "
+            f"{lock_path}.\n"
+            "This is almost always the gateway's embedded dispatcher "
+            "(kanban.dispatch_in_gateway, default true) — running a "
+            "second one races it on the same kanban.db with no mutual "
+            "exclusion.\n"
+            "Stop the other dispatcher; --force cannot override a held "
+            "singleton lock.",
+            file=sys.stderr,
+        )
+        return 3
+    if lock_state == "unavailable":
+        if not force:
             print(
-                f"hermes kanban dispatch: refusing — another dispatcher"
-                f"{holder_desc} already holds the singleton lock at "
-                f"{lock_path}.\n"
-                "This is almost always the gateway's embedded dispatcher "
-                "(kanban.dispatch_in_gateway, default true) — running a "
-                "second one races it on the same kanban.db with no mutual "
-                "exclusion.\n"
-                "Stop the other dispatcher, or pass --force to override "
-                "(dangerous: two dispatchers may then race on kanban.db).",
+                "hermes kanban dispatch: refusing — the single-dispatcher "
+                "lock is unavailable on this platform/filesystem. "
+                "Use --force only if you have verified that no other "
+                "dispatcher can be running.",
                 file=sys.stderr,
             )
             return 3
-        if lock_state == "unavailable":
-            print(
-                "hermes kanban dispatch: warning — the single-dispatcher "
-                "lock is unavailable on this platform/filesystem; "
-                "proceeding without the mutual-exclusion guard.",
-                file=sys.stderr,
-            )
+        print(
+            "hermes kanban dispatch: warning — the single-dispatcher lock "
+            "is unavailable on this platform/filesystem; proceeding only "
+            "because --force was specified.",
+            file=sys.stderr,
+        )
     try:
         return _cmd_dispatch_run(args)
     finally:

@@ -7,7 +7,9 @@ with no mutual exclusion. The CLI `dispatch` entry now takes the exact same
 machine-wide singleton lock the gateway's embedded dispatcher holds
 (`gateway.kanban_watchers._acquire_singleton_lock` /
 `dispatcher_singleton_lock_path`), refusing loudly (nonzero exit) when
-another dispatcher already holds it, unless `--force`.
+another dispatcher already holds it, including with `--force`. The force
+flag is limited to explicitly permitting operation when locking is genuinely
+unavailable.
 """
 
 from __future__ import annotations
@@ -82,7 +84,9 @@ def test_dispatch_refuses_when_another_dispatcher_holds_the_lock(
     kanban_home, monkeypatch, capsys,
 ):
     calls = []
-    _stub_dispatch_once(monkeypatch, calls)
+    monkeypatch.setattr(
+        kb_cli, "_cmd_dispatch_run", lambda _args: calls.append(True) or 0,
+    )
 
     lock_path = dispatcher_singleton_lock_path()
     holder_handle, holder_state = _acquire_singleton_lock(lock_path)
@@ -93,15 +97,19 @@ def test_dispatch_refuses_when_another_dispatcher_holds_the_lock(
         _release_singleton_lock(holder_handle)
 
     assert rc != 0
-    assert calls == [], "dispatch_once must NOT run while another dispatcher holds the lock"
+    assert calls == [], "_cmd_dispatch_run must not run on lock contention"
     err = capsys.readouterr().err
     assert "refusing" in err.lower()
     assert "--force" in err
 
 
-def test_dispatch_force_bypasses_a_held_lock(kanban_home, monkeypatch):
+def test_dispatch_force_does_not_bypass_a_held_lock(
+    kanban_home, monkeypatch, capsys,
+):
     calls = []
-    _stub_dispatch_once(monkeypatch, calls)
+    monkeypatch.setattr(
+        kb_cli, "_cmd_dispatch_run", lambda _args: calls.append(True) or 0,
+    )
 
     lock_path = dispatcher_singleton_lock_path()
     holder_handle, holder_state = _acquire_singleton_lock(lock_path)
@@ -111,8 +119,9 @@ def test_dispatch_force_bypasses_a_held_lock(kanban_home, monkeypatch):
     finally:
         _release_singleton_lock(holder_handle)
 
-    assert rc == 0
-    assert len(calls) == 1, "--force must bypass the lock and still dispatch"
+    assert rc != 0
+    assert calls == [], "--force must not bypass lock contention"
+    assert "cannot override" in capsys.readouterr().err
 
 
 def test_dispatch_reports_holder_pid_when_available(kanban_home, monkeypatch, capsys):
@@ -155,10 +164,8 @@ def test_stale_lock_is_reclaimed_automatically_after_holder_process_dies(
     assert len(calls) == 1, "a stale (crashed-holder) lock must be reclaimed automatically"
 
 
-def test_dispatch_fails_open_when_lock_is_unavailable(kanban_home, monkeypatch):
-    """When the locking mechanism itself can't be used (import failure,
-    non-POSIX filesystem, etc.) dispatch must still proceed — mutual
-    exclusion is best-effort and must never block a legitimate dispatch."""
+def test_dispatch_fails_closed_when_lock_is_unavailable(kanban_home, monkeypatch):
+    """Unavailable locking fails closed unless --force is explicit."""
     calls = []
     _stub_dispatch_once(monkeypatch, calls)
 
@@ -170,8 +177,51 @@ def test_dispatch_fails_open_when_lock_is_unavailable(kanban_home, monkeypatch):
 
     rc = kb_cli._cmd_dispatch(_args())
 
+    assert rc != 0
+    assert calls == []
+
+
+def test_dispatch_force_proceeds_when_lock_is_unavailable(
+    kanban_home, monkeypatch, capsys,
+):
+    calls = []
+    _stub_dispatch_once(monkeypatch, calls)
+
+    import gateway.kanban_watchers as watchers_mod
+
+    monkeypatch.setattr(
+        watchers_mod, "_acquire_singleton_lock", lambda _path: (None, "unavailable"),
+    )
+
+    rc = kb_cli._cmd_dispatch(_args(force=True))
+
     assert rc == 0
     assert len(calls) == 1
+    assert "--force" in capsys.readouterr().err
+
+
+def test_dispatch_force_still_attempts_the_canonical_gateway_lock(
+    kanban_home, monkeypatch,
+):
+    calls = []
+    _stub_dispatch_once(monkeypatch, calls)
+    observed_paths = []
+
+    import gateway.kanban_watchers as watchers_mod
+
+    real_acquire = watchers_mod._acquire_singleton_lock
+
+    def record_acquire(path):
+        observed_paths.append(path)
+        return real_acquire(path)
+
+    monkeypatch.setattr(watchers_mod, "_acquire_singleton_lock", record_acquire)
+
+    rc = kb_cli._cmd_dispatch(_args(force=True))
+
+    assert rc == 0
+    assert calls
+    assert observed_paths == [dispatcher_singleton_lock_path()]
 
 
 def test_run_slash_dispatch_accepts_force_flag(kanban_home):
