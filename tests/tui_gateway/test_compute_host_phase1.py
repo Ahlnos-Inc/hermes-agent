@@ -285,6 +285,26 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert not registry.exists()
 
 
+def test_supervisor_spawn_env_does_not_restore_stripped_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token")
+    monkeypatch.setenv("PATH", "/required/bin")
+
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-c", ""],
+        heartbeat_secs=23,
+        autostart=False,
+    )
+
+    env = supervisor._build_spawn_env()
+
+    assert env["PATH"] == "/required/bin"
+    assert env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] == "23"
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
 def test_supervisor_crash_emits_turn_error_and_respawns(tmp_path):
     script = tmp_path / "fake_host.py"
     script.write_text(

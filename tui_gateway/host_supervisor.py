@@ -305,19 +305,23 @@ class HostSupervisor:
             with self._lock:
                 self._pending_controls.pop(request_id, None)
 
-    def _spawn_locked(self, *, reason: str) -> None:
-        if self._stopped_respawning:
-            raise RuntimeError("compute host respawn disabled after crash loop")
-        self._hello_event.clear()
-        self._hello = {}
+    def _build_spawn_env(self) -> dict[str, str]:
+        """Build the sanitized environment for a compute-host child."""
         env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
         if self.env:
             env.update(self.env)
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = str(_repo_root()) + os.pathsep + env["PYTHONPATH"]
+        return env
+
+    def _spawn_locked(self, *, reason: str) -> None:
+        if self._stopped_respawning:
+            raise RuntimeError("compute host respawn disabled after crash loop")
+        self._hello_event.clear()
+        self._hello = {}
+        env = self._build_spawn_env()
         proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),
