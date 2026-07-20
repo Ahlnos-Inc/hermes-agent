@@ -200,6 +200,8 @@ def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     git_config = Path(run_env["GIT_CONFIG_GLOBAL"])
     gh_config = Path(run_env["GH_CONFIG_DIR"])
     assert run_env["GH_TOKEN"] == TOKEN
+    # github_write does NOT carry bws_bootstrap: no BWS token in the terminal.
+    assert "BWS_ACCESS_TOKEN" not in run_env
     assert run_env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert run_env["GIT_CONFIG_COUNT"] == "2"
     assert run_env["GIT_CONFIG_VALUE_0"] == ""
@@ -242,6 +244,44 @@ def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     assert fill.returncode == 0, fill.stderr
     assert f"password={TOKEN}" in fill.stdout
     assert TOKEN not in caplog.text
+
+
+def test_bws_bootstrap_worker_terminal_gets_bws_access_token(tmp_path, monkeypatch):
+    """The transitional bws_bootstrap grant reaches worker subprocesses.
+
+    Regression for the marketing-operator break: its skill shells out to the
+    ``bws`` CLI, which needs BWS_ACCESS_TOKEN in the terminal env. The value
+    must be the contract-delivered handoff, not any ambient copy.
+    """
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / wc.MANIFEST_FILENAME).write_text(
+        "version: 1\n"
+        "profiles:\n"
+        "  marketing-operator:\n"
+        "    actions: [bws_bootstrap]\n"
+        "  releaser:\n"
+        "    actions: [github_write]\n",
+        encoding="utf-8",
+    )
+    delivered = "worker-bws-token-never-log"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_PROFILE", "marketing-operator")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-bws-terminal")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(hermes_home).digest)
+    monkeypatch.setenv(wc.BWS_BOOTSTRAP_HANDOFF_ENV, delivered)
+    # An ambient BWS token must be stripped and replaced by the delivered one.
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "ambient-bws-must-not-survive")
+    wc.reset_worker_credential_context_for_tests()
+    try:
+        run_env = local._make_run_env({"PATH": "/usr/bin:/bin"})
+        assert run_env.get("BWS_ACCESS_TOKEN") == delivered
+        # bws_bootstrap does NOT carry github_write: no GH_TOKEN.
+        assert "GH_TOKEN" not in run_env
+    finally:
+        wc.cleanup_worker_terminal_artifacts()
+        wc.reset_worker_credential_context_for_tests()
 
 
 def test_terminal_artifact_cleanup_is_idempotent(monkeypatch, worker_contract):

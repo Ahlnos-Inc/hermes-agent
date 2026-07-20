@@ -527,12 +527,21 @@ def _terminal_artifacts() -> tuple[Path, Path, Path]:
 def project_worker_terminal_environment(
     environ: dict[str, str],
 ) -> bool:
-    """Isolate worker terminals and project ``github_write`` when trusted."""
+    """Isolate worker terminals and project trusted action credentials.
+
+    ``github_write`` is projected as ``GH_TOKEN`` plus a token-free git helper.
+    ``bws_bootstrap`` is the transitional FULL-PROCESS grant (marketing-operator):
+    its ``BWS_ACCESS_TOKEN`` must also reach the worker's subprocesses — e.g. the
+    ``bws`` CLI the marketing skill shells out to for its Instagram secrets — so
+    it is re-projected here after the sanitizer stripped every ambient copy. Only
+    a trusted worker with the grant receives either value.
+    """
     runtime = bootstrap_worker_credential_context()
     if runtime is None:
         return False
 
     token = get_trusted_worker_credential("github_write", environ=os.environ)
+    bws_bootstrap = get_trusted_worker_credential("bws_bootstrap", environ=os.environ)
     _run_dir, gh_config_dir, git_config = _terminal_artifacts()
     # Remove ambient command-scope config knobs before installing the exact
     # two entries below.  This is configuration isolation, not a credential
@@ -556,6 +565,8 @@ def project_worker_terminal_environment(
         environ["GH_TOKEN"] = token
         environ["GIT_CONFIG_KEY_1"] = "credential.helper"
         environ["GIT_CONFIG_VALUE_1"] = GIT_ENV_TOKEN_HELPER
+    if bws_bootstrap is not None:
+        environ[BWS_BOOTSTRAP_ENV] = bws_bootstrap
     return True
 
 
