@@ -12173,6 +12173,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Profile-build onboarding directive failed, using plain intro: %s",
                         _pb_err,
                     )
+                    context_prompt += _intro_note
 
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
