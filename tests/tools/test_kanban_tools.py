@@ -1189,7 +1189,7 @@ def test_block_rejects_empty_reason(worker_env):
         assert json.loads(out).get("error")
 
 
-def _make_goal_mode_worker_env(monkeypatch, tmp_path):
+def _make_goal_mode_worker_env(monkeypatch, tmp_path, *, unfinished_parent=False):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
     from pathlib import Path as _Path
@@ -1212,6 +1212,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
         )
         claimed = kb.claim_task(conn, goal_task_id)
         _attest_test_worker(kb, conn, claimed, monkeypatch)
+        if unfinished_parent:
+            parent_id = kb.create_task(
+                conn, title="unfinished dependency", assignee="test-worker",
+            )
+            # Link after claiming so the test models a worker that discovers
+            # the dependency during its active attempt.
+            kb.link_tasks(conn, parent_id, goal_task_id)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
@@ -1268,7 +1275,9 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
-    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    tid = _make_goal_mode_worker_env(
+        monkeypatch, tmp_path, unfinished_parent=True,
+    )
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True

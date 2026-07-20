@@ -6122,18 +6122,17 @@ def test_block_task_needs_input_persists_failure_signature_event(kanban_home):
     assert payload["signature"] == _SMOKE_CHECK_SAMPLE
 
 
-def test_block_task_dependency_wait_does_not_persist_failure_signature(
+def test_block_task_dependency_wait_persists_failure_signature(
     kanban_home,
 ):
-    """A ``dependency`` block is healthy backpressure on an unfinished
-    parent, not a failure — it must NOT contribute to the circuit
-    breaker's history."""
+    """A genuine dependency wait contributes its graph-aware signature."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        child = kb.create_task(
-            conn, title="child", assignee="alice", parents=[parent],
-        )
-        kb.block_task(
+        child = kb.create_task(conn, title="child", assignee="alice")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+        assert kb.block_task(
             conn, child, reason=_SMOKE_CHECK_SAMPLE, kind="dependency",
         )
         rows = conn.execute(
@@ -6141,7 +6140,26 @@ def test_block_task_dependency_wait_does_not_persist_failure_signature(
             "AND kind = 'failure_signature'",
             (child,),
         ).fetchall()
-    assert rows == []
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["source"] == "dependency_wait"
+    assert payload["unresolved_parent_ids"] == [parent]
+    assert payload["dependency_reason"] == _SMOKE_CHECK_SAMPLE
+
+
+def test_successful_completion_resets_failure_signature_history(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fresh run", assignee="alice")
+        _record_signature_failure(conn, task_id, _SMOKE_CHECK_SAMPLE)
+        _record_signature_failure(conn, task_id, _SMOKE_CHECK_SAMPLE)
+        assert kb.check_failure_signature_breaker(conn, task_id) is not None
+        assert kb.complete_task(conn, task_id, result="recovered")
+        assert kb.check_failure_signature_breaker(conn, task_id) is None
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'failure_signature' LIMIT 1",
+            (task_id,),
+        ).fetchone() is None
 
 
 def test_block_task_with_no_usable_reason_text_records_nothing(kanban_home):

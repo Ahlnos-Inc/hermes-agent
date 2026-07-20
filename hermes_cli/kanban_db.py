@@ -148,7 +148,8 @@ BLOCK_RECURRENCE_LIMIT = 2
 # _set_status_direct``), not by anything in this module.
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "spawn_failed", "block_loop_detected", "status", "archived", "unblocked",
+    "spawn_failed", "block_loop_detected", "dependency_loop_detected",
+    "status", "archived", "unblocked",
 )
 # The subset of TERMINAL_KINDS that represents a step actually going wrong,
 # as opposed to progressing normally (``completed``) or being administratively
@@ -7781,6 +7782,14 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # A successful completion starts a fresh breaker window. Keep the
+        # ordinary task-event audit trail, but remove only the derived
+        # failure-signature samples so an old dependency wall cannot trip a
+        # later, unrelated run.
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, _FAILURE_SIGNATURE_EVENT_KIND),
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8441,6 +8450,23 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+        dependency_info = None
+        dependency_hard_block = False
+        if kind == "dependency":
+            dependency_info = _dependency_wait_info(
+                conn, task_id, effective_summary,
+            )
+            if not dependency_info["unresolved_parent_ids"]:
+                # A dependency wait is only recoverable while a linked parent
+                # is unfinished.  Treat a false dependency classification as a
+                # human blocker instead of parking it in todo, where the
+                # dispatcher would immediately promote it again.
+                dependency_hard_block = True
+                kind = "needs_input"
+                reason = _dependency_hard_block_reason(
+                    dependency_info, effective_summary,
+                )
+                effective_summary = summary or reason
 
         if kind == "dependency":
             cur = conn.execute(
@@ -8480,116 +8506,127 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "signature": _record_dependency_wait(
+                        conn, task_id, effective_summary,
+                        dependency_info=dependency_info, run_id=run_id,
+                    )["signature"],
+                    "unresolved_parent_ids": dependency_info["unresolved_parent_ids"],
+                },
+                run_id=run_id,
             )
             _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            target_status = "triage"
-            event_kind = "block_loop_detected"
         else:
-            target_status = "blocked"
-            event_kind = "blocked"
+            # Truly-blocked kinds. Increment the unblock-loop counter when this
+            # is a re-block for the SAME reason after a prior unblock.
+            same_cause = prev_kind == kind
+            recurrences = prev_recurrences + 1 if same_cause else 1
 
-        if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = ?,
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       worker_started_at = NULL,
-                       worker_pgid = NULL,
-                       worker_sid = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
-                """ + (
-                    " AND current_run_id IS NULL" if require_no_active_run else ""
-                ),
-                (target_status, kind, recurrences, task_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = ?,
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       worker_started_at = NULL,
-                       worker_pgid = NULL,
-                       worker_sid = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
-                   AND current_run_id = ?
-                """,
-                (target_status, kind, recurrences, task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
-            return False
-        run_id = _end_run(
-            conn, task_id,
-            outcome="blocked", status="blocked",
-            summary=effective_summary,
-            metadata=metadata,
-        )
-        if run_id is None and effective_summary:
-            run_id = _synthesize_ended_run(
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                target_status = "triage"
+                event_kind = "block_loop_detected"
+            else:
+                target_status = "blocked"
+                event_kind = "blocked"
+
+            if expected_run_id is None:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = ?,
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           worker_started_at = NULL,
+                           worker_pgid = NULL,
+                           worker_sid = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'review')
+                    """ + (
+                        " AND current_run_id IS NULL" if require_no_active_run else ""
+                    ),
+                    (target_status, kind, recurrences, task_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = ?,
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           worker_started_at = NULL,
+                           worker_pgid = NULL,
+                           worker_sid = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'review')
+                       AND current_run_id = ?
+                    """,
+                    (target_status, kind, recurrences, task_id, int(expected_run_id)),
+                )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
                 conn, task_id,
-                outcome="blocked",
+                outcome="blocked", status="blocked",
                 summary=effective_summary,
                 metadata=metadata,
             )
-        payload = {"reason": reason, "kind": kind, "recurrences": recurrences}
-        if event_kind == "block_loop_detected":
-            payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
-        # BUILD-261: record the normalized failure signature for this
-        # block so the release/remediation circuit breaker
-        # (check_failure_signature_breaker) can compare it against this
-        # task's (or its remediation children's) next attempt before a
-        # future respawn. A worker's block reason is exactly the shape of
-        # a CI failure excerpt (e.g. "##[error]smoke check failed: ...").
-        # Deliberately NOT hooked into the crash/timeout/spawn-failure
-        # funnel (_record_task_failure) — that path already has its own
-        # well-tested, independently-configurable failure_limit breaker,
-        # and layering a second, lower-default-threshold breaker on the
-        # identical event stream would silently override an operator's
-        # more lenient failure_limit for any task whose infra errors
-        # happen to repeat verbatim (very common). This path — a task
-        # explicitly blocked with a human-readable reason — is where the
-        # BUILD-261 incident's failure text actually lives.
-        _record_failure_signature(
-            conn, task_id, effective_summary, run_id=run_id,
+            if run_id is None and effective_summary:
+                run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome="blocked",
+                    summary=effective_summary,
+                    metadata=metadata,
+                )
+            payload = {"reason": reason, "kind": kind, "recurrences": recurrences}
+            if event_kind == "block_loop_detected":
+                payload["limit"] = BLOCK_RECURRENCE_LIMIT
+            _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+            # BUILD-261: record the normalized failure signature for this
+            # block so the release/remediation circuit breaker
+            # (check_failure_signature_breaker) can compare it against this
+            # task's (or its remediation children's) next attempt before a
+            # future respawn. A worker's block reason is exactly the shape of
+            # a CI failure excerpt (e.g. "##[error]smoke check failed: ...").
+            # Deliberately NOT hooked into the crash/timeout/spawn-failure
+            # funnel (_record_task_failure) — that path already has its own
+            # well-tested, independently-configurable failure_limit breaker,
+            # and layering a second, lower-default-threshold breaker on the
+            # identical event stream would silently override an operator's
+            # more lenient failure_limit for any task whose infra errors
+            # happen to repeat verbatim (very common). This path — a task
+            # explicitly blocked with a human-readable reason — is where the
+            # BUILD-261 incident's failure text actually lives.
+            _record_failure_signature(
+                conn, task_id, effective_summary, run_id=run_id,
+            )
+            if dependency_hard_block:
+                _append_dependency_loop_event(
+                    conn,
+                    task_id,
+                    signature=dependency_info["signature"],
+                    recurrences=1,
+                    limit=_resolve_failure_signature_repeat_threshold(),
+                    reason=dependency_info["normalized_reason"] or reason,
+                    run_id=run_id,
+                )
+            _blocked_task = get_task(conn, task_id)
+    if kind != "dependency":
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=reason,
         )
-        _blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_blocked",
-        task_id,
-        board=get_current_board(),
-        assignee=_blocked_task.assignee if _blocked_task else None,
-        run_id=run_id,
-        reason=reason,
-    )
     return True
 
 
@@ -8695,24 +8732,38 @@ def operator_block_task(
                 )
         return OperatorBlockResult(True, False, termination)
 
-    prev_kind = fenced["block_kind"]
-    prev_recurrences = int(fenced["block_recurrences"] or 0)
-    if kind == "dependency":
-        recurrences = prev_recurrences
-        target_status = "todo"
-        event_kind = "dependency_wait"
-    else:
-        recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-        target_status = (
-            "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
-        )
-        event_kind = (
-            "block_loop_detected"
-            if target_status == "triage"
-            else "blocked"
-        )
     now = int(time.time())
     with write_txn(conn):
+        prev_kind = fenced["block_kind"]
+        prev_recurrences = int(fenced["block_recurrences"] or 0)
+        dependency_info = None
+        dependency_hard_block = False
+        if kind == "dependency":
+            dependency_info = _dependency_wait_info(
+                conn, task_id, effective_summary,
+            )
+            if not dependency_info["unresolved_parent_ids"]:
+                dependency_hard_block = True
+                kind = "needs_input"
+                reason = _dependency_hard_block_reason(
+                    dependency_info, effective_summary,
+                )
+                effective_summary = summary or reason
+
+        if kind == "dependency":
+            recurrences = prev_recurrences
+            target_status = "todo"
+            event_kind = "dependency_wait"
+        else:
+            recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+            target_status = (
+                "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+            )
+            event_kind = (
+                "block_loop_detected"
+                if target_status == "triage"
+                else "blocked"
+            )
         cur = conn.execute(
             """UPDATE tasks
                   SET status = ?, claim_lock = NULL, claim_expires = NULL,
@@ -8756,6 +8807,14 @@ def operator_block_task(
         payload = {"reason": reason, "kind": kind}
         if kind != "dependency":
             payload["recurrences"] = recurrences
+        else:
+            payload["signature"] = _record_dependency_wait(
+                conn, task_id, effective_summary,
+                dependency_info=dependency_info, run_id=run_id,
+            )["signature"]
+            payload["unresolved_parent_ids"] = dependency_info[
+                "unresolved_parent_ids"
+            ]
         if event_kind == "block_loop_detected":
             payload["limit"] = BLOCK_RECURRENCE_LIMIT
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
@@ -8763,15 +8822,26 @@ def operator_block_task(
             _record_failure_signature(
                 conn, task_id, effective_summary, run_id=run_id,
             )
+            if dependency_hard_block:
+                _append_dependency_loop_event(
+                    conn,
+                    task_id,
+                    signature=dependency_info["signature"],
+                    recurrences=1,
+                    limit=_resolve_failure_signature_repeat_threshold(),
+                    reason=dependency_info["normalized_reason"] or reason,
+                    run_id=run_id,
+                )
         blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_blocked",
-        task_id,
-        board=get_current_board(),
-        assignee=blocked_task.assignee if blocked_task else None,
-        run_id=run_id,
-        reason=reason,
-    )
+    if kind != "dependency":
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
     return OperatorBlockResult(True, True, termination)
 
 
@@ -12430,6 +12500,7 @@ def _record_failure_signature(
     error_text: Optional[str],
     *,
     run_id: Optional[int] = None,
+    context: Optional[dict] = None,
 ) -> str:
     """Persist the normalized failure signature for a run that just ended
     in failure, as a ``failure_signature`` task_event.
@@ -12444,12 +12515,132 @@ def _record_failure_signature(
     sig = normalize_failure_signature(error_text)
     if not sig:
         return ""
+    payload = {
+        "signature": sig,
+        "raw_excerpt": (error_text or "")[:300],
+    }
+    if context:
+        payload.update(context)
     _append_event(
         conn, task_id, _FAILURE_SIGNATURE_EVENT_KIND,
-        {"signature": sig, "raw_excerpt": (error_text or "")[:300]},
+        payload,
         run_id=run_id,
     )
     return sig
+
+
+def _dependency_wait_info(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: Optional[str],
+) -> dict:
+    """Return the stable accounting identity for one dependency report.
+
+    A dependency wait is specific to the unfinished parent set, not merely
+    to the prose a worker happened to use.  Parent ids are sorted so the
+    same graph state produces the same signature regardless of query order;
+    the reason uses the existing failure-signature normalizer so timestamps,
+    run ids, and other attempt-specific noise do not defeat the breaker.
+    """
+    rows = conn.execute(
+        """SELECT p.id, p.status, p.policy_quarantined, p.policy_invalidated
+             FROM tasks p
+             JOIN task_links l ON l.parent_id = p.id
+            WHERE l.child_id = ?""",
+        (task_id,),
+    ).fetchall()
+    parent_ids = sorted(row["id"] for row in rows)
+    unresolved_parent_ids = sorted(
+        row["id"]
+        for row in rows
+        if row["status"] not in ("done", "archived")
+        or row["policy_quarantined"]
+        or row["policy_invalidated"]
+    )
+    normalized_reason = normalize_failure_signature(reason)
+    signature = (
+        "dependency parents: "
+        f"{', '.join(unresolved_parent_ids) if unresolved_parent_ids else '<none>'}; "
+        f"reason: {normalized_reason or '<none>'}"
+    )
+    return {
+        "signature": signature,
+        "parent_ids": parent_ids,
+        "unresolved_parent_ids": unresolved_parent_ids,
+        "normalized_reason": normalized_reason,
+    }
+
+
+def _record_dependency_wait(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: Optional[str],
+    *,
+    dependency_info: Optional[dict] = None,
+    run_id: Optional[int] = None,
+) -> dict:
+    """Record one genuine dependency wait through the signature breaker.
+
+    Both worker and operator block paths call this helper.  False dependency
+    classifications still use the same signature construction, but are hard
+    blocked by their caller and do not enter the repeat window as waits.
+    """
+    info = dependency_info or _dependency_wait_info(conn, task_id, reason)
+    if info["unresolved_parent_ids"]:
+        info = dict(info)
+        info["signature"] = _record_failure_signature(
+            conn,
+            task_id,
+            info["signature"],
+            run_id=run_id,
+            context={
+                "source": "dependency_wait",
+                "unresolved_parent_ids": info["unresolved_parent_ids"],
+                "dependency_reason": info["normalized_reason"],
+            },
+        )
+    return info
+
+
+def _dependency_hard_block_reason(info: dict, reported_reason: Optional[str]) -> str:
+    """Explain why a claimed dependency cannot be parked for auto-resume."""
+    if info["parent_ids"]:
+        parent_context = (
+            "no unfinished linked parent "
+            f"(declared: {', '.join(info['parent_ids'])})"
+        )
+    else:
+        parent_context = "no linked parent"
+    detail = (reported_reason or "unspecified dependency wait").strip()
+    return (
+        "dependency_unavailable: artifact/capability unavailable; "
+        f"{parent_context}; reported reason: {detail}"
+    )
+
+
+def _append_dependency_loop_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    signature: str,
+    recurrences: int,
+    limit: int,
+    reason: Optional[str],
+    run_id: Optional[int] = None,
+) -> int:
+    """Append the dependency-loop audit event without firing another hook."""
+    return _append_event(
+        conn,
+        task_id,
+        "dependency_loop_detected",
+        {
+            "signature": signature,
+            "recurrences": recurrences,
+            "limit": limit,
+            "reason": reason,
+        },
+        run_id=run_id,
+    )
 
 
 def _resolve_failure_signature_repeat_threshold(
@@ -12514,12 +12705,23 @@ def _recent_failure_signatures(
             payload = json.loads(r["payload"]) if r["payload"] else {}
         except (TypeError, ValueError):
             payload = {}
-        out.append({
+        record = {
             "task_id": r["task_id"],
             "run_id": r["run_id"],
             "signature": payload.get("signature", ""),
             "created_at": r["created_at"],
-        })
+        }
+        if payload.get("source") == "dependency_wait":
+            record.update(
+                {
+                    "source": "dependency_wait",
+                    "unresolved_parent_ids": payload.get(
+                        "unresolved_parent_ids", []
+                    ),
+                    "dependency_reason": payload.get("dependency_reason", ""),
+                }
+            )
+        out.append(record)
     return out
 
 
@@ -12572,6 +12774,18 @@ def _trip_failure_signature_breaker(
         r["task_id"] + (f"#run{r['run_id']}" if r["run_id"] else "")
         for r in trip["records"]
     )
+    dependency_trip = bool(trip["records"]) and all(
+        record.get("source") == "dependency_wait"
+        for record in trip["records"]
+    )
+    dependency_reason = next(
+        (
+            record.get("dependency_reason")
+            for record in trip["records"]
+            if record.get("dependency_reason")
+        ),
+        "",
+    )
     reason = (
         f"circuit breaker: {trip['threshold']} consecutive identical "
         f"failure signatures — halting respawn (runs: {refs})"
@@ -12591,6 +12805,16 @@ def _trip_failure_signature_breaker(
         conn, task_id, reason=reason, summary=reason, kind="needs_input",
     )
     if blocked:
+        if dependency_trip:
+            with write_txn(conn):
+                _append_dependency_loop_event(
+                    conn,
+                    task_id,
+                    signature=trip["signature"],
+                    recurrences=len(trip["records"]),
+                    limit=trip["threshold"],
+                    reason=dependency_reason or reason,
+                )
         try:
             add_comment(conn, task_id, "circuit-breaker", comment)
         except ValueError:

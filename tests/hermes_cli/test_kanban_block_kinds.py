@@ -136,13 +136,21 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 
 def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
-    """Dependency waits never enter the human 'blocked' bucket."""
+    """A dependency wait with an unfinished linked parent parks in todo."""
     with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
         tid = _running_task(conn)
+        kb.link_tasks(conn, parent, tid)
         assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
+        signature_events = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "failure_signature"
+        ]
+        assert len(signature_events) == 1
+        assert parent in signature_events[0].payload["signature"]
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
@@ -160,6 +168,122 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         kb.complete_task(conn, parent, result="done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
+
+
+def test_dependency_without_unfinished_parent_hard_blocks_first_wait(
+    kanban_home: Path,
+) -> None:
+    """A false dependency claim cannot re-enter the promotion loop."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="already done", assignee="worker")
+        assert kb.complete_task(conn, parent, result="done")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent, child)
+
+        assert kb.block_task(
+            conn, child, reason="artifact commit is unreachable", kind="dependency",
+        )
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert "artifact/capability unavailable" in (
+            kb.latest_run(conn, child).summary or ""
+        )
+        events = [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "dependency_loop_detected"
+        ]
+        assert len(events) == 1
+        assert events[0].payload["recurrences"] == 1
+        assert events[0].payload["limit"] == kb.DEFAULT_FAILURE_SIGNATURE_REPEAT_THRESHOLD
+
+
+def test_repeated_dependency_signature_blocks_before_third_spawn(
+    kanban_home: Path, all_assignees_spawnable, monkeypatch,
+) -> None:
+    """Equivalent waits are capped by the existing dispatch breaker."""
+    hooks: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, *_args, **kwargs: hooks.append((event, kwargs.get("reason"))),
+    )
+    with kb.connect_closing() as conn:
+        pending_parent = kb.create_task(
+            conn, title="still running", assignee="worker",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='running' WHERE id=?",
+                (pending_parent,),
+            )
+        done_parent = kb.create_task(conn, title="done parent", assignee="worker")
+        assert kb.complete_task(conn, done_parent, result="done")
+        hooks.clear()
+        child = kb.create_task(
+            conn, title="child", assignee="alice",
+        )
+        kb.link_tasks(conn, pending_parent, child)
+
+        for _ in range(2):
+            with kb.write_txn(conn):
+                # The parent gate normally prevents a claim while this
+                # parent is running; this direct status transition models a
+                # second worker report from a raced/legacy ready row and
+                # exercises the shared accounting path itself.
+                conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+            assert kb.block_task(
+                conn,
+                child,
+                reason="2026-07-20T12:00:00Z parent artifact is not reachable",
+                kind="dependency",
+            )
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        spawned: list[str] = []
+
+        def fake_spawn(task, _workspace):
+            spawned.append(task.id)
+            return kb.SpawnReceipt(
+                pid=12345,
+                release=lambda: None,
+                abort=lambda: None,
+                process_started_at=1234.5,
+                process_group_id=12345,
+                session_id=12345,
+            )
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, child)
+        loop_events = [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "dependency_loop_detected"
+        ]
+
+    assert spawned == []
+    assert task is not None
+    assert (child, loop_events[-1].payload["signature"]) in result.circuit_breaker_tripped
+    assert task.status == "blocked"
+    assert len(loop_events) == 1
+    assert loop_events[0].payload["recurrences"] == 2
+    assert [event for event, _reason in hooks] == ["kanban_task_blocked"], hooks
+
+
+def test_dependency_wait_signatures_do_not_cross_trip(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        parent_a = kb.create_task(conn, title="parent a", assignee="worker")
+        parent_b = kb.create_task(conn, title="parent b", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_a, child)
+        kb.link_tasks(conn, parent_b, child)
+        assert kb.block_task(conn, child, reason="wait for A", kind="dependency")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+        assert kb.block_task(conn, child, reason="wait for B", kind="dependency")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert kb.check_failure_signature_breaker(conn, child) is None
 
 
 # ---------------------------------------------------------------------------
