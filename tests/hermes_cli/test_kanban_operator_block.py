@@ -252,10 +252,12 @@ def test_operator_block_stale_run_cas_does_not_touch_replacement(tmp_path) -> No
 def test_operator_dependency_block_preserves_dependency_routing(tmp_path) -> None:
     db_path = tmp_path / "kanban.db"
     with contextlib.closing(kb.connect(db_path)) as conn:
+        parent_id = kb.create_task(conn, title="unfinished parent", assignee="worker")
         task_id = kb.create_task(conn, title="wait for dependency", assignee="worker")
         host = kb._claimer_id().split(":", 1)[0]
         claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
         assert claimed is not None
+        kb.link_tasks(conn, parent_id=parent_id, child_id=task_id)
         _attach_worker(conn, task_id, 62001)
 
         result = kb.operator_block_task(
