@@ -542,14 +542,14 @@ def _bootstrap_worker_credentials_early() -> None:
                 try:
                     from hermes_cli.worker_credentials import (
                         PRIVATE_HANDOFF_PREFIX,
-                        UNCONDITIONAL_STRIP_ENV,
+                        worker_credential_strip_env,
                     )
                 except Exception:
                     private_handoff_prefix = "HERMES_WORKER_CREDENTIAL_"
                     strip_env = _WORKER_CREDENTIAL_FALLBACK_STRIP_ENV
                 else:
                     private_handoff_prefix = PRIVATE_HANDOFF_PREFIX
-                    strip_env = UNCONDITIONAL_STRIP_ENV
+                    strip_env = worker_credential_strip_env()
                 for name in list(os.environ):
                     if (
                         name.startswith(private_handoff_prefix)

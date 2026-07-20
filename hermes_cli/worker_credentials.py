@@ -433,13 +433,7 @@ def bootstrap_worker_credential_context(
                 if definition.handoff_env in handoff
             }
 
-        source_config = _bitwarden_config(get_default_hermes_root()) or {}
-        configured_access_token_env = (
-            source_config.get("access_token_env") or BWS_BOOTSTRAP_ENV
-        )
-        strip_env = set(UNCONDITIONAL_STRIP_ENV)
-        if isinstance(configured_access_token_env, str) and configured_access_token_env:
-            strip_env.add(configured_access_token_env)
+        strip_env = worker_credential_strip_env()
 
         for key in strip_env:
             target.pop(key, None)
@@ -616,6 +610,28 @@ def _bitwarden_config(home_path: Path) -> dict[str, Any] | None:
         return None
     config = secrets_cfg.get("bitwarden")
     return config if isinstance(config, dict) else None
+
+
+def worker_credential_strip_env(
+    root: Path | str | None = None,
+) -> frozenset[str]:
+    """Return environment names that must be stripped from workers."""
+    try:
+        source_config = _bitwarden_config(
+            get_default_hermes_root() if root is None else Path(root)
+        ) or {}
+        configured_access_token_env = (
+            source_config.get("access_token_env") or BWS_BOOTSTRAP_ENV
+        )
+        strip_env = set(UNCONDITIONAL_STRIP_ENV)
+        if (
+            isinstance(configured_access_token_env, str)
+            and configured_access_token_env
+        ):
+            strip_env.add(configured_access_token_env)
+        return frozenset(strip_env)
+    except Exception:
+        return frozenset(UNCONDITIONAL_STRIP_ENV)
 
 
 def _fetch_bitwarden_result(

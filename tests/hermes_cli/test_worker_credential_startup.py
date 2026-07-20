@@ -56,6 +56,36 @@ def test_early_startup_exception_scrubs_worker_credentials(monkeypatch):
     assert "GITHUB_APP_INSTALLATION_ID" not in os.environ
 
 
+def test_early_startup_exception_scrubs_custom_bitwarden_bootstrap_name(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import main as main_mod
+    from hermes_cli import worker_credentials as wc
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-early-custom-failure")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "15")
+    monkeypatch.setenv("CUSTOM_BWS_TOKEN", "custom-bootstrap")
+    monkeypatch.setattr(
+        wc,
+        "_bitwarden_config",
+        lambda _root: {
+            "enabled": True,
+            "access_token_env": "CUSTOM_BWS_TOKEN",
+        },
+    )
+
+    def fail_bootstrap():
+        raise RuntimeError("bootstrap failure")
+
+    monkeypatch.setattr(wc, "bootstrap_worker_credential_context", fail_bootstrap)
+
+    main_mod._bootstrap_worker_credentials_early()
+
+    assert "CUSTOM_BWS_TOKEN" not in os.environ
+
+
 def test_startup_fallback_strip_set_covers_unconditional_deny_set():
     from hermes_cli import main as main_mod
     from hermes_cli import worker_credentials as wc

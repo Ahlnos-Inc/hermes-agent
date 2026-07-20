@@ -143,6 +143,31 @@ def test_releaser_bootstrap_strips_ambient_credentials(tmp_path, monkeypatch):
     assert wc.has_trusted_worker_action("github_write")
 
 
+def test_worker_credential_strip_env_uses_configured_bitwarden_name(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(wc, "_bitwarden_config", lambda _root: None)
+    default_strip_env = wc.worker_credential_strip_env(tmp_path)
+
+    assert wc.BWS_BOOTSTRAP_ENV in default_strip_env
+    assert "CUSTOM_BWS_TOKEN" not in default_strip_env
+
+    monkeypatch.setattr(
+        wc,
+        "_bitwarden_config",
+        lambda _root: {"access_token_env": "CUSTOM_BWS_TOKEN"},
+    )
+    assert "CUSTOM_BWS_TOKEN" in wc.worker_credential_strip_env(tmp_path)
+
+    def fail_config(_root):
+        raise RuntimeError("config read failure")
+
+    monkeypatch.setattr(wc, "_bitwarden_config", fail_config)
+    assert wc.worker_credential_strip_env(tmp_path) == frozenset(
+        wc.UNCONDITIONAL_STRIP_ENV
+    )
+
+
 def test_worker_bootstrap_strips_custom_bitwarden_bootstrap_name(
     tmp_path, monkeypatch
 ):
