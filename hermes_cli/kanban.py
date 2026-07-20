@@ -700,16 +700,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--json", action="store_true")
     # BUILD-263: the gateway's embedded dispatcher (dispatch_in_gateway,
     # default true) holds a machine-wide singleton lock for its whole
-    # process lifetime. Without this flag, a manually-run `hermes kanban
-    # dispatch` — or worse, a shell loop left running unattended — races
-    # the gateway on the same kanban.db with no mutual exclusion (the
-    # 2026-07-08 incident: two such orphaned loops ran for 6 and 19 days).
-    # Refusing by default and requiring an explicit opt-in makes that
-    # footgun something you have to reach for, not fall into.
+    # process lifetime. Keep --force for CLI compatibility, but the guard
+    # below never permits dispatch without a working lock.
     p_disp.add_argument(
         "--force", action="store_true",
-        help="Proceed only when the single-dispatcher lock is unavailable; "
-             "never override a lock held by another dispatcher.",
+        help="Retained for compatibility; does not override the singleton lock.",
     )
 
     # --- daemon (deprecated) ---
@@ -727,11 +722,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Write the daemon's PID to this file on start")
     p_daemon.add_argument("--verbose", "-v", action="store_true",
                           help="Log each tick's outcome to stdout")
-    # Undocumented escape hatch for users who truly cannot run the gateway.
-    # Intentionally excluded from --help so nobody discovers it casually and
-    # keeps the old double-dispatcher pattern alive.
-    p_daemon.add_argument("--force", action="store_true",
-                          help=argparse.SUPPRESS)
+    p_daemon.add_argument(
+        "--force", action="store_true",
+        help="Run the deprecated daemon; retained for compatibility and does "
+             "not override the singleton lock.",
+    )
 
     # --- watch ---
     p_watch = sub.add_parser(
@@ -2352,15 +2347,13 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 @contextlib.contextmanager
-def _dispatcher_singleton_guard(*, command: str, force: bool):
+def _dispatcher_singleton_guard(*, command: str):
     """Guard a dispatcher lifetime with the gateway's singleton lock.
 
-    ``force`` is deliberately limited to the unavailable-lock case. A held
-    lock always wins, so the gateway, one-shot CLI dispatch, and the legacy
-    daemon cannot bypass each other by choosing a different entry point.
-    Yields ``False`` when the caller must refuse to run and ``True`` when the
-    caller may proceed. A forced unavailable lock yields ``True`` without a
-    handle, while a held lock is released when the context exits.
+    The gateway, one-shot CLI dispatch, and the legacy daemon cannot bypass
+    each other by choosing a different entry point. Yields ``False`` when the
+    caller must refuse to run and ``True`` when the caller may proceed. A held
+    lock is released when the context exits.
     """
     lock_handle = None
     lock_path = None
@@ -2373,13 +2366,9 @@ def _dispatcher_singleton_guard(*, command: str, force: bool):
             dispatcher_singleton_lock_path,
         )
         lock_path = dispatcher_singleton_lock_path()
-        # Always ask the OS for the shared lock, including under --force.
-        # --force only changes the policy for a genuinely unavailable lock.
         lock_handle, lock_state = _acquire_singleton_lock(lock_path)
     except Exception:
         # Treat an import, path, or platform locking failure as unavailable.
-        # The normal policy is fail closed; --force is the explicit, narrow
-        # escape hatch for environments where the lock cannot be used.
         lock_handle, lock_state = None, "unavailable"
 
     if lock_state == "contended":
@@ -2403,22 +2392,14 @@ def _dispatcher_singleton_guard(*, command: str, force: bool):
         return
 
     if lock_state == "unavailable":
-        if not force:
-            print(
-                f"hermes kanban {command}: refusing — the single-dispatcher "
-                "lock is unavailable on this platform/filesystem. "
-                "Use --force only if you have verified that no other "
-                "dispatcher can be running.",
-                file=sys.stderr,
-            )
-            yield False
-            return
         print(
-            f"hermes kanban {command}: warning — the single-dispatcher lock "
-            "is unavailable on this platform/filesystem; proceeding only "
-            "because --force was specified.",
+            f"hermes kanban {command}: refusing — the singleton lock at "
+            f"{lock_path} is unavailable. Dispatch cannot run without a "
+            "working singleton lock; fix the locking environment and retry.",
             file=sys.stderr,
         )
+        yield False
+        return
 
     try:
         yield True
@@ -2436,12 +2417,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     BUILD-263: always attempts the exact lock held by the gateway's embedded
     dispatcher (``kanban.dispatch_in_gateway``, default true). It refuses
     (clear stderr message, nonzero exit) when another dispatcher already holds
-    that lock. ``--force`` is only an explicit opt-in for the narrower case
-    where the locking mechanism is genuinely unavailable; it never overrides
-    OS-level lock contention.
+    that lock. ``--force`` is retained for compatibility and never overrides
+    the singleton lock, including when locking is unavailable or contended.
     """
-    force = bool(getattr(args, "force", False))
-    with _dispatcher_singleton_guard(command="dispatch", force=force) as allowed:
+    with _dispatcher_singleton_guard(command="dispatch") as allowed:
         if not allowed:
             return 3
         return _cmd_dispatch_run(args)
@@ -2569,15 +2548,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     Left in as a stub so users with the old command in scripts/systemd
     units get a clear migration message instead of a cryptic
-    "no such command" error. A ``--force`` escape hatch keeps the old
-    standalone daemon alive for the rare edge case where someone truly
-    cannot run the gateway (e.g. running on a host that forbids
-    long-lived background services), but the default path exits 2
-    with guidance so nobody accidentally keeps running two dispatchers
-    against the same kanban.db.
+    "no such command" error. ``--force`` selects the legacy standalone
+    daemon path for compatibility, but the singleton lock remains mandatory;
+    the default path exits 2 with guidance so nobody accidentally keeps
+    running two dispatchers against the same kanban.db.
     """
     force = bool(getattr(args, "force", False))
-    with _dispatcher_singleton_guard(command="daemon", force=force) as allowed:
+    with _dispatcher_singleton_guard(command="daemon") as allowed:
         if not allowed:
             return 3
         if not force:

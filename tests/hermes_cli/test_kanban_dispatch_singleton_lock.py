@@ -8,8 +8,7 @@ machine-wide singleton lock the gateway's embedded dispatcher holds
 (`gateway.kanban_watchers._acquire_singleton_lock` /
 `dispatcher_singleton_lock_path`), refusing loudly (nonzero exit) when
 another dispatcher already holds it, including with `--force`. The force
-flag is limited to explicitly permitting operation when locking is genuinely
-unavailable.
+flag is retained for compatibility and never bypasses the singleton lock.
 """
 
 from __future__ import annotations
@@ -254,8 +253,11 @@ def test_stale_lock_is_reclaimed_automatically_after_holder_process_dies(
     assert len(calls) == 1, "a stale (crashed-holder) lock must be reclaimed automatically"
 
 
-def test_dispatch_fails_closed_when_lock_is_unavailable(kanban_home, monkeypatch):
-    """Unavailable locking fails closed unless --force is explicit."""
+@pytest.mark.parametrize("force", [False, True])
+def test_dispatch_refuses_when_lock_is_unavailable(
+    kanban_home, monkeypatch, capsys, force,
+):
+    """Unavailable locking always fails closed, including with --force."""
     calls = []
     _stub_dispatch_once(monkeypatch, calls)
 
@@ -265,17 +267,22 @@ def test_dispatch_fails_closed_when_lock_is_unavailable(kanban_home, monkeypatch
         watchers_mod, "_acquire_singleton_lock", lambda _path: (None, "unavailable"),
     )
 
-    rc = kb_cli._cmd_dispatch(_args())
+    lock_path = dispatcher_singleton_lock_path()
+    rc = kb_cli._cmd_dispatch(_args(force=force))
 
-    assert rc != 0
+    assert rc == 3
     assert calls == []
+    err = capsys.readouterr().err
+    assert str(lock_path) in err
+    assert "cannot run without a working singleton lock" in err
+    assert "--force" not in err
 
 
-def test_dispatch_force_proceeds_when_lock_is_unavailable(
+def test_daemon_force_refuses_when_lock_is_unavailable(
     kanban_home, monkeypatch, capsys,
 ):
     calls = []
-    _stub_dispatch_once(monkeypatch, calls)
+    monkeypatch.setattr(kb, "run_daemon", lambda **_kwargs: calls.append(True))
 
     import gateway.kanban_watchers as watchers_mod
 
@@ -283,11 +290,15 @@ def test_dispatch_force_proceeds_when_lock_is_unavailable(
         watchers_mod, "_acquire_singleton_lock", lambda _path: (None, "unavailable"),
     )
 
-    rc = kb_cli._cmd_dispatch(_args(force=True))
+    lock_path = dispatcher_singleton_lock_path()
+    rc = kb_cli._cmd_daemon(_args(force=True, interval=0.01))
 
-    assert rc == 0
-    assert len(calls) == 1
-    assert "--force" in capsys.readouterr().err
+    assert rc == 3
+    assert calls == []
+    err = capsys.readouterr().err
+    assert str(lock_path) in err
+    assert "cannot run without a working singleton lock" in err
+    assert "--force" not in err
 
 
 def test_dispatch_force_still_attempts_the_canonical_gateway_lock(
