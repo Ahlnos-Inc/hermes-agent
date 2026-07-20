@@ -14861,8 +14861,22 @@ def _default_spawn(
     if not profile_arg:
         raise RuntimeError(f"task {task.id} run contract has no profile")
 
+    # Resolve the machine-global worker credential contract before creating
+    # any worker artifacts or releasing the start gate.  Custom spawn_fn
+    # paths remain deliberately outside this default-spawn authority path.
+    from hermes_cli.worker_credentials import (
+        build_worker_environment,
+        prepare_worker_credentials,
+    )
+
+    worker_credential_plan = prepare_worker_credentials(
+        profile_arg,
+        base_env=os.environ,
+        run_id=task.current_run_id,
+    )
+
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    env = build_worker_environment(os.environ, worker_credential_plan)
     # Workers are always headless.  A gateway launched from a TUI session or
     # a profile defaulting to TUI must not turn a quiet one-shot worker into an
     # interactive process that exits without running the task.

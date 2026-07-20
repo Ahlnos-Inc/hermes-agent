@@ -505,6 +505,68 @@ from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
+
+# This hardcoded emergency list mirrors UNCONDITIONAL_STRIP_ENV; both must
+# move together when the worker credential deny set changes.
+_WORKER_CREDENTIAL_FALLBACK_STRIP_ENV = frozenset(
+    {
+        "BWS_ACCESS_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY_PATH",
+        "GITHUB_APP_INSTALLATION_ID",
+        "GH_TOKEN_SECRET_WRITE",
+        "HERMES_WORKER_CREDENTIAL_GITHUB_WRITE",
+        "HERMES_WORKER_CREDENTIAL_BWS_BOOTSTRAP",
+        "HERMES_WORKER_CREDENTIAL_MANIFEST_DIGEST",
+    }
+)
+
+
+def _bootstrap_worker_credentials_early() -> None:
+    """Consume worker handoffs before plugin or MCP discovery can run."""
+    try:
+        from hermes_cli.worker_credentials import bootstrap_worker_credential_context
+
+        bootstrap_worker_credential_context()
+    except Exception:
+        try:
+            if (
+                "HERMES_KANBAN_TASK" in os.environ
+                and "HERMES_KANBAN_RUN_ID" in os.environ
+            ):
+                try:
+                    from hermes_cli.worker_credentials import (
+                        PRIVATE_HANDOFF_PREFIX,
+                        worker_credential_strip_env,
+                    )
+                except Exception:
+                    private_handoff_prefix = "HERMES_WORKER_CREDENTIAL_"
+                    strip_env = _WORKER_CREDENTIAL_FALLBACK_STRIP_ENV
+                else:
+                    private_handoff_prefix = PRIVATE_HANDOFF_PREFIX
+                    strip_env = worker_credential_strip_env()
+                for name in list(os.environ):
+                    if (
+                        name.startswith(private_handoff_prefix)
+                        or name in strip_env
+                    ):
+                        os.environ.pop(name, None)
+        except Exception:
+            pass
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "worker credential bootstrap unavailable", exc_info=True
+        )
+
+
+_bootstrap_worker_credentials_early()
+
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
 # module-import time). Without this, config.yaml's toggle is ignored because

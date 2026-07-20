@@ -274,6 +274,100 @@ def test_dispatch_rejects_legacy_integer_pid_without_signalling_it(
     assert signalled == []
 
 
+def _write_worker_contract(home: Path, *, actions: str = "[github_write]") -> None:
+    (home / "worker-credential-contract.yaml").write_text(
+        "version: 1\nprofiles:\n  releaser:\n    actions: "
+        f"{actions}\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n  bitwarden:\n    enabled: true\n"
+        "    project_id: kanban-spawn-test\n    auto_install: false\n",
+        encoding="utf-8",
+    )
+
+
+def _spawn_test_task(*, assignee: str = "releaser") -> kb.Task:
+    return kb.Task(
+        id="t_credential_spawn",
+        title="credential spawn",
+        body=None,
+        assignee=assignee,
+        status="ready",
+        priority=0,
+        created_by="test",
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+
+
+def test_default_spawn_preflights_and_handoffs_only_authorized_action(
+    kanban_home, monkeypatch, caplog
+):
+    from agent.secret_sources.base import FetchResult
+    from hermes_cli import worker_credentials as wc
+
+    sentinel = "spawn-sentinel-token"
+    _write_worker_contract(kanban_home)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token")
+    monkeypatch.setenv("GH_TOKEN_SECRET_WRITE", "ambient-secret-token")
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets={wc.GITHUB_WRITE_SOURCE_KEY: sentinel}),
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 55_501
+
+    def fake_popen(_cmd, *args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    task = _spawn_test_task()
+    with caplog.at_level("INFO", logger=wc._log.name):
+        receipt = kb._default_spawn(task, str(kanban_home / "workspace"))
+
+    env = captured["env"]
+    assert receipt.pid == 55_501
+    assert env[wc.GITHUB_WRITE_HANDOFF_ENV] == sentinel
+    assert wc.BWS_BOOTSTRAP_ENV not in env
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert wc.GITHUB_WRITE_SOURCE_KEY not in env
+    assert sentinel not in caplog.text
+    assert sentinel not in repr(receipt)
+
+
+def test_default_spawn_does_not_call_popen_when_credential_preflight_fails(
+    kanban_home, monkeypatch
+):
+    _write_worker_contract(kanban_home)
+    monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
+    called = []
+
+    def fake_popen(*_args, **_kwargs):
+        called.append(True)
+        raise AssertionError("Popen must not run after credential preflight failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="missing BWS bootstrap"):
+        kb._default_spawn(_spawn_test_task(), str(kanban_home / "workspace"))
+
+    assert called == []
+
+
 def test_pid_attach_rejects_stale_run_without_partial_write(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="stale attach", assignee="worker")
@@ -535,7 +629,7 @@ def test_reclaim_terminates_attested_worker_process_group():
         assert not kb._pid_alive(child_pid)
     finally:
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
         except (ProcessLookupError, PermissionError):
             pass
         leader.wait(timeout=3.0)

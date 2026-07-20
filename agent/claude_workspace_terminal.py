@@ -759,6 +759,18 @@ def build_workspace_terminal_args(
 ) -> dict[str, Any]:
     """Wrap a Hermes terminal call in exact-env macOS Seatbelt isolation."""
 
+    # Claude's SDK terminal intentionally has no network-enabled action
+    # projection.  A github_write worker must fail closed here instead of
+    # silently dropping its grant or pretending that the SDK boundary is
+    # authorized.
+    from hermes_cli.worker_credentials import has_trusted_worker_action
+
+    if has_trusted_worker_action("github_write"):
+        raise RuntimeError(
+            "Claude SDK workspace terminal does not support github_write; "
+            "use the authorized local terminal boundary"
+        )
+
     root = Path(workspace).expanduser().resolve()
     command = str(arguments.get("command") or "").strip()
     if not command:
