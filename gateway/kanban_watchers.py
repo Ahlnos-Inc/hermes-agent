@@ -1837,8 +1837,18 @@ class GatewayKanbanWatchersMixin:
         # index pages. The lock lives at the machine-global kanban root
         # (shared across profiles by design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+        _lock_path = dispatcher_singleton_lock_path()
+        try:
+            _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+        except Exception as exc:
+            logger.error(
+                "kanban dispatcher: refusing to start embedded dispatcher — "
+                "singleton lock acquisition failed at %s (%s); "
+                "config kanban.dispatch_in_gateway=true requires that lock.",
+                _lock_path,
+                exc,
+            )
+            return
         if _lock_state == "contended":
             logger.info(
                 "kanban dispatcher: another gateway already holds the dispatcher "
@@ -1849,10 +1859,13 @@ class GatewayKanbanWatchersMixin:
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
         else:
-            logger.warning(
-                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                "on config control alone.", _lock_path,
+            logger.error(
+                "kanban dispatcher: refusing to start embedded dispatcher — "
+                "singleton lock unavailable at %s; config "
+                "kanban.dispatch_in_gateway=true cannot be honored safely.",
+                _lock_path,
             )
+            return
 
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
