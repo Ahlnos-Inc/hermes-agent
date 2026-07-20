@@ -248,6 +248,58 @@ def test_coder_and_architect_terminals_can_use_external_venv_read_only(
         assert external_write not in profile
 
 
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+@pytest.mark.parametrize("worker_profile", ["coder", "verifier"])
+@pytest.mark.parametrize("use_extra", [False, True])
+def test_terminal_sandbox_extra_read_paths_plumb_through(
+    tmp_path, worker_profile, use_extra
+):
+    """BUILD-581: `sandbox_extra_read_paths` grants extra Seatbelt reads for
+    both the mutable worker terminal path (coder/architect) and the
+    read-only worker terminal path (reviewer/verifier), and leaves the
+    profile unchanged when unset."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    extra_root = tmp_path / "extra-readable"
+    extra_root.mkdir()
+    sandbox_extra_read_paths = (str(extra_root),) if use_extra else ()
+
+    captured = {}
+
+    def dispatch(name, arguments, *, task_id):
+        # Read the Seatbelt profile now: the read-only path's disposable
+        # scratch root (and its profile file) is removed once this returns.
+        argv = shlex.split(arguments["command"])
+        captured["profile"] = Path(argv[argv.index("-f") + 1]).read_text(
+            encoding="utf-8"
+        )
+        return "ok"
+
+    options = build_claude_agent_options(
+        sdk=FakeSdk,
+        model="claude-sonnet-4-6",
+        system_prompt="worker",
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        profile_home=tmp_path / "profile",
+        inherited_env={"PATH": os.environ["PATH"]},
+        tool_definitions=[_kanban_tool("terminal")],
+        dispatch=dispatch,
+        effective_task_id="worker-task",
+        kanban_task_id="BUILD-581",
+        worker_profile=worker_profile,
+        sandbox_extra_read_paths=sandbox_extra_read_paths,
+    )
+    terminal = options.mcp_servers["hermes"]["tools"][0]
+    command = "cat missing.txt" if worker_profile == "verifier" else "echo hi"
+
+    result = asyncio.run(terminal({"command": command}))
+
+    assert result.get("is_error") is not True, result
+    rule = f'(allow file-read* (subpath "{extra_root.resolve()}"))'
+    assert (rule in captured["profile"]) is use_extra
+
+
 @pytest.mark.parametrize("worker_profile", ["reviewer", "verifier"])
 def test_read_only_worker_profiles_omit_mutation_capabilities(
     tmp_path, worker_profile

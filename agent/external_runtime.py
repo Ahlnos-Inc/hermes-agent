@@ -138,6 +138,27 @@ def _claude_workspace(agent: Any) -> Path:
     return Path(resolve_agent_cwd()).expanduser().resolve()
 
 
+def _sandbox_extra_read_paths() -> tuple[str, ...]:
+    """Resolve least-privilege extra Seatbelt read paths for the terminal tool.
+
+    Sources (merged): the active profile's ``model.sandbox_extra_read_paths``
+    config list, plus the colon-separated ``HERMES_SANDBOX_EXTRA_READ_PATHS``
+    env passthrough a kanban worker spawn can set per task. Both unset ->
+    empty tuple -> sandbox behavior unchanged (default-deny outside the
+    workspace, as today).
+    """
+
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    configured = cfg_get(
+        load_config_readonly(), "model", "sandbox_extra_read_paths", default=()
+    )
+    paths = [str(path) for path in configured] if isinstance(configured, (list, tuple)) else []
+    env_value = os.getenv("HERMES_SANDBOX_EXTRA_READ_PATHS", "")
+    paths.extend(part for part in env_value.split(":") if part)
+    return tuple(paths)
+
+
 def _claude_project_state_dir(host_home: Path, workspace: Path) -> Path:
     project_key = re.sub(r"[^A-Za-z0-9]", "-", str(workspace))
     path = host_home / ".claude" / "projects" / project_key
@@ -423,6 +444,7 @@ def run_claude_agent_sdk_attempt(
                 auxiliary_tool_names=tuple(
                     getattr(agent, "_claude_auxiliary_tool_names", ()) or ()
                 ),
+                sandbox_extra_read_paths=_sandbox_extra_read_paths(),
             )
 
         attempt_budgets = resolve_attempt_budgets(agent)

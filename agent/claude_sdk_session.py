@@ -102,6 +102,7 @@ def build_claude_agent_options(
     capability_mode: str = "worker",
     auxiliary_tool_names: Iterable[str] = (),
     worker_profile: str | None = None,
+    sandbox_extra_read_paths: Iterable[str | Path] = (),
 ) -> Any:
     """Create the sole supported Claude runtime policy: an isolated worker.
 
@@ -135,6 +136,7 @@ def build_claude_agent_options(
     if read_only_worker:
         file_broker.deny_credentials_for_read_only_worker()
     process_broker = WorkerProcessBroker(effective_task_id) if "process" in tool_names else None
+    extra_read_paths = list(sandbox_extra_read_paths)
 
     def _transform(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "terminal":
@@ -146,6 +148,7 @@ def build_claude_agent_options(
             workspace=workspace_path,
             host_home=host_home_path,
             exact_env=env,
+            additional_readable_roots=extra_read_paths or None,
         )
 
     mcp_server = build_hermes_sdk_mcp_server(
@@ -166,6 +169,7 @@ def build_claude_agent_options(
                         exact_env=env,
                         dispatch=dispatch,
                         task_id=effective_task_id,
+                        extra_readable_roots=extra_read_paths,
                     )
                 }
                 if read_only_worker and "terminal" in tool_names

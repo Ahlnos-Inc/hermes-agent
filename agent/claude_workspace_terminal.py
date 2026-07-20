@@ -967,6 +967,7 @@ def dispatch_read_only_workspace_terminal(
     task_id: str,
     platform_name: str | None = None,
     scratch_parent: str | Path | None = None,
+    extra_readable_roots: list[str | Path] | None = None,
 ) -> Any:
     """Dispatch one reviewer/verifier command without writable access to source."""
 
@@ -1028,7 +1029,7 @@ def dispatch_read_only_workspace_terminal(
             platform_name=platform_name,
             read_only=not use_mirror,
             runtime_root=run_root / "runtime",
-            additional_readable_roots=dependency_roots,
+            additional_readable_roots=[*dependency_roots, *(extra_readable_roots or [])],
             git_metadata_enabled=not use_mirror,
         )
         return dispatch("terminal", transformed, task_id=task_id)

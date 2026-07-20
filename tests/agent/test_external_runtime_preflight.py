@@ -190,6 +190,39 @@ def test_external_runtime_uses_active_profile_capability_policy(
     ]
 
 
+def test_sandbox_extra_read_paths_unset_by_default(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "build581-unset"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_SANDBOX_EXTRA_READ_PATHS", raising=False)
+
+    assert external_runtime._sandbox_extra_read_paths() == ()
+
+
+def test_sandbox_extra_read_paths_reads_profile_config_and_env(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "build581-set"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  runtime: claude_agent_sdk\n"
+        "  sandbox_extra_read_paths:\n"
+        "  - /Users/nicholas/.hermes/hermes-agent\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv(
+        "HERMES_SANDBOX_EXTRA_READ_PATHS", "/extra/one:/extra/two"
+    )
+
+    assert external_runtime._sandbox_extra_read_paths() == (
+        "/Users/nicholas/.hermes/hermes-agent",
+        "/extra/one",
+        "/extra/two",
+    )
+
+
 def test_claude_session_id_round_trips_through_hermes_session_metadata():
     class FakeDb:
         row = {"model_config": '{"runtime": "claude_agent_sdk"}'}
