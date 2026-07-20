@@ -531,16 +531,40 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     copied too when present. Returns the backup path, or None on failure.
     """
     import datetime
+    import os
     import shutil
+    import subprocess
+
+    def _copy(source: Path, destination: Path) -> None:
+        # BUILD-567 class: an in-process open()/close() of a live DB file
+        # drops EVERY POSIX fcntl lock this process holds on it (SQLite
+        # "How To Corrupt" §2.2) — in the long-lived gateway other
+        # SessionDB connections may be mid-write on this same state.db.
+        # Copy via a child process, whose descriptors cannot touch our
+        # locks. Windows has no fcntl hazard; keep the in-process copy.
+        # (Same pattern as hermes_cli.kanban_db._copy_off_lock — duplicated
+        # here because kanban_db imports this module.)
+        if os.name == "nt":
+            shutil.copy2(source, destination)
+            return
+        result = subprocess.run(
+            ["cp", "-p", str(source), str(destination)],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise OSError(
+                f"cp failed ({result.returncode}): "
+                f"{result.stderr.decode(errors='replace')[:200]}"
+            )
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     try:
-        shutil.copy2(db_path, backup_path)
+        _copy(db_path, backup_path)
         for suffix in ("-wal", "-shm"):
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
-                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+                _copy(sidecar, backup_path.with_name(backup_path.name + suffix))
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
