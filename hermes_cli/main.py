@@ -505,6 +505,23 @@ from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
+
+def _bootstrap_worker_credentials_early() -> None:
+    """Consume worker handoffs before plugin or MCP discovery can run."""
+    try:
+        from hermes_cli.worker_credentials import bootstrap_worker_credential_context
+
+        bootstrap_worker_credential_context()
+    except Exception:
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "worker credential bootstrap unavailable", exc_info=True
+        )
+
+
+_bootstrap_worker_credentials_early()
+
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
 # module-import time). Without this, config.yaml's toggle is ignored because

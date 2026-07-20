@@ -15,13 +15,13 @@ turn this into an arbitrary environment-variable injector.
 
 from __future__ import annotations
 
-import contextvars
 import hashlib
 import json
 import logging
 import os
 import secrets
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,6 +44,7 @@ GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
 PRIVATE_HANDOFF_PREFIX = "HERMES_WORKER_CREDENTIAL_"
 GITHUB_WRITE_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}GITHUB_WRITE"
 BWS_BOOTSTRAP_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}BWS_BOOTSTRAP"
+MANIFEST_DIGEST_ENV = f"{PRIVATE_HANDOFF_PREFIX}MANIFEST_DIGEST"
 
 # Terminal-only artifacts live below the machine-global Kanban runtime root,
 # never in a profile home.  The directory names are generated locally; task
@@ -202,9 +203,8 @@ class ConsumedWorkerCredentials:
         return bool(self.capabilities)
 
 
-_TRUSTED_WORKER_CREDENTIALS: contextvars.ContextVar[dict[str, str]] = (
-    contextvars.ContextVar("_TRUSTED_WORKER_CREDENTIALS", default={})
-)
+_WORKER_CREDENTIAL_LOCK = threading.Lock()
+_TRUSTED_WORKER_CREDENTIALS: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -230,12 +230,8 @@ class TrustedWorkerCredentialRuntime:
         return dict(self._values).get(capability)
 
 
-_TRUSTED_WORKER_RUNTIME: contextvars.ContextVar[
-    TrustedWorkerCredentialRuntime | None
-] = contextvars.ContextVar("_TRUSTED_WORKER_RUNTIME", default=None)
-_TERMINAL_ARTIFACT_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
-    "_TERMINAL_ARTIFACT_DIR", default=None
-)
+_TRUSTED_WORKER_RUNTIME: TrustedWorkerCredentialRuntime | None = None
+_TERMINAL_ARTIFACT_DIR: Path | None = None
 
 
 def _normalize_profile(profile: str) -> str:
@@ -383,57 +379,69 @@ def bootstrap_worker_credential_context(
     Non-worker processes remain uninitialized and therefore cannot project an
     action credential.
     """
-    existing = _TRUSTED_WORKER_RUNTIME.get()
-    if existing is not None:
-        return existing
+    global _TRUSTED_WORKER_RUNTIME
 
-    target = os.environ if environ is None else environ
-    identity = _worker_identity(target)
-    handoff = {
-        name: target.get(name)
-        for name in (GITHUB_WRITE_HANDOFF_ENV, BWS_BOOTSTRAP_HANDOFF_ENV)
-        if isinstance(target.get(name), str) and target.get(name)
-    }
-    if identity is None:
-        # No Kanban worker identity means this is an ordinary Hermes process.
-        # Do not consume a marker here; the unconditional child scrubbing
-        # still removes it, and ordinary processes can never project it.
-        return None
+    with _WORKER_CREDENTIAL_LOCK:
+        if _TRUSTED_WORKER_RUNTIME is not None:
+            return _TRUSTED_WORKER_RUNTIME
 
-    # Consume every private handoff name, including an unknown future name,
-    # before any terminal or hook subprocess can inherit it.
-    for key in list(target):
-        if key.startswith(PRIVATE_HANDOFF_PREFIX):
-            target.pop(key, None)
+        target = os.environ if environ is None else environ
+        identity = _worker_identity(target)
+        handoff = {
+            name: target.get(name)
+            for name in (GITHUB_WRITE_HANDOFF_ENV, BWS_BOOTSTRAP_HANDOFF_ENV)
+            if isinstance(target.get(name), str) and target.get(name)
+        }
+        if identity is None:
+            # No Kanban worker identity means this is an ordinary Hermes
+            # process. Do not consume a marker here; the unconditional child
+            # scrubbing still removes it, and ordinary processes can never
+            # project it.
+            return None
 
-    profile, task_id, run_id = identity
-    try:
-        manifest = load_manifest()
-    except WorkerCredentialError:
-        manifest = WorkerCredentialManifest(
-            version=CONTRACT_VERSION,
-            profiles={},
-            digest=_manifest_digest({}),
-            path=None,
+        expected_digest = target.get(MANIFEST_DIGEST_ENV)
+
+        # Consume every private handoff name, including an unknown future
+        # name, before any terminal or hook subprocess can inherit it.
+        for key in list(target):
+            if key.startswith(PRIVATE_HANDOFF_PREFIX):
+                target.pop(key, None)
+
+        profile, task_id, run_id = identity
+        try:
+            manifest = load_manifest()
+        except WorkerCredentialError:
+            manifest = WorkerCredentialManifest(
+                version=CONTRACT_VERSION,
+                profiles={},
+                digest=_manifest_digest({}),
+                path=None,
+            )
+
+        if expected_digest is not None and expected_digest != manifest.digest:
+            _log.warning(
+                "worker credential manifest digest mismatch; no capabilities admitted"
+            )
+            admitted: dict[str, str] = {}
+        else:
+            granted = manifest.actions_for(profile)
+            admitted = {
+                capability: handoff[definition.handoff_env]
+                for capability in granted
+                if capability in CAPABILITIES
+                for definition in (CAPABILITIES[capability],)
+                if definition.handoff_env in handoff
+            }
+        runtime = TrustedWorkerCredentialRuntime(
+            profile=profile,
+            task_id=task_id,
+            run_id=run_id,
+            manifest_digest=manifest.digest,
+            capabilities=tuple(sorted(admitted)),
+            _values=tuple(sorted(admitted.items())),
         )
-    granted = manifest.actions_for(profile)
-    admitted = {
-        capability: handoff[definition.handoff_env]
-        for capability in granted
-        if capability in CAPABILITIES
-        for definition in (CAPABILITIES[capability],)
-        if definition.handoff_env in handoff
-    }
-    runtime = TrustedWorkerCredentialRuntime(
-        profile=profile,
-        task_id=task_id,
-        run_id=run_id,
-        manifest_digest=manifest.digest,
-        capabilities=tuple(sorted(admitted)),
-        _values=tuple(sorted(admitted.items())),
-    )
-    _TRUSTED_WORKER_RUNTIME.set(runtime)
-    return runtime
+        _TRUSTED_WORKER_RUNTIME = runtime
+        return runtime
 
 
 def _runtime_matches_current_worker(
@@ -473,37 +481,41 @@ def has_trusted_worker_action(
 
 def _terminal_artifacts() -> tuple[Path, Path, Path]:
     """Create (run_dir, gh_config_dir, global_git_config) atomically enough."""
-    existing = _TERMINAL_ARTIFACT_DIR.get()
-    if existing is not None:
-        gh_dir = existing / "gh-config"
-        git_config = existing / "gitconfig"
-        if existing.is_dir() and gh_dir.is_dir() and git_config.is_file():
-            return existing, gh_dir, git_config
+    global _TERMINAL_ARTIFACT_DIR
 
-    runtime_root = worker_credential_runtime_root()
-    runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    runtime_root.chmod(0o700)
-    run_dir = runtime_root / f"run-{secrets.token_hex(16)}"
-    run_dir.mkdir(mode=0o700)
-    run_dir.chmod(0o700)
-    gh_dir = run_dir / "gh-config"
-    gh_dir.mkdir(mode=0o700)
-    gh_dir.chmod(0o700)
-    git_config = run_dir / "gitconfig"
-    git_config.write_text("[credential]\n\thelper =\n", encoding="utf-8")
-    git_config.chmod(0o600)
-    _TERMINAL_ARTIFACT_DIR.set(run_dir)
-    return run_dir, gh_dir, git_config
+    with _WORKER_CREDENTIAL_LOCK:
+        existing = _TERMINAL_ARTIFACT_DIR
+        if existing is not None:
+            gh_dir = existing / "gh-config"
+            git_config = existing / "gitconfig"
+            if existing.is_dir() and gh_dir.is_dir() and git_config.is_file():
+                return existing, gh_dir, git_config
+
+        runtime_root = worker_credential_runtime_root()
+        runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        runtime_root.chmod(0o700)
+        run_dir = runtime_root / f"run-{secrets.token_hex(16)}"
+        run_dir.mkdir(mode=0o700)
+        run_dir.chmod(0o700)
+        gh_dir = run_dir / "gh-config"
+        gh_dir.mkdir(mode=0o700)
+        gh_dir.chmod(0o700)
+        git_config = run_dir / "gitconfig"
+        git_config.write_text("[credential]\n\thelper =\n", encoding="utf-8")
+        git_config.chmod(0o600)
+        _TERMINAL_ARTIFACT_DIR = run_dir
+        return run_dir, gh_dir, git_config
 
 
-def project_github_write_terminal_environment(
+def project_worker_terminal_environment(
     environ: dict[str, str],
 ) -> bool:
-    """Project ``github_write`` after sanitization for an authorized terminal."""
-    token = get_trusted_worker_credential("github_write", environ=os.environ)
-    if token is None:
+    """Isolate worker terminals and project ``github_write`` when trusted."""
+    runtime = bootstrap_worker_credential_context()
+    if runtime is None:
         return False
 
+    token = get_trusted_worker_credential("github_write", environ=os.environ)
     _run_dir, gh_config_dir, git_config = _terminal_artifacts()
     # Remove ambient command-scope config knobs before installing the exact
     # two entries below.  This is configuration isolation, not a credential
@@ -516,22 +528,32 @@ def project_github_write_terminal_environment(
             or key.startswith("GIT_CONFIG_VALUE_")
         ):
             environ.pop(key, None)
-    environ["GH_TOKEN"] = token
+    environ.pop("GH_TOKEN", None)
     environ["GH_CONFIG_DIR"] = str(gh_config_dir)
     environ["GIT_CONFIG_NOSYSTEM"] = "1"
     environ["GIT_CONFIG_GLOBAL"] = str(git_config)
-    environ["GIT_CONFIG_COUNT"] = "2"
+    environ["GIT_CONFIG_COUNT"] = "2" if token is not None else "1"
     environ["GIT_CONFIG_KEY_0"] = "credential.helper"
     environ["GIT_CONFIG_VALUE_0"] = ""
-    environ["GIT_CONFIG_KEY_1"] = "credential.helper"
-    environ["GIT_CONFIG_VALUE_1"] = GIT_ENV_TOKEN_HELPER
+    if token is not None:
+        environ["GH_TOKEN"] = token
+        environ["GIT_CONFIG_KEY_1"] = "credential.helper"
+        environ["GIT_CONFIG_VALUE_1"] = GIT_ENV_TOKEN_HELPER
     return True
+
+
+# Kept as a compatibility alias for callers that used the old, grant-specific
+# name. Worker isolation now applies to denied workers too.
+project_github_write_terminal_environment = project_worker_terminal_environment
 
 
 def cleanup_worker_terminal_artifacts() -> bool:
     """Remove the current terminal run directory; safe to call repeatedly."""
-    run_dir = _TERMINAL_ARTIFACT_DIR.get()
-    _TERMINAL_ARTIFACT_DIR.set(None)
+    global _TERMINAL_ARTIFACT_DIR
+
+    with _WORKER_CREDENTIAL_LOCK:
+        run_dir = _TERMINAL_ARTIFACT_DIR
+        _TERMINAL_ARTIFACT_DIR = None
     if run_dir is None:
         return False
     try:
@@ -545,8 +567,12 @@ def cleanup_worker_terminal_artifacts() -> bool:
 
 def reset_worker_credential_context_for_tests() -> None:
     """Reset process-local state for isolated unit tests."""
-    _TRUSTED_WORKER_RUNTIME.set(None)
-    _TERMINAL_ARTIFACT_DIR.set(None)
+    global _TRUSTED_WORKER_RUNTIME, _TERMINAL_ARTIFACT_DIR
+
+    with _WORKER_CREDENTIAL_LOCK:
+        _TRUSTED_WORKER_RUNTIME = None
+        _TERMINAL_ARTIFACT_DIR = None
+        _TRUSTED_WORKER_CREDENTIALS.clear()
 
 
 @contextmanager
@@ -765,6 +791,7 @@ def build_worker_environment(
     }
     for key, value in plan._handoff:
         env[key] = value
+    env[MANIFEST_DIGEST_ENV] = plan.manifest_digest
     if "bws_bootstrap" in plan.capabilities:
         for key, value in plan._handoff:
             if key == BWS_BOOTSTRAP_HANDOFF_ENV:
@@ -797,9 +824,8 @@ def consume_worker_credential_handoff(
             consumed[capability] = value
 
     if consumed:
-        trusted = dict(_TRUSTED_WORKER_CREDENTIALS.get())
-        trusted.update(consumed)
-        _TRUSTED_WORKER_CREDENTIALS.set(trusted)
+        with _WORKER_CREDENTIAL_LOCK:
+            _TRUSTED_WORKER_CREDENTIALS.update(consumed)
     return ConsumedWorkerCredentials(
         capabilities=tuple(sorted(consumed)),
         _values=tuple(sorted(consumed.items())),
@@ -808,7 +834,8 @@ def consume_worker_credential_handoff(
 
 def get_consumed_worker_credential(capability: str) -> str | None:
     """Return a consumed value for an internal authorized boundary."""
-    return _TRUSTED_WORKER_CREDENTIALS.get().get(capability)
+    with _WORKER_CREDENTIAL_LOCK:
+        return _TRUSTED_WORKER_CREDENTIALS.get(capability)
 
 
 # Descriptive aliases keep call sites readable while preserving one contract.

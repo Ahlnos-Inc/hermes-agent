@@ -1170,7 +1170,7 @@ def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     from hermes_cli.worker_credentials import (
         bootstrap_worker_credential_context,
-        project_github_write_terminal_environment,
+        project_worker_terminal_environment,
     )
 
     bootstrap_worker_credential_context()
@@ -1236,7 +1236,7 @@ def _make_run_env(env: dict) -> dict:
 
     # The only raw terminal projection.  Hooks, cron, execute_code, browser,
     # and MCP children use the sanitizers above and never call this function.
-    project_github_write_terminal_environment(run_env)
+    project_worker_terminal_environment(run_env)
 
     return run_env
 

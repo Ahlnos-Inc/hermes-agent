@@ -104,6 +104,55 @@ def test_non_releaser_cannot_self_grant_with_private_marker(
     assert not wc.has_trusted_worker_action("github_write")
 
 
+def test_denied_worker_terminal_gets_git_and_gh_isolation(
+    monkeypatch, worker_contract
+):
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/user/gh-config")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/user/gitconfig")
+
+    run_env = local._make_run_env({"PATH": "/usr/bin:/bin"})
+
+    gh_config = Path(run_env["GH_CONFIG_DIR"])
+    assert gh_config.is_dir()
+    assert list(gh_config.iterdir()) == []
+    assert "GH_TOKEN" not in run_env
+    assert run_env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert run_env["GIT_CONFIG_COUNT"] == "1"
+    assert run_env["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert run_env["GIT_CONFIG_VALUE_0"] == ""
+    assert Path(run_env["GIT_CONFIG_GLOBAL"]).is_file()
+
+
+def test_non_worker_terminal_keeps_existing_git_and_gh_environment(
+    monkeypatch, worker_contract
+):
+    for name in (
+        "HERMES_PROFILE",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "GH_CONFIG_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    run_env = local._make_run_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "GH_CONFIG_DIR": "/user/gh-config",
+            "GIT_CONFIG_GLOBAL": "/user/gitconfig",
+        }
+    )
+
+    assert run_env["GH_CONFIG_DIR"] == "/user/gh-config"
+    assert run_env["GIT_CONFIG_GLOBAL"] == "/user/gitconfig"
+    assert "GIT_CONFIG_NOSYSTEM" not in run_env
+    assert "GIT_CONFIG_COUNT" not in run_env
+
+
 def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     monkeypatch, worker_contract, tmp_path, caplog
 ):

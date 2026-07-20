@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,13 @@ from hermes_cli import worker_credentials as wc
 
 
 SENTINEL = "sentinel-worker-token-do-not-log"
+
+
+@pytest.fixture(autouse=True)
+def _reset_worker_credential_state():
+    wc.reset_worker_credential_context_for_tests()
+    yield
+    wc.reset_worker_credential_context_for_tests()
 
 
 def _write_manifest(root: Path, body: str) -> None:
@@ -109,6 +117,79 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     assert "GH_TOKEN" not in child_env
     assert "GITHUB_TOKEN" not in child_env
     assert wc.BWS_BOOTSTRAP_ENV not in child_env
+    assert child_env[wc.MANIFEST_DIGEST_ENV] == plan.manifest_digest
+
+
+def test_trusted_worker_state_is_visible_to_terminal_thread(tmp_path, monkeypatch):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-thread")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, SENTINEL)
+    monkeypatch.setenv(
+        wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest
+    )
+
+    runtime = wc.bootstrap_worker_credential_context()
+    assert runtime is not None
+
+    observed: dict[str, object] = {}
+
+    def check_thread_state() -> None:
+        observed["trusted"] = wc.has_trusted_worker_action("github_write")
+        projected: dict[str, str] = {"PATH": "/usr/bin:/bin"}
+        observed["projected"] = wc.project_github_write_terminal_environment(
+            projected
+        )
+        observed["token"] = projected.get("GH_TOKEN")
+
+    thread = threading.Thread(target=check_thread_state)
+    thread.start()
+    thread.join()
+
+    assert observed == {
+        "trusted": True,
+        "projected": True,
+        "token": SENTINEL,
+    }
+
+
+def test_manifest_digest_match_admits_grant(tmp_path, monkeypatch):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-digest-match")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "8")
+    monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, SENTINEL)
+    monkeypatch.setenv(
+        wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest
+    )
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.capabilities == ("github_write",)
+    assert wc.has_trusted_worker_action("github_write")
+
+
+def test_manifest_digest_mismatch_admits_nothing(tmp_path, monkeypatch, caplog):
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-digest-mismatch")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "9")
+    monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, SENTINEL)
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, "dispatcher-digest-is-wrong")
+
+    with caplog.at_level(logging.WARNING, logger=wc._log.name):
+        runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.capabilities == ()
+    assert not wc.has_trusted_worker_action("github_write")
+    assert "worker credential manifest digest mismatch" in caplog.text
+    assert SENTINEL not in caplog.text
 
 
 def test_empty_or_unknown_profile_receives_no_capability_or_secret(tmp_path, monkeypatch):
