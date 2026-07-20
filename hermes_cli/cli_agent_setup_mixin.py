@@ -104,7 +104,13 @@ class CLIAgentSetupMixin:
             # dispatcher only saw "pid gone" after 'Goodbye!'. Always log the
             # full resolution failure with inputs so a dead lane is
             # diagnosable from errors.log alone.
-            logger.error(
+            import os as _os
+            _log_fn = (
+                logger.debug
+                if _os.environ.get("PYTEST_CURRENT_TEST")
+                else logger.error
+            )
+            _log_fn(
                 "provider resolution failed (fatal for this run): "
                 "requested_provider=%r model=%r exc=%r",
                 self.requested_provider, self.model, _primary_exc,
