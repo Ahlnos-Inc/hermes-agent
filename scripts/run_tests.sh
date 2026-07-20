@@ -105,8 +105,9 @@ fi
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
+BOOTSTRAP_HERMES_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-pytest-bootstrap.XXXXXX")"
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (HERMES_HOME=$BOOTSTRAP_HERMES_HOME; TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
@@ -122,6 +123,7 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_HOME="$BOOTSTRAP_HERMES_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

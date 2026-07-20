@@ -22,7 +22,16 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
+
+# Pytest imports test modules during collection, before any fixture can run.
+# Give those imports an isolated home now so module-level path constants and
+# import-time logging can never resolve to the developer's live ~/.hermes.
+_BOOTSTRAP_HERMES_HOME = Path(
+    tempfile.mkdtemp(prefix="hermes-pytest-bootstrap-")
+).resolve()
+os.environ["HERMES_HOME"] = str(_BOOTSTRAP_HERMES_HOME)
 
 import pytest
 

@@ -18,16 +18,29 @@ from typing import Any, Dict, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_EXECUTIONS_FILE_AT_IMPORT = get_hermes_home().resolve() / "cron" / "executions.db"
+# Compatibility surface for callers/tests that intentionally pin the ledger
+# path. Internal storage calls use _executions_file() so HERMES_HOME changes
+# after module import are honored.
+EXECUTIONS_FILE = _EXECUTIONS_FILE_AT_IMPORT
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _executions_file() -> Path:
+    """Resolve the active profile's execution ledger at call time."""
+    configured = Path(EXECUTIONS_FILE)
+    if configured != _EXECUTIONS_FILE_AT_IMPORT:
+        return configured
+    return get_hermes_home().resolve() / "cron" / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = _executions_file()
+    executions_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(executions_file, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
