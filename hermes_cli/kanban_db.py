@@ -999,6 +999,10 @@ class Task:
     policy_quarantined: bool = False
     policy_invalidated: bool = False
     policy_quarantine_reason: Optional[str] = None
+    # BUILD-655: parsed source_refs_json. List of dicts, one per source ref
+    # declaration. None means no source refs were declared (default behavior:
+    # no materialization). Empty list is equivalent to None (no refs).
+    source_refs: Optional[list] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1115,6 +1119,11 @@ class Task:
             policy_quarantine_reason=(
                 row["policy_quarantine_reason"] if "policy_quarantine_reason" in keys else None
             ),
+            source_refs=(
+                _parse_source_refs_json(row["source_refs_json"])
+                if "source_refs_json" in keys and row["source_refs_json"]
+                else None
+            ),
         )
 
 
@@ -1219,6 +1228,9 @@ class Attachment:
     size: int
     uploaded_by: Optional[str]
     created_at: int
+    # BUILD-655: controller-computed SHA-256 of the stored blob (hex str).
+    # None on legacy rows uploaded before BUILD-655.
+    sha256: Optional[str] = None
 
 
 @dataclass
@@ -1526,7 +1538,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- value is never released by automatic promotion or ordinary unblock.
     policy_quarantined   INTEGER NOT NULL DEFAULT 0,
     policy_invalidated   INTEGER NOT NULL DEFAULT 0,
-    policy_quarantine_reason TEXT
+    policy_quarantine_reason TEXT,
+    -- BUILD-655: JSON array of source-ref declarations. Each entry is a dict:
+    -- {ref, task_id, filename|attachment_id, sha256 (optional but recommended)}.
+    -- The dispatcher resolves these and materializes the attachments into the
+    -- worker's .hermes-sources/ inbox before spawn. NULL = no sources needed.
+    source_refs_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1604,7 +1621,11 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    -- BUILD-655: controller-computed SHA-256 of the stored blob. NULL on legacy
+    -- rows (pre-BUILD-655). Populated at upload time; used by materialize_sources()
+    -- as the trust anchor for digest-pinned source materialization.
+    sha256       TEXT
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -2767,6 +2788,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ):
             if name not in gate_cols:
                 _add_column_if_missing(conn, "architecture_gates", name, definition)
+
+    # BUILD-655: sha256 on task_attachments (computed at upload time). Some
+    # focused migration tests intentionally create only a tasks table, so first
+    # prove the optional attachment table exists before inspecting its columns.
+    attachment_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_attachments'"
+    ).fetchone()
+    if attachment_table is not None:
+        att_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")}
+        if "sha256" not in att_cols:
+            _add_column_if_missing(conn, "task_attachments", "sha256", "sha256 TEXT")
+
+    # BUILD-655: source_refs_json on tasks.
+    if "source_refs_json" not in cols:
+        _add_column_if_missing(conn, "tasks", "source_refs_json", "source_refs_json TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -5117,6 +5153,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     mutation_context: Optional[MutationContext] = None,
+    source_refs: Optional[list] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5448,6 +5485,12 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Validate and normalise source_refs before insert.
+                _source_refs_json: Optional[str] = None
+                if source_refs is not None:
+                    _normalized_refs = _normalize_source_refs(source_refs)
+                    if _normalized_refs:
+                        _source_refs_json = json.dumps(_normalized_refs)
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -5457,8 +5500,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, toolsets, model_override, model_provider_override,
                         model_reasoning_effort, max_retries, goal_mode, goal_max_turns,
-                        session_id, workflow_key, workflow_template_id, current_step_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        session_id, workflow_key, workflow_template_id, current_step_key,
+                        source_refs_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5488,6 +5532,7 @@ def create_task(
                         workflow_key or None,
                         workflow_template_id or None,
                         current_step_key or None,
+                        _source_refs_json,
                     ),
                 )
                 for pid in parents:
@@ -5942,6 +5987,8 @@ def store_attachment_bytes(
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
+    # Compute SHA-256 of the stored bytes (BUILD-655 trust anchor).
+    _att_sha256 = hashlib.sha256(data).hexdigest()
     try:
         return add_attachment(
             conn,
@@ -5951,6 +5998,7 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            sha256=_att_sha256,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -5971,12 +6019,17 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    sha256: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
     The caller is responsible for writing the blob to ``stored_path``
     first (under :func:`task_attachments_dir`); this only persists the
     metadata row and appends an ``attached`` event.
+
+    ``sha256`` is the hex SHA-256 of the stored bytes, computed at upload
+    time by :func:`store_attachment_bytes`. Stored as the BUILD-655 trust
+    anchor for digest-pinned source materialization.
     """
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
@@ -5990,8 +6043,8 @@ def add_attachment(
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at, sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
@@ -6000,6 +6053,7 @@ def add_attachment(
                 int(size),
                 uploaded_by,
                 now,
+                sha256 or None,
             ),
         )
         _append_event(
@@ -6016,6 +6070,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
         "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
+    att_keys = {row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")}
     return [
         Attachment(
             id=r["id"],
@@ -6026,6 +6081,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             size=r["size"] or 0,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
+            sha256=r["sha256"] if "sha256" in att_keys else None,
         )
         for r in rows
     ]
@@ -6037,6 +6093,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
     ).fetchone()
     if r is None:
         return None
+    _att_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")}
     return Attachment(
         id=r["id"],
         task_id=r["task_id"],
@@ -6046,6 +6103,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         size=r["size"] or 0,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
+        sha256=r["sha256"] if "sha256" in _att_cols else None,
     )
 
 
@@ -11131,6 +11189,540 @@ def latest_runtime_observation(
 # Durable continuation contracts (BUILD-487)
 # ---------------------------------------------------------------------------
 
+
+# ── BUILD-655: task-local source materialization ──────────────────────────────
+
+# Typed failure codes for source materialization. All are terminal blockers:
+# the dispatcher blocks the task and does NOT spawn on any of these.
+_SOURCE_ERROR_CODES: frozenset = frozenset({
+    "SOURCE_REF_UNRESOLVED",  # declared ref has no matching attachment
+    "SOURCE_REF_AMBIGUOUS",   # ref matches multiple attachments
+    "SOURCE_REF_UNPINNED",    # ref found but expected_sha256 not declared
+    "SOURCE_DIGEST_MISMATCH", # copied-bytes SHA-256 ≠ expected_sha256
+    "SOURCE_COPY_MISMATCH",   # post-copy re-read SHA-256 ≠ expected_sha256
+    "SOURCE_BUDGET_EXCEEDED", # inbox would exceed per-file or total budget
+    "SOURCE_PATH_ESCAPE",     # filename contains directory traversal
+})
+
+# Inbox layout constants (INV2 + INV6)
+_SOURCES_DIR = ".hermes-sources"
+_SOURCES_TMP_DIR = ".hermes-sources.tmp"
+_SOURCES_MANIFEST = "manifest.json"
+_SOURCE_PER_FILE_MAX_BYTES = 25 * 1024 * 1024   # 25 MB (existing attachment cap)
+_SOURCE_TOTAL_MAX_BYTES = 64 * 1024 * 1024       # 64 MB total inbox budget
+
+
+class SourceMaterializationError(Exception):
+    """Typed source-materialization failure (always a no-spawn terminal blocker).
+
+    ``code`` is one of :data:`_SOURCE_ERROR_CODES`; callers translate it into
+    a typed block reason stored on the task so the board shows the root cause.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        if code not in _SOURCE_ERROR_CODES:
+            raise ValueError(f"unknown source error code: {code!r}")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ResolvedSourceRef:
+    """A fully-resolved source ref ready for stream-copy materialization."""
+
+    ref: str               # logical key from source_refs_json
+    attachment_id: int     # ``task_attachments`` row id
+    task_id: str           # task that owns the attachment
+    filename: str          # safe basename for the inbox copy
+    on_disk_path: Path     # canonical absolute path (realpath-checked vs store root)
+    expected_sha256: Optional[str]  # None → caller raises SOURCE_REF_UNPINNED
+
+
+def _parse_source_refs_json(raw: str) -> Optional[list]:
+    """Deserialise source_refs_json; return None on empty/invalid."""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and parsed:
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_source_refs(refs: list) -> list:
+    """Validate and normalise a source_refs list for storage.
+
+    Raises :class:`ValueError` on structural errors so ``create_task``
+    can surface a user-facing message instead of silently dropping data.
+    """
+    out = []
+    seen_refs: set = set()
+    for i, entry in enumerate(refs):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"source_refs[{i}] must be a dict, got {type(entry).__name__!r}"
+            )
+        ref = str(entry.get("ref") or "").strip()
+        if not ref:
+            raise ValueError(f"source_refs[{i}]: 'ref' is required and must be non-empty")
+        if ref in seen_refs:
+            raise ValueError(f"source_refs: duplicate ref {ref!r}")
+        seen_refs.add(ref)
+        task_id = str(entry.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError(f"source_refs[{i}] (ref={ref!r}): 'task_id' is required")
+        if not entry.get("attachment_id") and not str(entry.get("filename") or "").strip():
+            raise ValueError(
+                f"source_refs[{i}] (ref={ref!r}): must specify 'attachment_id' or 'filename'"
+            )
+        out.append({k: v for k, v in entry.items() if k in {
+            "ref", "task_id", "attachment_id", "filename", "sha256",
+        }})
+    return out
+
+
+def resolve_source_refs(
+    conn: sqlite3.Connection,
+    task: "Task",
+    *,
+    store_root: Optional[Path] = None,
+    board: Optional[str] = None,
+) -> list[ResolvedSourceRef]:
+    """Resolve a task's source_refs to concrete, realpath-checked file paths.
+
+    Each entry in ``task.source_refs`` must declare:
+    - ``ref``: logical key
+    - ``task_id``: task that owns the attachment
+    - ``attachment_id`` OR ``filename``: how to find the attachment row
+
+    An ``sha256`` field is encouraged but not required here — absence is
+    surfaced as :class:`SourceMaterializationError` (``SOURCE_REF_UNPINNED``)
+    by :func:`materialize_sources`, keeping the resolver pure.
+
+    The store-root realpath guard (INV2) ensures no ref can escape the
+    attachment store via symlinks or ``..`` components.
+    """
+    if not task.source_refs:
+        return []
+
+    if store_root is None:
+        store_root = attachments_root(board=board)
+    store_root = store_root.resolve()
+
+    resolved: list[ResolvedSourceRef] = []
+    for entry in task.source_refs:
+        if not isinstance(entry, dict):
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source_refs entry is not a dict: {entry!r}",
+            )
+        ref = str(entry.get("ref") or "").strip()
+        if not ref:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                "source_refs entry missing 'ref' key.",
+            )
+        # ``ref`` becomes an inbox directory name. Require one non-dot path
+        # component so a malicious declaration cannot traverse from tmp_dir.
+        if ref in {".", ".."} or Path(ref).name != ref:
+            raise SourceMaterializationError(
+                "SOURCE_PATH_ESCAPE",
+                f"source ref {ref!r}: ref must be a single safe path component.",
+            )
+        ref_task_id = str(entry.get("task_id") or "").strip()
+        if not ref_task_id:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source ref {ref!r}: missing 'task_id'.",
+            )
+
+        expected_sha256: Optional[str] = None
+        raw_sha256 = entry.get("sha256")
+        if raw_sha256:
+            expected_sha256 = str(raw_sha256).strip().lower() or None
+
+        # ── Resolve attachment row ────────────────────────────────────────────
+        att: Optional[Attachment] = None
+        attachment_id_raw = entry.get("attachment_id")
+        if attachment_id_raw is not None:
+            att = get_attachment(conn, int(attachment_id_raw))
+            if att is None or att.task_id != ref_task_id:
+                raise SourceMaterializationError(
+                    "SOURCE_REF_UNRESOLVED",
+                    f"source ref {ref!r}: attachment_id={attachment_id_raw!r} "
+                    f"not found in task {ref_task_id!r}.",
+                )
+        else:
+            ref_filename = str(entry.get("filename") or "").strip()
+            if not ref_filename:
+                raise SourceMaterializationError(
+                    "SOURCE_REF_UNRESOLVED",
+                    f"source ref {ref!r}: must specify 'attachment_id' or 'filename'.",
+                )
+            all_atts = list_attachments(conn, ref_task_id)
+            matches = [a for a in all_atts if a.filename == ref_filename]
+            if not matches:
+                raise SourceMaterializationError(
+                    "SOURCE_REF_UNRESOLVED",
+                    f"source ref {ref!r}: no attachment named {ref_filename!r} "
+                    f"in task {ref_task_id!r}.",
+                )
+            if len(matches) > 1:
+                raise SourceMaterializationError(
+                    "SOURCE_REF_AMBIGUOUS",
+                    f"source ref {ref!r}: {len(matches)} attachments named "
+                    f"{ref_filename!r} in task {ref_task_id!r}; use 'attachment_id' instead.",
+                )
+            att = matches[0]
+
+        # ── Validate stored path (INV2: realpath guard) ───────────────────────
+        stored = Path(att.stored_path)
+        try:
+            canonical = stored.resolve()
+        except OSError as exc:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source ref {ref!r}: cannot resolve {att.stored_path!r}: {exc}",
+            ) from exc
+
+        try:
+            canonical.relative_to(store_root)
+        except ValueError:
+            raise SourceMaterializationError(
+                "SOURCE_PATH_ESCAPE",
+                f"source ref {ref!r}: resolved path {str(canonical)!r} is outside "
+                f"the attachment store root {str(store_root)!r}.",
+            )
+
+        if not canonical.is_file():
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source ref {ref!r}: attachment file not found at {str(canonical)!r}.",
+            )
+
+        # ── Guard filename for path-escape in inbox (INV2) ────────────────────
+        safe_fn = att.filename
+        if "/" in safe_fn or "\\" in safe_fn:
+            raise SourceMaterializationError(
+                "SOURCE_PATH_ESCAPE",
+                f"source ref {ref!r}: filename {safe_fn!r} contains path separators.",
+            )
+
+        resolved.append(ResolvedSourceRef(
+            ref=ref,
+            attachment_id=att.id,
+            task_id=att.task_id,
+            filename=safe_fn,
+            on_disk_path=canonical,
+            expected_sha256=expected_sha256 or None,
+        ))
+
+    return resolved
+
+
+def _stream_copy_sha256(src_path: Path, dst_path: Path) -> str:
+    """Stream-copy src to dst, returning the hex SHA-256 of written bytes.
+
+    Never uses move/hardlink/symlink — always a fresh byte sequence (INV6).
+    Raises :class:`OSError` on I/O failure.
+    """
+    h = hashlib.sha256()
+    with src_path.open("rb") as fsrc, dst_path.open("wb") as fdst:
+        for chunk in iter(lambda: fsrc.read(1024 * 1024), b""):
+            h.update(chunk)
+            fdst.write(chunk)
+    return h.hexdigest()
+
+
+def materialize_sources(
+    refs: list[ResolvedSourceRef],
+    workspace: Path,
+    *,
+    total_budget: int = _SOURCE_TOTAL_MAX_BYTES,
+    per_file_budget: int = _SOURCE_PER_FILE_MAX_BYTES,
+) -> Path:
+    """Atomically copy verified source refs into workspace/.hermes-sources/.
+
+    Invariants satisfied:
+    - INV2: all manifest paths are workspace-relative and under workspace root
+    - INV3: sha256(copied_file) == manifest entry == declared expected_sha256
+    - INV5: any failure → :class:`SourceMaterializationError`; caller blocks task
+    - INV6: copies are 0444 (read-only); canonical attachment bytes are unchanged
+
+    Returns the final ``.hermes-sources`` path (exists iff no exception raised).
+    """
+    if not refs:
+        return workspace / _SOURCES_DIR
+
+    tmp_dir = workspace / _SOURCES_TMP_DIR
+    final_dir = workspace / _SOURCES_DIR
+
+    # A prior failed copy may have left this controller-owned temp directory.
+    # It is never a worker input (only final_dir is), so removing it before a
+    # retry prevents stale bytes from being promoted by a later successful run.
+    if tmp_dir.exists():
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    total_bytes = 0
+    manifest_entries = []
+
+    for ref_obj in refs:
+        if ref_obj.expected_sha256 is None:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNPINNED",
+                f"source ref {ref_obj.ref!r}: no expected SHA-256 declared in source_refs_json. "
+                "Add \'sha256\' to the entry or accept the integrity risk explicitly.",
+            )
+
+        try:
+            size = ref_obj.on_disk_path.stat().st_size
+        except OSError as exc:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source ref {ref_obj.ref!r}: cannot stat {str(ref_obj.on_disk_path)!r}: {exc}",
+            ) from exc
+
+        if size > per_file_budget:
+            raise SourceMaterializationError(
+                "SOURCE_BUDGET_EXCEEDED",
+                f"source ref {ref_obj.ref!r} ({ref_obj.filename!r}): "
+                f"size {size} bytes exceeds per-file budget {per_file_budget}.",
+            )
+        total_bytes += size
+        if total_bytes > total_budget:
+            raise SourceMaterializationError(
+                "SOURCE_BUDGET_EXCEEDED",
+                f"source ref {ref_obj.ref!r}: cumulative inbox {total_bytes} bytes "
+                f"exceeds total budget {total_budget}.",
+            )
+
+        ref_dir = tmp_dir / ref_obj.ref
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        dest = ref_dir / ref_obj.filename
+
+        try:
+            copied_sha256 = _stream_copy_sha256(ref_obj.on_disk_path, dest)
+        except OSError as exc:
+            raise SourceMaterializationError(
+                "SOURCE_COPY_MISMATCH",
+                f"source ref {ref_obj.ref!r}: I/O error copying {ref_obj.filename!r}: {exc}",
+            ) from exc
+
+        # Primary integrity check: copied-bytes hash == pinned digest (TOCTOU-safe)
+        if copied_sha256 != ref_obj.expected_sha256:
+            raise SourceMaterializationError(
+                "SOURCE_DIGEST_MISMATCH",
+                f"source ref {ref_obj.ref!r}: "
+                f"copied SHA-256 {copied_sha256!r} ≠ expected {ref_obj.expected_sha256!r}.",
+            )
+
+        # Post-copy re-read verification (INV3 defence-in-depth, detects torn writes)
+        post_sha256 = _file_sha256(dest)
+        if post_sha256 != ref_obj.expected_sha256:
+            raise SourceMaterializationError(
+                "SOURCE_COPY_MISMATCH",
+                f"source ref {ref_obj.ref!r}: "
+                f"post-copy SHA-256 {post_sha256!r} ≠ expected {ref_obj.expected_sha256!r}.",
+            )
+
+        dest.chmod(0o444)  # INV6: read-only
+
+        rel_path = f"{_SOURCES_DIR}/{ref_obj.ref}/{ref_obj.filename}"
+        manifest_entries.append({
+            "ref": ref_obj.ref,
+            "filename": ref_obj.filename,
+            "path": rel_path,
+            "sha256": ref_obj.expected_sha256,
+            "size": size,
+            "source_attachment_id": ref_obj.attachment_id,
+        })
+
+    # Write manifest with fsync, then atomic rename tmp → final (INV4, INV5)
+    manifest_path = tmp_dir / _SOURCES_MANIFEST
+    manifest_bytes = json.dumps(
+        {"version": 1, "entries": manifest_entries}, indent=2,
+    ).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+    try:
+        with manifest_path.open("rb") as _fh:
+            os.fsync(_fh.fileno())
+    except OSError:
+        pass  # best-effort; rename provides cross-filesystem durability
+
+    # Remove any stale final inbox before atomic rename
+    if final_dir.exists():
+        import shutil as _shutil
+        _shutil.rmtree(final_dir)
+    tmp_dir.rename(final_dir)
+    return final_dir
+
+
+def load_task_sources(workspace: Optional[Path] = None) -> dict[str, Path]:
+    """Worker-side accessor: read the materialized source inbox and re-verify.
+
+    Returns ``{ref: Path}`` for all entries in the ``.hermes-sources/manifest.json``.
+    Raises :class:`SourceMaterializationError` when:
+    - The inbox directory exists but the manifest is missing (incomplete materialization)
+    - Any file path escapes the workspace root (path-escape attack)
+    - Any re-read SHA-256 mismatches the manifest entry (corruption or tampering)
+
+    Returns an empty dict (no error) when no sources were declared/materialized.
+    """
+    if workspace is None:
+        ws_env = (
+            os.environ.get("HERMES_KANBAN_WORKSPACE")
+            or os.environ.get("HOME")
+        )
+        if not ws_env:
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                "HERMES_KANBAN_WORKSPACE not set; cannot locate source inbox.",
+            )
+        workspace = Path(ws_env)
+
+    workspace = workspace.resolve()
+    sources_dir = workspace / _SOURCES_DIR
+    manifest_path = sources_dir / _SOURCES_MANIFEST
+
+    if not sources_dir.exists():
+        return {}  # No sources — not an error
+
+    if not manifest_path.exists():
+        raise SourceMaterializationError(
+            "SOURCE_REF_UNRESOLVED",
+            f"Source inbox {str(sources_dir)!r} exists but manifest.json is missing; "
+            "materialization may be incomplete.",
+        )
+
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+    except (ValueError, OSError) as exc:
+        raise SourceMaterializationError(
+            "SOURCE_REF_UNRESOLVED",
+            f"Cannot read/parse source manifest at {str(manifest_path)!r}: {exc}",
+        ) from exc
+
+    entries = manifest.get("entries") or []
+    result: dict[str, Path] = {}
+
+    for entry in entries:
+        ref = str(entry.get("ref") or "")
+        rel_path = str(entry.get("path") or "")
+        expected_sha256 = str(entry.get("sha256") or "")
+
+        # Assert workspace-local path (INV2)
+        file_path = (workspace / rel_path).resolve()
+        try:
+            file_path.relative_to(workspace)
+        except ValueError:
+            raise SourceMaterializationError(
+                "SOURCE_PATH_ESCAPE",
+                f"source ref {ref!r}: manifest path {rel_path!r} resolves "
+                f"outside workspace {str(workspace)!r}.",
+            )
+
+        if not file_path.is_file():
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNRESOLVED",
+                f"source ref {ref!r}: inbox file {str(file_path)!r} is missing.",
+            )
+
+        # Re-verify SHA-256 (INV3 defence-in-depth)
+        if expected_sha256:
+            actual = _file_sha256(file_path)
+            if actual != expected_sha256:
+                raise SourceMaterializationError(
+                    "SOURCE_DIGEST_MISMATCH",
+                    f"source ref {ref!r}: re-read SHA-256 {actual!r} ≠ "
+                    f"manifest entry {expected_sha256!r}.",
+                )
+
+        result[ref] = file_path
+
+    return result
+
+
+def _source_materialization_config() -> dict[str, Any]:
+    """Return the ``kanban.source_materialization`` config sub-dict.
+
+    Fail-open to ``{"attachments": True}`` (default-on) when the config
+    cannot be loaded. The feature flag ``kanban.source_materialization.attachments``
+    is the kill-switch (rollback: set to false).
+    """
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = load_config().get("kanban") or {}
+        sm = kanban_cfg.get("source_materialization") or {}
+        return dict(sm) if isinstance(sm, dict) else {}
+    except Exception:
+        return {}
+
+
+def _maybe_materialize_sources(
+    conn: sqlite3.Connection,
+    task: "Task",
+    workspace: Path,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Controller-side source materialization hook: resolves and copies source refs.
+
+    Returns ``None`` on success (or when the task has no source refs).
+    Returns an error string and blocks the task on any failure (INV5: fail-closed).
+    """
+    try:
+        refs = resolve_source_refs(conn, task, board=board)
+        if refs:
+            materialize_sources(refs, workspace)
+        return None
+    except SourceMaterializationError as exc:
+        _log.warning(
+            "kanban source materialization failed for %s: [%s] %s",
+            task.id, exc.code, exc,
+        )
+        try:
+            block_task(
+                conn,
+                task.id,
+                reason=f"{exc.code}: {exc}",
+                summary=(
+                    f"Source materialization failed before spawn (code={exc.code}). "
+                    "Check source_refs_json entries and attachment availability."
+                ),
+                metadata={"failure_code": exc.code, "phase": "source_materialization"},
+                kind="capability",
+                expected_run_id=task.current_run_id,
+            )
+        except Exception:
+            _log.error(
+                "failed to persist source materialization block for task %s",
+                task.id, exc_info=True,
+            )
+        return f"source_materialization:{exc.code}: {exc}"
+    except Exception as exc:
+        _log.warning(
+            "kanban source materialization unexpected error for %s: %s",
+            task.id, exc, exc_info=True,
+        )
+        try:
+            block_task(
+                conn,
+                task.id,
+                reason=f"SOURCE_MATERIALIZATION_ERROR: {exc}",
+                summary="Unexpected error during source materialization.",
+                metadata={"failure_code": "SOURCE_MATERIALIZATION_ERROR"},
+                kind="capability",
+                expected_run_id=task.current_run_id,
+            )
+        except Exception:
+            _log.error(
+                "failed to persist unexpected source materialization block for task %s",
+                task.id, exc_info=True,
+            )
+        return f"source_materialization:unexpected: {exc}"
+
+
+# ── End BUILD-655 ─────────────────────────────────────────────────────────────
 def _continuation_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
@@ -14439,6 +15031,13 @@ def _dispatch_once_locked(
             result.spawn_errors.append((claimed.id, continuation_error))
             result.auto_blocked.append(claimed.id)
             continue
+        # ── BUILD-655: source materialization (controller-side, pre-exec) ──
+        if _source_materialization_config().get("attachments", True):
+            _sm_error = _maybe_materialize_sources(conn, claimed, workspace, board=board)
+            if _sm_error is not None:
+                result.spawn_errors.append((claimed.id, _sm_error))
+                result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             _spawn_and_attach_worker(
@@ -14586,6 +15185,13 @@ def _dispatch_once_locked(
             result.spawn_errors.append((claimed.id, continuation_error))
             result.auto_blocked.append(claimed.id)
             continue
+        # ── BUILD-655: source materialization (controller-side, pre-exec) ──
+        if _source_materialization_config().get("attachments", True):
+            _sm_error_rev = _maybe_materialize_sources(conn, claimed, workspace, board=board)
+            if _sm_error_rev is not None:
+                result.spawn_errors.append((claimed.id, _sm_error_rev))
+                result.auto_blocked.append(claimed.id)
+                continue
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
