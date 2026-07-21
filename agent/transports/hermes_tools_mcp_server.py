@@ -20,8 +20,8 @@ Scope (what we expose):
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
-  - kanban_* (complete/block/comment/    — kanban worker + orchestrator
-    heartbeat/show/list/create/            handoff (stateless: read env var,
+  - kanban_* (complete/block/rework/     — kanban worker + orchestrator
+    comment/heartbeat/show/list/create/    handoff (stateless: read env var,
     unblock/link)                          write ~/.hermes/kanban.db)
 
 What we DO NOT expose:
@@ -135,6 +135,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # the env var and write to ~/.hermes/kanban.db.
     "kanban_complete",
     "kanban_block",
+    "kanban_request_rework",
     "kanban_comment",
     "kanban_heartbeat",
     "kanban_show",

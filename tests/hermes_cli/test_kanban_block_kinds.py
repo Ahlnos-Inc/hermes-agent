@@ -170,10 +170,10 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_dependency_without_unfinished_parent_hard_blocks_first_wait(
+def test_dependency_without_unfinished_parent_enters_pending_wait(
     kanban_home: Path,
 ) -> None:
-    """A false dependency claim cannot re-enter the promotion loop."""
+    """A missing fix card waits without entering the human queue."""
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="already done", assignee="worker")
         assert kb.complete_task(conn, parent, result="done")
@@ -184,18 +184,153 @@ def test_dependency_without_unfinished_parent_hard_blocks_first_wait(
             conn, child, reason="artifact commit is unreachable", kind="dependency",
         )
         task = kb.get_task(conn, child)
-        assert task.status == "blocked"
-        assert task.block_kind == "needs_input"
-        assert "artifact/capability unavailable" in (
-            kb.latest_run(conn, child).summary or ""
-        )
+        assert task.status == "todo"
+        assert task.block_kind == "dependency_pending"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.recompute_ready(conn) == 0
+        promoted, refusal = kb.promote_task(conn, child, actor="operator", force=True)
+        assert promoted is False
+        assert refusal is not None and "materialization is pending" in refusal
+        assert not [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "failure_signature"
+        ]
         events = [
             event for event in kb.list_events(conn, child)
-            if event.kind == "dependency_loop_detected"
+            if event.kind == "dependency_pending"
         ]
         assert len(events) == 1
-        assert events[0].payload["recurrences"] == 1
-        assert events[0].payload["limit"] == kb.DEFAULT_FAILURE_SIGNATURE_REPEAT_THRESHOLD
+        assert events[0].payload["baseline_parent_ids"] == [parent]
+        assert events[0].payload["source_event_kind"] == "kanban_block"
+
+
+def test_dispatch_tick_reconciles_before_promotion_without_respawning_pending(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="pending review")
+        assert kb.block_task(conn, child, reason="await fix", kind="dependency")
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert result.promoted == 0
+        assert result.spawned == []
+        assert result.dependency_waits_timed_out == 0
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).block_kind == "dependency_pending"
+
+
+def test_pending_wait_materializes_unfinished_then_rearms_terminal_parent(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="review")
+        assert kb.block_task(conn, child, reason="return to coder", kind="dependency")
+        fix = kb.create_task(conn, title="fix", assignee="worker")
+        kb.link_tasks(conn, fix, child)
+
+        result = kb.reconcile_dependency_waits(conn, now=100)
+        assert result.waits_materialized == 1
+        assert kb.get_task(conn, child).block_kind == "dependency"
+
+        assert kb.complete_task(conn, fix, result="fixed")
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.get_task(conn, child).block_kind is None
+
+
+def test_pending_wait_rearms_when_new_parent_is_already_terminal(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="review")
+        assert kb.block_task(conn, child, reason="return to coder", kind="dependency")
+        fix = kb.create_task(conn, title="already fixed", assignee="worker")
+        assert kb.complete_task(conn, fix, result="fixed")
+        kb.link_tasks(conn, fix, child)
+
+        result = kb.reconcile_dependency_waits(conn, now=100)
+        assert result.waits_rearmed == 1
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.get_task(conn, child).block_kind is None
+
+
+def test_pending_wait_sla_escalates_once_and_only_then_records_failure(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="review")
+        assert kb.block_task(
+            conn, child, reason="return to coder", kind="dependency",
+            materialization_sla_seconds=10,
+        )
+        pending = [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "dependency_pending"
+        ][-1]
+        deadline = pending.payload["materialize_by"]
+        assert kb.reconcile_dependency_waits(conn, now=deadline - 1).timed_out == 0
+        assert kb.reconcile_dependency_waits(conn, now=deadline).timed_out == 1
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert len([
+            event for event in kb.list_events(conn, child)
+            if event.kind == "dependency_materialization_timeout"
+        ]) == 1
+        assert len([
+            event for event in kb.list_events(conn, child)
+            if event.kind == "failure_signature"
+        ]) == 1
+        assert kb.reconcile_dependency_waits(conn, now=deadline + 1).timed_out == 0
+        assert len([
+            event for event in kb.list_events(conn, child)
+            if event.kind == "failure_signature"
+        ]) == 1
+
+
+def test_legacy_dependency_hard_block_recovers_only_with_dependency_provenance(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="fix", assignee="worker")
+        child = kb.create_task(conn, title="review", assignee="worker")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (child,),
+            )
+            kb._append_event(
+                conn, child, "blocked",
+                {"reason": "dependency_unavailable: no fix card", "kind": "needs_input"},
+            )
+            kb._append_event(
+                conn, child, "dependency_loop_detected", {"reason": "no parent"},
+            )
+        result = kb.reconcile_dependency_waits(conn, now=100)
+        assert result.legacy_recovered == 1
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).block_kind == "dependency"
+
+
+def test_human_approval_block_ignores_unrelated_parent(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unrelated", assignee="worker")
+        child = kb.create_task(conn, title="approval", assignee="worker")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (child,),
+            )
+            kb._append_event(
+                conn, child, "blocked",
+                {"reason": "legal approval required", "kind": "needs_input"},
+            )
+        result = kb.reconcile_dependency_waits(conn, now=100)
+        assert result.legacy_recovered == 0
+        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.get_task(conn, child).block_kind == "needs_input"
 
 
 def test_repeated_dependency_signature_blocks_before_third_spawn(

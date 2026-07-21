@@ -2800,6 +2800,9 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Maximum time a dependency declaration may wait for its fix/review
+        # parent to materialize before it becomes a genuine human blocker.
+        "dependency_materialization_sla_seconds": 900,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

@@ -88,6 +88,34 @@ def test_no_nudge_after_kanban_block(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_kanban_request_rework(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_rework",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_rework",
+            "tool_call_id": "1",
+            "content": "rework requested",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 def test_nudge_budget_exhausted(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None

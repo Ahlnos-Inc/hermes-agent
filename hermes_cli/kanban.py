@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -621,6 +622,41 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_rework = sub.add_parser(
+        "rework",
+        help="Create/adopt a fix card and re-arm a review task atomically",
+    )
+    p_rework.add_argument("review_task_id", help="Review or verifier task id")
+    p_rework.add_argument(
+        "--reason", required=True,
+        help="Concrete finding that the fix card must address",
+    )
+    p_rework.add_argument(
+        "--fix-task", dest="fix_task_id", default=None,
+        help="Adopt an existing fix task (the live repair form)",
+    )
+    p_rework.add_argument("--title", default=None, help="Title for a new fix task")
+    p_rework.add_argument("--body", default=None, help="Body for a new fix task")
+    p_rework.add_argument("--assignee", default=None, help="Assignee for a new fix task")
+    p_rework.add_argument(
+        "--workspace", default="scratch",
+        help="Workspace for a new fix: scratch | worktree[:path] | dir:path",
+    )
+    p_rework.add_argument("--branch", default=None, help="Branch for a worktree fix")
+    p_rework.add_argument("--project", default=None, help="Project for a new fix")
+    p_rework.add_argument("--priority", type=int, default=None)
+    p_rework.add_argument("--skill", action="append", default=None, dest="skills")
+    p_rework.add_argument("--toolset", action="append", default=None, dest="toolsets")
+    p_rework.add_argument("--max-runtime", default=None)
+    p_rework.add_argument("--summary", default=None)
+    p_rework.add_argument("--metadata", default=None)
+    p_rework.add_argument(
+        "--request-key", default=None,
+        help="Stable idempotency key (generated deterministically when omitted)",
+    )
+    p_rework.add_argument("--dry-run", action="store_true")
+    p_rework.add_argument("--json", action="store_true")
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1016,6 +1052,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "rework":   _cmd_rework,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -2205,6 +2242,157 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_rework(args: argparse.Namespace) -> int:
+    """Atomically request review rework from the CLI surface."""
+    reason = str(args.reason or "").strip()
+    if not reason:
+        print("kanban rework: --reason is required", file=sys.stderr)
+        return 2
+    has_adopt = bool(args.fix_task_id and str(args.fix_task_id).strip())
+    has_create = any(
+        value is not None
+        for value in (
+            args.title, args.body, args.assignee, args.project, args.branch,
+            args.priority, args.max_runtime,
+        )
+    ) or bool(args.skills or args.toolsets) or args.workspace != "scratch"
+    if has_adopt and has_create:
+        print(
+            "kanban rework: --fix-task cannot be combined with new-fix options",
+            file=sys.stderr,
+        )
+        return 2
+    if not has_adopt and (not args.title or not args.assignee):
+        print(
+            "kanban rework: provide --fix-task or both --title and --assignee",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        branch_name = _parse_branch_flag(args.branch)
+        max_runtime = _parse_duration(args.max_runtime)
+    except argparse.ArgumentTypeError as exc:
+        print(f"kanban rework: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"kanban rework: {exc}", file=sys.stderr)
+        return 2
+    if branch_name and ws_kind != "worktree":
+        print("kanban rework: --branch is only valid with --workspace worktree", file=sys.stderr)
+        return 2
+    metadata = None
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban rework: --metadata: {exc}", file=sys.stderr)
+            return 2
+
+    if has_adopt:
+        fix_input: object = {"fix_task_id": str(args.fix_task_id).strip()}
+    else:
+        fix_input = {
+            "title": args.title,
+            "body": args.body,
+            "assignee": args.assignee,
+            "workspace_kind": ws_kind,
+            "workspace_path": ws_path,
+            "project_id": args.project,
+            "branch_name": branch_name,
+            "priority": args.priority,
+            "skills": tuple(args.skills) if args.skills else None,
+            "toolsets": tuple(args.toolsets) if args.toolsets else None,
+            "max_runtime_seconds": max_runtime,
+        }
+    request_key = args.request_key
+    if not request_key:
+        request_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "review_task_id": args.review_task_id,
+                    "reason": reason,
+                    "fix": fix_input,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    with kb.connect_closing() as conn:
+        review = kb.get_task(conn, args.review_task_id)
+        fix_task = (
+            kb.get_task(conn, str(args.fix_task_id).strip())
+            if has_adopt else None
+        )
+        if args.dry_run:
+            if review is None:
+                print(f"kanban rework: unknown review task {args.review_task_id}", file=sys.stderr)
+                return 1
+            if has_adopt and fix_task is None:
+                print(f"kanban rework: unknown fix task {args.fix_task_id}", file=sys.stderr)
+                return 1
+            result = {
+                "dry_run": True,
+                "review_task_id": args.review_task_id,
+                "fix_task_id": (
+                    str(args.fix_task_id).strip() if has_adopt else None
+                ),
+                "request_key": request_key,
+                "review_status": review.status,
+                "fix_action": "adopted" if has_adopt else "created",
+                "reason": reason,
+            }
+            if args.json:
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                action = "adopt" if has_adopt else "create"
+                print(
+                    f"Would {action} fix for {args.review_task_id} "
+                    f"(request_key={request_key})"
+                )
+            return 0
+
+        if has_adopt:
+            fix: kb.ExistingFixTask | kb.NewFixTask = kb.ExistingFixTask(
+                task_id=str(args.fix_task_id).strip()
+            )
+        else:
+            fix = kb.NewFixTask(**fix_input)
+        expected_run_id = _worker_run_id_for(args.review_task_id)
+        result = kb.request_rework(
+            conn,
+            args.review_task_id,
+            finding=reason,
+            fix=fix,
+            request_key=request_key,
+            actor=_profile_author(),
+            summary=args.summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+            require_no_active_run=expected_run_id is None,
+        )
+        output = {
+            "review_task_id": result.review_task_id,
+            "fix_task_id": result.fix_task_id,
+            "fix_action": result.fix_action,
+            "review_status": result.review_status,
+            "request_event_id": result.request_event_id,
+            "request_key": request_key,
+        }
+        if args.json:
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Rework {result.fix_action}: {result.fix_task_id}; "
+                f"review {result.review_task_id} → {result.review_status}"
+            )
+    return 0
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -2467,12 +2655,16 @@ def _cmd_dispatch_run(args: argparse.Namespace) -> int:
         signature_repeat_threshold = _coerce_positive_int(
             _kanban_cfg.get("failure_signature_threshold")
         )
+        dependency_materialization_sla_seconds = _coerce_positive_int(
+            _kanban_cfg.get("dependency_materialization_sla_seconds")
+        )
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
         signature_repeat_threshold = None
+        dependency_materialization_sla_seconds = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2483,6 +2675,7 @@ def _cmd_dispatch_run(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             signature_repeat_threshold=signature_repeat_threshold,
+            dependency_materialization_sla_seconds=dependency_materialization_sla_seconds,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2492,6 +2685,11 @@ def _cmd_dispatch_run(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "dependency_links_restored": res.dependency_links_restored,
+            "dependency_waits_materialized": res.dependency_waits_materialized,
+            "dependency_waits_rearmed": res.dependency_waits_rearmed,
+            "dependency_legacy_recovered": res.dependency_legacy_recovered,
+            "dependency_waits_timed_out": res.dependency_waits_timed_out,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2519,6 +2717,23 @@ def _cmd_dispatch_run(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    if any(
+        (
+            res.dependency_links_restored,
+            res.dependency_waits_materialized,
+            res.dependency_waits_rearmed,
+            res.dependency_legacy_recovered,
+            res.dependency_waits_timed_out,
+        )
+    ):
+        print(
+            "Dependency reconcile: "
+            f"links={res.dependency_links_restored}, "
+            f"materialized={res.dependency_waits_materialized}, "
+            f"rearmed={res.dependency_waits_rearmed}, "
+            f"legacy={res.dependency_legacy_recovered}, "
+            f"timed_out={res.dependency_waits_timed_out}"
+        )
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

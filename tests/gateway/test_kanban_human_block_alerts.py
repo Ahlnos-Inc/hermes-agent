@@ -6,7 +6,10 @@ sweep fires regardless of subscriptions, skips auto-resolving block kinds
 ledger, and re-alerts on a re-block after an unblock (new event id).
 """
 
-from gateway.kanban_watchers import _collect_human_blocked_events
+from gateway.kanban_watchers import (
+    _collect_human_blocked_events,
+    _human_block_event_is_current,
+)
 from hermes_cli import kanban_db as kb
 
 
@@ -21,10 +24,19 @@ def _mktask(conn, title="t"):
     return task if isinstance(task, str) else task.id
 
 
+def _set_blocked(conn, task_id):
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+            (task_id,),
+        )
+
+
 def test_human_blocked_event_is_collected_even_when_subscribed(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
     kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="123")
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "blocked", {"reason": "needs approval", "kind": "needs_input"})
 
     out = _collect_human_blocked_events(kb, conn)
@@ -35,6 +47,7 @@ def test_human_blocked_event_is_collected_even_when_subscribed(tmp_path):
 def test_auto_resolving_block_kinds_are_skipped(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "blocked", {"reason": "flaky", "kind": "transient"})
     kb._append_event(conn, task_id, "blocked", {"reason": "parents", "kind": "dependency"})
     assert _collect_human_blocked_events(kb, conn) == []
@@ -43,15 +56,17 @@ def test_auto_resolving_block_kinds_are_skipped(tmp_path):
 def test_untyped_block_and_triage_escalation_are_collected(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "blocked", {"reason": "generic"})
     kb._append_event(conn, task_id, "block_loop_detected", {"reason": "loop", "recurrences": 2})
     out = _collect_human_blocked_events(kb, conn)
-    assert [o["event"].kind for o in out] == ["blocked", "block_loop_detected"]
+    assert [o["event"].kind for o in out] == ["block_loop_detected"]
 
 
 def test_ledger_dedups_per_event_but_reblock_realerts(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "blocked", {"reason": "one", "kind": "needs_input"})
     first = _collect_human_blocked_events(kb, conn)
     assert len(first) == 1
@@ -73,6 +88,7 @@ def test_ledger_dedups_per_event_but_reblock_realerts(tmp_path):
 def test_gave_up_events_alert_the_console(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "gave_up", {"error": "pid gone", "failures": 2})
     out = _collect_human_blocked_events(kb, conn)
     assert [o["event"].kind for o in out] == ["gave_up"]
@@ -81,7 +97,23 @@ def test_gave_up_events_alert_the_console(tmp_path):
 def test_done_and_archived_tasks_are_skipped(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
     kb._append_event(conn, task_id, "blocked", {"reason": "x", "kind": "needs_input"})
     conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
     conn.commit()
     assert _collect_human_blocked_events(kb, conn) == []
+
+
+def test_alert_healed_before_send_is_suppressed(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
+    kb._append_event(conn, task_id, "blocked", {"reason": "needs approval", "kind": "needs_input"})
+    conn.commit()
+    items = _collect_human_blocked_events(kb, conn)
+    assert len(items) == 1
+    items[0]["db_path"] = str(tmp_path / "kanban.db")
+    assert _human_block_event_is_current(kb, items[0])
+
+    assert kb.unblock_task(conn, task_id)
+    assert not _human_block_event_is_current(kb, items[0])

@@ -274,9 +274,21 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
             JOIN tasks t ON t.id = e.task_id
             WHERE e.kind IN ({placeholders})
               AND e.created_at >= ?
-              AND t.status NOT IN ('done', 'archived')
+              AND t.status IN ('blocked', 'triage')
               AND COALESCE(json_extract(e.payload, '$.kind'), '')
                   NOT IN ({auto_placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_events newer
+                   WHERE newer.task_id = e.task_id
+                     AND newer.id > e.id
+                     AND newer.kind IN (
+                         'blocked', 'block_loop_detected', 'gave_up',
+                         'unblocked', 'promoted', 'promoted_manual',
+                         'dependency_recovered', 'dependency_rearmed',
+                         'dependency_materialized', 'rework_requested',
+                         'completed', 'archived', 'status'
+                     )
+              )
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
                               WHERE nd.delivery_key =
                                   'human-block/' || e.task_id || '/' || e.id)
@@ -307,6 +319,65 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
             "delivery_key": f"human-block/{row['task_id']}/{int(row['id'])}",
         })
     return out
+
+
+def _human_block_event_is_current(kb, item: dict) -> bool:
+    """Freshly verify one alert before its external send.
+
+    Collection and delivery are separate phases.  Re-open the board here so
+    a rework/unblock that commits after collection suppresses the pending
+    Telegram send instead of paging on a healed epoch.
+    """
+    try:
+        db_path = item.get("db_path")
+        if db_path:
+            fresh_conn = kb.connect_closing(db_path=Path(db_path))
+        else:
+            fresh_conn = kb.connect_closing(board=item.get("board"))
+        with fresh_conn as fresh:
+            row = fresh.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (item["task_id"],),
+            ).fetchone()
+            if row is None or row["status"] not in {"blocked", "triage"}:
+                return False
+            event = fresh.execute(
+                "SELECT kind, payload FROM task_events WHERE id = ? "
+                "AND task_id = ?",
+                (int(item["event"].id), item["task_id"]),
+            ).fetchone()
+            if event is None or event["kind"] not in HUMAN_BLOCK_EVENT_KINDS:
+                return False
+            payload = {}
+            if event["payload"]:
+                try:
+                    value = json.loads(event["payload"])
+                    payload = value if isinstance(value, dict) else {}
+                except Exception:
+                    return False
+            if payload.get("kind") in HUMAN_BLOCK_AUTO_KINDS:
+                return False
+            newer = fresh.execute(
+                """SELECT 1 FROM task_events
+                     WHERE task_id = ? AND id > ?
+                       AND kind IN (
+                           'blocked', 'block_loop_detected', 'gave_up',
+                           'unblocked', 'promoted', 'promoted_manual',
+                           'dependency_recovered', 'dependency_rearmed',
+                           'dependency_materialized', 'rework_requested',
+                           'completed', 'archived', 'status'
+                       )
+                     LIMIT 1""",
+                (item["task_id"], int(item["event"].id)),
+            ).fetchone()
+            return newer is None
+    except Exception:
+        logger.debug(
+            "kanban notifier: fresh human-block check failed for %s",
+            item.get("task_id"),
+            exc_info=True,
+        )
+        return False
 
 
 def _snapshot_process_fds(db_path: Path, out_path: Path) -> "Optional[str]":
@@ -983,6 +1054,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     for b in blocked:
                                         b["board"] = slug
+                                        b["db_path"] = resolved_db_path
                                     human_blocked.extend(blocked)
                                 except Exception as exc:
                                     logger.debug(
@@ -1359,7 +1431,6 @@ class GatewayKanbanWatchersMixin:
                     last = hb_attempts.get(key, 0.0)
                     if time.monotonic() - last < ORPHAN_FAILURE_RETRY_SECONDS:
                         continue
-                    hb_attempts[key] = time.monotonic()
                     msg = render_kanban_event(
                         task_id=item["task_id"],
                         task=item.get("task"),
@@ -1368,6 +1439,14 @@ class GatewayKanbanWatchersMixin:
                     )
                     if not msg:
                         continue
+                    from hermes_cli import kanban_db as _kb
+                    # This is intentionally the last local operation before
+                    # the external send: a block healed after collection must
+                    # not page the operator for the old epoch.
+                    if not _human_block_event_is_current(_kb, item):
+                        hb_attempts.pop(key, None)
+                        continue
+                    hb_attempts[key] = time.monotonic()
                     msg = (
                         "🧑‍🔧 Human input needed — reply here to unblock:\n"
                         + msg

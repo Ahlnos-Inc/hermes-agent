@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import signal
 import time
 
@@ -278,3 +279,36 @@ def test_operator_dependency_block_preserves_dependency_routing(tmp_path) -> Non
         assert run is not None
         assert run.status == "blocked"
         assert run.outcome == "blocked"
+
+
+def test_operator_dependency_block_without_parent_enters_pending(tmp_path) -> None:
+    db_path = tmp_path / "kanban.db"
+    with contextlib.closing(kb.connect(db_path)) as conn:
+        task_id = kb.create_task(conn, title="wait for materialization", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert claimed is not None
+        _attach_worker(conn, task_id, 62002)
+
+        result = kb.operator_block_task(
+            conn,
+            task_id,
+            reason="review requested a fix card",
+            kind="dependency",
+            materialization_sla_seconds=60,
+            signal_fn=lambda _pid, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+
+        assert result.accepted is True
+        assert result.finalized is True
+        pending = kb.get_task(conn, task_id)
+        assert pending is not None
+        assert pending.status == "todo"
+        assert pending.block_kind == "dependency_pending"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'dependency_pending' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["materialize_by"] >= int(time.time())

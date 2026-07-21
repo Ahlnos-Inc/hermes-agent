@@ -57,7 +57,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_request_rework",
+        "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -139,6 +140,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_request_rework",
         "kanban_comment", "kanban_create", "kanban_compile_workflow", "kanban_link",
         "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -1180,6 +1182,47 @@ def test_worker_block_returns_typed_terminal_control(worker_env):
     assert isinstance(out, kt.KanbanTerminalControl)
     assert out.action is kt.KanbanTerminalAction.BLOCK
     assert json.loads(out)["ok"] is True
+
+
+def test_worker_request_rework_adopts_fix_and_stops_loop(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        fix_id = kb.create_task(conn, title="fix finding", assignee="coder")
+
+    out = kt._handle_request_rework({
+        "finding": "review caught a P1 defect",
+        "fix_task_id": fix_id,
+        "request_key": "review-run-1",
+    })
+    assert isinstance(out, kt.KanbanTerminalControl)
+    assert out.action is kt.KanbanTerminalAction.REWORK
+    result = json.loads(out)
+    assert result["fix_task_id"] == fix_id
+    assert result["fix_action"] == "adopted"
+
+    with kb.connect_closing() as conn:
+        review = kb.get_task(conn, worker_env)
+        assert review is not None
+        assert review.status == "todo"
+        assert review.block_kind is None
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (fix_id, worker_env),
+        ).fetchone() is not None
+
+
+def test_request_rework_requires_exactly_one_fix_form(worker_env):
+    from tools import kanban_tools as kt
+
+    both = json.loads(kt._handle_request_rework({
+        "finding": "bad",
+        "request_key": "rk",
+        "fix_task_id": "t_existing",
+        "fix": {"title": "new", "assignee": "coder"},
+    }))
+    assert "exactly one" in both["error"]
 
 
 def test_block_rejects_empty_reason(worker_env):

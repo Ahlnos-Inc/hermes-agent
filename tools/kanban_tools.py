@@ -500,6 +500,7 @@ class KanbanTerminalAction(str, Enum):
 
     COMPLETE = "complete"
     BLOCK = "block"
+    REWORK = "rework"
 
 
 class KanbanTerminalControl(str):
@@ -528,12 +529,16 @@ class KanbanTerminalControl(str):
     def final_response(self) -> str:
         if self.action is KanbanTerminalAction.COMPLETE:
             return "Kanban task completed."
+        if self.action is KanbanTerminalAction.REWORK:
+            return "Kanban rework requested; review task parked until the fix is delivered."
         return "Kanban task blocked."
 
     @property
     def tool_name(self) -> str:
         if self.action is KanbanTerminalAction.COMPLETE:
             return "kanban_complete"
+        if self.action is KanbanTerminalAction.REWORK:
+            return "kanban_request_rework"
         return "kanban_block"
 
 
@@ -1889,6 +1894,114 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_request_rework(args: dict, **kw) -> str:
+    """Atomically create/adopt a fix card and re-arm a review card."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    finding = args.get("finding")
+    if not finding or not str(finding).strip():
+        return tool_error("finding is required — describe the defect to fix")
+    request_key = args.get("request_key")
+    if not request_key or not str(request_key).strip():
+        return tool_error("request_key is required for idempotent rework")
+    fix_task_id = args.get("fix_task_id")
+    fix_spec = args.get("fix")
+    has_fix_task_id = bool(fix_task_id and str(fix_task_id).strip())
+    has_fix_spec = fix_spec is not None
+    if has_fix_task_id == has_fix_spec:
+        return tool_error("provide exactly one of fix_task_id or fix")
+    if fix_spec is not None and not isinstance(fix_spec, dict):
+        return tool_error("fix must be an object")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        if fix_spec is not None:
+            list_fields = ("skills", "toolsets")
+            normalized_lists: dict[str, Optional[tuple[str, ...]]] = {}
+            for field in list_fields:
+                value = fix_spec.get(field)
+                if value is None:
+                    normalized_lists[field] = None
+                elif isinstance(value, (list, tuple)):
+                    normalized_lists[field] = tuple(str(item) for item in value)
+                else:
+                    return tool_error(f"fix.{field} must be an array")
+            fix = kb.NewFixTask(
+                title=str(fix_spec.get("title") or ""),
+                body=fix_spec.get("body"),
+                assignee=str(fix_spec.get("assignee") or ""),
+                workspace_kind=fix_spec.get("workspace_kind"),
+                workspace_path=fix_spec.get("workspace_path"),
+                project_id=fix_spec.get("project_id"),
+                branch_name=fix_spec.get("branch_name"),
+                priority=fix_spec.get("priority"),
+                skills=normalized_lists["skills"],
+                toolsets=normalized_lists["toolsets"],
+                max_runtime_seconds=fix_spec.get("max_runtime_seconds"),
+            )
+        else:
+            fix = kb.ExistingFixTask(task_id=str(fix_task_id).strip())
+
+        finding = redact_sensitive_text(str(finding), force=True)
+        summary = args.get("summary")
+        if summary is not None:
+            summary = redact_sensitive_text(str(summary), force=True)
+        metadata = _stamp_worker_session_metadata(tid, metadata)
+        actor = (
+            os.environ.get("HERMES_KANBAN_ACTOR")
+            or os.environ.get("HERMES_PROFILE")
+            or "worker"
+        )
+        expected_run_id = _worker_run_id(tid)
+        if os.environ.get("HERMES_KANBAN_TASK") == tid and expected_run_id is None:
+            return tool_error(
+                "HERMES_KANBAN_RUN_ID is required when a worker requests rework"
+            )
+        conn = None
+        try:
+            kb_obj, conn = _connect(board=board)
+            result = kb_obj.request_rework(
+                conn,
+                tid,
+                finding=finding,
+                fix=fix,
+                request_key=str(request_key).strip(),
+                actor=actor,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+                require_no_active_run=expected_run_id is None,
+            )
+            return _worker_terminal_ok(
+                KanbanTerminalAction.REWORK,
+                task_id=tid,
+                fix_task_id=result.fix_task_id,
+                fix_action=result.fix_action,
+                review_status=result.review_status,
+                request_event_id=result.request_event_id,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_rework: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_rework failed")
+        return tool_error(f"kanban_request_rework: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -3482,6 +3595,71 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_REWORK_SCHEMA = {
+    "name": "kanban_request_rework",
+    "description": (
+        "Reviewer/verifier terminal action. Atomically record a finding, "
+        "create or adopt exactly one fix card, link fix→review, close the "
+        "current review run, and park or re-arm the review card. Use this "
+        "when changes are requested; use kanban_block with kind='needs_input' "
+        "only when a genuine human decision is required. request_key is "
+        "mandatory so retries cannot duplicate the fix or edge."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "finding": {
+                "type": "string",
+                "description": "The concrete review defect the fix must address.",
+            },
+            "request_key": {
+                "type": "string",
+                "description": "Stable caller-generated idempotency key for this finding.",
+            },
+            "fix_task_id": {
+                "type": "string",
+                "description": "Adopt this existing fix card; mutually exclusive with fix.",
+            },
+            "fix": {
+                "type": "object",
+                "description": "Create a new fix card; mutually exclusive with fix_task_id.",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "assignee": {"type": "string"},
+                    "workspace_kind": {"type": "string"},
+                    "workspace_path": {"type": "string"},
+                    "project_id": {"type": "string"},
+                    "branch_name": {"type": "string"},
+                    "priority": {"type": "integer"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "toolsets": {"type": "array", "items": {"type": "string"}},
+                    "max_runtime_seconds": {"type": "integer"},
+                },
+                "required": ["title", "assignee"],
+            },
+            "summary": {
+                "type": "string",
+                "description": "Optional concise handoff for the fix worker.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured review metadata.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["finding", "request_key"],
+        "oneOf": [
+            {"required": ["fix_task_id"]},
+            {"required": ["fix"]},
+        ],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -3907,6 +4085,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_request_rework",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_REWORK_SCHEMA,
+    handler=_handle_request_rework,
+    check_fn=_check_kanban_mode,
+    emoji="🔁",
 )
 
 registry.register(
