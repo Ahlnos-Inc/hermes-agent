@@ -11866,13 +11866,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # pre-dispatch chokepoint, and it also saves the duplicate agent
         # turn, not just the duplicate row. Adapters without stable message
         # ids (event.message_id unset) are unaffected.
-        if (
-            event.message_id
-            and not getattr(event, "internal", False)
-            and await self.async_session_store.has_platform_message_id(
-                session_entry.session_id, str(event.message_id)
-            )
-        ):
+        _already_persisted = False
+        if event.message_id and not getattr(event, "internal", False):
+            # SessionStore guarantees a bool. Check it strictly so an
+            # unavailable/custom store that returns a truthy sentinel cannot
+            # discard a legitimate inbound turn.
+            _already_persisted = (
+                await self.async_session_store.has_platform_message_id(
+                    session_entry.session_id, str(event.message_id)
+                )
+            ) is True
+        if _already_persisted:
             logger.warning(
                 "Dropping redelivered %s update message_id=%s for session %s "
                 "(already persisted); no new turn started",
@@ -12774,12 +12778,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Dedupe: skip if this platform message_id is already in the
                 # transcript (prevents duplicate user turns on Telegram retries
                 # after transient failures). #47237
-                _skip_persist = (
-                    event.message_id
-                    and await self.async_session_store.has_platform_message_id(
-                        session_entry.session_id, str(event.message_id)
-                    )
-                )
+                _skip_persist = False
+                if event.message_id:
+                    _skip_persist = (
+                        await self.async_session_store.has_platform_message_id(
+                            session_entry.session_id, str(event.message_id)
+                        )
+                    ) is True
                 if _skip_persist:
                     logger.info(
                         "Skipping duplicate user turn "

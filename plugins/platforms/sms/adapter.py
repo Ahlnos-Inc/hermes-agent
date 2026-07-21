@@ -66,8 +66,8 @@ class SmsAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SMS)
-        self._account_sid: str = os.environ["TWILIO_ACCOUNT_SID"]
-        self._auth_token: str = os.environ["TWILIO_AUTH_TOKEN"]
+        self._account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+        self._auth_token: str = os.getenv("TWILIO_AUTH_TOKEN", "")
         self._from_number: str = os.getenv("TWILIO_PHONE_NUMBER", "")
         self._webhook_port: int = int(
             os.getenv("SMS_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT))
@@ -90,6 +90,12 @@ class SmsAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         import aiohttp
         from aiohttp import web
+
+        if not self._account_sid or not self._auth_token:
+            msg = "[sms] Twilio credentials are not configured — cannot start"
+            logger.error(msg)
+            self._set_fatal_error("sms_missing_credentials", msg, retryable=False)
+            return False
 
         if not self._from_number:
             msg = "[sms] TWILIO_PHONE_NUMBER not set — cannot send replies"

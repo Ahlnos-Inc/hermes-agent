@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).parents[2].resolve()
 PLATFORMS_DIR = PROJECT_ROOT / "plugins" / "platforms"
 
 
@@ -54,6 +54,8 @@ class _MockPluginContext:
 
     def __init__(self):
         self.registered_names: list[str] = []
+        self.registered_cli_commands: list[str] = []
+        self.registered_hooks: list[str] = []
 
     def register_platform(
         self,
@@ -75,6 +77,13 @@ class _MockPluginContext:
         )
         platform_registry.register(entry)
         self.registered_names.append(name)
+
+    def register_cli_command(self, *, name: str, **kwargs: Any) -> None:
+        self.registered_cli_commands.append(name)
+
+    def register_hook(self, event: str, callback: Any) -> None:
+        assert callable(callback)
+        self.registered_hooks.append(event)
 
 
 def _import_platform_module(name: str) -> ModuleType:

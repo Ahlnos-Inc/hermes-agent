@@ -2141,11 +2141,11 @@ class GatewayKanbanWatchersMixin:
                     disabled_corrupt_boards.pop(slug, None)
                     return
                 logger.error(
-                    "kanban dispatcher: board %s database %s is corrupt and "
-                    "auto-recovery failed (%s); pausing dispatch until the file "
-                    "changes or the quarantine timer expires. Restore the file, "
-                    "then run `hermes kanban init` if you need a fresh board.",
-                    slug, fingerprint[0], detail,
+                    "kanban dispatcher: board %s database %s is not a valid SQLite "
+                    "database (%s); auto-recovery failed (%s); pausing dispatch until "
+                    "the file changes or the quarantine timer expires. Restore the "
+                    "file, then run `hermes kanban init` if you need a fresh board.",
+                    slug, fingerprint[0], exc, detail,
                 )
             else:
                 logger.info(
