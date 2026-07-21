@@ -13405,13 +13405,12 @@ def reconcile_dependency_waits(
             if not dependency_origin or not parents:
                 continue
             unsatisfied = [parent for parent in parents if not _parent_is_satisfied(parent)]
-            if unsatisfied:
-                changed = _to_dependency(task_id)
-                target_status = "todo"
-            else:
-                changed = _clear_to_ready(task_id)
-                target_status = "ready"
-            if changed:
+            # Legacy hard blocks have no baseline from which to prove that a
+            # parent was newly linked.  A fully satisfied existing parent set
+            # is therefore not evidence of a fix and must remain blocked.
+            if not unsatisfied:
+                continue
+            if _to_dependency(task_id):
                 legacy_recovered += 1
                 _append_event(
                     conn,
@@ -13420,7 +13419,7 @@ def reconcile_dependency_waits(
                     {
                         "parent_ids": sorted(parent["id"] for parent in parents),
                         "unfinished_parent_ids": sorted(parent["id"] for parent in unsatisfied),
-                        "status": target_status,
+                        "status": "todo",
                         "source_event_kind": state_event["kind"],
                     },
                 )

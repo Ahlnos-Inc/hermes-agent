@@ -311,6 +311,39 @@ def test_legacy_dependency_hard_block_recovers_only_with_dependency_provenance(
         assert kb.get_task(conn, child).block_kind == "dependency"
 
 
+def test_legacy_dependency_hard_block_stays_blocked_when_parents_are_satisfied(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="original coder card", assignee="worker")
+        assert kb.complete_task(conn, parent, result="done")
+        child = kb.create_task(conn, title="review", assignee="worker")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (child,),
+            )
+            kb._append_event(
+                conn, child, "blocked",
+                {"reason": "dependency_unavailable: no unfinished linked parent", "kind": "needs_input"},
+            )
+            kb._append_event(
+                conn, child, "dependency_loop_detected", {"reason": "no unfinished parent"},
+            )
+
+        result = kb.reconcile_dependency_waits(conn, now=100)
+
+        assert result.legacy_recovered == 0
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert not [
+            event for event in kb.list_events(conn, child)
+            if event.kind == "dependency_recovered"
+        ]
+
+
 def test_human_approval_block_ignores_unrelated_parent(
     kanban_home: Path,
 ) -> None:
