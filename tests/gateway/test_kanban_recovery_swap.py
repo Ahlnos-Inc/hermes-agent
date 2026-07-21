@@ -1,4 +1,4 @@
-"""BUILD-567: writer-safe board recovery swap (``_attempt_board_db_recovery``).
+"""Writer-safe board recovery-swap behavior.
 
 The swap must abort (and retry next tick) if any writer commits between the
 sqlite3 ``.recover`` snapshot and the atomic file swap, and must succeed when
@@ -7,7 +7,13 @@ letting a fresh ``connect()`` bind a stale ``-wal`` to the recovered inode
 mid-swap — was a corruption seed.
 """
 
+import os
+from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
+
+import pytest
 
 import gateway.kanban_watchers as kw
 from hermes_cli import kanban_db as kb
@@ -40,53 +46,215 @@ def _healthy_board(tmp_path):
 
 
 def _integrity_ok(db):
-    conn = sqlite3.connect(str(db))
+    conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
     try:
         return conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         conn.close()
 
 
-def test_recovery_succeeds_when_board_is_quiet(tmp_path):
+def _task_count(db):
+    conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    try:
+        return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _install_sqlite_process_fake(
+    monkeypatch,
+    tmp_path,
+    live_db,
+    *,
+    after_recover=None,
+    recover_failure=None,
+):
+    """Emulate only the external sqlite3 process used by production recovery."""
+    executable = tmp_path / "fake-sqlite3"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        command = tuple(str(arg) for arg in args)
+        input_data = kwargs.pop("input", None)
+        assert kwargs.pop("capture_output", None) is True
+        timeout = kwargs.pop("timeout", None)
+        assert kwargs.pop("check", False) is False
+        assert not kwargs
+        assert command[0] == str(executable)
+        calls.append(command)
+
+        if len(command) == 3 and Path(command[1]) == live_db and command[2] == ".recover":
+            assert input_data is None
+            assert timeout == 300
+            if recover_failure is None:
+                with sqlite3.connect(str(live_db)) as conn:
+                    stdout = "\n".join(conn.iterdump()).encode()
+                result = subprocess.CompletedProcess(command, 0, stdout, b"")
+            else:
+                returncode, stdout, stderr = recover_failure
+                result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
+            if after_recover is not None:
+                after_recover()
+            return result
+
+        if len(command) == 2:
+            assert timeout == 300
+            assert isinstance(input_data, bytes) and input_data.strip()
+            recovered_db = Path(command[1])
+            assert recovered_db.name.startswith(live_db.name + ".recovered-")
+            with sqlite3.connect(str(recovered_db)) as conn:
+                conn.executescript(input_data.decode())
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        if len(command) == 3 and command[2] == "PRAGMA integrity_check":
+            assert input_data is None
+            assert timeout == 120
+            recovered_db = Path(command[1])
+            with sqlite3.connect(str(recovered_db)) as conn:
+                result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            return subprocess.CompletedProcess(command, 0, f"{result}\n".encode(), b"")
+
+        raise AssertionError(f"unexpected sqlite3 operation: {command!r}")
+
+    monkeypatch.setattr(kw.shutil, "which", lambda name: str(executable) if name == "sqlite3" else None)
+    monkeypatch.setattr(kw.subprocess, "run", fake_run)
+    return calls
+
+
+def test_recovery_succeeds_when_board_is_quiet(tmp_path, monkeypatch):
     db = _healthy_board(tmp_path)
+    original = db.read_bytes()
+    calls = _install_sqlite_process_fake(monkeypatch, tmp_path, db)
+
     ok, detail = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
     assert ok, detail
     assert "corrupt original preserved" in detail
+    assert len(calls) == 3
     assert db.exists() and _integrity_ok(db)
-    # The pre-swap original was preserved, not destroyed.
-    assert len(list(tmp_path.glob("kanban.db.corrupt-*.bak"))) == 1
+    assert _task_count(db) == 1
+    backups = list(tmp_path.glob("kanban.db.corrupt-*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert not list(tmp_path.glob("kanban.db.recovered-*.tmp"))
+    assert not Path(f"{db}-wal").exists()
+    assert not Path(f"{db}-shm").exists()
 
 
 def test_recovery_aborts_when_board_changes_mid_recover(tmp_path, monkeypatch):
     db = _healthy_board(tmp_path)
-    real_run = kw.subprocess.run
-    calls = {"n": 0}
 
-    def fake_run(*args, **kwargs):
-        result = real_run(*args, **kwargs)
-        # After the ``.recover`` read completes (first subprocess call),
-        # simulate a concurrent notifier commit landing on the live board.
-        if calls["n"] == 0:
-            writer = sqlite3.connect(str(db))
-            try:
-                writer.execute("CREATE TABLE IF NOT EXISTS _concurrent(x)")
-                writer.execute("INSERT INTO _concurrent VALUES (1)")
-                writer.commit()
-            finally:
-                writer.close()
-        calls["n"] += 1
-        return result
+    def commit_after_snapshot():
+        with sqlite3.connect(str(db)) as writer:
+            writer.execute("CREATE TABLE IF NOT EXISTS _concurrent(x)")
+            writer.execute("INSERT INTO _concurrent VALUES (1)")
 
-    monkeypatch.setattr(kw.subprocess, "run", fake_run)
+    calls = _install_sqlite_process_fake(
+        monkeypatch,
+        tmp_path,
+        db,
+        after_recover=commit_after_snapshot,
+    )
 
     ok, detail = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
     assert not ok
     assert "changed during recovery" in detail
-    # No swap happened: the live DB was never renamed out.
+    assert "could not acquire write lock" not in detail
+    assert len(calls) == 3
     assert not list(tmp_path.glob("kanban.db.corrupt-*.bak"))
-    # The concurrent writer's commit survived (it was not clobbered by a swap).
-    conn = sqlite3.connect(str(db))
-    try:
+    assert not list(tmp_path.glob("kanban.db.recovered-*.tmp"))
+    with sqlite3.connect(str(db)) as conn:
         assert conn.execute("SELECT count(*) FROM _concurrent").fetchone()[0] == 1
-    finally:
-        conn.close()
+
+
+def test_recovery_aborts_when_board_file_is_replaced_mid_recover(tmp_path, monkeypatch):
+    db = _healthy_board(tmp_path)
+    replacement = tmp_path / "replacement.db"
+    with sqlite3.connect(str(replacement)) as conn:
+        conn.execute("CREATE TABLE replacement_marker(value TEXT)")
+        conn.execute("INSERT INTO replacement_marker VALUES ('replacement')")
+    replacement_bytes = replacement.read_bytes()
+
+    calls = _install_sqlite_process_fake(
+        monkeypatch,
+        tmp_path,
+        db,
+        after_recover=lambda: os.replace(replacement, db),
+    )
+
+    ok, detail = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
+    assert not ok
+    assert "board file was replaced during recovery" in detail
+    assert len(calls) == 3
+    assert db.read_bytes() == replacement_bytes
+    assert not list(tmp_path.glob("kanban.db.corrupt-*.bak"))
+    assert not list(tmp_path.glob("kanban.db.recovered-*.tmp"))
+
+
+def test_recovery_fails_closed_when_cli_returns_empty_recovery(tmp_path, monkeypatch):
+    db = _healthy_board(tmp_path)
+    original = db.read_bytes()
+    calls = _install_sqlite_process_fake(
+        monkeypatch,
+        tmp_path,
+        db,
+        recover_failure=(0, b"", b"sql error: no such table: sqlite_dbpage (1)\n"),
+    )
+
+    ok, detail = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
+    assert not ok
+    assert ".recover failed:" in detail
+    assert "sqlite_dbpage" in detail
+    assert len(calls) == 1
+    assert db.read_bytes() == original
+    assert not list(tmp_path.glob("kanban.db.corrupt-*.bak"))
+    assert not list(tmp_path.glob("kanban.db.recovered-*.tmp"))
+
+
+def _require_working_real_recover(tmp_path):
+    sqlite3_cli = shutil.which("sqlite3")
+    if not sqlite3_cli:
+        pytest.skip("sqlite3 CLI is not installed")
+
+    probe = tmp_path / "recover-capability.db"
+    recovered = tmp_path / "recover-capability-reloaded.db"
+    with sqlite3.connect(str(probe)) as conn:
+        conn.execute("CREATE TABLE probe(value TEXT)")
+        conn.execute("INSERT INTO probe VALUES ('present')")
+
+    dump = subprocess.run(
+        [sqlite3_cli, str(probe), ".recover"],
+        capture_output=True,
+        timeout=30,
+    )
+    if dump.returncode != 0 or not dump.stdout.strip():
+        pytest.skip("sqlite3 CLI cannot execute .recover on this host")
+    load = subprocess.run(
+        [sqlite3_cli, str(recovered)],
+        input=dump.stdout,
+        capture_output=True,
+        timeout=30,
+    )
+    check = subprocess.run(
+        [sqlite3_cli, str(recovered), "PRAGMA integrity_check"],
+        capture_output=True,
+        timeout=30,
+    )
+    if load.returncode != 0 or check.stdout.decode(errors="replace").strip() != "ok":
+        pytest.skip("sqlite3 CLI .recover output is not reloadable on this host")
+
+
+def test_real_sqlite_cli_recovery_smoke_when_supported(tmp_path):
+    _require_working_real_recover(tmp_path)
+    db = _healthy_board(tmp_path)
+
+    ok, detail = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
+    assert ok, detail
+    assert db.exists() and _integrity_ok(db)
+    assert _task_count(db) == 1
