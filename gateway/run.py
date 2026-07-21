@@ -1924,6 +1924,7 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    CLARIFY_SEND_WAIT_TIMEOUT_SECONDS,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -19591,7 +19592,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     send_ok = False
                 else:
                     try:
-                        result = fut.result(timeout=15)
+                        result = fut.result(timeout=CLARIFY_SEND_WAIT_TIMEOUT_SECONDS)
                         send_ok = bool(getattr(result, "success", False))
                     except Exception as exc:
                         logger.warning("Clarify send failed: %s", exc)

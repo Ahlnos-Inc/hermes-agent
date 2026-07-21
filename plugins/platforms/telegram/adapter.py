@@ -5143,7 +5143,43 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            msg = await self._send_message_with_thread_fallback(**kwargs)
+            try:
+                msg = await self._send_message_with_thread_fallback(**kwargs)
+            except Exception as send_err:
+                retry_after = getattr(send_err, "retry_after", None)
+                if retry_after is None:
+                    raise
+                if hasattr(retry_after, "total_seconds"):
+                    retry_after = retry_after.total_seconds()
+                wait = float(retry_after)
+                logger.warning(
+                    "[%s] Telegram flood control on clarify prompt, retrying in %.1fs: %s",
+                    self.name,
+                    wait,
+                    _redact_telegram_error_text(send_err),
+                )
+                await asyncio.sleep(wait)
+                try:
+                    msg = await self._send_message_with_thread_fallback(**kwargs)
+                except Exception as retry_err:
+                    logger.warning(
+                        "[%s] Clarify button retry failed; sending plain-text fallback: %s",
+                        self.name,
+                        _redact_telegram_error_text(retry_err),
+                    )
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs.pop("reply_markup", None)
+                    reply_hint = (
+                        "Reply with the option number or your answer."
+                        if choices
+                        else "Reply with your answer."
+                    )
+                    fallback_kwargs["text"] = (
+                        f"{text}\n\n{reply_hint}"
+                    )
+                    msg = await self._send_message_with_thread_fallback(**fallback_kwargs)
+                    from tools.clarify_gateway import mark_awaiting_text
+                    mark_awaiting_text(clarify_id)
             self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:

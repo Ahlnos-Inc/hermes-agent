@@ -67,6 +67,12 @@ def _clear_clarify_state():
         cm._notify_cbs.clear()
 
 
+class _RetryAfter(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"Retry after {seconds}")
+        self.retry_after = seconds
+
+
 # ===========================================================================
 # send_clarify — render
 # ===========================================================================
@@ -76,6 +82,12 @@ class TestTelegramSendClarify:
 
     def setup_method(self):
         _clear_clarify_state()
+
+    def test_gateway_wait_budget_covers_retry_after_regression(self):
+        """The sync bridge must wait longer than the observed 17s flood delay."""
+        from gateway.platforms.base import CLARIFY_SEND_WAIT_TIMEOUT_SECONDS
+
+        assert CLARIFY_SEND_WAIT_TIMEOUT_SECONDS > 17
 
     @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
@@ -131,6 +143,84 @@ class TestTelegramSendClarify:
         assert "reply_markup" not in kwargs
         assert "What is your name?" in kwargs["text"]
         assert adapter._clarify_state["cid2"] == "sk2"
+
+    @pytest.mark.asyncio
+    async def test_retry_after_over_15_seconds_retries_button_prompt(self):
+        """Flood control longer than the old gateway wait still delivers clarify."""
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 102
+
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[_RetryAfter(17), mock_msg]
+        )
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            result = await adapter.send_clarify(
+                chat_id="12345",
+                question="Which option?",
+                choices=["alpha", "beta"],
+                clarify_id="cid-flood",
+                session_key="sk-flood",
+            )
+
+        assert result.success is True
+        assert result.message_id == "102"
+        sleep.assert_awaited_once_with(17.0)
+        assert adapter._bot.send_message.await_count == 2
+        assert adapter._clarify_state["cid-flood"] == "sk-flood"
+
+    @pytest.mark.asyncio
+    async def test_failed_button_retry_delivers_text_fallback_without_orphaning_state(self):
+        """Clarify stays pending and text-routable after visible fallback delivery."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register(
+            "cid-fallback",
+            "sk-fallback",
+            "Which option?",
+            ["alpha", "beta"],
+        )
+        fallback_msg = MagicMock()
+        fallback_msg.message_id = 103
+
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[
+                _RetryAfter(17),
+                RuntimeError("button retry failed"),
+                fallback_msg,
+            ]
+        )
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await adapter.send_clarify(
+                chat_id="-100123",
+                question="Which option?",
+                choices=["alpha", "beta"],
+                clarify_id="cid-fallback",
+                session_key="sk-fallback",
+                metadata={"thread_id": "77"},
+            )
+
+        assert result.success is True
+        assert result.message_id == "103"
+        assert adapter._bot.send_message.await_count == 3
+        fallback_kwargs = adapter._bot.send_message.await_args_list[-1].kwargs
+        assert "reply_markup" not in fallback_kwargs
+        assert fallback_kwargs["message_thread_id"] == 77
+        assert "Reply with the option number" in fallback_kwargs["text"]
+        pending = cm.get_pending_for_session("sk-fallback")
+        assert pending is not None
+        assert pending.clarify_id == "cid-fallback"
+        assert pending.awaiting_text is True
+        assert adapter._clarify_state["cid-fallback"] == "sk-fallback"
 
     @pytest.mark.asyncio
     async def test_not_connected(self):
