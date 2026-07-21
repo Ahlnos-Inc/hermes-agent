@@ -1559,16 +1559,20 @@ def test_thread_id_whitespace_and_unannotated_values():
     assert TelegramAdapter._message_thread_id_for_send("  7  ") == 7
     assert TelegramAdapter._message_thread_id_for_send("12038") == 12038
     assert TelegramAdapter._message_thread_id_for_send(12038) == 12038
-    # empty / comment-only / None → no thread id
-    assert TelegramAdapter._message_thread_id_for_send("   # only a comment") is None
+    # empty / None → genuine absence, no thread id
     assert TelegramAdapter._message_thread_id_for_send("") is None
     assert TelegramAdapter._message_thread_id_for_send(None) is None
+    # BUILD-636 P1: a non-empty comment-only value is malformed and fails
+    # closed — it must NOT be treated as absence (which would authorize a
+    # General/root send).
+    with pytest.raises(ValueError, match="positive ASCII integer"):
+        TelegramAdapter._message_thread_id_for_send("   # only a comment")
 
 
 def test_malformed_thread_id_fails_loud_before_send():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
-    with pytest.raises(ValueError, match="must be numeric"):
+    with pytest.raises(ValueError, match="positive ASCII integer"):
         TelegramAdapter._message_thread_id_for_send("not-a-number")
-    with pytest.raises(ValueError, match="must be numeric"):
+    with pytest.raises(ValueError, match="positive ASCII integer"):
         TelegramAdapter._message_thread_id_for_typing("2b  # typo")

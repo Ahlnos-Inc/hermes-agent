@@ -384,6 +384,34 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_bare_telegram_home_target_preserves_home_thread_id(self):
+        config, telegram_cfg = _make_config()
+        config.get_home_channel = lambda _platform: SimpleNamespace(
+            chat_id="-1001", thread_id="2"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {"action": "send", "target": "telegram", "message": "hello"}
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="2",
+            media_files=[],
+            force_document=False,
+        )
+
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
         config, telegram_cfg = _make_config()
         cache_file = tmp_path / "channel_directory.json"
@@ -1349,6 +1377,19 @@ class TestSendTelegramThreadIdMapping:
 
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["message_thread_id"] == 17585
+
+    def test_comment_only_thread_fails_closed_without_bot_call(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram("tok", "-1001234567890", "hello", thread_id="# Alerts")
+        )
+
+        assert result["success"] is False
+        assert result["retryable"] is False
+        assert "topic" in result["error"].lower()
+        bot.send_message.assert_not_awaited()
 
     def test_no_thread_id_no_kwarg(self, monkeypatch):
         """With no thread_id, message_thread_id must not appear in kwargs."""

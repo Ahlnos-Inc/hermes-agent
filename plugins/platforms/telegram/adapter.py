@@ -269,7 +269,9 @@ from gateway.platforms.base import (
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
+    TelegramTopicIdError,
     normalize_telegram_chat_id,
+    parse_telegram_topic_id,
 )
 from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
@@ -1063,17 +1065,33 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not metadata:
-            return None
-        thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
-        return str(thread_id) if thread_id is not None else None
+        return cls._metadata_topic_id(
+            metadata, "thread_id", "message_thread_id"
+        )
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        return cls._metadata_topic_id(
+            metadata,
+            "direct_messages_topic_id",
+            "telegram_direct_messages_topic_id",
+        )
+
+    @staticmethod
+    def _metadata_topic_id(
+        metadata: Optional[Dict[str, Any]], primary: str, secondary: str
+    ) -> Optional[str]:
         if not metadata:
             return None
-        topic_id = metadata.get("direct_messages_topic_id") or metadata.get("telegram_direct_messages_topic_id")
-        return str(topic_id) if topic_id is not None else None
+        for key in (primary, secondary):
+            if key not in metadata:
+                continue
+            topic_id = parse_telegram_topic_id(
+                metadata[key], source=f"metadata.{key}"
+            )
+            if topic_id is not None:
+                return str(topic_id)
+        return None
 
     @classmethod
     def _metadata_reply_to_message_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -1168,38 +1186,13 @@ class TelegramAdapter(BasePlatformAdapter):
         return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
 
     @classmethod
-    def _coerce_thread_id(cls, thread_id: Optional[str]) -> Optional[str]:
-        """Return the effective numeric thread-id string from a possibly
-        annotated configuration value.
-
-        A configured topic like ``TELEGRAM_HOME_CHANNEL_THREAD_ID=2  # Alerts
-        topic (was 1=General; moved 2026-07-19)`` reaches here as the whole
-        annotated string; passing it straight to ``int()`` raised
-        ``invalid literal for int() with base 10`` and blocked every send to the
-        home channel (BUILD-566). Strip an inline ``#`` comment and surrounding
-        whitespace to recover the effective value. An empty value yields
-        ``None``; a genuinely non-numeric value fails loud with an actionable
-        configuration error BEFORE any send is attempted.
-        """
-        if thread_id is None:
-            return None
-        cleaned = str(thread_id).split("#", 1)[0].strip()
-        if not cleaned:
-            return None
-        if not re.fullmatch(r"-?\d+", cleaned):
-            raise ValueError(
-                f"Telegram thread/topic id must be numeric, got {thread_id!r} "
-                f"(effective value after stripping any inline comment: "
-                f"{cleaned!r}). Fix the configured TELEGRAM_*_THREAD_ID value."
-            )
-        return cleaned
-
-    @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
-        cleaned = cls._coerce_thread_id(thread_id)
-        if cleaned is None or cleaned == cls._GENERAL_TOPIC_THREAD_ID:
+        topic_id = parse_telegram_topic_id(
+            thread_id, source="message_thread_id"
+        )
+        if topic_id is None or topic_id == int(cls._GENERAL_TOPIC_THREAD_ID):
             return None
-        return int(cleaned)
+        return topic_id
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -1210,10 +1203,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # bubble in the General topic (omitting it hides the bubble entirely
         # from the client's view of that topic). Preserve the real id here —
         # sends still map "1" → None via _message_thread_id_for_send.
-        cleaned = cls._coerce_thread_id(thread_id)
-        if cleaned is None:
-            return None
-        return int(cleaned)
+        return parse_telegram_topic_id(thread_id, source="message_thread_id")
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
@@ -4278,7 +4268,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     "thread_fallback": used_thread_fallback,
                 },
             )
-            
+        except TelegramTopicIdError as exc:
+            logger.error("[%s] Rejected Telegram topic route: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as e:
             safe_error = _redact_telegram_error_text(e)
             logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
@@ -4849,7 +4841,13 @@ class TelegramAdapter(BasePlatformAdapter):
         text = content if len(content) <= self.MAX_MESSAGE_LENGTH else \
             self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
 
-        thread_id = self._metadata_thread_id(metadata)
+        try:
+            thread_id = self._message_thread_id_for_typing(
+                self._metadata_thread_id(metadata)
+            )
+        except TelegramTopicIdError as exc:
+            logger.error("[%s] Rejected Telegram draft topic route: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc), retryable=False)
 
         # Apply the same MarkdownV2 conversion the regular ``send`` path uses
         # so the animated draft preview renders with identical formatting to
@@ -7019,6 +7017,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_thread_id=message_thread_id,
             )
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+        except TelegramTopicIdError as exc:
+            logger.error("[%s] Rejected Telegram typing topic route: %s", self.name, exc)
+            return
         except Exception as e:
             # For DM topic lanes, Telegram may reject message_thread_id.
             # Fall back to sending typing without thread_id so the typing

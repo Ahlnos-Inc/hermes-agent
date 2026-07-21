@@ -371,13 +371,13 @@ def _merge_top_level_home_channels(
         existing_home = plat_data.get("home_channel")
         if isinstance(existing_home, dict) and existing_home.get("chat_id"):
             continue
-        home_channel: dict[str, str] = {
+        home_channel: dict[str, Any] = {
             "platform": platform_key,
             "chat_id": str(chat_id),
             "name": str(name or default_name),
         }
         if thread_id not in (None, ""):
-            home_channel["thread_id"] = str(thread_id)
+            home_channel["thread_id"] = thread_id
         plat_data["home_channel"] = home_channel
         platforms_data[platform_key] = plat_data
 
@@ -426,6 +426,21 @@ def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bo
     return True
 
 
+def _normalize_telegram_home_thread_id(raw: Any, *, source: str) -> Optional[str]:
+    """Normalize a Telegram config topic without disabling other platforms."""
+    from plugins.platforms.telegram.telegram_ids import (
+        TelegramTopicIdError,
+        parse_telegram_topic_id,
+    )
+
+    try:
+        topic_id = parse_telegram_topic_id(raw, source=source)
+    except TelegramTopicIdError as exc:
+        logger.warning("%s; quarantining Telegram topic configuration", exc)
+        return str(raw).strip()
+    return str(topic_id) if topic_id is not None else None
+
+
 @dataclass
 class HomeChannel:
     """
@@ -453,11 +468,19 @@ class HomeChannel:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
+        platform = Platform(data["platform"])
+        raw_thread_id = data.get("thread_id")
         return cls(
-            platform=Platform(data["platform"]),
+            platform=platform,
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
-            thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            thread_id=(
+                _normalize_telegram_home_thread_id(
+                    raw_thread_id, source="platforms.telegram.home_channel.thread_id"
+                )
+                if platform == Platform.TELEGRAM
+                else str(raw_thread_id) if raw_thread_id else None
+            ),
         )
 
 
@@ -1657,7 +1680,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.TELEGRAM,
             chat_id=telegram_home,
             name=getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
-            thread_id=getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
+            thread_id=_normalize_telegram_home_thread_id(
+                getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID"),
+                source="TELEGRAM_HOME_CHANNEL_THREAD_ID",
+            ),
         )
     
     # Discord

@@ -1098,9 +1098,30 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
-        if cron_thread:
-            return cron_thread
+        from plugins.platforms.telegram.telegram_ids import (
+            TelegramTopicIdError,
+            parse_telegram_topic_id,
+        )
+
+        candidates = [
+            ("TELEGRAM_CRON_THREAD_ID", os.getenv("TELEGRAM_CRON_THREAD_ID")),
+            (f"{env_var}_THREAD_ID", os.getenv(f"{env_var}_THREAD_ID")),
+        ]
+        legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
+        if legacy:
+            candidates.append((f"{legacy}_THREAD_ID", os.getenv(f"{legacy}_THREAD_ID")))
+        for source, raw in candidates:
+            try:
+                topic_id = parse_telegram_topic_id(raw, source=source)
+            except TelegramTopicIdError as exc:
+                # A malformed selected value is deliberately retained so the
+                # Telegram send boundary rejects it instead of selecting a
+                # lower-precedence topic or the General/root route.
+                logger.warning("%s; quarantining Telegram cron topic", exc)
+                return str(raw).strip()
+            if topic_id is not None:
+                return str(topic_id)
+        return None
     value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)

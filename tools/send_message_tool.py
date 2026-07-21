@@ -466,6 +466,7 @@ def _handle_send(args):
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
         if home:
             chat_id = home.chat_id
+            thread_id = getattr(home, "thread_id", None)
             used_home_channel = True
         else:
             home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
@@ -1139,6 +1140,16 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     instead, bypassing MarkdownV2 conversion.
     """
     try:
+        from plugins.platforms.telegram.telegram_ids import parse_telegram_topic_id
+
+        parsed_topic_id = parse_telegram_topic_id(
+            thread_id, source="send_message.thread_id"
+        )
+    except ValueError as exc:
+        logger.warning("send_message rejected Telegram topic route: %s", exc)
+        return {"success": False, "error": str(exc), "retryable": False}
+
+    try:
         from telegram import Bot
         from telegram.constants import ParseMode
 
@@ -1205,7 +1216,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
         thread_kwargs = {}
-        if thread_id is not None:
+        if parsed_topic_id is not None:
             # Reuse the gateway adapter's General-topic mapping: in Telegram
             # forum supergroups, the General topic is addressed as
             # message_thread_id="1" on incoming updates, but Bot API
@@ -1217,13 +1228,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 from plugins.platforms.telegram.adapter import TelegramAdapter
                 effective_thread_id = TelegramAdapter._message_thread_id_for_send(
-                    str(thread_id)
+                    str(parsed_topic_id)
                 )
             except Exception:
                 # Fallback: explicit mapping in case the adapter import
                 # fails (e.g. python-telegram-bot missing in this venv).
                 effective_thread_id = (
-                    None if str(thread_id) == "1" else int(thread_id)
+                    None if parsed_topic_id == 1 else parsed_topic_id
                 )
             if effective_thread_id is not None:
                 thread_kwargs["message_thread_id"] = effective_thread_id
