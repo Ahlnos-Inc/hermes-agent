@@ -75,6 +75,7 @@ from hermes_constants import get_config_path, get_hermes_home
 # is idempotent — calling it twice is safe but the second call is a no-op
 # unless ``force=True``.
 _logging_initialized = False
+_logging_initialized_home = None
 
 # Thread-local storage for per-conversation session context.
 _session_context = threading.local()
@@ -299,15 +300,21 @@ def setup_logging(
     Path
         The ``logs/`` directory where files are written.
     """
-    global _logging_initialized
+    global _logging_initialized, _logging_initialized_home
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
-    # Once per process (unless force): logging handlers are global root
-    # state. Re-running under a different HERMES_HOME (multiplexed profile
-    # turn, per-test home) would ACCUMULATE handlers and broadcast every
-    # record into each previously seen home's log directory.
+    # Handlers are global root state. Re-running under a DIFFERENT
+    # HERMES_HOME (multiplexed profile turn, per-test home) must not
+    # ACCUMULATE handlers and broadcast records into every previously seen
+    # home's log directory — so once initialized, other homes no-op. The
+    # SAME home may re-run registration: _add_rotating_handler dedups by
+    # resolved path, and a later mode ("gateway"/"gui") legitimately adds
+    # its component file this way.
     if _logging_initialized and not force:
-        return log_dir
+        if _logging_initialized_home is not None and (
+            log_dir.resolve() != _logging_initialized_home
+        ):
+            return log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Read config defaults (best-effort — config may not be loaded yet).
@@ -376,6 +383,7 @@ def setup_logging(
         logging.getLogger(name).setLevel(logging.WARNING)
 
     _logging_initialized = True
+    _logging_initialized_home = log_dir.resolve()
     return log_dir
 
 
