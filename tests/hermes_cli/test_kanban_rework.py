@@ -130,6 +130,30 @@ def test_request_key_replay_has_no_duplicate_writes(board: Path) -> None:
         ).fetchone()[0] == 1
 
 
+def test_same_run_request_key_retry_replays_before_run_cas(board: Path) -> None:
+    """A retry from the run that committed the request is idempotent."""
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        run_id = _claim(conn, review, claimer="reviewer")
+        fix = kb.create_task(conn, title="fix", assignee="coder")
+
+        first = kb.request_rework(
+            conn, review, finding="same finding", fix=kb.ExistingFixTask(fix),
+            request_key="same-run-key", actor="reviewer",
+            expected_run_id=run_id,
+        )
+        second = kb.request_rework(
+            conn, review, finding="same finding", fix=kb.ExistingFixTask(fix),
+            request_key="same-run-key", actor="reviewer",
+            expected_run_id=run_id,
+        )
+
+        assert first.fix_action == "adopted"
+        assert second.fix_action == "replayed"
+        assert second.replayed_same_run is True
+        assert second.request_event_id == first.request_event_id
+
+
 def test_failed_transition_rolls_back_fix_edge_run_and_events(board: Path, monkeypatch) -> None:
     with kb.connect_closing(board) as conn:
         review = _create_review(conn)

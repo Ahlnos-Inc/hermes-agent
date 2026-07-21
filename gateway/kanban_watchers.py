@@ -252,6 +252,25 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
 # state of all (2026-07-19: two architect tasks sat silent this way).
 HUMAN_BLOCK_EVENT_KINDS = ("blocked", "block_loop_detected", "gave_up")
 HUMAN_BLOCK_AUTO_KINDS = ("transient", "dependency")
+HUMAN_BLOCK_AUTO_BLOCK_KINDS = (*HUMAN_BLOCK_AUTO_KINDS, "dependency_pending")
+HUMAN_BLOCK_LIVE_STATUSES = frozenset({"blocked", "triage"})
+# A status event only heals an alert when its payload records a genuine exit
+# from the human-gated state.  ``triage`` is itself a human gate, so it must
+# not be treated as an epoch boundary merely because it is newer.
+HUMAN_BLOCK_HEALING_STATUSES = (
+    "todo", "scheduled", "ready", "running", "done", "archived",
+)
+
+
+def _is_human_block_state(status: Optional[str], block_kind: Optional[str]) -> bool:
+    """Whether the task's live projection still requires human attention."""
+    return (
+        status in HUMAN_BLOCK_LIVE_STATUSES
+        and (
+            status == "triage"
+            or block_kind not in HUMAN_BLOCK_AUTO_BLOCK_KINDS
+        )
+    )
 
 
 def _collect_human_blocked_events(kb, conn) -> "list[dict]":
@@ -267,6 +286,8 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
     kinds = HUMAN_BLOCK_EVENT_KINDS
     placeholders = ",".join("?" for _ in kinds)
     auto_placeholders = ",".join("?" for _ in HUMAN_BLOCK_AUTO_KINDS)
+    live_auto_placeholders = ",".join("?" for _ in HUMAN_BLOCK_AUTO_BLOCK_KINDS)
+    healing_placeholders = ",".join("?" for _ in HUMAN_BLOCK_HEALING_STATUSES)
     cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
     rows = conn.execute(
         f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
@@ -274,7 +295,14 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
             JOIN tasks t ON t.id = e.task_id
             WHERE e.kind IN ({placeholders})
               AND e.created_at >= ?
-              AND t.status IN ('blocked', 'triage')
+              AND (
+                  t.status = 'triage'
+                  OR (
+                      t.status = 'blocked'
+                      AND COALESCE(t.block_kind, '')
+                          NOT IN ({live_auto_placeholders})
+                  )
+              )
               AND COALESCE(json_extract(e.payload, '$.kind'), '')
                   NOT IN ({auto_placeholders})
               AND NOT EXISTS (
@@ -288,13 +316,22 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
                          'dependency_materialized', 'rework_requested',
                          'completed', 'archived', 'status'
                      )
+                     AND (
+                         newer.kind != 'status'
+                         OR json_extract(newer.payload, '$.status')
+                            IN ({healing_placeholders})
+                     )
               )
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
                               WHERE nd.delivery_key =
                                   'human-block/' || e.task_id || '/' || e.id)
             ORDER BY e.id
             LIMIT ?""",
-        (*kinds, cutoff, *HUMAN_BLOCK_AUTO_KINDS, ORPHAN_FAILURE_BATCH_PER_TICK),
+        (
+            *kinds, cutoff, *HUMAN_BLOCK_AUTO_BLOCK_KINDS,
+            *HUMAN_BLOCK_AUTO_KINDS, *HUMAN_BLOCK_HEALING_STATUSES,
+            ORPHAN_FAILURE_BATCH_PER_TICK,
+        ),
     ).fetchall()
     out: list[dict] = []
     for row in rows:
@@ -336,10 +373,12 @@ def _human_block_event_is_current(kb, item: dict) -> bool:
             fresh_conn = kb.connect_closing(board=item.get("board"))
         with fresh_conn as fresh:
             row = fresh.execute(
-                "SELECT status FROM tasks WHERE id = ?",
+                "SELECT status, block_kind FROM tasks WHERE id = ?",
                 (item["task_id"],),
             ).fetchone()
-            if row is None or row["status"] not in {"blocked", "triage"}:
+            if row is None or not _is_human_block_state(
+                row["status"], row["block_kind"],
+            ):
                 return False
             event = fresh.execute(
                 "SELECT kind, payload FROM task_events WHERE id = ? "
@@ -367,8 +406,16 @@ def _human_block_event_is_current(kb, item: dict) -> bool:
                            'dependency_materialized', 'rework_requested',
                            'completed', 'archived', 'status'
                        )
+                       AND (
+                           kind != 'status'
+                           OR json_extract(payload, '$.status')
+                              IN (?, ?, ?, ?, ?, ?)
+                       )
                      LIMIT 1""",
-                (item["task_id"], int(item["event"].id)),
+                (
+                    item["task_id"], int(item["event"].id),
+                    *HUMAN_BLOCK_HEALING_STATUSES,
+                ),
             ).fetchone()
             return newer is None
     except Exception:

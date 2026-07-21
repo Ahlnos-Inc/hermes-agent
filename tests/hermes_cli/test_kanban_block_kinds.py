@@ -366,6 +366,80 @@ def test_human_approval_block_ignores_unrelated_parent(
         assert kb.get_task(conn, child).block_kind == "needs_input"
 
 
+def test_reconcile_dependency_sweeps_filter_before_limit_and_honor_task_ids(
+    kanban_home: Path,
+) -> None:
+    """Pure human gates cannot starve targeted or legacy dependency recovery."""
+    with kb.connect_closing() as conn:
+        human_ids = []
+        for index in range(200):
+            human = kb.create_task(
+                conn, title=f"human gate {index}", assignee="worker",
+            )
+            human_ids.append(human)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind='needs_input' "
+                    "WHERE id = ?",
+                    (human,),
+                )
+                kb._append_event(
+                    conn, human, "blocked",
+                    {"reason": "waiting for approval", "kind": "needs_input"},
+                )
+
+        parent = kb.create_task(conn, title="unfinished fix", assignee="worker")
+        targeted = kb.create_task(conn, title="legacy targeted review", assignee="worker")
+        kb.link_tasks(conn, parent, targeted)
+        with kb.write_txn(conn):
+            placeholders = ",".join("?" for _ in human_ids)
+            conn.execute(
+                f"UPDATE tasks SET created_at=1 WHERE id IN ({placeholders})",
+                human_ids,
+            )
+            conn.execute(
+                "UPDATE tasks SET created_at=2 WHERE id IN (?, ?)",
+                (parent, targeted),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (targeted,),
+            )
+            kb._append_event(
+                conn, targeted, "blocked",
+                {"reason": "dependency_unavailable: no fix card", "kind": "needs_input"},
+            )
+            kb._append_event(
+                conn, targeted, "dependency_loop_detected", {"reason": "no fix card"},
+            )
+
+        targeted_result = kb.reconcile_dependency_waits(
+            conn, now=100, limit=200, task_ids=[targeted],
+        )
+        assert targeted_result.legacy_recovered == 1
+        assert kb.get_task(conn, targeted).status == "todo"
+
+        later = kb.create_task(conn, title="legacy board-wide review", assignee="worker")
+        kb.link_tasks(conn, parent, later)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at=3 WHERE id = ?", (later,))
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+                (later,),
+            )
+            kb._append_event(
+                conn, later, "blocked",
+                {"reason": "dependency_unavailable: no fix card", "kind": "needs_input"},
+            )
+            kb._append_event(
+                conn, later, "dependency_loop_detected", {"reason": "no fix card"},
+            )
+
+        board_result = kb.reconcile_dependency_waits(conn, now=100, limit=200)
+        assert board_result.legacy_recovered == 1
+        assert kb.get_task(conn, later).status == "todo"
+
+
 def test_repeated_dependency_signature_blocks_before_third_spawn(
     kanban_home: Path, all_assignees_spawnable, monkeypatch,
 ) -> None:

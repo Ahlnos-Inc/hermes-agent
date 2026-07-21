@@ -1213,6 +1213,50 @@ def test_worker_request_rework_adopts_fix_and_stops_loop(worker_env):
         ).fetchone() is not None
 
 
+def test_later_run_replayed_rework_is_not_terminal_control(worker_env, monkeypatch):
+    """A stable key from an older run must not strand the current run."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        fix_id = kb.create_task(conn, title="fix finding", assignee="coder")
+
+    first = kt._handle_request_rework({
+        "finding": "review caught a P1 defect",
+        "fix_task_id": fix_id,
+        "request_key": "stable-finding-key",
+    })
+    assert isinstance(first, kt.KanbanTerminalControl)
+
+    with kb.connect_closing() as conn:
+        assert kb.complete_task(conn, fix_id, result="fixed")
+        claimed = kb.claim_task(conn, worker_env, claimer="test-worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    replay = kt._handle_request_rework({
+        "finding": "review caught a P1 defect",
+        "fix_task_id": fix_id,
+        "request_key": "stable-finding-key",
+    })
+
+    assert not isinstance(replay, kt.KanbanTerminalControl)
+    replay_payload = json.loads(replay)
+    assert replay_payload["fix_action"] == "replayed"
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == run_id
+        run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert run is not None
+        assert run["ended_at"] is None
+        assert run["outcome"] is None
+
+
 def test_request_rework_requires_exactly_one_fix_form(worker_env):
     from tools import kanban_tools as kt
 

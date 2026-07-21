@@ -1002,7 +1002,7 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, block_kind FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1049,7 +1049,25 @@ def _set_status_direct(
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (
+                task_id,
+                run_id,
+                json.dumps(
+                    {
+                        "status": new_status,
+                        # A dashboard move into a human-gated column must
+                        # carry the live block projection too.  Consumers use
+                        # the resulting status/block_kind pair to distinguish
+                        # a new human epoch from a real healing transition.
+                        **(
+                            {"block_kind": prev["block_kind"]}
+                            if new_status in {"blocked", "triage"}
+                            else {}
+                        ),
+                    }
+                ),
+                int(time.time()),
+            ),
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that

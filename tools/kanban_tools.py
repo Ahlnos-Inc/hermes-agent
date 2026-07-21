@@ -1986,13 +1986,21 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 expected_run_id=expected_run_id,
                 require_no_active_run=expected_run_id is None,
             )
+            result_fields = {
+                "fix_task_id": result.fix_task_id,
+                "fix_action": result.fix_action,
+                "review_status": result.review_status,
+                "request_event_id": result.request_event_id,
+            }
+            # A replay from a later run is idempotent data access, not a
+            # lifecycle transition for this worker.  Returning ordinary tool
+            # output keeps the current run alive so it can finish explicitly.
+            if result.fix_action == "replayed" and not result.replayed_same_run:
+                return _ok(task_id=tid, **result_fields)
             return _worker_terminal_ok(
                 KanbanTerminalAction.REWORK,
                 task_id=tid,
-                fix_task_id=result.fix_task_id,
-                fix_action=result.fix_action,
-                review_status=result.review_status,
-                request_event_id=result.request_event_id,
+                **result_fields,
             )
         finally:
             if conn is not None:

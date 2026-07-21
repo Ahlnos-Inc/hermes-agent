@@ -983,8 +983,12 @@ class ReworkResult:
     review_task_id: str
     fix_task_id: str
     fix_action: Literal["created", "adopted", "replayed"]
-    review_status: Literal["todo", "ready"]
+    review_status: str
     request_event_id: int
+    # Only a replay from the run that originally committed the request may
+    # end the caller's worker.  A later run using the same stable key gets the
+    # stored result, but remains responsible for closing itself.
+    replayed_same_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -5753,14 +5757,8 @@ def request_rework(
                 "SELECT * FROM task_runs WHERE id = ?",
                 (int(review_row["current_run_id"]),),
             ).fetchone()
-        if expected_run_id is not None:
-            if review_row["current_run_id"] != int(expected_run_id):
-                raise ValueError("stale expected_run_id")
-            if active_run is None or active_run["ended_at"] is not None:
-                raise ValueError("expected_run_id is not an active run")
-
         prior = conn.execute(
-            """SELECT id, payload FROM task_events
+            """SELECT id, run_id, payload FROM task_events
                  WHERE task_id = ? AND kind = 'rework_requested'
                    AND json_extract(payload, '$.request_key') = ?
                  ORDER BY id DESC LIMIT 1""",
@@ -5776,15 +5774,23 @@ def request_rework(
                 raise ValueError("rework_requested event has no fix_task_id")
             current = get_task(conn, review_task_id)
             current_status = current.status if current else "todo"
-            if current_status not in {"todo", "ready"}:
-                current_status = "todo"
             return ReworkResult(
                 review_task_id=review_task_id,
                 fix_task_id=prior_fix_id,
                 fix_action="replayed",
                 review_status=current_status,
                 request_event_id=int(prior["id"]),
+                replayed_same_run=(
+                    expected_run_id is not None
+                    and prior["run_id"] is not None
+                    and int(prior["run_id"]) == int(expected_run_id)
+                ),
             )
+        if expected_run_id is not None:
+            if review_row["current_run_id"] != int(expected_run_id):
+                raise ValueError("stale expected_run_id")
+            if active_run is None or active_run["ended_at"] is not None:
+                raise ValueError("expected_run_id is not an active run")
         if expected_run_id is None and _task_has_active_run_identity(review_row, active_run):
             # The operator path must first use operator_block_task's durable
             # fence/terminate/finalize sequence. Never send signals while the
@@ -13155,6 +13161,15 @@ def reconcile_dependency_waits(
             value = {}
         return value if isinstance(value, dict) else {}
 
+    def _task_scope(column: str = "task_id") -> tuple[str, list[str]]:
+        """Push an optional task-id selection below each sweep's LIMIT."""
+        if requested_ids is None:
+            return "", []
+        if not requested_ids:
+            return " AND 0", []
+        placeholders = ",".join("?" for _ in requested_ids)
+        return f" AND {column} IN ({placeholders})", sorted(requested_ids)
+
     def _parent_rows(task_id: str) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT p.id, p.status, p.policy_quarantined, p.policy_invalidated "
@@ -13198,15 +13213,18 @@ def reconcile_dependency_waits(
     with write_txn(conn):
         # Rework events are authoritative for the orientation and allow a
         # crashed reconciler or an older writer to repair the missing edge.
+        event_scope, event_scope_params = _task_scope("task_id")
         event_query = (
             "SELECT id, task_id, payload FROM task_events "
-            "WHERE kind = 'rework_requested' ORDER BY id DESC LIMIT ?"
+            "WHERE kind = 'rework_requested'"
+            + event_scope
+            + " ORDER BY id DESC LIMIT ?"
         )
-        event_rows = conn.execute(event_query, (bounded_limit,)).fetchall()
+        event_rows = conn.execute(
+            event_query, (*event_scope_params, bounded_limit),
+        ).fetchall()
         for event in event_rows:
             review_id = event["task_id"]
-            if requested_ids is not None and review_id not in requested_ids:
-                continue
             payload = _payload(event)
             fix_id = str(payload.get("fix_task_id") or "").strip()
             if not fix_id or fix_id == review_id:
@@ -13245,15 +13263,16 @@ def reconcile_dependency_waits(
                     },
                 )
 
+        pending_scope, pending_scope_params = _task_scope("id")
         pending_rows = conn.execute(
             "SELECT id FROM tasks WHERE status = 'todo' "
-            "AND block_kind = 'dependency_pending' ORDER BY created_at, id LIMIT ?",
-            (bounded_limit,),
+            "AND block_kind = 'dependency_pending'"
+            + pending_scope
+            + " ORDER BY created_at, id LIMIT ?",
+            (*pending_scope_params, bounded_limit),
         ).fetchall()
         for task_row in pending_rows:
             task_id = task_row["id"]
-            if requested_ids is not None and task_id not in requested_ids:
-                continue
             pending_event = conn.execute(
                 "SELECT id, payload FROM task_events "
                 "WHERE task_id = ? AND kind = 'dependency_pending' "
@@ -13347,17 +13366,38 @@ def reconcile_dependency_waits(
                         context={"failure_code": "dependency_materialization_timeout"},
                     )
 
+        dependency_scope, dependency_scope_params = _task_scope("tasks.id")
         dependency_rows = conn.execute(
-            "SELECT id, status, block_kind FROM tasks "
-            "WHERE (status = 'todo' AND block_kind = 'dependency') "
-            "   OR (status = 'blocked' AND block_kind = 'needs_input') "
-            "ORDER BY created_at, id LIMIT ?",
-            (bounded_limit,),
+            "SELECT tasks.id, tasks.status, tasks.block_kind FROM tasks "
+            "WHERE ((tasks.status = 'todo' AND tasks.block_kind = 'dependency') "
+            "   OR (tasks.status = 'blocked' AND tasks.block_kind = 'needs_input' "
+            "       AND EXISTS ("
+            "           SELECT 1 FROM task_links candidate_link "
+            "            WHERE candidate_link.child_id = tasks.id"
+            "       )"
+            "       AND EXISTS ("
+            "           SELECT 1 FROM task_events provenance "
+            "            WHERE provenance.task_id = tasks.id"
+            "              AND ("
+            "                  provenance.kind IN "
+            "                      ('dependency_loop_detected', "
+            "                       'dependency_materialization_timeout')"
+            "                  OR (provenance.kind = 'blocked' AND ("
+            "                      json_extract(provenance.payload, '$.kind') = 'dependency' "
+            "                      OR json_extract(provenance.payload, '$.failure_code') "
+            "                           = 'dependency_materialization_timeout' "
+            "                      OR lower(COALESCE(json_extract(provenance.payload, "
+            "                           '$.reason'), '')) LIKE '%dependency_unavailable%'"
+            "                  ))"
+            "              )"
+            "       )"
+            "   ))"
+            + dependency_scope
+            + " ORDER BY tasks.created_at, tasks.id LIMIT ?",
+            (*dependency_scope_params, bounded_limit),
         ).fetchall()
         for task_row in dependency_rows:
             task_id = task_row["id"]
-            if requested_ids is not None and task_id not in requested_ids:
-                continue
             parents = _parent_rows(task_id)
             if task_row["status"] == "todo" and task_row["block_kind"] == "dependency":
                 if parents and all(_parent_is_satisfied(parent) for parent in parents):

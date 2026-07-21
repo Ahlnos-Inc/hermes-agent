@@ -63,6 +63,36 @@ def test_untyped_block_and_triage_escalation_are_collected(tmp_path):
     assert [o["event"].kind for o in out] == ["block_loop_detected"]
 
 
+def test_dashboard_triage_transition_does_not_heal_human_alert(tmp_path):
+    """A later dashboard ``status: triage`` event is still human-gated."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
+    kb._append_event(
+        conn, task_id, "blocked",
+        {"reason": "needs approval", "kind": "needs_input"},
+    )
+    conn.commit()
+
+    assert _set_status_direct(conn, task_id, "triage")
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "triage"
+    assert task.block_kind == "needs_input"
+    status_event = kb.list_events(conn, task_id)[-1]
+    assert status_event.kind == "status"
+    assert status_event.payload == {
+        "status": "triage", "block_kind": "needs_input",
+    }
+
+    items = _collect_human_blocked_events(kb, conn)
+    assert [item["task_id"] for item in items] == [task_id]
+    items[0]["db_path"] = str(tmp_path / "kanban.db")
+    assert _human_block_event_is_current(kb, items[0])
+
+
 def test_ledger_dedups_per_event_but_reblock_realerts(tmp_path):
     conn = _board(tmp_path)
     task_id = _mktask(conn)
