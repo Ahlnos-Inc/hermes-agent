@@ -1003,6 +1003,10 @@ class Task:
     # declaration. None means no source refs were declared (default behavior:
     # no materialization). Empty list is equivalent to None (no refs).
     source_refs: Optional[list] = None
+    # Keep the raw declaration solely to distinguish no declaration from a
+    # corrupt persisted declaration. The dispatcher must fail closed on the
+    # latter rather than silently treating it as no sources.
+    source_refs_json: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1121,6 +1125,11 @@ class Task:
             ),
             source_refs=(
                 _parse_source_refs_json(row["source_refs_json"])
+                if "source_refs_json" in keys and row["source_refs_json"]
+                else None
+            ),
+            source_refs_json=(
+                row["source_refs_json"]
                 if "source_refs_json" in keys and row["source_refs_json"]
                 else None
             ),
@@ -11198,10 +11207,17 @@ _SOURCE_ERROR_CODES: frozenset = frozenset({
     "SOURCE_REF_UNRESOLVED",  # declared ref has no matching attachment
     "SOURCE_REF_AMBIGUOUS",   # ref matches multiple attachments
     "SOURCE_REF_UNPINNED",    # ref found but expected_sha256 not declared
+    "SOURCE_REF_INVALID",     # persisted declaration is malformed or corrupt
+    "SOURCE_REF_UNAUTHORIZED",  # tenant or task graph does not authorize source access
+    "SOURCE_PROVENANCE_UNAPPROVED",  # source task was not completed/approved
     "SOURCE_DIGEST_MISMATCH", # copied-bytes SHA-256 ≠ expected_sha256
     "SOURCE_COPY_MISMATCH",   # post-copy re-read SHA-256 ≠ expected_sha256
     "SOURCE_BUDGET_EXCEEDED", # inbox would exceed per-file or total budget
     "SOURCE_PATH_ESCAPE",     # filename contains directory traversal
+    "SOURCE_BUNDLE_IDENTITY_INVALID",  # missing or malformed bundle identity
+    "SOURCE_BUNDLE_VERIFY_FAILED",      # stock git rejected the bundle
+    "SOURCE_BUNDLE_REF_MISMATCH",       # bundle refs differ from declaration
+    "SOURCE_BUNDLE_COMMIT_MISMATCH",    # named ref does not resolve to declaration
 })
 
 # Inbox layout constants (INV2 + INV6)
@@ -11210,6 +11226,7 @@ _SOURCES_TMP_DIR = ".hermes-sources.tmp"
 _SOURCES_MANIFEST = "manifest.json"
 _SOURCE_PER_FILE_MAX_BYTES = 25 * 1024 * 1024   # 25 MB (existing attachment cap)
 _SOURCE_TOTAL_MAX_BYTES = 64 * 1024 * 1024       # 64 MB total inbox budget
+_SOURCE_REF_MAX_ENTRIES = 16
 
 
 class SourceMaterializationError(Exception):
@@ -11236,10 +11253,12 @@ class ResolvedSourceRef:
     filename: str          # safe basename for the inbox copy
     on_disk_path: Path     # canonical absolute path (realpath-checked vs store root)
     expected_sha256: Optional[str]  # None → caller raises SOURCE_REF_UNPINNED
+    expected_git_commit: Optional[str]
+    expected_git_ref: Optional[str]
 
 
 def _parse_source_refs_json(raw: str) -> Optional[list]:
-    """Deserialise source_refs_json; return None on empty/invalid."""
+    """Deserialise a non-empty source_refs_json declaration, or return None."""
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list) and parsed:
@@ -11255,6 +11274,12 @@ def _normalize_source_refs(refs: list) -> list:
     Raises :class:`ValueError` on structural errors so ``create_task``
     can surface a user-facing message instead of silently dropping data.
     """
+    if not isinstance(refs, list):
+        raise ValueError("source_refs must be a list")
+    if len(refs) > _SOURCE_REF_MAX_ENTRIES:
+        raise ValueError(
+            f"source_refs may contain at most {_SOURCE_REF_MAX_ENTRIES} declarations"
+        )
     out = []
     seen_refs: set = set()
     for i, entry in enumerate(refs):
@@ -11277,6 +11302,7 @@ def _normalize_source_refs(refs: list) -> list:
             )
         out.append({k: v for k, v in entry.items() if k in {
             "ref", "task_id", "attachment_id", "filename", "sha256",
+            "git_commit", "git_ref",
         }})
     return out
 
@@ -11303,6 +11329,11 @@ def resolve_source_refs(
     attachment store via symlinks or ``..`` components.
     """
     if not task.source_refs:
+        if getattr(task, "source_refs_json", None):
+            raise SourceMaterializationError(
+                "SOURCE_REF_INVALID",
+                "source_refs_json is malformed, empty, or not a non-empty list.",
+            )
         return []
 
     if store_root is None:
@@ -11335,11 +11366,32 @@ def resolve_source_refs(
                 "SOURCE_REF_UNRESOLVED",
                 f"source ref {ref!r}: missing 'task_id'.",
             )
+        source_task = get_task(conn, ref_task_id)
+        is_authorized_parent = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (ref_task_id, task.id),
+        ).fetchone() is not None
+        if (
+            source_task is None
+            or source_task.tenant != task.tenant
+            or not is_authorized_parent
+        ):
+            raise SourceMaterializationError(
+                "SOURCE_REF_UNAUTHORIZED",
+                f"source ref {ref!r}: source task must be a same-tenant parent of the consumer.",
+            )
+        if source_task.status != "done":
+            raise SourceMaterializationError(
+                "SOURCE_PROVENANCE_UNAPPROVED",
+                f"source ref {ref!r}: source task {ref_task_id!r} is not completed/approved.",
+            )
 
         expected_sha256: Optional[str] = None
         raw_sha256 = entry.get("sha256")
         if raw_sha256:
             expected_sha256 = str(raw_sha256).strip().lower() or None
+        expected_git_commit = str(entry.get("git_commit") or "").strip().lower() or None
+        expected_git_ref = str(entry.get("git_ref") or "").strip() or None
 
         # ── Resolve attachment row ────────────────────────────────────────────
         att: Optional[Attachment] = None
@@ -11415,6 +11467,8 @@ def resolve_source_refs(
             filename=safe_fn,
             on_disk_path=canonical,
             expected_sha256=expected_sha256 or None,
+            expected_git_commit=expected_git_commit,
+            expected_git_ref=expected_git_ref,
         ))
 
     return resolved
@@ -11432,6 +11486,67 @@ def _stream_copy_sha256(src_path: Path, dst_path: Path) -> str:
             h.update(chunk)
             fdst.write(chunk)
     return h.hexdigest()
+
+
+def _verify_git_bundle_identity(ref_obj: ResolvedSourceRef) -> None:
+    """Validate a one-ref Git bundle in a fresh bare repository.
+
+    The attachment digest proves byte identity. Stock Git then proves that the
+    declared immutable commit is exposed by exactly the declared named ref;
+    accepting a bundle with an extra or abbreviated ref would weaken that
+    contract before the worker has a chance to consume it.
+    """
+    commit = ref_obj.expected_git_commit
+    git_ref = ref_obj.expected_git_ref
+    if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SourceMaterializationError(
+            "SOURCE_BUNDLE_IDENTITY_INVALID",
+            f"source ref {ref_obj.ref!r}: git_commit must be an exact 40-character SHA-1.",
+        )
+    if not git_ref or not git_ref.startswith("refs/") or any(
+        part in {"", ".", ".."} for part in git_ref.split("/")
+    ):
+        raise SourceMaterializationError(
+            "SOURCE_BUNDLE_IDENTITY_INVALID",
+            f"source ref {ref_obj.ref!r}: git_ref must be one safe named refs/* ref.",
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-bundle-verify-") as temp_dir:
+            fresh_repo = Path(temp_dir) / "fresh.git"
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(fresh_repo)],
+                check=True, capture_output=True, text=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "-C", str(fresh_repo), "bundle", "verify", str(ref_obj.on_disk_path)],
+                check=True, capture_output=True, text=True, timeout=15,
+            )
+            listed = subprocess.run(
+                ["git", "bundle", "list-heads", str(ref_obj.on_disk_path)],
+                check=True, capture_output=True, text=True, timeout=15,
+            ).stdout.splitlines()
+            remote = subprocess.run(
+                ["git", "ls-remote", str(ref_obj.on_disk_path), git_ref],
+                check=True, capture_output=True, text=True, timeout=15,
+            ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise SourceMaterializationError(
+            "SOURCE_BUNDLE_VERIFY_FAILED",
+            f"source ref {ref_obj.ref!r}: stock git bundle verification failed: {exc}",
+        ) from exc
+
+    expected_line = f"{commit}\t{git_ref}"
+    actual_lines = [line.replace(" ", "\t", 1) for line in listed if line.strip()]
+    if actual_lines != [expected_line]:
+        raise SourceMaterializationError(
+            "SOURCE_BUNDLE_REF_MISMATCH",
+            f"source ref {ref_obj.ref!r}: bundle must expose exactly {expected_line!r}.",
+        )
+    if remote != [expected_line]:
+        raise SourceMaterializationError(
+            "SOURCE_BUNDLE_COMMIT_MISMATCH",
+            f"source ref {ref_obj.ref!r}: {git_ref!r} did not resolve to declared commit.",
+        )
 
 
 def materialize_sources(
@@ -11525,6 +11640,8 @@ def materialize_sources(
                 f"source ref {ref_obj.ref!r}: "
                 f"post-copy SHA-256 {post_sha256!r} ≠ expected {ref_obj.expected_sha256!r}.",
             )
+
+        _verify_git_bundle_identity(ref_obj)
 
         dest.chmod(0o444)  # INV6: read-only
 

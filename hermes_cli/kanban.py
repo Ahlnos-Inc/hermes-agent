@@ -324,6 +324,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "implementation tasks; scratch workers cannot access "
                                "another repo. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument(
+        "--source-refs",
+        default=None,
+        help=(
+            "JSON array of bounded source declarations. Each entry pins an "
+            "attachment SHA-256, exact Git commit, and named Git ref."
+        ),
+    )
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -1387,6 +1395,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    source_refs = None
+    raw_source_refs = getattr(args, "source_refs", None)
+    if raw_source_refs is not None:
+        try:
+            source_refs = json.loads(raw_source_refs)
+        except (TypeError, ValueError) as exc:
+            print(f"kanban: --source-refs must be valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(source_refs, list):
+            print("kanban: --source-refs must be a JSON array", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1412,6 +1431,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             workflow_key=getattr(args, "workflow_key", None),
             current_step_key=getattr(args, "current_step_key", None),
+            source_refs=source_refs,
         )
         task = kb.get_task(conn, task_id)
     # --- vault doc impact gate (auto-insert curator before finalizer) ---

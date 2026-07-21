@@ -93,6 +93,26 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_persists_source_refs(kanban_home):
+    source_refs = [{
+        "ref": "bundle",
+        "task_id": "t_source",
+        "attachment_id": 1,
+        "sha256": "0" * 64,
+        "git_commit": "0" * 40,
+        "git_ref": "refs/heads/source",
+    }]
+    out = kc.run_slash(
+        "create consumer --assignee alice --source-refs "
+        + repr(json.dumps(source_refs)),
+    )
+    assert "Created" in out
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn)
+
+    assert tasks[0].source_refs == source_refs
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

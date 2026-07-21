@@ -1544,6 +1544,33 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_exposes_and_persists_source_refs(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    source_refs = [{
+        "ref": "bundle",
+        "task_id": worker_env,
+        "attachment_id": 1,
+        "sha256": "0" * 64,
+        "git_commit": "0" * 40,
+        "git_ref": "refs/heads/source",
+    }]
+    out = kt._handle_create({
+        "title": "bundle consumer",
+        "assignee": "peer",
+        "source_refs": source_refs,
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, result["task_id"])
+
+    assert task is not None
+    assert task.source_refs == source_refs
+    assert "source_refs" in kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+
+
 def test_create_schema_exposes_model_override():
     from tools.kanban_tools import KANBAN_CREATE_SCHEMA
 

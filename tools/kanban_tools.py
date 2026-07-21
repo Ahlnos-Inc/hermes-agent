@@ -2673,6 +2673,9 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    source_refs = args.get("source_refs")
+    if source_refs is not None and not isinstance(source_refs, list):
+        return tool_error("source_refs must be a list of bounded source declarations")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -2789,6 +2792,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
                 mutation_context=mutation_context,
+                source_refs=source_refs,
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None
@@ -3532,6 +3536,27 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Optional namespace for multi-project isolation. "
                     "Defaults to HERMES_TENANT env if set."
+                ),
+            },
+            "source_refs": {
+                "type": "array",
+                "maxItems": 16,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "attachment_id": {"type": "integer"},
+                        "filename": {"type": "string"},
+                        "sha256": {"type": "string"},
+                        "git_commit": {"type": "string"},
+                        "git_ref": {"type": "string"},
+                    },
+                    "required": ["ref", "task_id", "sha256", "git_commit", "git_ref"],
+                },
+                "description": (
+                    "Bounded source declarations. Each entry pins a task attachment to "
+                    "its SHA-256, exact 40-character Git commit, and named Git ref."
                 ),
             },
             "priority": {
