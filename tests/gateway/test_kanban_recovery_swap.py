@@ -9,7 +9,10 @@ are an expected, passing outcome rather than a skipped test.
 """
 
 import asyncio
+from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -59,6 +62,77 @@ def _integrity_ok(db):
         return conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         conn.close()
+
+
+def _install_sqlite_process_fake(
+    monkeypatch,
+    tmp_path,
+    live_db,
+    *,
+    after_recover=None,
+    recover_failure=None,
+):
+    """Emulate only the external sqlite3 process used by production recovery."""
+    executable = tmp_path / "fake-sqlite3"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        command = tuple(str(arg) for arg in args)
+        input_data = kwargs.pop("input", None)
+        assert kwargs.pop("capture_output", None) is True
+        timeout = kwargs.pop("timeout", None)
+        assert kwargs.pop("check", False) is False
+        assert not kwargs
+        assert command[0] == str(executable)
+        calls.append(command)
+
+        if command[1:] == ("-batch", ":memory:", ".recover"):
+            assert input_data is None
+            assert timeout == 30
+            return subprocess.CompletedProcess(command, 0, b"BEGIN;\n", b"")
+
+        if len(command) == 3 and Path(command[1]) == live_db and command[2] == ".recover":
+            assert input_data is None
+            assert timeout == 300
+            if recover_failure is None:
+                with sqlite3.connect(str(live_db)) as conn:
+                    stdout = "\n".join(conn.iterdump()).encode()
+                result = subprocess.CompletedProcess(command, 0, stdout, b"")
+            else:
+                returncode, stdout, stderr = recover_failure
+                result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
+            if after_recover is not None:
+                after_recover()
+            return result
+
+        if len(command) == 2:
+            assert timeout == 300
+            assert isinstance(input_data, bytes) and input_data.strip()
+            recovered_db = Path(command[1])
+            assert recovered_db.name.startswith(live_db.name + ".recovered-")
+            with sqlite3.connect(str(recovered_db)) as conn:
+                conn.executescript(input_data.decode())
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        if len(command) == 3 and command[2] == "PRAGMA integrity_check":
+            assert input_data is None
+            assert timeout == 120
+            recovered_db = Path(command[1])
+            with sqlite3.connect(str(recovered_db)) as conn:
+                result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            return subprocess.CompletedProcess(command, 0, f"{result}\n".encode(), b"")
+
+        raise AssertionError(f"unexpected sqlite3 operation: {command!r}")
+
+    monkeypatch.setattr(
+        kw.shutil,
+        "which",
+        lambda name: str(executable) if name == "sqlite3" else None,
+    )
+    monkeypatch.setattr(kw.subprocess, "run", fake_run)
+    return calls
 
 
 def test_recovery_follows_real_host_capability(tmp_path, hermetic_home, monkeypatch):
@@ -119,45 +193,29 @@ def test_recovery_aborts_when_board_changes_mid_recover(
     monkeypatch.setattr(kw.time, "time", lambda: 1_750_000_000.0)
     monkeypatch.setattr(kw.time, "monotonic", lambda: 10_000.0)
     db = _healthy_board(tmp_path)
-    # Keep this test deterministic on runners whose sqlite3 lacks dbpage;
-    # the first test is the real-host capability contract.
-    monkeypatch.setattr(
-        kw,
-        "_probe_sqlite_recover_capability",
-        lambda _sqlite3_cli: (True, "injected .recover capability"),
+
+    def commit_after_snapshot():
+        with sqlite3.connect(str(db)) as writer:
+            writer.execute("CREATE TABLE IF NOT EXISTS _concurrent(x)")
+            writer.execute("INSERT INTO _concurrent VALUES (1)")
+
+    calls = _install_sqlite_process_fake(
+        monkeypatch,
+        tmp_path,
+        db,
+        after_recover=commit_after_snapshot,
     )
-    real_run = kw.subprocess.run
-    calls = {"n": 0}
-
-    def fake_run(*args, **kwargs):
-        result = real_run(*args, **kwargs)
-        # After the ``.recover`` read completes (first recovery subprocess),
-        # simulate a concurrent notifier commit landing on the live board.
-        if calls["n"] == 0:
-            writer = sqlite3.connect(str(db))
-            try:
-                writer.execute("CREATE TABLE IF NOT EXISTS _concurrent(x)")
-                writer.execute("INSERT INTO _concurrent VALUES (1)")
-                writer.commit()
-            finally:
-                writer.close()
-        calls["n"] += 1
-        return result
-
-    monkeypatch.setattr(kw.subprocess, "run", fake_run)
 
     result = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
     assert result.status == kw.RecoveryStatus.RETRY
     assert "changed during recovery" in result.detail
-    # No swap happened: the live DB was never renamed out.
+    assert "could not acquire write lock" not in result.detail
+    assert len(calls) == 4
     assert not list(tmp_path.glob("kanban.db.corrupt-*.bak"))
-    # The concurrent writer's commit survived (it was not clobbered by a swap).
-    conn = sqlite3.connect(str(db))
-    try:
-        assert conn.execute("SELECT count(*) FROM _concurrent").fetchone()[0] == 1
-    finally:
-        conn.close()
     assert not list(tmp_path.glob("kanban.db.recovered-*.tmp"))
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM _concurrent").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("initial_delivery_failure", ["false", "exception"])
