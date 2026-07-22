@@ -287,7 +287,9 @@ def test_workspace_kind_validation(kanban_home):
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
@@ -303,6 +305,90 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert task.branch_name == "wt/t6-wire"
     assert events[0].payload["branch_name"] == "wt/t6-wire"
     assert "Branch:   wt/t6-wire" in context
+
+
+def test_worktree_create_rejects_anchor_outside_repo(kanban_home, tmp_path):
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+    anchor = non_repo / "anchor"
+
+    with kb.connect() as conn:
+        with pytest.raises(kb.WorkspaceContractError) as ei:
+            kb.create_task(
+                conn,
+                title="doomed",
+                workspace_kind="worktree",
+                workspace_path=str(anchor),
+            )
+        assert ei.value.code == "worktree_bad_anchor"
+        assert str(anchor) in str(ei.value)
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_worktree_create_accepts_missing_leaf_inside_repo(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "lazy-leaf"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="lazy worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.workspace_path == str(target)
+    assert not target.exists()
+
+
+def test_worktree_create_with_project_repo_and_no_path_is_unchanged(
+    kanban_home, tmp_path,
+):
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "project-repo"
+    _init_git_repo(repo)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Project repo",
+            folders=[str(repo)],
+        )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="project worktree", project_id=project_id)
+        task = kb.get_task(conn, tid)
+
+    expected = repo / ".worktrees" / tid
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(expected)
+    assert not expected.exists()
+
+
+def test_scratch_and_dir_creation_are_unaffected_by_worktree_anchor_validation(
+    kanban_home, tmp_path,
+):
+    outside_repo = tmp_path / "not-a-repo"
+    with kb.connect() as conn:
+        scratch_id = kb.create_task(conn, title="scratch")
+        dir_path = outside_repo / "notes"
+        dir_id = kb.create_task(
+            conn,
+            title="notes",
+            workspace_kind="dir",
+            workspace_path=str(dir_path),
+        )
+        scratch = kb.get_task(conn, scratch_id)
+        directory = kb.get_task(conn, dir_id)
+
+    assert scratch is not None and scratch.workspace_kind == "scratch"
+    assert directory is not None
+    assert directory.workspace_kind == "dir"
+    assert directory.workspace_path == str(dir_path)
 
 
 def test_branch_name_requires_worktree_workspace(kanban_home):
@@ -2703,8 +2789,10 @@ def test_dispatch_worktree_contract_violation_blocks_without_retry(
     import hermes_cli.profiles as profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     # An absolute path that is NOT inside any git repo → deterministic
-    # worktree_bad_anchor at resolution. Creation succeeds (path is set), so
-    # this stands in for a legacy row / filesystem drift.
+    # worktree_bad_anchor at resolution. Manufacture the invalid path after a
+    # valid create to stand in for a legacy row / filesystem drift.
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
     spawns: list[str] = []
@@ -2719,7 +2807,12 @@ def test_dispatch_worktree_contract_violation_blocks_without_retry(
             title="ship",
             assignee="sentinel",
             workspace_kind="worktree",
-            workspace_path=str(non_repo / ".worktrees" / "x"),
+            workspace_path=str(repo / ".worktrees" / "x"),
+            toolsets=["terminal"],
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(non_repo / ".worktrees" / "x"), tid),
         )
         result = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=5)
         task = kb.get_task(conn, tid)
