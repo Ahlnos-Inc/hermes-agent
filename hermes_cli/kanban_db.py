@@ -665,9 +665,29 @@ def attachments_root(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "attachments"
 
 
+# Kanban task ids are canonically ``t_<hex>`` (see _new_task_id). Any other
+# shape -- a path separator, ``..``, an empty string -- must never be joined
+# onto a filesystem root, because it could move the attachment/log boundary
+# outside its owning directory (path traversal). Enforced at every point where
+# a task id becomes a filesystem path.
+_SAFE_TASK_ID_RE = re.compile(r"^t_[0-9a-f]+$")
+
+
+def _validate_task_id_component(task_id: Any) -> str:
+    """Return ``task_id`` if it is a single safe path component, else raise.
+
+    Rejects traversal (``..``), separators, and empty ids so an untrusted id
+    can never relocate a filesystem boundary. See BUILD-711.
+    """
+    tid = str(task_id)
+    if not _SAFE_TASK_ID_RE.match(tid):
+        raise ValueError(f"unsafe kanban task id for filesystem use: {task_id!r}")
+    return tid
+
+
 def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     """Return the per-task attachment directory ``<root>/<task_id>/``."""
-    return attachments_root(board=board) / task_id
+    return attachments_root(board=board) / _validate_task_id_component(task_id)
 
 
 def worker_logs_dir(board: Optional[str] = None) -> Path:
@@ -8629,7 +8649,54 @@ def get_current_review_artifact(
     return _review_artifact_binding_from_row(row)
 
 
+def _trusted_attachments_root(conn: sqlite3.Connection) -> Path:
+    """Attachments root for the board that owns ``conn`` -- never task-derived.
+
+    The containment boundary for an artifact must come from a trusted source,
+    not from the attachment's own (untrusted) ``task_id`` or ``stored_path``.
+    We derive the owning board from the connection's database file
+    (``PRAGMA database_list``) and map it to that board's attachments root,
+    honoring the ``HERMES_KANBAN_ATTACHMENTS_ROOT`` override. A non-canonical
+    DB path with no override fails closed. See BUILD-711.
+    """
+    override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    row = conn.execute("PRAGMA database_list").fetchone()
+    db_file = row[2] if row is not None else None
+    if db_file:
+        db_path = Path(db_file).resolve()
+        # Map the connection's ACTUAL db file to its board's attachments root
+        # using canonical layout constants -- never kanban_db_path(), which
+        # honors HERMES_KANBAN_DB and would collapse every overridden db to the
+        # "default" comparison. Default board: <home>/kanban.db. Named board:
+        # <home>/kanban/boards/<slug>/kanban.db (exact structure required).
+        if db_path == (kanban_home() / "kanban.db").resolve():
+            return attachments_root(board=DEFAULT_BOARD).resolve()
+        # The directory name must already BE the canonical slug -- otherwise
+        # _normalize_board_slug would remap a non-canonical dir (e.g. 'PROJ',
+        # 'proj ', or a named dir literally called 'default') onto a different
+        # board's attachments root. Require an exact, canonical, non-default
+        # slug or fail closed. (Sol review, BUILD-711.)
+        slug = db_path.parent.name
+        try:
+            canonical_slug = _normalize_board_slug(slug)
+        except ValueError:
+            canonical_slug = None
+        if (
+            db_path.name == "kanban.db"
+            and db_path.parent.parent == boards_root().resolve()
+            and slug == canonical_slug
+            and slug != DEFAULT_BOARD
+        ):
+            return attachments_root(board=slug).resolve()
+    raise ReviewArtifactError(
+        "review artifact owning board root is unresolvable for this connection"
+    )
+
+
 def _hash_review_attachment(
+    conn: sqlite3.Connection,
     attachment: Attachment,
 ) -> str:
     """Rehash one attachment while proving path ownership and read stability."""
@@ -8638,12 +8705,29 @@ def _hash_review_attachment(
     path = Path(attachment.stored_path)
     try:
         resolved = path.resolve(strict=True)
-        root = task_attachments_dir(attachment.task_id).resolve(strict=False)
+        root = _trusted_attachments_root(conn)
     except (OSError, RuntimeError) as exc:
         raise ReviewArtifactError(
             f"review artifact path cannot be resolved: {attachment.stored_path}"
         ) from exc
-    if resolved != root and root not in resolved.parents:
+    # Boundary comes from the trusted board root; the id is validated as a
+    # single safe component; the file must sit exactly at <root>/<task_id>/<name>.
+    # This closes both the traversal escape (untrusted task_id moving the root)
+    # and the false reject of a legitimate non-current-board attachment that the
+    # old current-board-derived boundary produced. BUILD-711.
+    try:
+        owner_task_id = _validate_task_id_component(attachment.task_id)
+    except ValueError as exc:
+        raise ReviewArtifactError(
+            f"review artifact has an unsafe owning task id: {attachment.task_id!r}"
+        ) from exc
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        raise ReviewArtifactError(
+            "review artifact path escaped its owning attachment directory"
+        )
+    if len(relative.parts) != 2 or relative.parts[0] != owner_task_id:
         raise ReviewArtifactError(
             "review artifact path escaped its owning attachment directory"
         )
@@ -8721,7 +8805,7 @@ def _validate_review_attachment(
         raise ReviewArtifactError(
             f"attachment {normalized_id} does not belong to task {owner_task_id}"
         )
-    return attachment, _hash_review_attachment(attachment)
+    return attachment, _hash_review_attachment(conn, attachment)
 
 
 def _body_contains_exact_stored_path(body: Optional[str], stored_path: str) -> bool:
@@ -8784,7 +8868,14 @@ def _body_references_attachment_location(
     body = str(task_row["body"] or "") if task_row is not None else ""
     if not body:
         return False
-    roots = {str(task_attachments_dir(review_task_id).resolve(strict=False))}
+    # Detection path -- must return a bool, never raise. task_attachments_dir
+    # now rejects an unsafe id (BUILD-711); a malformed review id here simply
+    # can't reference a valid attachment root, so fall back to the generic
+    # marker rather than propagating the ValueError.
+    try:
+        roots = {str(task_attachments_dir(review_task_id).resolve(strict=False))}
+    except ValueError:
+        roots = set()
     return any(root in body for root in roots) or "/attachments/" in body
 
 
@@ -14139,6 +14230,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    dirty_workspace: list[str] = field(default_factory=list)
+    """Task ids skipped because their workspace was detected as dirty
+    (uncommitted/untracked changes in a git repo). These tasks stay
+    ``running`` but no worker is spawned — the sentinel can escalate
+    or the human can clean the workspace and retry."""
     claim_race: list[str] = field(default_factory=list)
     """Task ids where an atomic claim (``claim_task`` / ``claim_review_task``)
     returned ``None`` — another claimant (a concurrent dispatcher, or a
@@ -17454,6 +17550,16 @@ def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
         return None
 
 
+def _is_workspace_dirty(workspace_path: str) -> bool:
+    """Pure check: return True if *workspace_path* is a git repo with uncommitted/untracked changes.
+
+    Thin wrapper around :func:`_capture_workspace_diag`. Never mutates state.
+    Returns ``False`` when the path is not a git repo or does not exist.
+    """
+    diag = _capture_workspace_diag(workspace_path)
+    return diag is not None and diag.get("dirty") is True
+
+
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
 # on a later run (a goal-mode finalize nudge, or the model simply emitting the
 # tool call next time), so a protocol violation is NOT deterministic — give it a
@@ -19035,6 +19141,27 @@ def _dispatch_once_locked(
             ).fetchone()
             if coll:
                 result.workspace_collisions.append((row["id"], coll["id"]))
+                continue
+        # ── Dirty-workspace pre-flight check ──────────────────────
+        # Approach A: refuse to dispatch when the workspace is a git
+        # repo with uncommitted/untracked changes.  This prevents the
+        # crash-class from occurring (architect workers in dirty
+        # shared workspaces).  Only reads git status — never writes.
+        # Scratch workspaces (no git repo) pass through cleanly.
+        # Worktree tasks use the board's default_workdir (the shared
+        # repo root) as their workspace_path — flagging those as dirty
+        # would block all worktree dispatches.  Skip worktrees.
+        if ws_info and ws_info[0] != "worktree":
+            _ws_path = (ws_info[1] if ws_info else None) or None
+            if _ws_path and _is_workspace_dirty(_ws_path):
+                ws_diag = _capture_workspace_diag(_ws_path)
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "dirty_workspace",
+                            {"workspace_diag": ws_diag or {}},
+                        )
+                result.dirty_workspace.append(row["id"])
                 continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

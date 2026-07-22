@@ -503,3 +503,111 @@ def test_architecture_approval_subject_rejects_stale_generation_and_invalidates_
             )
         invalidated = kb.get_architecture_gate(conn, gate_id)
         assert invalidated is not None and invalidated.state == "invalidated"
+
+
+def test_hash_review_attachment_rejects_task_id_traversal(board: Path, tmp_path: Path) -> None:
+    """BUILD-711: a task_id containing '..' must not move the containment root.
+
+    On the old code the boundary was built from the untrusted task_id, so a
+    file planted outside attachments_root validated as contained. The trusted
+    root is now derived independently, so the escape is rejected.
+    """
+    conn = kb.connect(db_path=board)
+    src = kb.create_task(conn, title="src", assignee="architect")
+    legit_id, _ = _attach(conn, src, "ok.md", b"ok\n")
+    legit = kb.get_attachment(conn, legit_id)
+    assert legit is not None
+    # Sanity: a legitimate attachment still validates and returns its digest.
+    assert kb._hash_review_attachment(conn, legit) == _sha(b"ok\n")
+
+    # Plant a file OUTSIDE the attachments root and point a crafted attachment
+    # at it via a traversing task_id (attachments_root/../escape/evil.md).
+    escape_dir = tmp_path / "escape"
+    escape_dir.mkdir()
+    evil = escape_dir / "evil.md"
+    evil.write_bytes(b"pwned\n")
+    crafted = kb.Attachment(
+        id=999_999,
+        task_id="../escape",
+        filename="evil.md",
+        stored_path=str(evil),
+        content_type=None,
+        size=evil.stat().st_size,
+        uploaded_by="attacker",
+        created_at=1,
+    )
+    with pytest.raises(kb.ReviewArtifactError, match="escaped|unsafe"):
+        kb._hash_review_attachment(conn, crafted)
+
+
+def test_hash_review_attachment_validates_non_current_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUILD-711: containment uses the connection's OWN board, not the current one.
+
+    The old check resolved against the current board's attachments_root with no
+    board arg, so a legitimate attachment on a different board was falsely
+    rejected as an escape. The trusted root is now derived from the connection's
+    database, so a non-current-board artifact validates. Without this fix the
+    call raises ReviewArtifactError('...escaped...').
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(kb.kanban_db_path(board=kb.DEFAULT_BOARD))
+    kb.init_db(kb.kanban_db_path(board="proj"))
+    # Current board is the default; the artifact lives on a NAMED board.
+    assert kb.get_current_board() == kb.DEFAULT_BOARD
+
+    named = kb.connect(board="proj")
+    src = kb.create_task(named, title="src", assignee="architect")
+    payload = b"named-board artifact\n"
+    aid = kb.store_attachment_bytes(named, src, "a.md", payload, board="proj")
+    att = kb.get_attachment(named, aid)
+    assert att is not None
+    # Validates via the connection-owned (proj) root even though the current
+    # board is default.
+    assert kb._hash_review_attachment(named, att) == _sha(payload)
+
+    # The trusted root is derived from the connection's OWN db file via the
+    # canonical layout, so HERMES_KANBAN_DB (which kanban_db_path honors and
+    # would otherwise collapse every db to the "default" comparison) must not
+    # change the resolved board root. Sol review of BUILD-711.
+    expected_root = kb.attachments_root(board="proj").resolve()
+    assert kb._trusted_attachments_root(named) == expected_root
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="proj")))
+    assert kb._trusted_attachments_root(named) == expected_root
+
+
+def test_trusted_attachments_root_rejects_noncanonical_board_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUILD-711 (Sol review): a non-canonical board dir must fail closed.
+
+    A directory whose name is not already its normalized slug -- e.g. one
+    literally called 'default', or with trailing whitespace -- must NOT be
+    remapped by _normalize_board_slug onto another board's attachments root.
+    """
+    import sqlite3 as _sq
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    boards = kb.boards_root()
+    for bad_name in ("default", "projx "):
+        bdir = boards / bad_name
+        bdir.mkdir(parents=True, exist_ok=True)
+        dbf = bdir / "kanban.db"
+        conn = _sq.connect(str(dbf))
+        conn.execute("PRAGMA journal_mode")  # materialize the file
+        with pytest.raises(kb.ReviewArtifactError, match="unresolvable"):
+            kb._trusted_attachments_root(conn)
+        conn.close()

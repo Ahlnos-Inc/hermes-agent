@@ -2909,15 +2909,23 @@ def _verify_worker_attachment(
     stored_path = Path(attachment.stored_path)
     try:
         stored_resolved = stored_path.resolve(strict=True)
-        attachment_root = kb.task_attachments_dir(task_id, board=board).resolve(
-            strict=False
-        )
+        # Trusted boundary derived from the CONNECTION's own board, not from the
+        # untrusted task_id and not from a separately-passed board arg that can
+        # disagree with the pinned db (HERMES_KANBAN_DB). BUILD-711.
+        trusted_root = kb._trusted_attachments_root(conn)
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"stored attachment path cannot be resolved: {exc}") from exc
-    if not (
-        stored_resolved == attachment_root
-        or attachment_root in stored_resolved.parents
-    ):
+    except kb.ReviewArtifactError as exc:
+        raise ValueError(f"stored attachment root is unresolvable: {exc}") from exc
+    try:
+        owner_task_id = kb._validate_task_id_component(task_id)
+    except ValueError as exc:
+        raise ValueError(f"unsafe task id for attachment: {task_id!r}") from exc
+    try:
+        relative = stored_resolved.relative_to(trusted_root)
+    except ValueError:
+        raise ValueError("stored attachment path escaped the task attachment directory")
+    if len(relative.parts) != 2 or relative.parts[0] != owner_task_id:
         raise ValueError("stored attachment path escaped the task attachment directory")
 
     _, stored_size, stored_sha256 = _read_worker_attachment_file(
