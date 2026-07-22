@@ -17744,7 +17744,9 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-) -> bool:
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> Optional[bool]:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
 
@@ -17754,7 +17756,8 @@ def _record_task_failure(
     auto-block threshold stay consistent.
 
     Returns True when the task was auto-blocked (counter reached
-    ``failure_limit``), False when it was just updated in place.
+    ``failure_limit``), False when it was just updated in place, and None
+    when an expected active run/claim no longer owns the task.
 
     Modes:
 
@@ -17790,17 +17793,27 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    expected_ownership = (
+        expected_run_id is not None or expected_claim_lock is not None
+    )
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, "
+            "current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if expected_ownership and (
+            expected_run_id is None
+            or expected_claim_lock is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+            or row["claim_lock"] != expected_claim_lock
+        ):
+            return None
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
-
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
         task_override = (
@@ -17817,24 +17830,47 @@ def _record_task_failure(
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
-                conn.execute(
+                update = conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    "WHERE id = ? AND "
+                    + (
+                        "status = 'running'"
+                        if expected_ownership
+                        else "status IN ('running', 'ready')"
+                    )
+                    + (
+                        " AND current_run_id = ? AND claim_lock = ?"
+                        if expected_ownership else ""
+                    ),
+                    (
+                        failures, error[:500], task_id,
+                        *((int(expected_run_id), expected_claim_lock)
+                          if expected_ownership else ()),
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
                 # counter fields.
-                conn.execute(
+                update = conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    "WHERE id = ? AND status IN ('ready', 'running')"
+                    + (
+                        " AND current_run_id = ? AND claim_lock = ?"
+                        if expected_ownership else ""
+                    ),
+                    (
+                        failures, error[:500], task_id,
+                        *((int(expected_run_id), expected_claim_lock)
+                          if expected_ownership else ()),
+                    ),
                 )
+            if expected_ownership and update.rowcount != 1:
+                return None
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
@@ -17866,22 +17902,32 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
-                conn.execute(
+                update = conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    "WHERE id = ? AND status = 'running'"
+                    + (
+                        " AND current_run_id = ? AND claim_lock = ?"
+                        if expected_ownership else ""
+                    ),
+                    (
+                        failures, error[:500], task_id,
+                        *((int(expected_run_id), expected_claim_lock)
+                          if expected_ownership else ()),
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
-                conn.execute(
+                update = conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error[:500], task_id),
                 )
+            if expected_ownership and update.rowcount != 1:
+                return None
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
@@ -17907,13 +17953,17 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
-) -> bool:
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> Optional[bool]:
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        expected_run_id=expected_run_id,
+        expected_claim_lock=expected_claim_lock,
     )
 
 
@@ -18886,12 +18936,17 @@ def _dispatch_once_locked(
                 "kanban dispatch: workspace resolution failed for %s: %s",
                 claimed.id, exc, exc_info=True,
             )
-            result.spawn_errors.append((claimed.id, f"workspace: {exc}"))
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
-            if auto:
+            if auto is None:
+                result.claim_race.append(claimed.id)
+            else:
+                result.spawn_errors.append((claimed.id, f"workspace: {exc}"))
+            if auto is True:
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
@@ -18952,12 +19007,17 @@ def _dispatch_once_locked(
                 "kanban dispatch: spawn_fn raised for %s (assignee=%s): %s",
                 claimed.id, claimed.assignee, exc, exc_info=True,
             )
-            result.spawn_errors.append((claimed.id, str(exc)))
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
-            if auto:
+            if auto is None:
+                result.claim_race.append(claimed.id)
+            else:
+                result.spawn_errors.append((claimed.id, str(exc)))
+            if auto is True:
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
@@ -19033,12 +19093,17 @@ def _dispatch_once_locked(
                 "kanban dispatch: review workspace resolution failed for %s: %s",
                 claimed.id, exc, exc_info=True,
             )
-            result.spawn_errors.append((claimed.id, f"workspace: {exc}"))
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
-            if auto:
+            if auto is None:
+                result.claim_race.append(claimed.id)
+            else:
+                result.spawn_errors.append((claimed.id, f"workspace: {exc}"))
+            if auto is True:
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
@@ -19090,12 +19155,17 @@ def _dispatch_once_locked(
                 "kanban dispatch: review spawn_fn raised for %s (assignee=%s): %s",
                 claimed.id, claimed.assignee, exc, exc_info=True,
             )
-            result.spawn_errors.append((claimed.id, str(exc)))
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
-            if auto:
+            if auto is None:
+                result.claim_race.append(claimed.id)
+            else:
+                result.spawn_errors.append((claimed.id, str(exc)))
+            if auto is True:
                 result.auto_blocked.append(claimed.id)
     return result
 
@@ -19454,7 +19524,8 @@ def _spawn_contract(
 
     A task without a run spec is a legacy/manual spawn and keeps the old task
     fields. Once a run carries a contract, mutable task routing is ignored.
-    Missing, stale, or malformed contracted runs fail closed before Popen.
+    Missing or malformed contracted runs fail closed before Popen. Run
+    currency is checked separately by the gated PID-attachment CAS.
     """
     legacy_route = {
         "provider": task.model_provider_override,
@@ -19474,7 +19545,6 @@ def _spawn_contract(
     with connect(board=board) as conn:
         row = conn.execute(
             "SELECT r.run_spec_json FROM task_runs r "
-            "JOIN tasks t ON t.id = r.task_id AND t.current_run_id = r.id "
             "WHERE r.id = ? AND r.task_id = ?",
             (int(task.current_run_id), task.id),
         ).fetchone()
@@ -19482,7 +19552,7 @@ def _spawn_contract(
             conn,
             int(task.current_run_id),
             task_id=task.id,
-            require_current=True,
+            require_current=False,
         )
     if row is None:
         raise RuntimeError(
