@@ -69,6 +69,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "publication_expected_sha": t.publication_expected_sha,
+        "publication_remote": t.publication_remote,
+        "publication_ref": t.publication_ref,
+        "is_publication": t.is_publication,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
@@ -657,6 +661,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_rework.add_argument("--dry-run", action="store_true")
     p_rework.add_argument("--json", action="store_true")
 
+    p_publish = sub.add_parser(
+        "publish",
+        aliases=["publication", "publication-handoff"],
+        help="Create/adopt a releaser card and park a committed task until publication",
+    )
+    p_publish.add_argument("requester_task_id", help="Coder task with the local commit")
+    p_publish.add_argument(
+        "--publication-task", "--publisher-task", dest="publication_task_id",
+        default=None, help="Adopt an existing publication card",
+    )
+    p_publish.add_argument(
+        "--sha", "--expected-sha", dest="expected_sha", default=None,
+        help="Exact local commit SHA to publish",
+    )
+    p_publish.add_argument(
+        "--workspace", default=None,
+        help="Coder checkout as dir:/absolute/path (defaults to the requester path)",
+    )
+    p_publish.add_argument("--remote", default="origin", help="Git remote name or URL")
+    p_publish.add_argument(
+        "--remote-ref", default=None,
+        help="Target remote ref, e.g. refs/heads/main",
+    )
+    p_publish.add_argument("--title", default=None, help="Optional publication card title")
+    p_publish.add_argument("--body", default=None, help="Optional publication card body")
+    p_publish.add_argument("--summary", default=None)
+    p_publish.add_argument("--metadata", default=None)
+    p_publish.add_argument(
+        "--request-key", required=True,
+        help="Mandatory stable idempotency key for this handoff",
+    )
+    p_publish.add_argument("--dry-run", action="store_true")
+    p_publish.add_argument("--json", action="store_true")
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1053,6 +1091,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "rework":   _cmd_rework,
+            "publish":  _cmd_publish,
+            "publication": _cmd_publish,
+            "publication-handoff": _cmd_publish,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -2389,6 +2430,143 @@ def _cmd_rework(args: argparse.Namespace) -> int:
             print(
                 f"Rework {result.fix_action}: {result.fix_task_id}; "
                 f"review {result.review_task_id} → {result.review_status}"
+            )
+    return 0
+
+
+def _cmd_publish(args: argparse.Namespace) -> int:
+    """Atomically hand a committed task to the releaser lane."""
+    publication_task_id = (
+        str(args.publication_task_id).strip()
+        if args.publication_task_id else None
+    )
+    create_values = (
+        args.expected_sha, args.workspace,
+        args.remote if args.remote != "origin" else None,
+        args.remote_ref, args.title, args.body,
+    )
+    if publication_task_id and any(value is not None for value in create_values):
+        print(
+            "kanban publish: --publication-task cannot be combined with "
+            "publication card fields",
+            file=sys.stderr,
+        )
+        return 2
+    if not publication_task_id and (
+        not args.expected_sha or not args.remote_ref
+    ):
+        print(
+            "kanban publish: provide --publication-task or --sha and --remote-ref",
+            file=sys.stderr,
+        )
+        return 2
+    metadata = None
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban publish: --metadata: {exc}", file=sys.stderr)
+            return 2
+
+    with kb.connect_closing() as conn:
+        requester = kb.get_task(conn, args.requester_task_id)
+        if requester is None:
+            print(
+                f"kanban publish: unknown requester task {args.requester_task_id}",
+                file=sys.stderr,
+            )
+            return 1
+        if publication_task_id:
+            publication = kb.ExistingPublicationTask(publication_task_id)
+            if args.dry_run:
+                existing = kb.get_task(conn, publication_task_id)
+                if existing is None or not existing.is_publication:
+                    print(
+                        f"kanban publish: unknown or invalid publication task "
+                        f"{publication_task_id}",
+                        file=sys.stderr,
+                    )
+                    return 1
+        else:
+            if args.workspace is None:
+                workspace_path = requester.workspace_path
+                if not workspace_path:
+                    print(
+                        "kanban publish: --workspace is required when the "
+                        "requester has no workspace path",
+                        file=sys.stderr,
+                    )
+                    return 2
+            else:
+                try:
+                    workspace_kind, workspace_path = _parse_workspace_flag(args.workspace)
+                except argparse.ArgumentTypeError as exc:
+                    print(f"kanban publish: {exc}", file=sys.stderr)
+                    return 2
+                if workspace_kind == "scratch" or not workspace_path:
+                    print(
+                        "kanban publish: --workspace must identify an absolute "
+                        "dir:/path or worktree:/path checkout",
+                        file=sys.stderr,
+                    )
+                    return 2
+            publication = kb.NewPublicationTask(
+                title=args.title or "Publish committed change",
+                body=args.body,
+                workspace_path=str(workspace_path),
+                expected_sha=str(args.expected_sha),
+                remote=args.remote or "origin",
+                remote_ref=str(args.remote_ref),
+            )
+
+        if args.dry_run:
+            output = {
+                "dry_run": True,
+                "requester_task_id": args.requester_task_id,
+                "publication_task_id": publication_task_id,
+                "request_key": args.request_key,
+                "publication_action": "adopted" if publication_task_id else "created",
+                "requester_status": requester.status,
+            }
+            if args.json:
+                print(json.dumps(output, indent=2, ensure_ascii=False))
+            else:
+                action = "adopt" if publication_task_id else "create"
+                print(
+                    f"Would {action} publication card for {args.requester_task_id} "
+                    f"(request_key={args.request_key})"
+                )
+            return 0
+
+        expected_run_id = _worker_run_id_for(args.requester_task_id)
+        result = kb.request_publication_handoff(
+            conn,
+            args.requester_task_id,
+            publication=publication,
+            request_key=args.request_key,
+            actor=_profile_author(),
+            summary=args.summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+            require_no_active_run=expected_run_id is None,
+        )
+        output = {
+            "requester_task_id": result.requester_task_id,
+            "publication_task_id": result.publication_task_id,
+            "publication_action": result.publication_action,
+            "requester_status": result.requester_status,
+            "request_event_id": result.request_event_id,
+            "request_key": args.request_key,
+        }
+        if args.json:
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Publication {result.publication_action}: "
+                f"{result.publication_task_id}; requester "
+                f"{result.requester_task_id} → {result.requester_status}"
             )
     return 0
 

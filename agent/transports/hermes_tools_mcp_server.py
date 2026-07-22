@@ -136,6 +136,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_complete",
     "kanban_block",
     "kanban_request_rework",
+    "kanban_request_publication",
     "kanban_comment",
     "kanban_heartbeat",
     "kanban_show",

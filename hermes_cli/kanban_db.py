@@ -936,6 +936,32 @@ class NewFixTask:
 
 
 @dataclass(frozen=True)
+class ExistingPublicationTask:
+    """An already-created publication card to bind to a requester."""
+
+    task_id: str
+
+
+@dataclass(frozen=True)
+class NewPublicationTask:
+    """The immutable source details needed for a releaser card.
+
+    ``workspace_path`` is the coder's existing checkout, not a new worker
+    scratch directory. The publication card stores the remote name and fully
+    qualified ref separately because those are the exact arguments used by
+    the completion readback.
+    """
+
+    title: str = "Publish committed change"
+    body: Optional[str] = None
+    assignee: str = "releaser"
+    workspace_path: str = ""
+    expected_sha: str = ""
+    remote_ref: str = ""
+    remote: str = "origin"
+
+
+@dataclass(frozen=True)
 class _PreparedTaskCreate:
     """Validated, transaction-ready task fields.
 
@@ -972,6 +998,9 @@ class _PreparedTaskCreate:
     workflow_template_id: Optional[str]
     current_step_key: Optional[str]
     project_id: Optional[str]
+    publication_expected_sha: Optional[str]
+    publication_remote: Optional[str]
+    publication_ref: Optional[str]
     project_obj: Any = None
     project_repo: Optional[str] = None
 
@@ -989,6 +1018,23 @@ class ReworkResult:
     # end the caller's worker.  A later run using the same stable key gets the
     # stored result, but remains responsible for closing itself.
     replayed_same_run: bool = False
+
+
+@dataclass(frozen=True)
+class PublicationHandoffResult:
+    """Committed outcome of one idempotent coder-to-releaser handoff."""
+
+    requester_task_id: str
+    publication_task_id: str
+    publication_action: Literal["created", "adopted", "replayed"]
+    requester_status: str
+    request_event_id: int
+    replayed_same_run: bool = False
+
+    @property
+    def publisher_task_id(self) -> str:
+        """Compatibility/readability alias for callers using publisher terminology."""
+        return self.publication_task_id
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1162,9 @@ class Task:
     policy_quarantined: bool = False
     policy_invalidated: bool = False
     policy_quarantine_reason: Optional[str] = None
+    publication_expected_sha: Optional[str] = None
+    publication_remote: Optional[str] = None
+    publication_ref: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1232,6 +1281,28 @@ class Task:
             policy_quarantine_reason=(
                 row["policy_quarantine_reason"] if "policy_quarantine_reason" in keys else None
             ),
+            publication_expected_sha=(
+                row["publication_expected_sha"]
+                if "publication_expected_sha" in keys else None
+            ),
+            publication_remote=(
+                row["publication_remote"] if "publication_remote" in keys else None
+            ),
+            publication_ref=(
+                row["publication_ref"] if "publication_ref" in keys else None
+            ),
+        )
+
+    @property
+    def is_publication(self) -> bool:
+        """Whether this row carries the immutable publication contract."""
+        return any(
+            value is not None
+            for value in (
+                self.publication_expected_sha,
+                self.publication_remote,
+                self.publication_ref,
+            )
         )
 
 
@@ -1645,7 +1716,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- value is never released by automatic promotion or ordinary unblock.
     policy_quarantined   INTEGER NOT NULL DEFAULT 0,
     policy_invalidated   INTEGER NOT NULL DEFAULT 0,
-    policy_quarantine_reason TEXT
+    policy_quarantine_reason TEXT,
+    -- Immutable publication contract. A row with any of these fields set is
+    -- a publication card and cannot complete without a remote readback that
+    -- observes ``publication_expected_sha`` at ``publication_ref``.
+    publication_expected_sha TEXT,
+    publication_remote    TEXT,
+    publication_ref       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2859,6 +2936,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
     if "policy_quarantine_reason" not in cols:
         _add_column_if_missing(conn, "tasks", "policy_quarantine_reason", "policy_quarantine_reason TEXT")
+    if "publication_expected_sha" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "publication_expected_sha", "publication_expected_sha TEXT"
+        )
+    if "publication_remote" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "publication_remote", "publication_remote TEXT"
+        )
+    if "publication_ref" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "publication_ref", "publication_ref TEXT"
+        )
 
     discovery_table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery_capabilities'"
@@ -5232,6 +5321,9 @@ def _prepare_task_create(
     workflow_key: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    publication_expected_sha: Optional[str] = None,
+    publication_remote: Optional[str] = None,
+    publication_ref: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> _PreparedTaskCreate:
@@ -5295,6 +5387,51 @@ def _prepare_task_create(
 
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    publication_values = (
+        publication_expected_sha,
+        publication_remote,
+        publication_ref,
+    )
+    if any(value is not None for value in publication_values):
+        if any(value is None or not str(value).strip() for value in publication_values):
+            raise ValueError(
+                "publication_expected_sha, publication_remote, and publication_ref "
+                "must be provided together"
+            )
+        publication_expected_sha = str(publication_expected_sha).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{7,64}", publication_expected_sha):
+            raise ValueError(
+                "publication_expected_sha must be a hexadecimal commit SHA "
+                "(7 to 64 characters)"
+            )
+        publication_remote = str(publication_remote).strip()
+        if (
+            not publication_remote
+            or publication_remote.startswith("-")
+            or any(ch.isspace() for ch in publication_remote)
+        ):
+            raise ValueError("publication_remote must be a non-empty token without whitespace")
+        publication_ref = str(publication_ref).strip()
+        if not publication_ref:
+            raise ValueError("publication_ref is required")
+        if not publication_ref.startswith("refs/"):
+            publication_ref = f"refs/heads/{publication_ref.lstrip('/')}"
+        if any(ch.isspace() for ch in publication_ref) or publication_ref == "refs/heads/":
+            raise ValueError("publication_ref must be a non-empty git ref without whitespace")
+        if workspace_kind == "scratch":
+            # A publication card reuses the coder's checkout. Keep it out of
+            # scratch cleanup even when the source worker came from scratch.
+            workspace_kind = "dir"
+        if not workspace_path or not str(workspace_path).strip():
+            raise ValueError("publication workspace_path is required")
+        workspace_path = str(Path(str(workspace_path).strip()).expanduser())
+        if not Path(workspace_path).is_absolute():
+            raise ValueError("publication workspace_path must be absolute")
+    else:
+        publication_expected_sha = None
+        publication_remote = None
+        publication_ref = None
 
     parents = tuple(p for p in parents if p)
 
@@ -5408,6 +5545,9 @@ def _prepare_task_create(
         workflow_template_id=workflow_template_id or None,
         current_step_key=current_step_key or None,
         project_id=project_id,
+        publication_expected_sha=publication_expected_sha,
+        publication_remote=publication_remote,
+        publication_ref=publication_ref,
         project_obj=project_obj,
         project_repo=project_repo,
     )
@@ -5500,8 +5640,13 @@ def _insert_task_in_txn(
             max_runtime_seconds,
             skills, toolsets, model_override, model_provider_override,
             model_reasoning_effort, max_retries, goal_mode, goal_max_turns,
-            session_id, workflow_key, workflow_template_id, current_step_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            session_id, workflow_key, workflow_template_id, current_step_key,
+            publication_expected_sha, publication_remote, publication_ref
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
         """,
         (
             task_id,
@@ -5531,6 +5676,9 @@ def _insert_task_in_txn(
             prepared.workflow_key,
             prepared.workflow_template_id,
             prepared.current_step_key,
+            prepared.publication_expected_sha,
+            prepared.publication_remote,
+            prepared.publication_ref,
         ),
     )
     for parent_id in parents:
@@ -5597,6 +5745,9 @@ def create_task(
     workflow_key: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    publication_expected_sha: Optional[str] = None,
+    publication_remote: Optional[str] = None,
+    publication_ref: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     mutation_context: Optional[MutationContext] = None,
@@ -5636,6 +5787,9 @@ def create_task(
         workflow_key=workflow_key,
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
+        publication_expected_sha=publication_expected_sha,
+        publication_remote=publication_remote,
+        publication_ref=publication_ref,
         board=board,
         project_id=project_id,
     )
@@ -5699,6 +5853,186 @@ def _rework_event_payload(
     }
 
 
+@dataclass(frozen=True)
+class _DependencyTransitionResult:
+    """Shared result for a card-parent handoff transition."""
+
+    requester_task_id: str
+    dependency_task_id: str
+    dependency_action: Literal["created", "adopted", "replayed"]
+    requester_status: str
+    request_event_id: int
+    replayed_same_run: bool = False
+
+
+def _transition_to_dependency(
+    conn: sqlite3.Connection,
+    requester_task_id: str,
+    *,
+    request_key: str,
+    request_event_kind: str,
+    dependency_event_kind: str,
+    dependency_id_payload_key: str,
+    materialize_dependency: Callable[
+        [sqlite3.Connection], tuple[str, Literal["created", "adopted"]]
+    ],
+    event_payload: Callable[
+        [sqlite3.Connection, str, Literal["created", "adopted"]], dict[str, Any]
+    ],
+    terminal_error: str,
+    unknown_error: str,
+    quarantine_error: str,
+    run_outcome: str,
+    run_status: str,
+    run_summary: Optional[str] = None,
+    run_metadata: Optional[dict] = None,
+    active_run_error: str = (
+        "requester task has an active worker; fence and terminate it before transition"
+    ),
+    expected_run_id: Optional[int] = None,
+    require_no_active_run: bool = False,
+    mutation_context: Optional[MutationContext] = None,
+) -> _DependencyTransitionResult:
+    """Atomically bind a dependency card as parent and park its requester.
+
+    Rework and publication handoff have the same graph mutation: validate the
+    requester/run fence, create or adopt a parent, link parent→requester,
+    close the requester's run, re-arm it behind the terminal-parent predicate,
+    and append one mirrored event pair. Keeping this composition point below
+    both public transitions prevents either caller from nesting ``write_txn``
+    through a public writer.
+    """
+    if expected_run_id is not None and require_no_active_run:
+        raise ValueError("expected_run_id and require_no_active_run are exclusive")
+
+    with write_txn(conn):
+        requester_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (requester_task_id,)
+        ).fetchone()
+        if requester_row is None:
+            raise ValueError(unknown_error)
+        if requester_row["status"] in {"done", "archived"}:
+            raise ValueError(terminal_error)
+        if requester_row["policy_quarantined"] or requester_row["policy_invalidated"]:
+            raise ValueError(quarantine_error)
+
+        active_run = None
+        if requester_row["current_run_id"] is not None:
+            active_run = conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?",
+                (int(requester_row["current_run_id"]),),
+            ).fetchone()
+
+        prior = conn.execute(
+            f"""SELECT id, run_id, payload FROM task_events
+                 WHERE task_id = ? AND kind = ?
+                   AND json_extract(payload, '$.request_key') = ?
+                 ORDER BY id DESC LIMIT 1""",
+            (requester_task_id, request_event_kind, request_key),
+        ).fetchone()
+        if prior is not None:
+            try:
+                prior_payload = json.loads(prior["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior_payload = {}
+            dependency_id = str(
+                prior_payload.get(dependency_id_payload_key) or ""
+            ).strip()
+            if not dependency_id:
+                raise ValueError(
+                    f"{request_event_kind} event has no {dependency_id_payload_key}"
+                )
+            current = get_task(conn, requester_task_id)
+            current_status = current.status if current else "todo"
+            return _DependencyTransitionResult(
+                requester_task_id=requester_task_id,
+                dependency_task_id=dependency_id,
+                dependency_action="replayed",
+                requester_status=current_status,
+                request_event_id=int(prior["id"]),
+                replayed_same_run=(
+                    expected_run_id is not None
+                    and prior["run_id"] is not None
+                    and int(prior["run_id"]) == int(expected_run_id)
+                ),
+            )
+
+        if expected_run_id is not None:
+            if requester_row["current_run_id"] != int(expected_run_id):
+                raise ValueError("stale expected_run_id")
+            if active_run is None or active_run["ended_at"] is not None:
+                raise ValueError("expected_run_id is not an active run")
+        if expected_run_id is None and _task_has_active_run_identity(
+            requester_row, active_run,
+        ):
+            raise ValueError(active_run_error)
+        elif require_no_active_run and requester_row["current_run_id"] is not None:
+            raise ValueError("requester task still has an active run")
+
+        dependency_task_id, disposition = materialize_dependency(conn)
+        _link_tasks_in_txn(
+            conn,
+            dependency_task_id,
+            requester_task_id,
+            mutation_context=mutation_context,
+        )
+
+        run_id = _end_run(
+            conn,
+            requester_task_id,
+            outcome=run_outcome,
+            status=run_status,
+            summary=run_summary,
+            metadata=run_metadata,
+        )
+        requester_parents = conn.execute(
+            """SELECT p.status, p.policy_quarantined, p.policy_invalidated
+                 FROM tasks p JOIN task_links l ON l.parent_id = p.id
+                WHERE l.child_id = ?""",
+            (requester_task_id,),
+        ).fetchall()
+        requester_status = "todo" if any(
+            not _parent_is_satisfied(parent) for parent in requester_parents
+        ) else "ready"
+        conn.execute(
+            """UPDATE tasks
+                  SET status = ?,
+                      block_kind = NULL,
+                      current_run_id = NULL,
+                      claim_lock = NULL,
+                      claim_expires = NULL,
+                      worker_pid = NULL,
+                      worker_started_at = NULL,
+                      worker_pgid = NULL,
+                      worker_sid = NULL
+                WHERE id = ?
+                  AND status NOT IN ('done', 'archived')""",
+            (requester_status, requester_task_id),
+        )
+        requester = get_task(conn, requester_task_id)
+        if requester is None or requester.status not in {"todo", "ready"}:
+            raise ValueError("requester task could not be re-armed")
+        requester_status = requester.status
+        payload = event_payload(conn, dependency_task_id, disposition)
+        if not payload.get("request_key"):
+            raise ValueError("dependency transition event payload needs request_key")
+        request_event_id = _append_event(
+            conn,
+            requester_task_id,
+            request_event_kind,
+            payload,
+            run_id=run_id,
+        )
+        _append_event(conn, dependency_task_id, dependency_event_kind, payload)
+        return _DependencyTransitionResult(
+            requester_task_id=requester_task_id,
+            dependency_task_id=dependency_task_id,
+            dependency_action=disposition,
+            requester_status=requester_status,
+            request_event_id=request_event_id,
+        )
+
+
 def request_rework(
     conn: sqlite3.Connection,
     review_task_id: str,
@@ -5733,80 +6067,17 @@ def request_rework(
         raise ValueError("request_key is required")
     if not actor:
         raise ValueError("actor is required")
-    if expected_run_id is not None and require_no_active_run:
-        raise ValueError("expected_run_id and require_no_active_run are exclusive")
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be a dict or None")
     if not isinstance(fix, (NewFixTask, ExistingFixTask)):
         raise TypeError("fix must be NewFixTask or ExistingFixTask")
 
-    with write_txn(conn):
-        review_row = conn.execute(
-            """SELECT * FROM tasks WHERE id = ?""",
-            (review_task_id,),
-        ).fetchone()
-        if review_row is None:
-            raise ValueError(f"unknown review task: {review_task_id}")
-        if review_row["status"] in {"done", "archived"}:
-            raise ValueError("cannot request rework for a terminal review task")
-        if review_row["policy_quarantined"] or review_row["policy_invalidated"]:
-            raise ValueError("cannot request rework for a quarantined or invalidated review task")
-        active_run = None
-        if review_row["current_run_id"] is not None:
-            active_run = conn.execute(
-                "SELECT * FROM task_runs WHERE id = ?",
-                (int(review_row["current_run_id"]),),
-            ).fetchone()
-        prior = conn.execute(
-            """SELECT id, run_id, payload FROM task_events
-                 WHERE task_id = ? AND kind = 'rework_requested'
-                   AND json_extract(payload, '$.request_key') = ?
-                 ORDER BY id DESC LIMIT 1""",
-            (review_task_id, request_key),
-        ).fetchone()
-        if prior is not None:
-            try:
-                prior_payload = json.loads(prior["payload"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                prior_payload = {}
-            prior_fix_id = str(prior_payload.get("fix_task_id") or "").strip()
-            if not prior_fix_id:
-                raise ValueError("rework_requested event has no fix_task_id")
-            current = get_task(conn, review_task_id)
-            current_status = current.status if current else "todo"
-            return ReworkResult(
-                review_task_id=review_task_id,
-                fix_task_id=prior_fix_id,
-                fix_action="replayed",
-                review_status=current_status,
-                request_event_id=int(prior["id"]),
-                replayed_same_run=(
-                    expected_run_id is not None
-                    and prior["run_id"] is not None
-                    and int(prior["run_id"]) == int(expected_run_id)
-                ),
-            )
-        if expected_run_id is not None:
-            if review_row["current_run_id"] != int(expected_run_id):
-                raise ValueError("stale expected_run_id")
-            if active_run is None or active_run["ended_at"] is not None:
-                raise ValueError("expected_run_id is not an active run")
-        if expected_run_id is None and _task_has_active_run_identity(review_row, active_run):
-            # The operator path must first use operator_block_task's durable
-            # fence/terminate/finalize sequence. Never send signals while the
-            # graph transaction is open and never release a foreign worker's
-            # claim by accident.
-            raise ValueError(
-                "review task has an active worker; fence and terminate it before rework"
-            )
-        elif require_no_active_run and review_row["current_run_id"] is not None:
-            raise ValueError("review task still has an active run")
-
+    def materialize(conn_in: sqlite3.Connection):
         if isinstance(fix, ExistingFixTask):
             fix_task_id = str(fix.task_id or "").strip()
             if not fix_task_id:
                 raise ValueError("fix_task_id is required")
-            fix_row = conn.execute(
+            fix_row = conn_in.execute(
                 "SELECT * FROM tasks WHERE id = ?", (fix_task_id,),
             ).fetchone()
             if fix_row is None:
@@ -5815,82 +6086,39 @@ def request_rework(
                 raise ValueError("a review task cannot be its own fix")
             if fix_row["policy_quarantined"] or fix_row["policy_invalidated"]:
                 raise ValueError("cannot adopt a quarantined or invalidated fix task")
-            disposition: Literal["created", "adopted"] = "adopted"
-        else:
-            if not fix.title or not str(fix.title).strip():
-                raise ValueError("fix.title is required")
-            if not fix.assignee or not str(fix.assignee).strip():
-                raise ValueError("fix.assignee is required")
-            prepared = _prepare_task_create(
-                title=fix.title,
-                body=fix.body,
-                assignee=fix.assignee,
-                created_by=actor,
-                workspace_kind=fix.workspace_kind,
-                workspace_path=fix.workspace_path,
-                project_id=fix.project_id,
-                branch_name=fix.branch_name,
-                priority=fix.priority,
-                max_runtime_seconds=fix.max_runtime_seconds,
-                skills=fix.skills,
-                toolsets=fix.toolsets,
-            )
-            fix_task_id = _insert_task_in_txn(
-                conn,
-                prepared,
-                mutation_context=mutation_context,
-            )
-            disposition = "created"
+            return fix_task_id, "adopted"
 
-        # The orientation is deliberate: fix is the parent, review is the
-        # child.  A done/archived adopted fix therefore satisfies the edge and
-        # re-arms the review immediately.
-        _link_tasks_in_txn(
-            conn,
-            fix_task_id,
-            review_task_id,
+        if not fix.title or not str(fix.title).strip():
+            raise ValueError("fix.title is required")
+        if not fix.assignee or not str(fix.assignee).strip():
+            raise ValueError("fix.assignee is required")
+        prepared = _prepare_task_create(
+            title=fix.title,
+            body=fix.body,
+            assignee=fix.assignee,
+            created_by=actor,
+            workspace_kind=fix.workspace_kind,
+            workspace_path=fix.workspace_path,
+            project_id=fix.project_id,
+            branch_name=fix.branch_name,
+            priority=fix.priority,
+            max_runtime_seconds=fix.max_runtime_seconds,
+            skills=fix.skills,
+            toolsets=fix.toolsets,
+        )
+        fix_task_id = _insert_task_in_txn(
+            conn_in,
+            prepared,
             mutation_context=mutation_context,
         )
+        return fix_task_id, "created"
 
-        run_id = _end_run(
-            conn,
-            review_task_id,
-            outcome="rework_requested",
-            status="rework_requested",
-            summary=summary or finding,
-            metadata=metadata,
-        )
-        # For a no-run operator recovery, clear any stale claim fields only
-        # after the active-run guard above has proved they are empty.
-        review_parents = conn.execute(
-            """SELECT p.status, p.policy_quarantined, p.policy_invalidated
-                 FROM tasks p JOIN task_links l ON l.parent_id = p.id
-                WHERE l.child_id = ?""",
-            (review_task_id,),
-        ).fetchall()
-        review_status = "todo" if any(
-            not _parent_is_satisfied(parent) for parent in review_parents
-        ) else "ready"
-        conn.execute(
-            """UPDATE tasks
-                  SET status = ?,
-                      block_kind = NULL,
-                      current_run_id = NULL,
-                      claim_lock = NULL,
-                      claim_expires = NULL,
-                      worker_pid = NULL,
-                      worker_started_at = NULL,
-                      worker_pgid = NULL,
-                      worker_sid = NULL
-                WHERE id = ?
-                  AND status NOT IN ('done', 'archived')""",
-            (review_status, review_task_id),
-        )
-        review = get_task(conn, review_task_id)
-        if review is None or review.status not in {"todo", "ready"}:
-            raise ValueError("review task could not be re-armed")
-        review_status = review.status
-        payload = _rework_event_payload(
+    def payload_factory(
+        _conn_in: sqlite3.Connection,
+        fix_task_id: str,
+        disposition: Literal["created", "adopted"],
+    ) -> dict[str, Any]:
+        return _rework_event_payload(
             review_task_id=review_task_id,
             fix_task_id=fix_task_id,
             request_key=request_key,
@@ -5900,26 +6128,234 @@ def request_rework(
             summary=summary,
             metadata=metadata,
         )
-        request_event_id = _append_event(
-            conn,
-            review_task_id,
-            "rework_requested",
-            payload,
-            run_id=run_id,
+
+    transition = _transition_to_dependency(
+        conn,
+        review_task_id,
+        request_key=request_key,
+        request_event_kind="rework_requested",
+        dependency_event_kind="rework_for",
+        dependency_id_payload_key="fix_task_id",
+        materialize_dependency=materialize,
+        event_payload=payload_factory,
+        terminal_error="cannot request rework for a terminal review task",
+        unknown_error=f"unknown review task: {review_task_id}",
+        quarantine_error=(
+            "cannot request rework for a quarantined or invalidated review task"
+        ),
+        run_outcome="rework_requested",
+        run_status="rework_requested",
+        run_summary=summary or finding,
+        run_metadata=metadata,
+        active_run_error=(
+            "review task has an active worker; fence and terminate it before rework"
+        ),
+        expected_run_id=expected_run_id,
+        require_no_active_run=require_no_active_run,
+        mutation_context=mutation_context,
+    )
+    return ReworkResult(
+        review_task_id=transition.requester_task_id,
+        fix_task_id=transition.dependency_task_id,
+        fix_action=transition.dependency_action,
+        review_status=transition.requester_status,
+        request_event_id=transition.request_event_id,
+        replayed_same_run=transition.replayed_same_run,
+    )
+
+
+def request_publication_handoff(
+    conn: sqlite3.Connection,
+    requester_task_id: str,
+    *,
+    publication: Optional[NewPublicationTask | ExistingPublicationTask] = None,
+    publication_task_id: Optional[str] = None,
+    expected_sha: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    remote: str = "origin",
+    remote_ref: Optional[str] = None,
+    request_key: str,
+    actor: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    require_no_active_run: bool = False,
+    mutation_context: Optional[MutationContext] = None,
+) -> PublicationHandoffResult:
+    """Atomically hand a committed-but-unpublished task to the releaser.
+
+    The publication card is deliberately a normal dependency parent. Its
+    three publication fields are immutable creation-time evidence consumed by
+    :func:`complete_task`; worker-provided completion metadata cannot satisfy
+    the publication gate.
+    """
+    requester_task_id = str(requester_task_id or "").strip()
+    request_key = str(request_key or "").strip()
+    actor = str(actor or "").strip()
+    if not requester_task_id:
+        raise ValueError("requester_task_id is required")
+    if not request_key:
+        raise ValueError("request_key is required")
+    if not actor:
+        raise ValueError("actor is required")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict or None")
+    if (publication is not None or publication_task_id is not None) and (
+        publication_task_id is not None
+        or expected_sha is not None
+        or workspace_path is not None
+        or remote != "origin"
+        or remote_ref is not None
+    ):
+        raise ValueError(
+            "publication cannot be combined with publication card fields"
         )
-        _append_event(
-            conn,
-            fix_task_id,
-            "rework_for",
-            payload,
+    if publication is None:
+        if publication_task_id is not None:
+            publication = ExistingPublicationTask(task_id=publication_task_id)
+        else:
+            publication = NewPublicationTask(
+                expected_sha=str(expected_sha or ""),
+                workspace_path=str(workspace_path or ""),
+                remote_ref=str(remote_ref or ""),
+                remote=remote or "origin",
+            )
+    if not isinstance(publication, (NewPublicationTask, ExistingPublicationTask)):
+        raise TypeError(
+            "publication must be NewPublicationTask or ExistingPublicationTask"
         )
-        return ReworkResult(
-            review_task_id=review_task_id,
-            fix_task_id=fix_task_id,
-            fix_action=disposition,
-            review_status=review_status,
-            request_event_id=request_event_id,
+
+    def materialize(conn_in: sqlite3.Connection):
+        if isinstance(publication, ExistingPublicationTask):
+            publication_id = str(publication.task_id or "").strip()
+            if not publication_id:
+                raise ValueError("publication_task_id is required")
+            row = conn_in.execute(
+                "SELECT * FROM tasks WHERE id = ?", (publication_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown publication task: {publication_id}")
+            if publication_id == requester_task_id:
+                raise ValueError("a requester task cannot be its own publication parent")
+            if any(
+                row[name] is None
+                for name in (
+                    "publication_expected_sha",
+                    "publication_remote",
+                    "publication_ref",
+                )
+            ):
+                raise ValueError("cannot adopt a task without a publication contract")
+            if _canonical_assignee(row["assignee"]) != "releaser":
+                raise ValueError("publication task must be assigned to releaser")
+            if row["policy_quarantined"] or row["policy_invalidated"]:
+                raise ValueError("cannot adopt a quarantined or invalidated publication task")
+            return publication_id, "adopted"
+
+        if _canonical_assignee(publication.assignee) != "releaser":
+            raise ValueError("publication cards must be assigned to releaser")
+        expected = str(publication.expected_sha or "").strip()
+        ref = str(publication.remote_ref or "").strip()
+        path = str(publication.workspace_path or "").strip()
+        if not expected:
+            raise ValueError("publication.expected_sha is required")
+        if not path:
+            raise ValueError("publication.workspace_path is required")
+        if not ref:
+            raise ValueError("publication.remote_ref is required")
+        title = str(publication.title or "").strip() or (
+            f"Publish {expected[:12]} to {ref}"
         )
+        body = publication.body
+        if body is None:
+            body = (
+                "Publish the recorded commit and verify the remote readback.\n"
+                f"Expected SHA: {expected}\n"
+                f"Workspace: {path}\n"
+                f"Remote ref: {publication.remote or 'origin'} {ref}"
+            )
+        prepared = _prepare_task_create(
+            title=title,
+            body=body,
+            assignee="releaser",
+            created_by=actor,
+            workspace_kind="dir",
+            workspace_path=path,
+            publication_expected_sha=expected,
+            publication_remote=publication.remote or "origin",
+            publication_ref=ref,
+        )
+        publication_id = _insert_task_in_txn(
+            conn_in,
+            prepared,
+            idempotency_key=request_key,
+            mutation_context=mutation_context,
+        )
+        return publication_id, "created"
+
+    def payload_factory(
+        conn_in: sqlite3.Connection,
+        publication_id: str,
+        disposition: Literal["created", "adopted"],
+    ) -> dict[str, Any]:
+        row = conn_in.execute(
+            """SELECT publication_expected_sha, publication_remote,
+                      publication_ref, workspace_path
+                 FROM tasks WHERE id = ?""",
+            (publication_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("publication card disappeared during handoff")
+        return {
+            "requester_task_id": requester_task_id,
+            "publication_task_id": publication_id,
+            "publisher_task_id": publication_id,
+            "request_key": request_key,
+            "idempotency_key": request_key,
+            "actor": actor,
+            "publication_action": disposition,
+            "expected_sha": row["publication_expected_sha"],
+            "workspace_path": row["workspace_path"],
+            "remote": row["publication_remote"],
+            "remote_ref": row["publication_ref"],
+            "summary": summary,
+            "metadata": metadata,
+        }
+
+    transition = _transition_to_dependency(
+        conn,
+        requester_task_id,
+        request_key=request_key,
+        request_event_kind="publication_handoff_requested",
+        dependency_event_kind="publication_handoff_for",
+        dependency_id_payload_key="publication_task_id",
+        materialize_dependency=materialize,
+        event_payload=payload_factory,
+        terminal_error="cannot request publication for a terminal requester task",
+        unknown_error=f"unknown requester task: {requester_task_id}",
+        quarantine_error=(
+            "cannot request publication for a quarantined or invalidated requester task"
+        ),
+        run_outcome="publication_handoff_requested",
+        run_status="publication_handoff_requested",
+        run_summary=summary,
+        run_metadata=metadata,
+        expected_run_id=expected_run_id,
+        require_no_active_run=require_no_active_run,
+        mutation_context=mutation_context,
+    )
+    return PublicationHandoffResult(
+        requester_task_id=transition.requester_task_id,
+        publication_task_id=transition.dependency_task_id,
+        publication_action=transition.dependency_action,
+        requester_status=transition.requester_status,
+        request_event_id=transition.request_event_id,
+        replayed_same_run=transition.replayed_same_run,
+    )
+
+
+# Short internal/API alias for callers that use the card's role as the noun.
+request_publication = request_publication_handoff
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -7975,6 +8411,77 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+PUBLICATION_READBACK_TIMEOUT_SECONDS = 30
+
+
+def _read_publication_remote_ref(row: sqlite3.Row) -> dict[str, Any]:
+    """Read the recorded remote ref from the publication card's checkout.
+
+    This is intentionally a read-only ``git ls-remote``. A push report or a
+    worker-supplied metadata flag never reaches this function; only the remote
+    object database's ref value can satisfy the completion gate.
+    """
+    expected = str(row["publication_expected_sha"] or "").strip().lower()
+    remote = str(row["publication_remote"] or "").strip()
+    ref = str(row["publication_ref"] or "").strip()
+    workspace = str(row["workspace_path"] or "").strip()
+    details: dict[str, Any] = {
+        "expected_sha": expected or None,
+        "remote": remote or None,
+        "remote_ref": ref or None,
+        "workspace_path": workspace or None,
+        "observed_sha": None,
+        "verified": False,
+    }
+    if not expected or not remote or not ref:
+        details["reason"] = "publication contract is incomplete"
+        return details
+    if not workspace:
+        details["reason"] = "publication workspace is missing"
+        return details
+    workspace_path = Path(workspace).expanduser()
+    if not workspace_path.is_dir():
+        details["reason"] = "publication workspace does not exist"
+        return details
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace_path),
+                "ls-remote",
+                "--exit-code",
+                "--refs",
+                remote,
+                ref,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PUBLICATION_READBACK_TIMEOUT_SECONDS,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        details["reason"] = f"git readback unavailable: {type(exc).__name__}"
+        return details
+    if completed.returncode != 0:
+        details["reason"] = "git ls-remote did not find the target ref"
+        return details
+    for line in (completed.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == ref:
+            details["observed_sha"] = fields[0].lower()
+            break
+    if details["observed_sha"] is None:
+        details["reason"] = "git readback returned no exact target ref"
+        return details
+    details["verified"] = details["observed_sha"] == expected
+    if not details["verified"]:
+        details["reason"] = "remote ref SHA does not match expected SHA"
+    return details
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8017,6 +8524,7 @@ def complete_task(
     delivery_withheld = False
     delivery_gate_id: Optional[str] = None
     delivery_digest: Optional[str] = None
+    publication_verification: Optional[dict[str, Any]] = None
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -8119,6 +8627,44 @@ def complete_task(
                 return False
             if _gate_requires_enforcement(gate):
                 _append_event(conn, task_id, "completion_blocked", {"reason": ARCHITECTURE_GATE_REASON_OPEN, "gate_id": gate.gate_id})
+                return False
+        # Keep this gate in the DB completion kernel so CLI, model-tool, and
+        # any future writer cannot bypass it with a success flag. The
+        # readback is bounded and happens before the status CAS while this
+        # transaction holds the write lock, pairing the immutable contract
+        # read with the completion decision.
+        publication_row = conn.execute(
+            "SELECT workspace_path, publication_expected_sha, publication_remote, "
+            "publication_ref FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if publication_row is None:
+            return False
+        if any(
+            publication_row[name] is not None
+            for name in (
+                "publication_expected_sha",
+                "publication_remote",
+                "publication_ref",
+            )
+        ):
+            publication_verification = _read_publication_remote_ref(publication_row)
+            if not publication_verification.get("verified"):
+                blocked_payload = {
+                    **publication_verification,
+                    "reason": "publication_ref_not_verified",
+                    "readback_reason": publication_verification.get("reason"),
+                    "expected_sha": publication_row["publication_expected_sha"],
+                    "remote": publication_row["publication_remote"],
+                    "remote_ref": publication_row["publication_ref"],
+                }
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked",
+                    blocked_payload,
+                    run_id=_current_run_id(conn, task_id),
+                )
                 return False
         if expected_run_id is None:
             cur = conn.execute(
@@ -8235,6 +8781,8 @@ def complete_task(
                 "result_len": len(result) if result else 0,
                 "summary": ev_summary or None,
             }
+        if publication_verification is not None:
+            completed_payload["publication_readback"] = publication_verification
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -16446,6 +16994,13 @@ def build_worker_context(
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.is_publication:
+        lines.append("Publication contract: remote readback is required before completion")
+        lines.append(f"Expected SHA: {task.publication_expected_sha or '(missing)'}")
+        lines.append(
+            f"Remote ref: {task.publication_remote or '(missing)'} "
+            f"{task.publication_ref or '(missing)'}"
+        )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,

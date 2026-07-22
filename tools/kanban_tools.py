@@ -501,6 +501,7 @@ class KanbanTerminalAction(str, Enum):
     COMPLETE = "complete"
     BLOCK = "block"
     REWORK = "rework"
+    PUBLICATION = "publication"
 
 
 class KanbanTerminalControl(str):
@@ -531,6 +532,8 @@ class KanbanTerminalControl(str):
             return "Kanban task completed."
         if self.action is KanbanTerminalAction.REWORK:
             return "Kanban rework requested; review task parked until the fix is delivered."
+        if self.action is KanbanTerminalAction.PUBLICATION:
+            return "Kanban publication handoff requested; task parked until the remote ref is verified."
         return "Kanban task blocked."
 
     @property
@@ -539,6 +542,8 @@ class KanbanTerminalControl(str):
             return "kanban_complete"
         if self.action is KanbanTerminalAction.REWORK:
             return "kanban_request_rework"
+        if self.action is KanbanTerminalAction.PUBLICATION:
+            return "kanban_request_publication"
         return "kanban_block"
 
 
@@ -1326,6 +1331,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "publication_expected_sha": task.publication_expected_sha,
+        "publication_remote": task.publication_remote,
+        "publication_ref": task.publication_ref,
+        "is_publication": task.is_publication,
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -1371,6 +1380,10 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "publication_expected_sha": t.publication_expected_sha,
+                    "publication_remote": t.publication_remote,
+                    "publication_ref": t.publication_ref,
+                    "is_publication": t.is_publication,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -1765,6 +1778,23 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"kanban_comment resolve_blocker_id plus "
                         f"resolution_evidence_ref, then retry completion."
                     )
+                blocked_event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? "
+                    "AND kind = 'completion_blocked' ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if blocked_event is not None:
+                    try:
+                        blocked_payload = json.loads(blocked_event["payload"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        blocked_payload = {}
+                    if blocked_payload.get("reason") == "publication_ref_not_verified":
+                        return tool_error(
+                            "kanban_complete blocked: publication target ref was "
+                            "not verified at the expected SHA. The task is still "
+                            "in-flight; publish the exact commit, read the remote "
+                            "ref back, then retry."
+                        )
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
@@ -2010,6 +2040,124 @@ def _handle_request_rework(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_request_rework failed")
         return tool_error(f"kanban_request_rework: {e}")
+
+
+def _handle_request_publication(args: dict, **kw) -> str:
+    """Atomically park a committed task behind a releaser publication card."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    request_key = args.get("request_key")
+    if not request_key or not str(request_key).strip():
+        return tool_error("request_key is required for publication handoff idempotency")
+    publication_task_id = args.get("publication_task_id")
+    publisher_task_id = args.get("publisher_task_id")
+    if publication_task_id and publisher_task_id and str(publication_task_id).strip() != str(publisher_task_id).strip():
+        return tool_error(
+            "publication_task_id and publisher_task_id must identify the same card"
+        )
+    publication_task_id = publication_task_id or publisher_task_id
+    create_fields = (
+        args.get("expected_sha"), args.get("workspace_path"),
+        args.get("remote") if args.get("remote") != "origin" else None,
+        args.get("remote_ref"),
+        args.get("title"), args.get("body"),
+    )
+    if publication_task_id and any(value is not None for value in create_fields):
+        return tool_error(
+            "publication_task_id cannot be combined with publication card fields"
+        )
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = None
+        try:
+            kb_obj, conn = _connect(board=board)
+            if publication_task_id:
+                publication = kb_obj.ExistingPublicationTask(
+                    task_id=str(publication_task_id).strip()
+                )
+            else:
+                task = kb_obj.get_task(conn, tid)
+                if task is None:
+                    return tool_error(f"unknown requester task: {tid}")
+                workspace_path = args.get("workspace_path") or task.workspace_path
+                if not workspace_path:
+                    return tool_error(
+                        "workspace_path is required when the requester has no stored workspace"
+                    )
+                if not args.get("expected_sha"):
+                    return tool_error("expected_sha is required for publication handoff")
+                if not args.get("remote_ref"):
+                    return tool_error("remote_ref is required for publication handoff")
+                publication = kb_obj.NewPublicationTask(
+                    title=str(args.get("title") or "Publish committed change"),
+                    body=args.get("body"),
+                    workspace_path=str(workspace_path),
+                    expected_sha=str(args.get("expected_sha")),
+                    remote=str(args.get("remote") or "origin"),
+                    remote_ref=str(args.get("remote_ref")),
+                )
+            finding = (
+                "Publication handoff for committed change"
+                if not args.get("summary")
+                else str(args.get("summary"))
+            )
+            summary = redact_sensitive_text(finding, force=True)
+            metadata = _stamp_worker_session_metadata(tid, metadata)
+            actor = (
+                os.environ.get("HERMES_KANBAN_ACTOR")
+                or os.environ.get("HERMES_PROFILE")
+                or "worker"
+            )
+            expected_run_id = _worker_run_id(tid)
+            if os.environ.get("HERMES_KANBAN_TASK") == tid and expected_run_id is None:
+                return tool_error(
+                    "HERMES_KANBAN_RUN_ID is required when a worker requests publication"
+                )
+            result = kb_obj.request_publication_handoff(
+                conn,
+                tid,
+                publication=publication,
+                request_key=str(request_key).strip(),
+                actor=actor,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+                require_no_active_run=expected_run_id is None,
+            )
+            result_fields = {
+                "publication_task_id": result.publication_task_id,
+                "publication_action": result.publication_action,
+                "requester_status": result.requester_status,
+                "request_event_id": result.request_event_id,
+            }
+            if result.publication_action == "replayed" and not result.replayed_same_run:
+                return _ok(task_id=tid, **result_fields)
+            return _worker_terminal_ok(
+                KanbanTerminalAction.PUBLICATION,
+                task_id=tid,
+                **result_fields,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_publication: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_publication failed")
+        return tool_error(f"kanban_request_publication: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -3668,6 +3816,74 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_PUBLICATION_SCHEMA = {
+    "name": "kanban_request_publication",
+    "description": (
+        "Coder terminal action for a committed change that this lane cannot "
+        "publish. Atomically create or adopt a releaser publication card, "
+        "link it as parent, close this run, and park this task until the "
+        "publication card proves the target remote ref contains the exact "
+        "commit SHA. request_key, expected_sha, workspace_path, and remote_ref "
+        "are durable handoff evidence; a worker report cannot satisfy the "
+        "completion readback. Use kanban_block(kind='capability') only when "
+        "no lane can perform the missing action."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "request_key": {
+                "type": "string",
+                "description": "Mandatory stable idempotency key for this handoff.",
+            },
+            "publication_task_id": {
+                "type": "string",
+                "description": "Adopt an existing publication card.",
+            },
+            "publisher_task_id": {
+                "type": "string",
+                "description": "Alias for publication_task_id.",
+            },
+            "expected_sha": {
+                "type": "string",
+                "description": "Exact local commit SHA to publish.",
+            },
+            "workspace_path": {
+                "type": "string",
+                "description": "Absolute coder checkout containing the commit.",
+            },
+            "remote": {
+                "type": "string",
+                "description": "Git remote name or URL; defaults to origin.",
+            },
+            "remote_ref": {
+                "type": "string",
+                "description": "Target remote ref, e.g. refs/heads/main.",
+            },
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": "Optional concise handoff for the releaser.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured commit and verification facts.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["request_key"],
+        "oneOf": [
+            {"required": ["publication_task_id"]},
+            {"required": ["publisher_task_id"]},
+            {"required": ["expected_sha", "workspace_path", "remote_ref"]},
+        ],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -4102,6 +4318,15 @@ registry.register(
     handler=_handle_request_rework,
     check_fn=_check_kanban_mode,
     emoji="🔁",
+)
+
+registry.register(
+    name="kanban_request_publication",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_PUBLICATION_SCHEMA,
+    handler=_handle_request_publication,
+    check_fn=_check_kanban_mode,
+    emoji="📤",
 )
 
 registry.register(

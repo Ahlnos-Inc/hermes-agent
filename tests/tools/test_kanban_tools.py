@@ -58,6 +58,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_request_rework",
+        "kanban_request_publication",
         "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -141,6 +142,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_request_rework",
+        "kanban_request_publication",
         "kanban_comment", "kanban_create", "kanban_compile_workflow", "kanban_link",
         "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -1210,6 +1212,46 @@ def test_worker_request_rework_adopts_fix_and_stops_loop(worker_env):
         assert conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
             (fix_id, worker_env),
+        ).fetchone() is not None
+
+
+def test_worker_request_publication_adopts_releaser_card_and_stops_loop(
+    worker_env, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+    with kb.connect_closing() as conn:
+        publication_id = kb.create_task(
+            conn,
+            title="publish committed change",
+            assignee="releaser",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            publication_expected_sha="a" * 40,
+            publication_remote="origin",
+            publication_ref="refs/heads/main",
+        )
+
+    out = kt._handle_request_publication({
+        "publication_task_id": publication_id,
+        "request_key": "publication-run-1",
+    })
+    assert isinstance(out, kt.KanbanTerminalControl)
+    assert out.action is kt.KanbanTerminalAction.PUBLICATION
+    result = json.loads(out)
+    assert result["publication_task_id"] == publication_id
+    assert result["publication_action"] == "adopted"
+
+    with kb.connect_closing() as conn:
+        requester = kb.get_task(conn, worker_env)
+        assert requester is not None
+        assert requester.status == "todo"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (publication_id, worker_env),
         ).fetchone() is not None
 
 

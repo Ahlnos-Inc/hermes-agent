@@ -6291,7 +6291,8 @@ def run_conversation(
                     )
                     agent._emit_status(
                         "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block/kanban_request_rework — "
+                        "kanban_complete/kanban_block/kanban_request_rework/"
+                        "kanban_request_publication — "
                         "nudging to finish"
                     )
                     # Same finalizer contract as verify-on-stop: clear

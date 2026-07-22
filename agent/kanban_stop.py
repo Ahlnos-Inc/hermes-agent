@@ -1,7 +1,7 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete``, ``kanban_block``, or
-``kanban_request_rework``. Models
+Kanban workers must end with ``kanban_complete``, ``kanban_block``,
+``kanban_request_rework``, or ``kanban_request_publication``. Models
 (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
@@ -22,6 +22,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
     "kanban_complete",
     "kanban_block",
     "kanban_request_rework",
+    "kanban_request_publication",
 })
 
 _DEFAULT_MAX_ATTEMPTS = 2
@@ -96,11 +97,14 @@ def build_kanban_stop_nudge(
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
-        "`kanban_complete`, `kanban_block`, or `kanban_request_rework`).\n\n"
+        "`kanban_complete`, `kanban_block`, `kanban_request_rework`, or "
+        "`kanban_request_publication`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
         "is done, `kanban_request_rework(...)` if you found a review defect, "
+        "`kanban_request_publication(...)` if you committed but this lane "
+        "cannot publish, "
         "OR `kanban_block(reason=...)` if you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
