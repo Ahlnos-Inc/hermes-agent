@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 
 import pytest
 
@@ -38,6 +39,18 @@ class _FakeKb:
 
     def kanban_db_path(self, slug):
         return self._path
+
+    def read_corruption_incident(self, path):
+        return kb.read_corruption_incident(path)
+
+    def clear_corruption_incident(self, path, **kwargs):
+        return kb.clear_corruption_incident(path, **kwargs)
+
+    def _stage_off_lock(self, source):
+        return kb._stage_off_lock(source)
+
+    def _atomic_copy2(self, source, destination):
+        return kb._atomic_copy2(source, destination)
 
 
 def _healthy_board(tmp_path):
@@ -218,6 +231,43 @@ def test_recovery_aborts_when_board_changes_mid_recover(
         assert conn.execute("SELECT count(*) FROM _concurrent").fetchone()[0] == 1
 
 
+def test_recovery_refreshes_one_canonical_incident_backup_and_clears_marker(
+    tmp_path, hermetic_home, monkeypatch
+):
+    """A successful swap preserves rows and leaves no rollback/recovery temp."""
+    monkeypatch.setattr(kw.time, "time", lambda: 1_750_000_000.0)
+    monkeypatch.setattr(kw.time, "monotonic", lambda: 10_000.0)
+    db = _healthy_board(tmp_path)
+    with kb.connect_closing(db) as conn:
+        task_id = kb.create_task(conn, title="row-preserved")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    incident = kb.ensure_corruption_incident(db, "simulated notify b-tree corruption")
+    assert incident.backup_path is not None
+
+    _install_sqlite_process_fake(monkeypatch, tmp_path, db)
+    def local_stage(source):
+        fd, name = tempfile.mkstemp(
+            dir=str(source.parent), prefix=f".{source.name}.test-stage.", suffix=".tmp"
+        )
+        Path(name).unlink()
+        shutil.copy2(source, name)
+        return Path(name)
+
+    monkeypatch.setattr(kb, "_stage_off_lock", local_stage)
+    result = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
+    assert result.status == kw.RecoveryStatus.RECOVERED
+    assert kb.read_corruption_incident(db) is None
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0] == 1
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+    assert list(tmp_path.glob("*.recovered-*.tmp")) == []
+    assert list(tmp_path.glob("*.rollback-*.tmp")) == []
+
+
 @pytest.mark.parametrize("initial_delivery_failure", ["false", "exception"])
 def test_unavailable_recovery_alert_retries_only_after_delivery_deadline(
     tmp_path, hermetic_home, monkeypatch, caplog, initial_delivery_failure
@@ -252,8 +302,8 @@ def test_unavailable_recovery_alert_retries_only_after_delivery_deadline(
                 raise RuntimeError("transient Telegram DNS failure")
             return False
         if len(attempts) == 2:
-            # A changed fingerprint must create a new alert key after the
-            # original alert is confirmed delivered.
+            # Corrupt bytes may change while this incident remains active;
+            # the incident ID, not the byte fingerprint, owns the alert key.
             db.write_bytes(b"changed corrupt database")
         return True
 
@@ -325,8 +375,8 @@ def test_unavailable_recovery_alert_retries_only_after_delivery_deadline(
     with caplog.at_level(logging.INFO, logger="gateway.run"):
         asyncio.run(runner._kanban_dispatcher_watcher())
 
-    assert len(attempts) == 3
-    assert [timestamp for timestamp, _message in attempts] == [0.0, 900.0, 901.0]
+    assert len(attempts) == 2
+    assert [timestamp for timestamp, _message in attempts] == [0.0, 900.0]
     first_alert = attempts[0][1]
     assert "alpha" in first_alert
     assert str(db.resolve()) in first_alert
@@ -338,7 +388,7 @@ def test_unavailable_recovery_alert_retries_only_after_delivery_deadline(
     assert "recover-capable sqlite3" in first_alert
     assert "known-good backup" in first_alert
     assert "kanban init" not in first_alert
-    assert probe_binaries == [str(fake_cli)] * 4
+    assert probe_binaries == [str(fake_cli)] * 3
     assert not list(tmp_path.glob("*.fdmap-*.txt"))
     unavailable_logs = [
         record for record in caplog.records
@@ -348,12 +398,11 @@ def test_unavailable_recovery_alert_retries_only_after_delivery_deadline(
         logging.ERROR,
         logging.INFO,
         logging.INFO,
-        logging.ERROR,
     ]
     assert all(path.is_relative_to(tmp_path) for path in tmp_path.rglob("*"))
 
 
-def test_recovered_alert_is_delivered_once_for_a_fingerprint(
+def test_recovered_alert_is_delivered_once_for_an_incident(
     tmp_path, hermetic_home, monkeypatch
 ):
     from gateway.run import GatewayRunner
@@ -376,6 +425,7 @@ def test_recovered_alert_is_delivered_once_for_a_fingerprint(
     runner._kanban_corrupt_wall_clock = lambda: 1_750_000_000.0
     runner._kanban_corrupt_monotonic_clock = lambda: mono_now[0]
     attempts = []
+    healed = [False]
 
     async def fake_notify(message):
         attempts.append(message)
@@ -402,17 +452,23 @@ def test_recovered_alert_is_delivered_once_for_a_fingerprint(
     monkeypatch.setattr(kanban_mod, "kanban_db_path", lambda board=None: db)
 
     def fake_connect(*args, **kwargs):
+        if healed[0]:
+            return type("HealthyConnection", (), {"close": lambda self: None})()
         raise kanban_mod.KanbanDbCorruptError(db, backup, "database disk image is malformed")
 
     monkeypatch.setattr(kanban_mod, "connect", fake_connect)
-    monkeypatch.setattr(
-        kw,
-        "_attempt_board_db_recovery",
-        lambda _kb, _slug, **_kwargs: kw.RecoveryResult(
+    monkeypatch.setattr(kanban_mod, "dispatch_once", lambda *args, **kwargs: None)
+    def fake_recovery(_kb, _slug, **_kwargs):
+        # Model the production helper's postcondition: the marker is cleared
+        # only after the recovered DB and canonical backup are published.
+        kanban_mod.clear_corruption_incident(db)
+        healed[0] = True
+        return kw.RecoveryResult(
             kw.RecoveryStatus.RECOVERED,
             "injected recovered result",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(kw, "_attempt_board_db_recovery", fake_recovery)
 
     tick_count = 0
 

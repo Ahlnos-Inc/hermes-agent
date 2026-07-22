@@ -86,7 +86,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional
 
@@ -2298,7 +2298,7 @@ def _validate_sqlite_header(path: Path) -> None:
     allowed. Existing non-empty files must have the SQLite header before we
     hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
     being collapsed into a generic PRAGMA error and lets the gateway's corrupt
-    board handling identify the board by fingerprint.
+    board handling identify the durable incident.
 
     Must never open-and-close the DB file with an ordinary descriptor — see
     :func:`_read_db_header`.
@@ -2333,17 +2333,410 @@ class KanbanDbCorruptError(RuntimeError):
 
     Fail-closed guard against silent recreation of a corrupt board file,
     which would otherwise destroy the user's tasks. Carries both the
-    original path and the timestamped backup we made before refusing.
+    original path and the canonical forensic backup made before refusing.
     """
 
-    def __init__(self, db_path: Path, backup_path: Optional[Path], reason: str):
+    def __init__(
+        self,
+        db_path: Path,
+        backup_path: Optional[Path],
+        reason: str,
+        *,
+        incident_id: Optional[str] = None,
+        incident: Optional["CorruptionIncident"] = None,
+    ):
         self.db_path = db_path
         self.backup_path = backup_path
         self.reason = reason
+        self.incident_id = incident_id or (
+            incident.incident_id if incident is not None else None
+        )
+        self.incident = incident
         backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
+        preservation = (
+            f"Original preserved; backup at {backup_str}."
+            if backup_path is not None
+            else "Original remains in place; forensic backup unavailable."
+        )
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
-            f"Original preserved; backup at {backup_str}."
+            + preservation
+            + (
+                f" Incident: {self.incident_id}."
+                if self.incident_id
+                else ""
+            )
+        )
+
+
+@dataclass(frozen=True)
+class CorruptionIncident:
+    """Durable identity for one corrupt DB file generation.
+
+    The incident is intentionally independent of the bytes currently in the
+    corrupt file. A board may continue to receive claim/crash events after a
+    notifier detects corruption; those legitimate writes must not manufacture
+    a new forensic epoch or backup for every changed digest.
+    """
+
+    incident_id: str
+    db_path: Path
+    dev: Optional[int]
+    ino: Optional[int]
+    reason: str
+    detected_at: float
+    backup_path: Optional[Path]
+    preservation_status: str
+    backup_sha256: Optional[str] = None
+
+    @property
+    def generation(self) -> "tuple[Optional[int], Optional[int]]":
+        return self.dev, self.ino
+
+
+CORRUPTION_MARKER_SUFFIX = ".corrupt.incident.json"
+CORRUPTION_BACKUP_PREFIX = ".corrupt."
+CORRUPTION_PRESERVATION_PENDING = "pending"
+CORRUPTION_PRESERVATION_PUBLISHED = "published"
+CORRUPTION_PRESERVATION_FAILED = "failed"
+
+
+def _corruption_wall_clock() -> float:
+    """Clock seam for incident timestamps and hermetic recovery tests."""
+    return time.time()
+
+
+def _resolved_db_path(path: Path) -> Path:
+    """Resolve a DB path once and keep all incident artifacts beside it."""
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser()
+
+
+def _db_file_generation(path: Path) -> "tuple[Optional[int], Optional[int]]":
+    """Return the file generation used to distinguish atomic replacements."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None
+    return stat.st_dev, stat.st_ino
+
+
+def corruption_incident_path(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Return the atomic incident marker path beside a board DB."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    resolved = _resolved_db_path(Path(path))
+    return resolved.with_name(resolved.name + CORRUPTION_MARKER_SUFFIX)
+
+
+def _incident_backup_path(path: Path, incident_id: str) -> Path:
+    """Return the canonical main-file backup for ``incident_id``."""
+    return path.with_name(
+        path.name + f"{CORRUPTION_BACKUP_PREFIX}{incident_id}.bak"
+    )
+
+
+def _incident_to_payload(incident: CorruptionIncident) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "incident_id": incident.incident_id,
+        "db_path": str(incident.db_path),
+        "dev": incident.dev,
+        "ino": incident.ino,
+        "reason": incident.reason,
+        "detected_at": incident.detected_at,
+        "backup_path": str(incident.backup_path) if incident.backup_path else None,
+        "preservation_status": incident.preservation_status,
+        "backup_sha256": incident.backup_sha256,
+    }
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a small JSON marker without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = -1
+    staged: Optional[Path] = None
+    try:
+        fd, name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        staged = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+        staged = None
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            dir_fd = -1
+        if dir_fd != -1:
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
+    except OSError:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if staged is not None:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _read_corruption_incident(path: Path) -> Optional[CorruptionIncident]:
+    """Read and validate an incident marker; malformed markers are ignored."""
+    resolved = _resolved_db_path(path)
+    marker = corruption_incident_path(resolved)
+    try:
+        raw = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        incident_id = str(raw["incident_id"]).strip()
+        marker_db_path = _resolved_db_path(Path(str(raw["db_path"])))
+        dev = raw.get("dev")
+        ino = raw.get("ino")
+        dev = int(dev) if dev is not None else None
+        ino = int(ino) if ino is not None else None
+        reason = str(raw["reason"])
+        detected_at = float(raw["detected_at"])
+        backup_raw = raw.get("backup_path")
+        backup_path = (
+            _resolved_db_path(Path(str(backup_raw)))
+            if backup_raw
+            else None
+        )
+        preservation_status = str(raw.get("preservation_status") or "pending")
+        backup_sha256 = raw.get("backup_sha256")
+        if backup_sha256 is not None:
+            backup_sha256 = str(backup_sha256)
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not incident_id or marker_db_path != resolved:
+        return None
+    if backup_path is not None and backup_path.parent != resolved.parent:
+        return None
+    return CorruptionIncident(
+        incident_id=incident_id,
+        db_path=resolved,
+        dev=dev,
+        ino=ino,
+        reason=reason,
+        detected_at=detected_at,
+        backup_path=backup_path,
+        preservation_status=preservation_status,
+        backup_sha256=backup_sha256,
+    )
+
+
+def read_corruption_incident(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> Optional[CorruptionIncident]:
+    """Return the active incident marker for a board, if one is published."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    return _read_corruption_incident(Path(path))
+
+
+def _publish_incident_backup(
+    incident: CorruptionIncident,
+) -> "tuple[str, Optional[str]]":
+    """Publish the one canonical forensic image for an incident.
+
+    The live DB and sidecars are first copied through a separate process. All
+    visible backup files are then published with ``os.replace`` from private
+    staged inodes, so a failed copy can leave no partial canonical artifact.
+    """
+    backup = incident.backup_path
+    if backup is None:
+        return CORRUPTION_PRESERVATION_FAILED, None
+    source = incident.db_path
+    staged = _stage_off_lock(source)
+    if staged is None:
+        return CORRUPTION_PRESERVATION_FAILED, None
+    source_digest: Optional[str] = None
+    sidecar_stages: list[tuple[Path, Path]] = []
+    try:
+        source_digest = _file_sha256(staged)
+        if source_digest is None or not _atomic_copy2(staged, backup):
+            return CORRUPTION_PRESERVATION_FAILED, source_digest
+        for suffix in ("-wal", "-shm"):
+            sidecar = source.with_name(source.name + suffix)
+            if not sidecar.exists():
+                continue
+            staged_sidecar = _stage_off_lock(sidecar)
+            if staged_sidecar is None:
+                return CORRUPTION_PRESERVATION_FAILED, source_digest
+            sidecar_stages.append((staged_sidecar, backup.with_name(backup.name + suffix)))
+        for staged_sidecar, sidecar_backup in sidecar_stages:
+            if not _atomic_copy2(staged_sidecar, sidecar_backup):
+                return CORRUPTION_PRESERVATION_FAILED, source_digest
+        return CORRUPTION_PRESERVATION_PUBLISHED, source_digest
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        for staged_sidecar, _destination in sidecar_stages:
+            try:
+                staged_sidecar.unlink()
+            except OSError:
+                pass
+
+
+def _ensure_corruption_incident_locked(
+    path: Path,
+    reason: str,
+    *,
+    detected_at: Optional[float] = None,
+) -> CorruptionIncident:
+    """Create or reuse an incident while the cross-process init lock is held."""
+    resolved = _resolved_db_path(path)
+    generation = _db_file_generation(resolved)
+    existing = _read_corruption_incident(resolved)
+    if (
+        existing is not None
+        and existing.generation == generation
+        and generation != (None, None)
+    ):
+        incident = existing
+        backup_is_valid = (
+            incident.backup_path is not None
+            and incident.backup_path.exists()
+            and (
+                incident.backup_sha256 is None
+                or _file_sha256(incident.backup_path) == incident.backup_sha256
+            )
+        )
+        if incident.preservation_status == CORRUPTION_PRESERVATION_PUBLISHED:
+            if backup_is_valid:
+                return incident
+        incident = replace(
+            incident,
+            reason=incident.reason or str(reason),
+            preservation_status=CORRUPTION_PRESERVATION_PENDING,
+        )
+    else:
+        incident_id = secrets.token_hex(16)
+        incident = CorruptionIncident(
+            incident_id=incident_id,
+            db_path=resolved,
+            dev=generation[0],
+            ino=generation[1],
+            reason=str(reason),
+            detected_at=(
+                _corruption_wall_clock()
+                if detected_at is None
+                else float(detected_at)
+            ),
+            backup_path=_incident_backup_path(resolved, incident_id),
+            preservation_status=CORRUPTION_PRESERVATION_PENDING,
+        )
+    marker = corruption_incident_path(resolved)
+    _atomic_write_json(marker, _incident_to_payload(incident))
+    status, digest = _publish_incident_backup(incident)
+    incident = replace(
+        incident,
+        preservation_status=status,
+        backup_sha256=digest,
+    )
+    _atomic_write_json(marker, _incident_to_payload(incident))
+    _log.warning(
+        "kanban corruption incident %s for %s: preservation=%s backup=%s",
+        incident.incident_id,
+        resolved,
+        incident.preservation_status,
+        incident.backup_path,
+    )
+    return incident
+
+
+def ensure_corruption_incident(
+    db_path: Optional[Path] = None,
+    reason: str = "corruption detected",
+    *,
+    board: Optional[str] = None,
+    detected_at: Optional[float] = None,
+) -> CorruptionIncident:
+    """Publish or reuse the durable incident for a corrupt board DB."""
+    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
+    resolved = _resolved_db_path(path)
+    with _cross_process_init_lock(resolved):
+        return _ensure_corruption_incident_locked(
+            resolved, reason, detected_at=detected_at,
+        )
+
+
+def _corrupt_error_for_incident(incident: CorruptionIncident) -> KanbanDbCorruptError:
+    backup_path = (
+        incident.backup_path
+        if (
+            incident.preservation_status == CORRUPTION_PRESERVATION_PUBLISHED
+            and incident.backup_path is not None
+            and incident.backup_path.exists()
+        )
+        else None
+    )
+    return KanbanDbCorruptError(
+        incident.db_path,
+        backup_path,
+        incident.reason,
+        incident_id=incident.incident_id,
+        incident=incident,
+    )
+
+
+def _clear_corruption_incident_locked(
+    path: Path,
+    *,
+    incident_id: Optional[str] = None,
+) -> bool:
+    resolved = _resolved_db_path(path)
+    current = _read_corruption_incident(resolved)
+    if current is None:
+        return False
+    if incident_id is not None and current.incident_id != incident_id:
+        return False
+    marker = corruption_incident_path(resolved)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return False
+    _INITIALIZED_PATHS.discard(str(resolved))
+    return True
+
+
+def clear_corruption_incident(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    incident_id: Optional[str] = None,
+) -> bool:
+    """Clear an incident after a verified healthy epoch is installed."""
+    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
+    resolved = _resolved_db_path(path)
+    with _cross_process_init_lock(resolved):
+        return _clear_corruption_incident_locked(
+            resolved, incident_id=incident_id,
         )
 
 
@@ -2361,11 +2754,14 @@ def _guard_cached_db_header(path: Path) -> None:
         _validate_sqlite_header(path)
     except sqlite3.DatabaseError as exc:
         try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        backup = _backup_corrupt_db(resolved)
-        raise KanbanDbCorruptError(resolved, backup, str(exc)) from exc
+            incident = ensure_corruption_incident(path, str(exc))
+        except OSError as marker_exc:
+            raise KanbanDbCorruptError(
+                _resolved_db_path(path),
+                None,
+                f"{exc}; incident marker publication failed: {marker_exc}",
+            ) from exc
+        raise _corrupt_error_for_incident(incident) from exc
 
 
 def _file_sha256(path: Path) -> Optional[str]:
@@ -2476,88 +2872,22 @@ def _atomic_copy2(source: Path, destination: Path) -> bool:
 
 
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
-    """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
+    """Compatibility wrapper for the durable incident publisher.
 
-    The backup filename is deterministic in the main DB's sha256, so repeated
-    quarantines of the same corrupt bytes (gateway restarts, dispatcher retries,
-    multi-profile fleets all hitting the same shared DB) reuse one backup
-    instead of amplifying disk usage by N. If the corrupt bytes actually
-    change between attempts — e.g. a partial repair or further damage — the
-    fingerprint changes and a separate backup is preserved.
-
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
-
-    Writes are confined to the original DB's parent directory. The backup
-    basename is derived purely from ``path.name`` and a content hash, never
-    from caller-supplied directory segments — no traversal is possible.
+    Older internal callers keep this name, but the live guard uses the random
+    incident marker and canonical backup rather than a byte fingerprint.
     """
-    # Resolve once and pin the parent so subsequent path operations cannot
-    # escape it. ``Path.resolve()`` collapses any ``..`` segments and
-    # symlinks, and we only ever write inside ``parent``.
-    resolved = path.resolve()
-    parent = resolved.parent
-    base_name = resolved.name  # basename only
-    # BUILD-567: stage the LIVE DB through a subprocess copy FIRST. Every
-    # subsequent read (digest, dedup, backup copy) then touches only this
-    # private staged inode — never the live DB — so no in-process close() can
-    # drop the gateway's fcntl locks on the board file. See _copy_off_lock.
-    staged = _stage_off_lock(resolved)
-    if staged is None:
-        return None
     try:
-        source_digest = _file_sha256(staged)
-        if source_digest is None:
-            return None
-        token = source_digest[:16]
-        candidate = parent / f"{base_name}.corrupt.{token}.bak"
-        # Defensive: candidate must still be inside parent after construction.
-        if candidate.parent != parent:
-            return None
-        if candidate.exists():
-            candidate_digest = _file_sha256(candidate)
-            if candidate_digest is None:
-                return None
-            if candidate_digest != source_digest:
-                incomplete = parent / (
-                    f"{candidate.name}.incomplete.{candidate_digest[:16]}.bak"
-                )
-                if incomplete.parent != parent:
-                    return None
-                if incomplete.exists():
-                    if _file_sha256(incomplete) != candidate_digest:
-                        return None
-                elif not _atomic_copy2(candidate, incomplete):
-                    return None
-                if not _atomic_copy2(staged, candidate):
-                    return None
-        else:
-            if not _atomic_copy2(staged, candidate):
-                return None
-        for suffix in ("-wal", "-shm"):
-            sidecar = parent / (base_name + suffix)
-            if sidecar.parent != parent or not sidecar.exists():
-                continue
-            sidecar_backup = parent / (candidate.name + suffix)
-            if sidecar_backup.parent != parent or sidecar_backup.exists():
-                continue
-            # Live sidecar too — stage off-lock before the in-process copy.
-            staged_sidecar = _stage_off_lock(sidecar)
-            if staged_sidecar is None:
-                continue
-            try:
-                _atomic_copy2(staged_sidecar, sidecar_backup)
-            finally:
-                try:
-                    staged_sidecar.unlink()
-                except OSError:
-                    pass
-        return candidate
-    finally:
-        try:
-            staged.unlink()
-        except OSError:
-            pass
+        incident = ensure_corruption_incident(path, "corruption detected")
+    except OSError:
+        return None
+    if (
+        incident.preservation_status != CORRUPTION_PRESERVATION_PUBLISHED
+        or incident.backup_path is None
+        or not incident.backup_path.exists()
+    ):
+        return None
+    return incident.backup_path
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:
@@ -2566,7 +2896,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     Opens the probe in read/write mode so SQLite can recover or
     checkpoint a healthy WAL/hot-journal DB before we declare it
     corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
+    sidecars) to the incident's canonical backup and raise
     :class:`KanbanDbCorruptError` so callers cannot silently recreate
     the schema on top of a damaged DB.
 
@@ -2585,37 +2915,131 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     confine all filesystem writes to its parent directory so any
     accidental ``..`` segments are collapsed before any I/O happens.
     """
-    # Resolve before any I/O. ``Path.resolve()`` normalizes ``..`` and
-    # symlinks, giving us a canonical path whose parent dir we can pin.
+    _guard_existing_db_is_healthy_with_options(path)
+
+
+def _is_corrupt_sqlite_error(exc: BaseException) -> bool:
+    """Recognize only the SQLite messages that prove structural corruption."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+    )
+
+
+def _integrity_probe_reason(path: Path) -> Optional[str]:
+    """Return a corruption reason, or ``None`` for a healthy existing DB."""
+    resolved = _resolved_db_path(path)
     try:
-        resolved = path.resolve()
+        if not resolved.exists() or resolved.stat().st_size == 0:
+            return None
     except OSError:
-        return
+        return None
+    try:
+        _validate_sqlite_header(resolved)
+    except sqlite3.DatabaseError as exc:
+        if not _is_corrupt_sqlite_error(exc):
+            raise
+        return f"sqlite refused to open file: {exc}"
+    probe = None
+    try:
+        probe = _sqlite_connect(resolved)
+        row = probe.execute("PRAGMA integrity_check").fetchone()
+    except sqlite3.OperationalError as exc:
+        # ``database is locked`` / ``disk I/O error`` remain ordinary transient
+        # failures. SQLite reports the malformed-image class as OperationalError
+        # too, so classify only the narrow structural messages above.
+        if not _is_corrupt_sqlite_error(exc):
+            raise
+        return f"sqlite refused to open file: {exc}"
+    except sqlite3.DatabaseError as exc:
+        if not _is_corrupt_sqlite_error(exc):
+            raise
+        return f"sqlite refused to open file: {exc}"
+    finally:
+        if probe is not None:
+            probe.close()
+    if not row or (row[0] or "").lower() != "ok":
+        return f"integrity_check returned {row[0] if row else '<no row>'!r}"
+    return None
+
+
+def _guard_existing_db_is_healthy_with_options(
+    path: Path,
+    *,
+    force: bool = False,
+    active_incident: Optional[CorruptionIncident] = None,
+    lock_held: bool = False,
+) -> None:
+    """Integrity-guard one DB, optionally forcing a healing probe."""
+    resolved = _resolved_db_path(path)
     try:
         if not resolved.exists() or resolved.stat().st_size == 0:
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    if not force and str(resolved) in _INITIALIZED_PATHS:
         return
-    reason: Optional[str] = None
-    try:
-        probe = _sqlite_connect(resolved)
-        try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
-    except sqlite3.DatabaseError as exc:
-        reason = f"sqlite refused to open file: {exc}"
+    reason = _integrity_probe_reason(resolved)
     if reason is None:
+        if active_incident is not None:
+            if lock_held:
+                _clear_corruption_incident_locked(
+                    resolved, incident_id=active_incident.incident_id,
+                )
+            else:
+                clear_corruption_incident(
+                    resolved, incident_id=active_incident.incident_id,
+                )
         return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+    try:
+        if lock_held:
+            incident = _ensure_corruption_incident_locked(resolved, reason)
+        else:
+            incident = ensure_corruption_incident(resolved, reason)
+    except OSError as marker_exc:
+        raise KanbanDbCorruptError(
+            resolved,
+            None,
+            f"{reason}; incident marker publication failed: {marker_exc}",
+        ) from marker_exc
+    raise _corrupt_error_for_incident(incident)
+
+
+def probe_corruption_incident(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Force a full health probe for an active incident.
+
+    ``connect()`` deliberately refuses an unchanged incident generation. The
+    dispatcher calls this function when quarantine expires so an operator's
+    in-place repair can be recognized without restarting the gateway. A
+    changed inode is probed through the same path; a healthy result clears the
+    marker, while a corrupt result preserves or advances the incident.
+    """
+    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
+    resolved = _resolved_db_path(path)
+    with _cross_process_init_lock(resolved):
+        incident = _read_corruption_incident(resolved)
+        if incident is None:
+            return True
+        current_generation = _db_file_generation(resolved)
+        if current_generation == (None, None):
+            return False
+        try:
+            _guard_existing_db_is_healthy_with_options(
+                resolved,
+                force=True,
+                active_incident=incident,
+                lock_held=True,
+            )
+        except KanbanDbCorruptError:
+            return False
+        return _read_corruption_incident(resolved) is None
 
 
 def connect(
@@ -2647,6 +3071,41 @@ def connect(
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # The marker is checked before SQLite opens the file. An unchanged active
+    # generation is a board-wide quarantine: workers and gateway threads all
+    # receive the same incident instead of opening the still-writable corrupt
+    # image and producing a new incident backup. A changed generation
+    # takes the slow path below, where a real integrity probe either heals the
+    # marker or publishes a new incident.
+    resolved_path = _resolved_db_path(path)
+    active_incident = _read_corruption_incident(resolved_path)
+    if active_incident is not None:
+        current_generation = _db_file_generation(resolved_path)
+        if (
+            current_generation == (None, None)
+            or current_generation == active_incident.generation
+        ):
+            if (
+                active_incident.preservation_status
+                != CORRUPTION_PRESERVATION_PUBLISHED
+                or active_incident.backup_path is None
+                or not active_incident.backup_path.exists()
+            ):
+                try:
+                    active_incident = ensure_corruption_incident(
+                        resolved_path, active_incident.reason,
+                    )
+                except OSError as marker_exc:
+                    raise KanbanDbCorruptError(
+                        resolved_path,
+                        None,
+                        f"{active_incident.reason}; incident marker publication "
+                        f"failed: {marker_exc}",
+                        incident_id=active_incident.incident_id,
+                        incident=active_incident,
+                    ) from marker_exc
+            raise _corrupt_error_for_incident(active_incident)
+
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
     # migrations) is already done and cached in _INITIALIZED_PATHS. Acquiring
@@ -2657,8 +3116,8 @@ def connect(
     # steady-state path there is nothing for the cross-process lock to protect
     # (no schema/migration writes run), so skip it entirely and just open the
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
-    resolved = str(path.resolve())
-    if resolved in _INITIALIZED_PATHS:
+    resolved = str(resolved_path)
+    if resolved in _INITIALIZED_PATHS and active_incident is None:
         # Preserve the cached fast path while detecting an external page-one
         # overwrite before SQLite's WAL setup turns it into an opaque error.
         _guard_cached_db_header(path)
@@ -2679,14 +3138,52 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
-        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-        # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
+        # Re-read the marker after taking the cross-process lock: another
+        # detector may have published it since the cheap pre-check above.
+        active_incident = _read_corruption_incident(path)
+        current_generation = _db_file_generation(path)
+        if active_incident is not None:
+            if (
+                current_generation == (None, None)
+                or current_generation == active_incident.generation
+            ):
+                if (
+                    active_incident.preservation_status
+                    != CORRUPTION_PRESERVATION_PUBLISHED
+                    or active_incident.backup_path is None
+                    or not active_incident.backup_path.exists()
+                ):
+                    try:
+                        active_incident = _ensure_corruption_incident_locked(
+                            path, active_incident.reason,
+                        )
+                    except OSError as marker_exc:
+                        raise KanbanDbCorruptError(
+                            resolved_path,
+                            None,
+                            f"{active_incident.reason}; incident marker "
+                            f"publication failed: {marker_exc}",
+                            incident_id=active_incident.incident_id,
+                            incident=active_incident,
+                        ) from marker_exc
+                raise _corrupt_error_for_incident(active_incident)
+            # An external atomic replacement or in-place repair invalidates the
+            # old generation. Force the integrity probe before clearing it.
+            _guard_existing_db_is_healthy_with_options(
+                path,
+                force=True,
+                active_incident=active_incident,
+                lock_held=True,
+            )
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
-        resolved = str(path.resolve())
+        _guard_existing_db_is_healthy_with_options(
+            path,
+            force=False,
+            lock_held=True,
+        )
+        resolved = str(resolved_path)
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
