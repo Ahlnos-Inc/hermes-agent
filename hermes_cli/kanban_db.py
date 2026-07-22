@@ -18198,12 +18198,47 @@ def _spawn_and_attach_worker(
     receipt: Optional[SpawnReceipt] = None
     try:
         try:
-            sig = inspect.signature(spawn_fn)
-            if "board" in sig.parameters:
-                raw_receipt = spawn_fn(task, workspace, board=board)
-            else:
-                raw_receipt = spawn_fn(task, workspace)
+            sig: Optional[inspect.Signature] = inspect.signature(spawn_fn)
         except (TypeError, ValueError):
+            # Signature introspection genuinely failed (e.g. an
+            # unintrospectable callable) -- fall back to the legacy
+            # two-argument compatibility path below. This is the ONLY
+            # TypeError/ValueError this function catches: it never wraps
+            # the call to spawn_fn itself, so an exception raised from
+            # inside spawn_fn's own body (e.g. ContinuationContractError,
+            # a ValueError subclass) always propagates unchanged instead
+            # of being mistaken for an arity mismatch and silently retried.
+            sig = None
+        accepts_board = sig is not None and "board" in sig.parameters
+        if accepts_board:
+            assert sig is not None
+            # Decide (and validate) the invocation form BEFORE executing
+            # spawn_fn. bind() only inspects the signature -- it never
+            # runs any of spawn_fn's own code -- so any TypeError it
+            # raises here is a genuine, pre-invocation arity problem, not
+            # something from inside the function body, and is allowed to
+            # propagate uncaught.
+            sig.bind(task, workspace, board=board)
+            raw_receipt = spawn_fn(task, workspace, board=board)
+        else:
+            # Legacy two-argument spawn_fn: a PRESELECTED compatibility
+            # path, never a fallback retry after a failed call. A
+            # two-argument spawn_fn has no way to honour ``board`` and
+            # always resolves the kanban DB implicitly via board=None, so
+            # it is only safe to invoke when that implicit resolution
+            # agrees with the database this dispatch actually claimed the
+            # task from. Refuse BEFORE invocation otherwise -- omission
+            # must never silently redirect database resolution.
+            if kanban_db_path(board=board) != kanban_db_path(board=None):
+                raise RuntimeError(
+                    "spawn_fn must accept board for a board-scoped "
+                    f"dispatch (board={board!r}): a legacy two-argument "
+                    "spawn_fn would resolve the kanban database as "
+                    f"{kanban_db_path(board=None)} instead of the "
+                    f"dispatched board's {kanban_db_path(board=board)}"
+                )
+            if sig is not None:
+                sig.bind(task, workspace)
             raw_receipt = spawn_fn(task, workspace)
         receipt = _coerce_spawn_receipt(raw_receipt)
         if task.current_run_id is None or not task.claim_lock:
@@ -19586,8 +19621,19 @@ def _spawn_contract(
             require_current=False,
         )
     if row is None:
+        # A missing row only proves the (run_id, task_id) pair was absent
+        # from the queried board database -- it does NOT establish that the
+        # run is stale/superseded. Naming it "no longer current" masked the
+        # real failure class (e.g. a spawn_fn body exception mis-caught as
+        # an arity mismatch and retried against the wrong board's DB -- see
+        # _spawn_and_attach_worker). Report the queried board + resolved
+        # path so a wrong-database lookup is diagnosable at a glance.
+        resolved_board = _normalize_board_slug(board) or get_current_board()
+        resolved_path = kanban_db_path(board=board)
         raise RuntimeError(
-            f"task {task.id} run {task.current_run_id} is no longer current"
+            "spawn contract lookup failed: task/run pair "
+            f"({task.id}, {task.current_run_id}) was not found in board "
+            f"database board={resolved_board!r} path={str(resolved_path)!r}"
         )
     raw = row["run_spec_json"]
     if not raw:

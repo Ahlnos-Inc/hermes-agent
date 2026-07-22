@@ -700,3 +700,136 @@ def test_manual_reclaim_observes_missing_pid_without_killing_scan_match(
     assert "orphan_worker_canary action=observe_only" in caplog.text
     assert "worker_pids=[42424]" in caplog.text
     assert "host:claim" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# BUILD-715: an arity-probing retry in _spawn_and_attach_worker used to catch
+# TypeError/ValueError raised from INSIDE spawn_fn's own body, mistake it for
+# a signature mismatch, and silently retry with degraded (board-less)
+# arguments -- which queried the wrong database and raised a misleading
+# "is no longer current" error that masked the real exception entirely.
+# ---------------------------------------------------------------------------
+
+
+def _claimed_task(conn) -> "kb.Task":
+    task_id = kb.create_task(conn, title="spawn attach fix", assignee="worker")
+    task = kb.claim_task(conn, task_id)
+    assert task is not None
+    return task
+
+
+def test_spawn_and_attach_worker_propagates_value_error_from_board_spawn_fn_unchanged(
+    kanban_home,
+):
+    class SentinelValueError(ValueError):
+        pass
+
+    calls = []
+
+    def spawn(task, workspace, *, board=None):
+        calls.append((task, workspace, board))
+        raise SentinelValueError("boom-from-inside-spawn_fn")
+
+    with kb.connect() as conn:
+        task = _claimed_task(conn)
+        with pytest.raises(SentinelValueError, match="boom-from-inside-spawn_fn"):
+            kb._spawn_and_attach_worker(
+                conn, task, "workspace", spawn, board="hermes-infra"
+            )
+
+    assert len(calls) == 1
+    assert calls[0] == (task, "workspace", "hermes-infra")
+
+
+def test_spawn_and_attach_worker_propagates_type_error_from_board_spawn_fn_unchanged(
+    kanban_home,
+):
+    class SentinelTypeError(TypeError):
+        pass
+
+    calls = []
+
+    def spawn(task, workspace, *, board=None):
+        calls.append((task, workspace, board))
+        raise SentinelTypeError("boom-from-inside-spawn_fn")
+
+    with kb.connect() as conn:
+        task = _claimed_task(conn)
+        with pytest.raises(SentinelTypeError, match="boom-from-inside-spawn_fn"):
+            kb._spawn_and_attach_worker(
+                conn, task, "workspace", spawn, board="hermes-infra"
+            )
+
+    assert len(calls) == 1
+    assert calls[0] == (task, "workspace", "hermes-infra")
+
+
+def _receipt(pid: int) -> "kb.SpawnReceipt":
+    return kb.SpawnReceipt(
+        pid=pid,
+        release=lambda: None,
+        abort=lambda: None,
+        process_started_at=1234.5,
+        process_group_id=pid,
+        session_id=pid,
+    )
+
+
+def test_spawn_and_attach_worker_invokes_legacy_two_arg_spawn_fn_once_when_db_paths_match(
+    kanban_home,
+):
+    calls = []
+
+    def spawn(task, workspace):
+        calls.append((task, workspace))
+        return _receipt(51_001)
+
+    with kb.connect() as conn:
+        task = _claimed_task(conn)
+        # board=None here resolves to the same DB as the implicit board=None
+        # inside _spawn_and_attach_worker, so the legacy two-arg path is a
+        # preselected, safe compatibility invocation.
+        pid = kb._spawn_and_attach_worker(conn, task, "workspace", spawn, board=None)
+
+    assert pid == 51_001
+    assert len(calls) == 1
+    assert calls[0] == (task, "workspace")
+
+
+def test_spawn_and_attach_worker_refuses_legacy_two_arg_spawn_fn_when_db_paths_differ(
+    kanban_home,
+):
+    calls = []
+
+    def spawn(task, workspace):
+        calls.append((task, workspace))
+        return _receipt(51_002)
+
+    with kb.connect() as conn:
+        task = _claimed_task(conn)
+        with pytest.raises(RuntimeError, match="spawn_fn must accept board"):
+            kb._spawn_and_attach_worker(
+                conn, task, "workspace", spawn, board="hermes-infra"
+            )
+
+    assert calls == []
+
+
+def test_spawn_contract_reports_queried_board_and_path_not_no_longer_current(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task = _claimed_task(conn)
+
+    expected_path = kb.kanban_db_path(board="hermes-infra")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        kb._spawn_contract(task, board="hermes-infra")
+
+    message = str(exc_info.value)
+    assert "is no longer current" not in message
+    assert "no longer current" not in message
+    assert task.id in message
+    assert str(task.current_run_id) in message
+    assert "hermes-infra" in message
+    assert str(expected_path) in message
