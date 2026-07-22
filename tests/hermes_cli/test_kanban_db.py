@@ -2898,6 +2898,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
     assert spawns == [(tid, str(expected)), (tid, str(expected))]
     assert second_task is not None
     assert second_task.workspace_path == str(expected)
+    assert second_task.workspace_managed
     actual_branch = subprocess.run(
         ["git", "-C", str(expected), "branch", "--show-current"],
         check=True,
@@ -2915,6 +2916,204 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
     assert listed.count(f"worktree {expected}\n") == 1
     assert f"worktree {expected}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
+
+
+def test_managed_terminal_worktree_is_removed_without_deleting_branch(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    branch = "wt/managed-clean"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="managed clean",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task, conn=conn)
+        materialized = kb.get_task(conn, task_id)
+        assert materialized is not None and materialized.workspace_managed
+
+        assert kb.complete_task(conn, task_id, result="done")
+        events = kb.list_events(conn, task_id)
+
+    assert not workspace.exists()
+    branch_check = subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", f"refs/heads/{branch}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_check.returncode == 0
+    assert any(event.kind == "workspace_cleaned" for event in events)
+
+
+def test_dirty_managed_terminal_worktree_is_deferred(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="managed dirty",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task, conn=conn)
+        (workspace / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        assert kb.complete_task(conn, task_id, result="done")
+        deferred = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup_deferred"
+        ]
+
+    assert workspace.exists()
+    assert deferred
+    assert deferred[-1].payload["reason"] == "git_worktree_remove_refused"
+
+
+def test_borrowed_terminal_worktree_is_never_reaped(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    borrowed = tmp_path / "borrowed"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(borrowed), "-b", "borrowed"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="borrowed",
+            workspace_kind="worktree",
+            workspace_path=str(borrowed),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb.resolve_workspace(task, conn=conn) == borrowed.resolve()
+        materialized = kb.get_task(conn, task_id)
+        assert materialized is not None and not materialized.workspace_managed
+        assert kb.complete_task(conn, task_id, result="done")
+
+    assert borrowed.exists()
+    assert not any(
+        event.kind == "workspace_cleaned" for event in kb.list_events(conn, task_id)
+    )
+
+
+def test_shared_worktree_waits_until_last_referencing_task_is_terminal(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        first_id = kb.create_task(
+            conn,
+            title="first owner",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        first = kb.get_task(conn, first_id)
+        assert first is not None
+        workspace = kb.resolve_workspace(first, conn=conn)
+
+        second_id = kb.create_task(
+            conn,
+            title="second reference",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+        )
+        second = kb.get_task(conn, second_id)
+        assert second is not None
+        assert kb.resolve_workspace(second, conn=conn) == workspace
+        assert not kb.get_task(conn, second_id).workspace_managed
+
+        assert kb.complete_task(conn, first_id, result="first done")
+        assert workspace.exists()
+        first_deferred = [
+            event for event in kb.list_events(conn, first_id)
+            if event.kind == "workspace_cleanup_deferred"
+        ]
+        assert first_deferred[-1].payload["reason"] == "active_task_references_workspace"
+
+        assert kb.complete_task(conn, second_id, result="second done")
+
+    assert not workspace.exists()
+
+
+def test_managed_worktree_identity_mismatch_fails_closed(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="identity mismatch",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task, conn=conn)
+        conn.execute(
+            "UPDATE tasks SET workspace_repo_common_dir = ? WHERE id = ?",
+            (str(tmp_path / "wrong-common"), task_id),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, task_id, result="done")
+        deferred = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup_deferred"
+        ]
+
+    assert workspace.exists()
+    assert deferred[-1].payload["reason"] == "workspace_git_common_directory_mismatch"
+
+
+def test_workspace_cleanup_sweep_reclaims_expired_lease_with_injected_clock(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="lease recovery",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task, conn=conn)
+        conn.execute(
+            "UPDATE tasks SET status = 'done', workspace_cleanup_lease = ?, "
+            "workspace_cleanup_lease_expires = ? WHERE id = ?",
+            ("crashed-cleaner", 150, task_id),
+        )
+        conn.commit()
+
+        assert kb.cleanup_terminal_task_worktrees(conn, now=100) == []
+        assert workspace.exists()
+        result = kb.cleanup_terminal_task_worktrees(
+            conn,
+            now=151,
+            clock=lambda: 151,
+        )
+
+    assert result and result[0]["status"] == "cleaned"
+    assert not workspace.exists()
 
 
 # ---------------------------------------------------------------------------

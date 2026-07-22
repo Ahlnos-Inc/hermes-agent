@@ -21,6 +21,7 @@ from agent.claude_cli_boundary import (
     ClaudeAttestationTransientError,
 )
 from agent.error_classifier import FailoverReason
+from agent.claude_workspace_terminal import WorkspaceBoundaryProvisioningError
 
 
 def _tool(name):
@@ -86,6 +87,47 @@ def test_preflight_uses_typed_attestation_classification(
 
     assert failure is not None
     assert failure.reason is expected
+
+
+def test_workspace_boundary_failure_is_typed_and_precedes_auth_attestation(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-708")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(external_runtime.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        external_runtime,
+        "load_claude_agent_sdk",
+        lambda: SimpleNamespace(__file__=__file__),
+    )
+    monkeypatch.setattr(external_runtime, "get_host_user_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        external_runtime,
+        "build_claude_subscription_env",
+        lambda *a, **k: {"PATH": "/usr/bin:/bin"},
+    )
+    monkeypatch.setattr(
+        external_runtime,
+        "prepare_workspace_terminal_boundary",
+        lambda *a, **k: (_ for _ in ()).throw(
+            WorkspaceBoundaryProvisioningError("external alias")
+        ),
+    )
+    attestation_called = []
+    monkeypatch.setattr(
+        external_runtime,
+        "attest_claude_max_auth",
+        lambda *a, **k: attestation_called.append(True),
+    )
+
+    failure = prepare_claude_agent_sdk_runtime(
+        SimpleNamespace(provider="anthropic", model="claude-haiku")
+    )
+
+    assert failure is not None
+    assert failure.provisioning is True
+    assert failure.reason is FailoverReason.unknown
+    assert attestation_called == []
 
 
 def test_external_runtime_uses_active_profile_capability_policy(

@@ -16,6 +16,7 @@ class RuntimeFailure:
     message: str
     reset_at: int | None = None
     replay_safe: bool = True
+    provisioning: bool = False
 
 
 @dataclass

@@ -15,6 +15,7 @@ from agent.request_budgets import AttemptDeadlineExceeded
 from agent.claude_subscription_env import build_claude_subscription_env
 from agent.claude_tool_guard import create_workspace_pre_tool_hook
 from agent.claude_workspace_terminal import (
+    WorkspaceTerminalBoundary,
     build_workspace_terminal_args,
     dispatch_read_only_workspace_terminal,
 )
@@ -90,6 +91,7 @@ def build_claude_agent_options(
     host_home: str | Path,
     profile_home: str | Path,
     inherited_env: Mapping[str, str] | None,
+    boundary: WorkspaceTerminalBoundary | None = None,
     tool_definitions: Iterable[Mapping[str, Any]],
     dispatch: Callable[..., Any],
     effective_task_id: str,
@@ -132,6 +134,7 @@ def build_claude_agent_options(
     file_broker = file_broker or WorkspaceFileBroker(
         workspace_path,
         deny_credential_reads=read_only_worker,
+        boundary=boundary,
     )
     if read_only_worker:
         file_broker.deny_credentials_for_read_only_worker()
@@ -148,6 +151,7 @@ def build_claude_agent_options(
             workspace=workspace_path,
             host_home=host_home_path,
             exact_env=env,
+            boundary=boundary,
             additional_readable_roots=extra_read_paths or None,
         )
 
@@ -167,6 +171,7 @@ def build_claude_agent_options(
                         workspace=workspace_path,
                         host_home=host_home_path,
                         exact_env=env,
+                        boundary=boundary,
                         dispatch=dispatch,
                         task_id=effective_task_id,
                         extra_readable_roots=extra_read_paths,

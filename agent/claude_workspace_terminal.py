@@ -252,29 +252,50 @@ def _seatbelt_string(path: Path) -> str:
     return json.dumps(str(path), ensure_ascii=False)
 
 
-def _reject_linked_workspace_files(root: Path) -> None:
-    """Fail closed if a regular file could alias a path outside the workspace."""
+class WorkspaceBoundaryProvisioningError(RuntimeError):
+    """The immutable workspace write boundary could not be prepared."""
 
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as exc:
-            raise RuntimeError(f"Could not inspect worker workspace: {directory}") from exc
-        for entry in entries:
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError as exc:
-                raise RuntimeError(f"Could not inspect workspace path: {entry.path}") from exc
-            if stat.S_ISDIR(info.st_mode):
-                pending.append(Path(entry.path))
-            elif stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
-                raise RuntimeError(
-                    "Workspace terminal rejects hard-linked regular file: "
-                    f"{entry.path}. Recreate dependency files in copy mode "
-                    "(for uv, set UV_LINK_MODE=copy)."
+
+@dataclass(frozen=True)
+class WorkspaceTerminalBoundary:
+    """The prepared write boundary shared by every terminal capability."""
+
+    root: Path
+    readonly_subtrees: tuple[Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        root = Path(self.root).expanduser().resolve(strict=False)
+        normalized: list[Path] = []
+        for raw_path in self.readonly_subtrees:
+            path = Path(raw_path).expanduser().resolve(strict=False)
+            if path == root or not path.is_relative_to(root):
+                raise WorkspaceBoundaryProvisioningError(
+                    "Workspace terminal read-only subtree is outside the workspace"
                 )
+            if any(path == existing or path.is_relative_to(existing) for existing in normalized):
+                continue
+            normalized.append(path)
+        normalized.sort(key=lambda path: (len(path.parts), str(path)))
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "readonly_subtrees", tuple(normalized))
+
+    def retarget(self, root: str | Path) -> "WorkspaceTerminalBoundary":
+        """Map the boundary's relative read-only roots onto a mirror root."""
+
+        target_root = Path(root).expanduser().resolve(strict=False)
+        mapped = tuple(
+            target_root / subtree.relative_to(self.root)
+            for subtree in self.readonly_subtrees
+        )
+        return WorkspaceTerminalBoundary(target_root, mapped)
+
+
+def _path_is_readonly_subtree(path: Path, boundary: WorkspaceTerminalBoundary) -> bool:
+    canonical = path.expanduser().resolve(strict=False)
+    return any(
+        canonical == subtree or canonical.is_relative_to(subtree)
+        for subtree in boundary.readonly_subtrees
+    )
 
 
 def _metadata_ancestors(path: Path) -> list[Path]:
@@ -339,6 +360,7 @@ def build_workspace_seatbelt_profile(
     restrict_reads: bool = True,
     workspace_writable: bool = True,
     denied_read_paths: list[str | Path] | None = None,
+    denied_write_roots: list[str | Path] | None = None,
     control_write_paths: list[str | Path] | None = None,
     control_write_roots: list[str | Path] | None = None,
     git_object_roots: list[str | Path] | None = None,
@@ -368,7 +390,13 @@ def build_workspace_seatbelt_profile(
         lines.append("(allow default)")
         if not allow_network:
             lines.append("(deny network*)")
-    lines.extend(["(deny file-write*)", '(allow file-write* (literal "/dev/null"))'])
+    lines.extend(
+        [
+            "(deny file-write*)",
+            "(deny file-link)",
+            '(allow file-write* (literal "/dev/null"))',
+        ]
+    )
     if workspace_writable:
         lines.append(f"(allow file-write* (subpath {_seatbelt_string(root)}))")
     if restrict_reads:
@@ -420,6 +448,9 @@ def build_workspace_seatbelt_profile(
     for denied_path in denied_read_paths or []:
         path = Path(denied_path).expanduser().resolve(strict=False)
         lines.append(f"(deny file-read* (literal {_seatbelt_string(path)}))")
+    for denied_root in denied_write_roots or []:
+        path = Path(denied_root).expanduser().resolve(strict=False)
+        lines.append(f"(deny file-write* (subpath {_seatbelt_string(path)}))")
     for writable in control_write_paths or []:
         path = Path(writable).expanduser().resolve(strict=False)
         lines.append(f"(allow file-write* (literal {_seatbelt_string(path)}))")
@@ -691,6 +722,149 @@ def _git_sandbox_metadata(root: Path, git: Path | None) -> _GitSandboxMetadata |
         return None
 
 
+def _registered_worktree_paths(git: Path, root: Path) -> list[Path]:
+    """Return paths from Git's registry without interpreting directory names."""
+
+    try:
+        raw = _git_output(git, root, "worktree", "list", "--porcelain", "-z")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    paths: list[Path] = []
+    for record in raw.split("\x00\x00"):
+        for field in record.split("\x00"):
+            if field.startswith("worktree "):
+                raw_path = field[len("worktree ") :].strip()
+                if raw_path:
+                    paths.append(Path(raw_path).expanduser())
+                break
+    return paths
+
+
+def _discover_attested_nested_worktrees(
+    root: Path,
+    git: Path | None,
+) -> tuple[Path, ...]:
+    """Find registered, integrity-checked worktrees nested below ``root``."""
+
+    if git is None:
+        return ()
+    root_metadata = _git_sandbox_metadata(root, git)
+    if root_metadata is None:
+        return ()
+    candidates: list[Path] = []
+    for raw_candidate in _registered_worktree_paths(git, root):
+        candidate = raw_candidate.resolve(strict=False)
+        if candidate == root or not candidate.is_relative_to(root):
+            continue
+        if not candidate.is_dir():
+            continue
+        try:
+            candidate_metadata = _git_sandbox_metadata(candidate, git)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            # A registered but malformed candidate is deliberately left in
+            # the census. It is not an attested read-only subtree.
+            continue
+        if candidate_metadata is None or candidate_metadata.object_dir is None:
+            continue
+        if candidate_metadata.common_dir != root_metadata.common_dir:
+            continue
+        candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _census_writable_workspace(boundary: WorkspaceTerminalBoundary) -> None:
+    """Verify all multiply-linked regular files in the writable scope.
+
+    A directory entry is counted only when it is visible in the effective
+    writable scope. This is intentional: an alias in a read-only subtree
+    remains an external alias from the included path's point of view and must
+    therefore fail the census.
+    """
+
+    pending = [boundary.root]
+    groups: dict[tuple[int, int], list[Any]] = {}
+    while pending:
+        directory = pending.pop()
+        if _path_is_readonly_subtree(directory, boundary):
+            continue
+        try:
+            entries = os.scandir(directory)
+        except OSError as exc:
+            raise WorkspaceBoundaryProvisioningError(
+                f"Could not inspect worker workspace: {directory}"
+            ) from exc
+        try:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise WorkspaceBoundaryProvisioningError(
+                        f"Could not inspect workspace path: {entry.path}"
+                    ) from exc
+                path = Path(entry.path)
+                if stat.S_ISDIR(info.st_mode):
+                    if not _path_is_readonly_subtree(path, boundary):
+                        pending.append(path)
+                    continue
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink <= 1:
+                    continue
+                key = (int(info.st_dev), int(info.st_ino))
+                previous = groups.get(key)
+                if previous is None:
+                    groups[key] = [1, int(info.st_nlink), path]
+                    continue
+                previous[0] += 1
+                if previous[1] != int(info.st_nlink):
+                    raise WorkspaceBoundaryProvisioningError(
+                        "Workspace terminal observed inconsistent hard-link metadata: "
+                        f"{previous[2]}"
+                    )
+        finally:
+            entries.close()
+
+    for observed_count, link_count, path in groups.values():
+        if observed_count != link_count:
+            raise WorkspaceBoundaryProvisioningError(
+                "Workspace terminal rejects hard-linked regular file with an alias "
+                f"outside the writable boundary: {path} "
+                f"(observed {observed_count} of {link_count} directory entries). "
+                "Recreate dependency files in copy mode (for uv, set "
+                "UV_LINK_MODE=copy)."
+            )
+
+
+def prepare_workspace_terminal_boundary(
+    workspace: str | Path,
+    *,
+    git: Path | None = None,
+) -> WorkspaceTerminalBoundary:
+    """Prepare and attest one immutable terminal write boundary."""
+
+    root = Path(workspace).expanduser().resolve(strict=False)
+    if not root.is_dir():
+        raise WorkspaceBoundaryProvisioningError(
+            f"Worker workspace does not exist: {root}"
+        )
+    selected_git = git if git is not None else _selected_git(os.defpath)
+    try:
+        readonly_subtrees = _discover_attested_nested_worktrees(root, selected_git)
+        boundary = WorkspaceTerminalBoundary(root, readonly_subtrees)
+    except WorkspaceBoundaryProvisioningError:
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WorkspaceBoundaryProvisioningError(
+            str(exc) or f"Could not attest worker workspace boundary: {root}"
+        ) from exc
+    _census_writable_workspace(boundary)
+    return boundary
+
+
+def _reject_linked_workspace_files(root: Path) -> None:
+    """Compatibility wrapper for callers of the former command-time guard."""
+
+    _census_writable_workspace(WorkspaceTerminalBoundary(root))
+
+
 def _mach_o_dependencies(paths: list[Path]) -> list[Path]:
     """Return exact existing dylib paths needed by the selected executables."""
 
@@ -751,6 +925,7 @@ def build_workspace_terminal_args(
     workspace: str | Path,
     host_home: str | Path,
     exact_env: Mapping[str, str],
+    boundary: WorkspaceTerminalBoundary | None = None,
     platform_name: str | None = None,
     read_only: bool = False,
     runtime_root: str | Path | None = None,
@@ -792,8 +967,13 @@ def build_workspace_terminal_args(
     host = Path(host_home).expanduser().resolve()
     if not root.is_dir():
         raise RuntimeError(f"Worker workspace does not exist: {root}")
-    _reject_linked_workspace_files(root)
     git = _selected_git(str(exact_env.get("PATH", "")))
+    if boundary is None:
+        boundary = prepare_workspace_terminal_boundary(root, git=git)
+    elif boundary.root != root:
+        raise RuntimeError(
+            "Workspace terminal boundary does not match the worker workspace"
+        )
     executable_paths = [
         Path(path)
         for path in (
@@ -837,6 +1017,10 @@ def build_workspace_terminal_args(
         if runtime_root is not None
         else root / ".hermes-claude-runtime"
     )
+    if _path_is_readonly_subtree(runtime_base, boundary):
+        raise RuntimeError(
+            "Workspace terminal runtime scratch is inside a read-only worktree"
+        )
     runtime_base.mkdir(mode=0o700, parents=True, exist_ok=True)
     runtime_base.chmod(0o700)
     profile = build_workspace_seatbelt_profile(
@@ -857,6 +1041,7 @@ def build_workspace_terminal_args(
         ),
         workspace_writable=not read_only,
         denied_read_paths=_workspace_credential_paths(root) if read_only else [],
+        denied_write_roots=list(boundary.readonly_subtrees),
         control_write_roots=[runtime_base],
     )
     profile_path = _write_terminal_profile(
@@ -940,8 +1125,18 @@ _MIRROR_EXCLUDED_NAMES = frozenset(
 )
 
 
-def _copy_workspace_to_mirror(source: Path, destination: Path) -> list[Path]:
+def _copy_workspace_to_mirror(
+    source: Path,
+    destination: Path,
+    *,
+    boundary: WorkspaceTerminalBoundary,
+) -> list[Path]:
     """Copy source state without creating write aliases back to the assignment."""
+
+    if boundary.root != source:
+        raise RuntimeError(
+            "Workspace terminal boundary does not match the mirror source"
+        )
 
     def _ignore(_directory: str, names: list[str]) -> set[str]:
         return {
@@ -977,6 +1172,7 @@ def dispatch_read_only_workspace_terminal(
     exact_env: Mapping[str, str],
     dispatch: Callable[..., Any],
     task_id: str,
+    boundary: WorkspaceTerminalBoundary | None = None,
     platform_name: str | None = None,
     scratch_parent: str | Path | None = None,
     extra_readable_roots: list[str | Path] | None = None,
@@ -994,7 +1190,13 @@ def dispatch_read_only_workspace_terminal(
         raise RuntimeError("Read-only worker terminal rejects background execution")
     if not source.is_dir():
         raise RuntimeError(f"Worker workspace does not exist: {source}")
-    _reject_linked_workspace_files(source)
+    selected_git = _selected_git(str(exact_env.get("PATH", "")))
+    if boundary is None:
+        boundary = prepare_workspace_terminal_boundary(source, git=selected_git)
+    elif boundary.root != source:
+        raise RuntimeError(
+            "Workspace terminal boundary does not match the worker workspace"
+        )
 
     scratch_base = Path(
         scratch_parent
@@ -1010,9 +1212,12 @@ def dispatch_read_only_workspace_terminal(
         execution_root = source
         if use_mirror:
             execution_root = run_root / "workspace"
-            dependency_roots = _copy_workspace_to_mirror(source, execution_root)
-            source_git = _selected_git(str(exact_env.get("PATH", "")))
-            source_git_metadata = _git_sandbox_metadata(source, source_git)
+            dependency_roots = _copy_workspace_to_mirror(
+                source,
+                execution_root,
+                boundary=boundary,
+            )
+            source_git_metadata = _git_sandbox_metadata(source, selected_git)
             if (
                 source_git_metadata is not None
                 and not source_git_metadata.common_dir.is_relative_to(source)
@@ -1038,6 +1243,7 @@ def dispatch_read_only_workspace_terminal(
             workspace=execution_root,
             host_home=host_home,
             exact_env=exact_env,
+            boundary=boundary.retarget(execution_root) if use_mirror else boundary,
             platform_name=platform_name,
             read_only=not use_mirror,
             runtime_root=run_root / "runtime",
@@ -1050,7 +1256,10 @@ def dispatch_read_only_workspace_terminal(
 
 
 __all__ = [
+    "WorkspaceBoundaryProvisioningError",
+    "WorkspaceTerminalBoundary",
     "build_workspace_seatbelt_profile",
     "build_workspace_terminal_args",
     "dispatch_read_only_workspace_terminal",
+    "prepare_workspace_terminal_boundary",
 ]

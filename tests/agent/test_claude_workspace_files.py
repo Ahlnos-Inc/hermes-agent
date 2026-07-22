@@ -4,6 +4,7 @@ import threading
 import pytest
 
 from agent.claude_workspace_files import WorkspaceFileBroker
+from agent.claude_workspace_terminal import WorkspaceTerminalBoundary
 
 
 def test_workspace_file_broker_reads_and_writes_relative_files(tmp_path):
@@ -60,6 +61,23 @@ def test_workspace_file_broker_rejects_symlink_and_hardlink_writes(tmp_path):
     assert secret.read_text(encoding="utf-8") == "original"
     with pytest.raises(RuntimeError):
         broker.handle("read_file", {"path": "hardlink.txt"})
+
+
+def test_workspace_file_broker_rejects_writes_under_readonly_subtree(tmp_path):
+    workspace = tmp_path / "worktree"
+    nested = workspace / "nested-worktree"
+    workspace.mkdir()
+    nested.mkdir()
+    boundary = WorkspaceTerminalBoundary(workspace, (nested,))
+    broker = WorkspaceFileBroker(workspace, boundary=boundary)
+
+    with pytest.raises(RuntimeError, match="read-only worktree"):
+        broker.handle(
+            "write_file",
+            {"path": "nested-worktree/result.txt", "content": "blocked"},
+        )
+
+    assert not (nested / "result.txt").exists()
 
 
 def test_workspace_file_broker_bounds_reads_and_closes_root_fd(tmp_path):

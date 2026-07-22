@@ -28,7 +28,12 @@ from agent.claude_sdk_session import (
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.request_budgets import resolve_attempt_budgets
 from agent.claude_subscription_env import build_claude_subscription_env
-from agent.claude_workspace_terminal import build_workspace_seatbelt_profile
+from agent.claude_workspace_terminal import (
+    WorkspaceBoundaryProvisioningError,
+    _selected_git,
+    build_workspace_seatbelt_profile,
+    prepare_workspace_terminal_boundary,
+)
 from agent.claude_workspace_files import WorkspaceFileBroker
 from hermes_constants import get_hermes_home, get_host_user_home
 
@@ -229,10 +234,14 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
             raise RuntimeError(
                 "Claude subscription worker filesystem isolation is supported on macOS only"
             )
+        exact_env = build_claude_subscription_env(os.environ, host_home=host_home)
+        boundary = prepare_workspace_terminal_boundary(
+            workspace,
+            git=_selected_git(str(exact_env.get("PATH", ""))),
+        )
         sdk_root = Path(sdk.__file__).resolve().parent
         cli_name = "claude.exe" if os.name == "nt" else "claude"
         bundled_cli = sdk_root / "_bundled" / cli_name
-        exact_env = build_claude_subscription_env(os.environ, host_home=host_home)
         claude_tmp = prepare_claude_sdk_temp_dir()
         worker_tmp = _prepare_claude_worker_tmp_dir(workspace)
         exact_env["TMPDIR"] = str(worker_tmp)
@@ -250,6 +259,7 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
                 _claude_project_state_dir(host_home, workspace),
                 claude_tmp,
             ],
+            denied_write_roots=list(boundary.readonly_subtrees),
         )
         cli_wrapper = create_exact_env_cli_wrapper(
             bundled_cli,
@@ -258,6 +268,13 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
             sandbox_profile=sandbox_profile,
         )
         attestation = attest_claude_max_auth(cli_wrapper, cache_ttl_seconds=0)
+    except WorkspaceBoundaryProvisioningError as exc:
+        agent._claude_boundary_provisioning_failure = str(exc)
+        return RuntimeFailure(
+            FailoverReason.unknown,
+            str(exc),
+            provisioning=True,
+        )
     except Exception as exc:
         if isinstance(exc, ClaudeAttestationError):
             _runtime_events_logger.warning(
@@ -291,6 +308,7 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
         "sdk": sdk,
         "host_home": host_home,
         "workspace": workspace,
+        "workspace_boundary": boundary,
         "cli_wrapper": cli_wrapper,
         "kanban_task_id": kanban_task_id,
         "attested_route": (
@@ -300,6 +318,47 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
         "attested_at": time.monotonic(),
     }
     return None
+
+
+def persist_claude_workspace_boundary_block(
+    agent: Any,
+    failure: RuntimeFailure,
+) -> bool:
+    """Fence a quiet Kanban worker when boundary provisioning exhausts fallback."""
+
+    if not failure.provisioning or not getattr(agent, "quiet_mode", False):
+        return False
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    raw_run_id = os.getenv("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return False
+    try:
+        from hermes_cli import kanban_db
+
+        with kanban_db.connect_closing() as conn:
+            return kanban_db.block_task(
+                conn,
+                task_id,
+                reason=(f"Claude workspace boundary unavailable: {failure.message}")[:160],
+                summary="Worker was fenced before the first model turn.",
+                metadata={
+                    "failure_code": "workspace_boundary_provisioning",
+                    "message": failure.message,
+                },
+                kind="capability",
+                expected_run_id=run_id,
+            )
+    except Exception:
+        _runtime_events_logger.warning(
+            "claude_workspace_boundary_block_failed task=%s",
+            task_id,
+            exc_info=True,
+        )
+        return False
 
 
 def run_claude_agent_sdk_attempt(
@@ -417,6 +476,7 @@ def run_claude_agent_sdk_attempt(
             workspace,
             deny_credential_reads=worker_profile.strip().lower()
             in {"reviewer", "verifier"},
+            boundary=context.get("workspace_boundary"),
         )
 
         def _options(resume: str | None) -> Any:
@@ -428,6 +488,7 @@ def run_claude_agent_sdk_attempt(
                 host_home=host_home,
                 profile_home=host_home,
                 inherited_env=os.environ,
+                boundary=context.get("workspace_boundary"),
                 tool_definitions=list(getattr(agent, "tools", None) or []),
                 dispatch=handle_function_call,
                 effective_task_id=effective_task_id,

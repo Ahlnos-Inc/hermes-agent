@@ -1188,6 +1188,12 @@ def run_conversation(
                 )
             continue
 
+        if getattr(failure, "provisioning", False):
+            from agent.external_runtime import (
+                persist_claude_workspace_boundary_block,
+            )
+
+            persist_claude_workspace_boundary_block(agent, failure)
         error = f"Claude runtime failed and no fallback was available: {failure.message}"
         messages.append({"role": "assistant", "content": error})
         return finalize_external_turn(
