@@ -578,6 +578,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_attach_rm = sub.add_parser("attach-rm", help="Delete an attachment by id")
     p_attach_rm.add_argument("attachment_id", type=int)
 
+    p_review_artifact = sub.add_parser(
+        "review-artifact",
+        help=(
+            "Show the authoritative review artifact or perform an explicit "
+            "legacy binding repair"
+        ),
+    )
+    p_review_artifact.add_argument("review_task_id")
+    p_review_artifact.add_argument(
+        "--bind-attachment",
+        type=int,
+        default=None,
+        help="Explicit attachment id to bind during operator repair",
+    )
+    p_review_artifact.add_argument(
+        "--expected-generation",
+        type=int,
+        default=None,
+        help="Required CAS generation for --bind-attachment",
+    )
+    p_review_artifact.add_argument("--json", action="store_true")
+
     p_complete = sub.add_parser("complete", help="Mark one or more tasks done")
     p_complete.add_argument("task_ids", nargs="+",
                             help="One or more task ids (only --result applies to all of them)")
@@ -588,6 +610,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--review-outputs",
+        default=None,
+        help=(
+            "JSON array selecting one attachment per artifact-bound review, "
+            "e.g. '[{\"review_task_id\": \"t_...\", "
+            "\"attachment_id\": 812}]'."
+        ),
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -1094,6 +1125,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
+            "review-artifact": _cmd_review_artifact,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
@@ -2148,6 +2180,115 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _review_artifact_dict(binding: Optional[kb.ReviewArtifactBinding]) -> Optional[dict[str, Any]]:
+    if binding is None:
+        return None
+    return {
+        "review_task_id": binding.review_task_id,
+        "generation": binding.generation,
+        "attachment_id": binding.attachment_id,
+        "sha256": binding.sha256,
+        "source_task_id": binding.source_task_id,
+        "source_run_id": binding.source_run_id,
+        "source_rework_event_id": binding.source_rework_event_id,
+        "created_at": binding.created_at,
+        "filename": binding.filename,
+        "stored_path": binding.stored_path,
+        "attachment_exists": binding.attachment_exists,
+        "size": binding.size,
+    }
+
+
+def _cmd_review_artifact(args: argparse.Namespace) -> int:
+    """Show or explicitly repair one review's artifact binding."""
+    review_task_id = str(args.review_task_id or "").strip()
+    if not review_task_id:
+        print("kanban review-artifact: review_task_id is required", file=sys.stderr)
+        return 2
+    bind_id = getattr(args, "bind_attachment", None)
+    expected = getattr(args, "expected_generation", None)
+    if bind_id is not None and expected is None:
+        print(
+            "kanban review-artifact: --expected-generation is required with "
+            "--bind-attachment",
+            file=sys.stderr,
+        )
+        return 2
+
+    with kb.connect_closing() as conn:
+        if bind_id is not None:
+            now = int(time.time())
+            with kb.write_txn(conn):
+                current = kb.get_current_review_artifact(conn, review_task_id)
+                if expected != (current.generation if current is not None else 0):
+                    raise kb.ReviewArtifactError(
+                        "review_artifact_generation_conflict: expected "
+                        f"{expected}, current {current.generation if current else 0}"
+                    )
+                has_rework_event = conn.execute(
+                    "SELECT 1 FROM task_events "
+                    "WHERE task_id = ? AND kind = 'rework_requested' LIMIT 1",
+                    (review_task_id,),
+                ).fetchone() is not None
+                if not has_rework_event:
+                    attachment = kb.get_attachment(conn, int(bind_id))
+                    if attachment is None:
+                        raise kb.ReviewArtifactError(
+                            f"unknown attachment {bind_id}"
+                        )
+                    binding = kb._seed_review_artifact_binding_in_txn(
+                        conn, review_task_id, attachment, now=now,
+                    )
+                else:
+                    event_id, payload = kb._latest_rework_event_for_review(
+                        conn, review_task_id,
+                    )
+                    fix_task_id = str(payload.get("fix_task_id") or "").strip()
+                    if not fix_task_id:
+                        raise kb.ReviewArtifactError(
+                            "latest rework event has no fix task"
+                        )
+                    fix_row = conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?", (fix_task_id,)
+                    ).fetchone()
+                    if fix_row is None or fix_row["status"] not in {"done", "archived"}:
+                        raise kb.ReviewArtifactError(
+                            f"fix task {fix_task_id} is not completed"
+                        )
+                    completed_run = conn.execute(
+                        "SELECT id FROM task_runs WHERE task_id = ? "
+                        "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+                        (fix_task_id,),
+                    ).fetchone()
+                    binding = kb.bind_review_artifact_in_txn(
+                        conn,
+                        review_task_id,
+                        int(bind_id),
+                        fix_task_id,
+                        int(completed_run["id"]) if completed_run is not None else None,
+                        event_id,
+                        int(expected),
+                        now,
+                    )
+            output = _review_artifact_dict(binding)
+        else:
+            output = _review_artifact_dict(
+                kb.get_current_review_artifact(conn, review_task_id)
+            )
+
+    if getattr(args, "json", False):
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    elif output is None:
+        print(f"No review artifact binding for {review_task_id}")
+    else:
+        print(
+            f"Review {review_task_id}: generation {output['generation']}, "
+            f"attachment {output['attachment_id']}, SHA-256 {output['sha256']}"
+        )
+        print(f"Path: {output['stored_path'] or '(missing attachment row)'}")
+    return 0
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
@@ -2168,12 +2309,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    raw_review_outputs = getattr(args, "review_outputs", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or raw_review_outputs):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: --summary / --metadata / --review-outputs are per-task "
+            "and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -2188,6 +2331,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    review_outputs = None
+    if raw_review_outputs:
+        try:
+            review_outputs = json.loads(raw_review_outputs)
+            if not isinstance(review_outputs, list):
+                raise ValueError("must be a JSON array")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --review-outputs: {exc}", file=sys.stderr)
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2196,6 +2348,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
+                review_outputs=review_outputs,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
