@@ -825,6 +825,24 @@ def test_complete_with_result_only(worker_env):
     assert d["ok"] is True
 
 
+def test_complete_review_outputs_schema_and_validation(worker_env):
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert properties["review_outputs"]["type"] == "array"
+    assert properties["review_outputs"]["items"]["required"] == [
+        "review_task_id",
+        "attachment_id",
+    ]
+
+    rejected = json.loads(
+        kt._handle_complete(
+            {"summary": "bad selection shape", "review_outputs": {"x": 1}}
+        )
+    )
+    assert "review_outputs must be a list" in rejected["error"]
+
+
 def test_complete_with_artifacts_lands_in_event_payload(worker_env):
     """``artifacts=[...]`` rides into the completed event payload so the
     gateway notifier can upload them as native attachments. See the

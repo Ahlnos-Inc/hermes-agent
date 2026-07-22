@@ -1636,6 +1636,7 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    review_outputs = args.get("review_outputs")
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -1688,6 +1689,16 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
+    if review_outputs is not None:
+        if not isinstance(review_outputs, (list, tuple)):
+            return tool_error(
+                "review_outputs must be a list of objects, got "
+                f"{type(review_outputs).__name__}"
+            )
+        review_outputs = list(review_outputs)
+        for index, item in enumerate(review_outputs):
+            if not isinstance(item, dict):
+                return tool_error(f"review_outputs[{index}] must be an object")
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
@@ -1743,6 +1754,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    review_outputs=review_outputs,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
@@ -3782,6 +3794,34 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "review_outputs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "review_task_id": {
+                            "type": "string",
+                            "description": (
+                                "Stable review task id whose current artifact "
+                                "this fix completed."
+                            ),
+                        },
+                        "attachment_id": {
+                            "type": "integer",
+                            "description": (
+                                "Exact attachment id returned by kanban_attach "
+                                "for the revised artifact."
+                            ),
+                        },
+                    },
+                    "required": ["review_task_id", "attachment_id"],
+                },
+                "description": (
+                    "For artifact-bound rework, select exactly one attachment "
+                    "per review task. The kernel verifies ownership, file "
+                    "existence, and SHA-256 before completing the fix."
                 ),
             },
             "board": _board_schema_prop(),

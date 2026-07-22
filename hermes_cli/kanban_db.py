@@ -1084,6 +1084,8 @@ class DependencyReconcileResult:
     waits_rearmed: int = 0
     legacy_recovered: int = 0
     timed_out: int = 0
+    artifact_backfilled: int = 0
+    artifact_selection_required: int = 0
 
     # Descriptive aliases keep the result pleasant for callers that prefer
     # verb-first names while the compact field names remain stable for
@@ -1478,6 +1480,34 @@ class Attachment:
     created_at: int
 
 
+@dataclass(frozen=True)
+class ReviewArtifactBinding:
+    """Authoritative review-scoped pointer to one attachment generation.
+
+    ``stored_path`` and the attachment metadata are denormalized into this
+    read model for context/claim callers.  The binding table remains the
+    authority for the generation and digest; the path is only usable after a
+    fresh integrity check.
+    """
+
+    review_task_id: str
+    generation: int
+    attachment_id: int
+    sha256: str
+    source_task_id: str
+    source_run_id: Optional[int]
+    source_rework_event_id: int
+    created_at: int
+    filename: Optional[str]
+    stored_path: Optional[str]
+    attachment_task_id: Optional[str]
+    size: Optional[int]
+
+    @property
+    def attachment_exists(self) -> bool:
+        return self.stored_path is not None
+
+
 @dataclass
 class Event:
     id: int
@@ -1581,6 +1611,10 @@ class ArchitectureGate:
     approval_surface: Optional[str]
     approved_digest: Optional[str]
     approved_at: Optional[int]
+    approval_review_task_id: Optional[str]
+    approval_review_completion_event_id: Optional[int]
+    approval_artifact_generation: Optional[int]
+    approval_artifact_sha256: Optional[str]
     authorization_event_id: Optional[int]
     enforcement_mode: str
     row_version: int
@@ -1605,6 +1639,28 @@ class ArchitectureGate:
             approval_surface=row["approval_surface"] if "approval_surface" in row.keys() else None,
             approved_digest=row["approved_digest"] if "approved_digest" in row.keys() else None,
             approved_at=(int(row["approved_at"]) if "approved_at" in row.keys() and row["approved_at"] is not None else None),
+            approval_review_task_id=(
+                row["approval_review_task_id"]
+                if "approval_review_task_id" in row.keys() else None
+            ),
+            approval_review_completion_event_id=(
+                int(row["approval_review_completion_event_id"])
+                if (
+                    "approval_review_completion_event_id" in row.keys()
+                    and row["approval_review_completion_event_id"] is not None
+                ) else None
+            ),
+            approval_artifact_generation=(
+                int(row["approval_artifact_generation"])
+                if (
+                    "approval_artifact_generation" in row.keys()
+                    and row["approval_artifact_generation"] is not None
+                ) else None
+            ),
+            approval_artifact_sha256=(
+                row["approval_artifact_sha256"]
+                if "approval_artifact_sha256" in row.keys() else None
+            ),
             authorization_event_id=(
                 int(row["authorization_event_id"])
                 if "authorization_event_id" in row.keys() and row["authorization_event_id"] is not None
@@ -1879,6 +1935,22 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+-- The current artifact for a review is a review-contract projection, not a
+-- global mutable filename.  Each completed fix appends one generation.  A
+-- source rework event is unique so retrying the same completion is harmless.
+CREATE TABLE IF NOT EXISTS review_artifact_bindings (
+    review_task_id       TEXT NOT NULL,
+    generation           INTEGER NOT NULL,
+    attachment_id        INTEGER NOT NULL,
+    sha256               TEXT NOT NULL,
+    source_task_id       TEXT NOT NULL,
+    source_run_id        INTEGER,
+    source_rework_event_id INTEGER NOT NULL,
+    created_at           INTEGER NOT NULL,
+    PRIMARY KEY (review_task_id, generation),
+    UNIQUE (review_task_id, source_rework_event_id)
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1944,6 +2016,10 @@ CREATE TABLE IF NOT EXISTS architecture_gates (
     approval_surface         TEXT,
     approved_digest          TEXT,
     approved_at               INTEGER,
+    approval_review_task_id  TEXT,
+    approval_review_completion_event_id INTEGER,
+    approval_artifact_generation INTEGER,
+    approval_artifact_sha256 TEXT,
     authorization_event_id    INTEGER,
     enforcement_mode         TEXT NOT NULL DEFAULT 'off',
     row_version              INTEGER NOT NULL DEFAULT 0,
@@ -2050,6 +2126,10 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_artifact_bindings_attachment
+    ON review_artifact_bindings(attachment_id);
+CREATE INDEX IF NOT EXISTS idx_review_artifact_bindings_current
+    ON review_artifact_bindings(review_task_id, generation DESC);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_notify_deliveries_task ON notify_deliveries(task_id, last_event_id);
 CREATE INDEX IF NOT EXISTS idx_architecture_gates_architect
@@ -3577,6 +3657,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("approval_surface", "approval_surface TEXT"),
             ("approved_digest", "approved_digest TEXT"),
             ("approved_at", "approved_at INTEGER"),
+            ("approval_review_task_id", "approval_review_task_id TEXT"),
+            (
+                "approval_review_completion_event_id",
+                "approval_review_completion_event_id INTEGER",
+            ),
+            ("approval_artifact_generation", "approval_artifact_generation INTEGER"),
+            ("approval_artifact_sha256", "approval_artifact_sha256 TEXT"),
             ("authorization_event_id", "authorization_event_id INTEGER"),
         ):
             if name not in gate_cols:
@@ -4526,7 +4613,12 @@ def _new_gate_id() -> str:
 
 
 def _append_gate_audit(
-    conn: sqlite3.Connection, gate: ArchitectureGate, kind: str, reason: Optional[str] = None,
+    conn: sqlite3.Connection,
+    gate: ArchitectureGate,
+    kind: str,
+    reason: Optional[str] = None,
+    *,
+    created_at: Optional[int] = None,
 ) -> int:
     payload: dict[str, Any] = {
         "gate_id": gate.gate_id,
@@ -4535,7 +4627,13 @@ def _append_gate_audit(
     }
     if reason:
         payload["reason"] = reason
-    return _append_event(conn, gate.architect_task_id, kind, payload)
+    return _append_event(
+        conn,
+        gate.architect_task_id,
+        kind,
+        payload,
+        created_at=created_at,
+    )
 
 
 def _open_architecture_gate(
@@ -4756,11 +4854,165 @@ def accept_architecture_handoff(conn: sqlite3.Connection, gate_id: str) -> Archi
         )
 
 
+def _architecture_descendant_task_ids(
+    conn: sqlite3.Connection,
+    architect_task_id: str,
+) -> list[str]:
+    """Return the gate's graph descendants in deterministic breadth order."""
+    seen: set[str] = {architect_task_id}
+    queue = [architect_task_id]
+    ordered: list[str] = []
+    while queue:
+        parent = queue.pop(0)
+        children = sorted(child_ids(conn, parent))
+        for child in children:
+            if child in seen:
+                continue
+            seen.add(child)
+            ordered.append(child)
+            queue.append(child)
+    return ordered
+
+
+def _review_attestation_for_task(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    include_stale: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Resolve a successful reviewer attestation against current bytes."""
+    task = get_task(conn, review_task_id)
+    if task is None or (task.status != "done" and not include_stale):
+        return None
+    binding = get_current_review_artifact(conn, review_task_id)
+    if binding is None:
+        return None
+    rows = conn.execute(
+        "SELECT id, payload, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC",
+        (review_task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attestation = payload.get("review_artifact_attestation") if isinstance(payload, dict) else None
+        if not isinstance(attestation, dict):
+            continue
+        required_attestation_fields = {
+            "review_task_id",
+            "review_completion_event_id",
+            "artifact_generation",
+            "artifact_attachment_id",
+            "artifact_sha256",
+        }
+        if not required_attestation_fields.issubset(attestation):
+            raise ArchitectureGateError("approval_evidence_changed")
+        try:
+            candidate = {
+                "review_task_id": str(attestation["review_task_id"]),
+                "review_completion_event_id": int(
+                    attestation["review_completion_event_id"]
+                ),
+                "artifact_generation": int(attestation["artifact_generation"]),
+                "artifact_attachment_id": int(attestation["artifact_attachment_id"]),
+                "artifact_sha256": str(attestation["artifact_sha256"]),
+            }
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ArchitectureGateError("approval_evidence_changed") from exc
+        current = (
+            candidate["review_task_id"] == review_task_id
+            and candidate["review_completion_event_id"] == int(row["id"])
+            and candidate["artifact_generation"] == binding.generation
+            and candidate["artifact_attachment_id"] == binding.attachment_id
+            and candidate["artifact_sha256"] == binding.sha256
+        )
+        if current:
+            _verify_review_artifact_binding(conn, binding)
+            return candidate
+        if include_stale:
+            return candidate
+    return None
+
+
+def _architecture_review_approval_subject_in_txn(
+    conn: sqlite3.Connection,
+    gate: ArchitectureGate,
+) -> dict[str, Any]:
+    """Build the authenticated approval subject without exposing artifact paths."""
+    candidates: list[dict[str, Any]] = []
+    stale_attestation = False
+    for task_id in [gate.architect_task_id, *_architecture_descendant_task_ids(
+        conn, gate.architect_task_id,
+    )]:
+        current = _review_attestation_for_task(conn, task_id)
+        if current is not None:
+            candidates.append(current)
+        elif _review_attestation_for_task(conn, task_id, include_stale=True) is not None:
+            stale_attestation = True
+    if len(candidates) > 1:
+        raise ArchitectureGateError("approval_review_ambiguous")
+    if not candidates:
+        if stale_attestation:
+            raise ArchitectureGateError("approval_evidence_changed")
+        return {
+            "gate_id": gate.gate_id,
+            "design_digest": gate.design_digest,
+            "review_task_id": None,
+            "review_completion_event_id": None,
+            "artifact_generation": None,
+            "artifact_sha256": None,
+            "digest": gate.design_digest,
+        }
+    attestation = candidates[0]
+    domain = {
+        "version": 1,
+        "gate_id": gate.gate_id,
+        "design_digest": gate.design_digest,
+        "review_task_id": attestation["review_task_id"],
+        "review_completion_event_id": attestation["review_completion_event_id"],
+        "artifact_generation": attestation["artifact_generation"],
+        "artifact_sha256": attestation["artifact_sha256"],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            domain,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**domain, "digest": digest}
+
+
+def architecture_review_approval_subject(
+    conn: sqlite3.Connection,
+    gate_id: str,
+) -> dict[str, Any]:
+    """Return the current authenticated approval subject for a gate.
+
+    The returned digest is a subject digest, not the artifact/file digest.
+    Callers must display and submit the stable review id, completion event,
+    generation, and SHA alongside it.
+    """
+    gate = get_architecture_gate(conn, gate_id)
+    if gate is None:
+        raise ValueError("unknown architecture gate")
+    return _architecture_review_approval_subject_in_txn(conn, gate)
+
+
 def approve_architecture_gate(
     conn: sqlite3.Connection,
     gate_id: str,
     context: MutationContext,
     digest: str,
+    *,
+    review_task_id: Optional[str] = None,
+    review_completion_event_id: Optional[int] = None,
+    artifact_generation: Optional[int] = None,
+    artifact_sha256: Optional[str] = None,
+    now: Optional[int] = None,
 ) -> ArchitectureGate:
     """Record an authenticated exact-digest human approval.
 
@@ -4772,6 +5024,32 @@ def approve_architecture_gate(
         raise ArchitectureGateError("approval_requires_human")
     if context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
         raise ArchitectureGateError("approval_surface_not_authenticated")
+    if review_completion_event_id is not None and isinstance(
+        review_completion_event_id, bool
+    ):
+        raise ArchitectureGateError("approval_evidence_changed")
+    if artifact_generation is not None and isinstance(artifact_generation, bool):
+        raise ArchitectureGateError("approval_evidence_changed")
+    try:
+        submitted_completion_event_id = (
+            int(review_completion_event_id)
+            if review_completion_event_id is not None else None
+        )
+        submitted_artifact_generation = (
+            int(artifact_generation)
+            if artifact_generation is not None else None
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ArchitectureGateError("approval_evidence_changed") from exc
+    submitted_artifact_sha256 = (
+        str(artifact_sha256).lower() if artifact_sha256 is not None else None
+    )
+    if now is None:
+        approval_now = int(time.time())
+    elif isinstance(now, bool) or not isinstance(now, int):
+        raise ArchitectureGateError("approval_now_must_be_integer")
+    else:
+        approval_now = int(now)
     with write_txn(conn):
         gate = get_architecture_gate(conn, gate_id)
         if gate is None or gate.board_key != context.board_key:
@@ -4781,6 +5059,14 @@ def approve_architecture_gate(
                 gate.approval_actor_id == context.principal
                 and gate.approval_surface == context.surface
                 and gate.approved_digest == digest
+                and gate.approval_review_task_id == (review_task_id or None)
+                and gate.approval_review_completion_event_id == (
+                    submitted_completion_event_id
+                )
+                and gate.approval_artifact_generation == (
+                    submitted_artifact_generation
+                )
+                and gate.approval_artifact_sha256 == submitted_artifact_sha256
             ):
                 return gate
             raise ArchitectureGateError("approval_replay_mismatch")
@@ -4788,22 +5074,62 @@ def approve_architecture_gate(
             raise ArchitectureGateError("approval_invalidated")
         if gate.state != "validated_awaiting_approval":
             raise ArchitectureGateError("approval_wrong_state")
-        if not digest or digest != gate.design_digest:
+        subject = _architecture_review_approval_subject_in_txn(conn, gate)
+        subject_review_id = subject["review_task_id"]
+        if subject_review_id is not None:
+            if (
+                str(review_task_id or "").strip() != subject_review_id
+                or submitted_completion_event_id is None
+                or submitted_completion_event_id != subject["review_completion_event_id"]
+                or submitted_artifact_generation is None
+                or submitted_artifact_generation != subject["artifact_generation"]
+                or submitted_artifact_sha256 != subject["artifact_sha256"]
+                or digest != subject["digest"]
+            ):
+                raise ArchitectureGateError("approval_evidence_changed")
+        elif any(
+            value is not None
+            for value in (
+                review_task_id,
+                review_completion_event_id,
+                artifact_generation,
+                artifact_sha256,
+            )
+        ):
+            raise ArchitectureGateError("approval_evidence_changed")
+        expected_digest = str(subject["digest"] or "")
+        if not digest or digest != expected_digest:
             raise ArchitectureGateError("approval_digest_mismatch")
-        now = int(time.time())
         cur = conn.execute(
             """UPDATE architecture_gates
                SET state = 'human_approved', approval_actor_id = ?, approval_actor_type = ?,
                    approval_surface = ?, approved_digest = ?, approved_at = ?,
+                   approval_review_task_id = ?,
+                   approval_review_completion_event_id = ?,
+                   approval_artifact_generation = ?,
+                   approval_artifact_sha256 = ?,
                    row_version = row_version + 1, updated_at = ?
              WHERE gate_id = ? AND state = 'validated_awaiting_approval' AND row_version = ?""",
-            (context.principal, context.actor_type, context.surface, digest, now, now, gate_id, gate.row_version),
+            (
+                context.principal, context.actor_type, context.surface, digest,
+                approval_now,
+                subject_review_id,
+                subject["review_completion_event_id"],
+                subject["artifact_generation"],
+                subject["artifact_sha256"],
+                approval_now, gate_id, gate.row_version,
+            ),
         )
         if cur.rowcount != 1:
             raise ArchitectureGateError("architecture_gate_cas_conflict")
         approved = get_architecture_gate(conn, gate_id)
         assert approved is not None
-        approval_event_id = _append_gate_audit(conn, approved, "approval_approved")
+        approval_event_id = _append_gate_audit(
+            conn,
+            approved,
+            "approval_approved",
+            created_at=approval_now,
+        )
         conn.execute(
             "UPDATE architecture_gates SET authorization_event_id = ? "
             "WHERE gate_id = ? AND authorization_event_id IS NULL",
@@ -5772,7 +6098,11 @@ def apply_policy_quarantine(
 
 
 def _invalidate_architecture_gate_in_txn(
-    conn: sqlite3.Connection, gate_id: str, *, reason: str,
+    conn: sqlite3.Connection,
+    gate_id: str,
+    *,
+    reason: str,
+    now: Optional[int] = None,
 ) -> ArchitectureGate:
     """CAS invalidation for an owning mutation already holding ``write_txn``."""
     gate = get_architecture_gate(conn, gate_id)
@@ -5780,16 +6110,45 @@ def _invalidate_architecture_gate_in_txn(
         raise ValueError("unknown architecture gate")
     if gate.state == "invalidated":
         return gate
+    invalidation_now = int(time.time()) if now is None else int(now)
     cur = conn.execute(
         """UPDATE architecture_gates SET state = 'invalidated', row_version = row_version + 1,
            updated_at = ? WHERE gate_id = ? AND row_version = ?""",
-        (int(time.time()), gate_id, gate.row_version),
+        (invalidation_now, gate_id, gate.row_version),
     )
     if cur.rowcount != 1:
         raise ArchitectureGateError("architecture_gate_cas_conflict")
     invalidated = get_architecture_gate(conn, gate_id)
     assert invalidated is not None
-    _append_gate_audit(conn, invalidated, "approval_invalidated", reason)
+    _append_gate_audit(
+        conn,
+        invalidated,
+        "approval_invalidated",
+        reason,
+        created_at=invalidation_now,
+    )
+    return invalidated
+
+
+def _invalidate_review_artifact_authorizations_in_txn(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+) -> int:
+    """Invalidate approvals whose authenticated subject names this review generation."""
+    rows = conn.execute(
+        "SELECT gate_id FROM architecture_gates "
+        "WHERE state = 'human_approved' AND approval_review_task_id = ?",
+        (review_task_id,),
+    ).fetchall()
+    invalidated = 0
+    for row in rows:
+        _invalidate_architecture_gate_in_txn(
+            conn, row["gate_id"], reason=reason, now=now,
+        )
+        invalidated += 1
     return invalidated
 
 
@@ -5844,6 +6203,10 @@ def reopen_architecture_gate(
                SET state = 'open', accepted_run_id = NULL, accepted_snapshot = NULL,
                    design_digest = NULL, approval_actor_id = NULL, approval_actor_type = NULL,
                    approval_surface = NULL, approved_digest = NULL, approved_at = NULL,
+                   approval_review_task_id = NULL,
+                   approval_review_completion_event_id = NULL,
+                   approval_artifact_generation = NULL,
+                   approval_artifact_sha256 = NULL,
                    authorization_event_id = NULL, row_version = row_version + 1, updated_at = ?
              WHERE gate_id = ? AND state = 'invalidated' AND row_version = ?""",
             (int(time.time()), gate_id, gate.row_version),
@@ -6444,8 +6807,9 @@ def _rework_event_payload(
     summary: Optional[str],
     metadata: Optional[dict],
     human_gate_task_id: Optional[str] = None,
+    artifact_binding: Optional[ReviewArtifactBinding] = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "review_task_id": review_task_id,
         "fix_task_id": fix_task_id,
         "request_key": request_key,
@@ -6458,6 +6822,16 @@ def _rework_event_payload(
         "metadata": metadata,
         "human_gate_task_id": human_gate_task_id,
     }
+    if artifact_binding is not None:
+        payload["artifact_binding"] = {
+            "generation": artifact_binding.generation,
+            "attachment_id": artifact_binding.attachment_id,
+            "sha256": artifact_binding.sha256,
+            "source_task_id": artifact_binding.source_task_id,
+            "source_run_id": artifact_binding.source_run_id,
+            "source_rework_event_id": artifact_binding.source_rework_event_id,
+        }
+    return payload
 
 
 def _normalize_rework_metadata(metadata: Optional[dict]) -> Optional[dict]:
@@ -6792,6 +7166,12 @@ def _transition_to_dependency(
             Optional[_DependencyTransitionResult],
         ]
     ] = None,
+    post_request: Optional[
+        Callable[
+            [sqlite3.Connection, str, Literal["created", "adopted"], int, Optional[int]],
+            None,
+        ]
+    ] = None,
     mutation_context: Optional[MutationContext] = None,
 ) -> _DependencyTransitionResult:
     """Atomically bind a dependency card as parent and park its requester.
@@ -6957,6 +7337,14 @@ def _transition_to_dependency(
             run_id=run_id,
         )
         _append_event(conn, dependency_task_id, dependency_event_kind, payload)
+        if post_request is not None:
+            post_request(
+                conn,
+                dependency_task_id,
+                disposition,
+                request_event_id,
+                run_id,
+            )
         return _DependencyTransitionResult(
             requester_task_id=requester_task_id,
             dependency_task_id=dependency_task_id,
@@ -7054,6 +7442,12 @@ def request_rework(
         fix_task_id: str,
         disposition: Literal["created", "adopted"],
     ) -> dict[str, Any]:
+        artifact_binding = _ensure_review_artifact_binding_in_txn(
+            _conn_in,
+            review_task_id,
+            now=int(time.time()),
+            require_if_referenced=True,
+        )
         return _rework_event_payload(
             review_task_id=review_task_id,
             fix_task_id=fix_task_id,
@@ -7064,6 +7458,7 @@ def request_rework(
             summary=summary,
             metadata=metadata,
             human_gate_task_id=human_gate_task_id,
+            artifact_binding=artifact_binding,
         )
 
     def pre_materialization(
@@ -7073,6 +7468,14 @@ def request_rework(
     ) -> Optional[_DependencyTransitionResult]:
         if requester_row["status"] == "triage":
             raise ValueError("review task is awaiting human triage")
+        artifact_binding = _ensure_review_artifact_binding_in_txn(
+            conn_in,
+            review_task_id,
+            now=int(time.time()),
+            require_if_referenced=True,
+        )
+        if artifact_binding is not None:
+            _verify_review_artifact_binding(conn_in, artifact_binding)
         history = _rework_history_rows(conn_in, review_task_id)
         round_count, nonprogress_streak = _rework_progress_state(
             history, metadata,
@@ -7098,6 +7501,7 @@ def request_rework(
             summary=summary,
             metadata=metadata,
             human_gate_task_id=human_gate_task_id,
+            artifact_binding=artifact_binding,
         )
         digest = _rework_blocker_digest(
             history,
@@ -7261,6 +7665,53 @@ def request_rework(
             escalation_reason=escalation_reason,
         )
 
+    def post_request(
+        conn_in: sqlite3.Connection,
+        fix_task_id: str,
+        disposition: Literal["created", "adopted"],
+        request_event_id: int,
+        _review_run_id: Optional[int],
+    ) -> None:
+        # An already-completed adopted fix has no future completion callback,
+        # so it may bind only when its attachment output is unambiguous. A
+        # still-open adopted fix follows the normal fix-completion path.
+        if disposition != "adopted":
+            return
+        fix_row = conn_in.execute(
+            "SELECT status FROM tasks WHERE id = ?", (fix_task_id,)
+        ).fetchone()
+        if fix_row is None or fix_row["status"] not in {"done", "archived"}:
+            return
+        binding = _ensure_review_artifact_binding_in_txn(
+            conn_in,
+            review_task_id,
+            now=int(time.time()),
+            require_if_referenced=False,
+        )
+        if binding is None:
+            return
+        candidates = list_attachments(conn_in, fix_task_id)
+        if len(candidates) != 1:
+            raise ReviewArtifactError(
+                f"adopted completed fix {fix_task_id} has {len(candidates)} "
+                "attachment candidates; explicit artifact selection is required"
+            )
+        completion_run = conn_in.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (fix_task_id,),
+        ).fetchone()
+        bind_review_artifact_in_txn(
+            conn_in,
+            review_task_id,
+            candidates[0].id,
+            fix_task_id,
+            int(completion_run["id"]) if completion_run is not None else None,
+            request_event_id,
+            binding.generation,
+            int(time.time()),
+        )
+
     transition = _transition_to_dependency(
         conn,
         review_task_id,
@@ -7285,6 +7736,7 @@ def request_rework(
         expected_run_id=expected_run_id,
         require_no_active_run=require_no_active_run,
         pre_materialization=pre_materialization,
+        post_request=post_request,
         mutation_context=mutation_context,
     )
     return ReworkResult(
@@ -7872,6 +8324,10 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+class ReviewArtifactError(ValueError):
+    """Raised when a review artifact cannot be selected or authenticated."""
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -8065,6 +8521,20 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        referenced = conn.execute(
+            "SELECT review_task_id, generation FROM review_artifact_bindings "
+            "WHERE attachment_id = ? ORDER BY review_task_id, generation",
+            (attachment_id,),
+        ).fetchall()
+        if referenced:
+            refs = ", ".join(
+                f"{row['review_task_id']}@{row['generation']}"
+                for row in referenced
+            )
+            raise ReviewArtifactError(
+                f"attachment {attachment_id} is referenced by review artifact "
+                f"binding(s): {refs}"
+            )
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
@@ -8076,6 +8546,477 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     except OSError:
         pass
     return att
+
+
+def _review_artifact_binding_from_row(
+    row: Optional[sqlite3.Row],
+) -> Optional[ReviewArtifactBinding]:
+    if row is None:
+        return None
+    keys = set(row.keys())
+    return ReviewArtifactBinding(
+        review_task_id=str(row["review_task_id"]),
+        generation=int(row["generation"]),
+        attachment_id=int(row["attachment_id"]),
+        sha256=str(row["sha256"]),
+        source_task_id=str(row["source_task_id"]),
+        source_run_id=(
+            int(row["source_run_id"])
+            if row["source_run_id"] is not None else None
+        ),
+        source_rework_event_id=int(row["source_rework_event_id"]),
+        created_at=int(row["created_at"]),
+        filename=(row["filename"] if "filename" in keys else None),
+        stored_path=(row["stored_path"] if "stored_path" in keys else None),
+        attachment_task_id=(
+            row["attachment_task_id"] if "attachment_task_id" in keys else None
+        ),
+        size=(int(row["size"]) if "size" in keys and row["size"] is not None else None),
+    )
+
+
+def get_current_review_artifact(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> Optional[ReviewArtifactBinding]:
+    """Return the highest explicit artifact generation for a review.
+
+    This is intentionally a read of structured state only. Callers that are
+    about to trust the bytes must use the integrity validator below; a row can
+    remain present after an out-of-band filesystem mutation or a deleted
+    attachment attempt.
+    """
+    row = conn.execute(
+        """SELECT b.*, a.task_id AS attachment_task_id, a.filename,
+                         a.stored_path, a.size
+              FROM review_artifact_bindings b
+              LEFT JOIN task_attachments a ON a.id = b.attachment_id
+             WHERE b.review_task_id = ?
+             ORDER BY b.generation DESC
+             LIMIT 1""",
+        (str(review_task_id),),
+    ).fetchone()
+    return _review_artifact_binding_from_row(row)
+
+
+def _hash_review_attachment(
+    attachment: Attachment,
+) -> str:
+    """Rehash one attachment while proving path ownership and read stability."""
+    if not attachment.stored_path:
+        raise ReviewArtifactError("review artifact has no stored path")
+    path = Path(attachment.stored_path)
+    try:
+        resolved = path.resolve(strict=True)
+        root = task_attachments_dir(attachment.task_id).resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ReviewArtifactError(
+            f"review artifact path cannot be resolved: {attachment.stored_path}"
+        ) from exc
+    if resolved != root and root not in resolved.parents:
+        raise ReviewArtifactError(
+            "review artifact path escaped its owning attachment directory"
+        )
+
+    try:
+        before = resolved.stat()
+    except OSError as exc:
+        raise ReviewArtifactError(
+            f"review artifact is unavailable: {resolved}"
+        ) from exc
+    if not resolved.is_file():
+        raise ReviewArtifactError(f"review artifact is not a regular file: {resolved}")
+    if before.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+        raise ReviewArtifactError("review artifact exceeds the attachment size limit")
+
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with resolved.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise ReviewArtifactError(
+                        "review artifact exceeds the attachment size limit"
+                    )
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+        current = resolved.stat()
+    except ReviewArtifactError:
+        raise
+    except OSError as exc:
+        raise ReviewArtifactError(
+            f"review artifact could not be read: {resolved}"
+        ) from exc
+
+    if (
+        total != before.st_size
+        or before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or current.st_dev != before.st_dev
+        or current.st_ino != before.st_ino
+        or current.st_size != before.st_size
+    ):
+        raise ReviewArtifactError(
+            f"review artifact changed during read: {resolved}"
+        )
+    if int(attachment.size) != total:
+        raise ReviewArtifactError(
+            "review artifact integrity mismatch: metadata size does not match "
+            "the stored bytes"
+        )
+    return digest.hexdigest()
+
+
+def _validate_review_attachment(
+    conn: sqlite3.Connection,
+    attachment_id: int,
+    *,
+    owner_task_id: Optional[str] = None,
+) -> tuple[Attachment, str]:
+    try:
+        normalized_id = int(attachment_id)
+    except (TypeError, ValueError) as exc:
+        raise ReviewArtifactError("attachment_id must be an integer") from exc
+    if normalized_id <= 0:
+        raise ReviewArtifactError("attachment_id must be positive")
+    attachment = get_attachment(conn, normalized_id)
+    if attachment is None:
+        raise ReviewArtifactError(f"unknown attachment {normalized_id}")
+    if owner_task_id is not None and attachment.task_id != str(owner_task_id):
+        raise ReviewArtifactError(
+            f"attachment {normalized_id} does not belong to task {owner_task_id}"
+        )
+    return attachment, _hash_review_attachment(attachment)
+
+
+def _body_contains_exact_stored_path(body: Optional[str], stored_path: str) -> bool:
+    """Match a stored path as a delimited body token, never by glob/newest."""
+    if not body or not stored_path:
+        return False
+    start = 0
+    delimiters = set(" \t\r\n`'\"()[]{}<>:,;!")
+    while True:
+        index = body.find(stored_path, start)
+        if index < 0:
+            return False
+        before_ok = index == 0 or body[index - 1] in delimiters
+        end = index + len(stored_path)
+        after_ok = end == len(body) or body[end] in delimiters
+        if before_ok and after_ok:
+            return True
+        start = index + 1
+
+
+def _legacy_review_artifact_matches(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> list[Attachment]:
+    task_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone()
+    body = task_row["body"] if task_row is not None else None
+    if not body:
+        return []
+    rows = conn.execute(
+        "SELECT * FROM task_attachments ORDER BY id ASC"
+    ).fetchall()
+    matches: list[Attachment] = []
+    for row in rows:
+        if _body_contains_exact_stored_path(body, str(row["stored_path"] or "")):
+            matches.append(
+                Attachment(
+                    id=int(row["id"]),
+                    task_id=str(row["task_id"]),
+                    filename=str(row["filename"]),
+                    stored_path=str(row["stored_path"]),
+                    content_type=row["content_type"],
+                    size=int(row["size"] or 0),
+                    uploaded_by=row["uploaded_by"],
+                    created_at=int(row["created_at"]),
+                )
+            )
+    return matches
+
+
+def _body_references_attachment_location(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> bool:
+    """Detect an artifact-looking absolute path without treating code paths as artifacts."""
+    task_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone()
+    body = str(task_row["body"] or "") if task_row is not None else ""
+    if not body:
+        return False
+    roots = {str(task_attachments_dir(review_task_id).resolve(strict=False))}
+    return any(root in body for root in roots) or "/attachments/" in body
+
+
+def _seed_review_artifact_binding_in_txn(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    attachment: Attachment,
+    *,
+    now: int,
+) -> ReviewArtifactBinding:
+    """Seed generation 1 from an exact legacy body/path match."""
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone():
+        raise ReviewArtifactError(f"unknown review task {review_task_id}")
+    current = get_current_review_artifact(conn, review_task_id)
+    if current is not None:
+        return current
+    _attachment, digest = _validate_review_attachment(conn, attachment.id)
+    conn.execute(
+        """INSERT INTO review_artifact_bindings
+           (review_task_id, generation, attachment_id, sha256, source_task_id,
+            source_run_id, source_rework_event_id, created_at)
+           VALUES (?, 1, ?, ?, ?, NULL, 0, ?)""",
+        (
+            review_task_id, attachment.id, digest, attachment.task_id, int(now),
+        ),
+    )
+    _append_event(
+        conn,
+        review_task_id,
+        "review_artifact_bound",
+        {
+            "generation": 1,
+            "attachment_id": attachment.id,
+            "sha256": digest,
+            "source_task_id": attachment.task_id,
+            "source_rework_event_id": 0,
+            "backfill": True,
+        },
+        created_at=int(now),
+    )
+    seeded = get_current_review_artifact(conn, review_task_id)
+    if seeded is None:
+        raise ReviewArtifactError("review artifact seed was not persisted")
+    return seeded
+
+
+def _ensure_review_artifact_binding_in_txn(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    now: int,
+    require_if_referenced: bool = False,
+) -> Optional[ReviewArtifactBinding]:
+    """Return the current binding, or deterministically seed legacy gen 1."""
+    current = get_current_review_artifact(conn, review_task_id)
+    if current is not None:
+        return current
+    matches = _legacy_review_artifact_matches(conn, review_task_id)
+    if len(matches) == 1:
+        return _seed_review_artifact_binding_in_txn(
+            conn, review_task_id, matches[0], now=now,
+        )
+    if len(matches) > 1:
+        raise ReviewArtifactError(
+            f"artifact_selection_required: review {review_task_id} has "
+            f"{len(matches)} exact attachment matches"
+        )
+    if require_if_referenced and _body_references_attachment_location(
+        conn, review_task_id,
+    ):
+        raise ReviewArtifactError(
+            f"artifact_selection_required: review {review_task_id} has no "
+            "attachment row matching its pinned path"
+        )
+    return None
+
+
+def _latest_rework_event_for_review(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> tuple[int, dict[str, Any]]:
+    row = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'rework_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (review_task_id,),
+    ).fetchone()
+    if row is None:
+        raise ReviewArtifactError(
+            f"review {review_task_id} has no rework_requested lineage event"
+        )
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReviewArtifactError(
+            f"review {review_task_id} has malformed rework lineage"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ReviewArtifactError(
+            f"review {review_task_id} has malformed rework lineage"
+        )
+    return int(row["id"]), payload
+
+
+def bind_review_artifact_in_txn(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    attachment_id: int,
+    source_fix_task_id: str,
+    source_run_id: Optional[int],
+    source_rework_event_id: int,
+    expected_generation: int,
+    now: int,
+) -> ReviewArtifactBinding:
+    """Append the next authoritative artifact generation inside a write txn.
+
+    The caller owns the surrounding :func:`write_txn`.  Validation happens
+    before the insert: the rework event must still be the latest request for
+    this review, the selected attachment must belong to the completing fix,
+    and the bytes must hash to the stored digest.  The source-event UNIQUE
+    constraint makes a replay return the original generation without writing a
+    second row or event.
+    """
+    review_task_id = str(review_task_id or "").strip()
+    source_fix_task_id = str(source_fix_task_id or "").strip()
+    if not review_task_id:
+        raise ReviewArtifactError("review_task_id is required")
+    if not source_fix_task_id:
+        raise ReviewArtifactError("source_fix_task_id is required")
+    if type(expected_generation) is not int or expected_generation < 0:
+        raise ReviewArtifactError("expected_generation must be a non-negative integer")
+    if type(source_rework_event_id) is not int or source_rework_event_id <= 0:
+        raise ReviewArtifactError("source_rework_event_id must be a positive integer")
+    if source_run_id is not None and (
+        type(source_run_id) is not int or source_run_id <= 0
+    ):
+        raise ReviewArtifactError("source_run_id must be a positive integer or None")
+    try:
+        normalized_now = int(now)
+    except (TypeError, ValueError) as exc:
+        raise ReviewArtifactError("now must be an integer") from exc
+
+    existing_row = conn.execute(
+        """SELECT b.*, a.task_id AS attachment_task_id, a.filename,
+                         a.stored_path, a.size
+              FROM review_artifact_bindings b
+              LEFT JOIN task_attachments a ON a.id = b.attachment_id
+             WHERE b.review_task_id = ? AND b.source_rework_event_id = ?""",
+        (review_task_id, source_rework_event_id),
+    ).fetchone()
+    attachment, digest = _validate_review_attachment(
+        conn, attachment_id, owner_task_id=source_fix_task_id,
+    )
+    if source_run_id is not None:
+        run_row = conn.execute(
+            "SELECT task_id FROM task_runs WHERE id = ?", (source_run_id,)
+        ).fetchone()
+        if run_row is None or run_row["task_id"] != source_fix_task_id:
+            raise ReviewArtifactError(
+                f"source_run_id {source_run_id} does not belong to fix task "
+                f"{source_fix_task_id}"
+            )
+
+    if existing_row is not None:
+        existing = _review_artifact_binding_from_row(existing_row)
+        assert existing is not None
+        if (
+            existing.attachment_id != attachment.id
+            or existing.source_task_id != source_fix_task_id
+            or existing.sha256 != digest
+        ):
+            raise ReviewArtifactError(
+                "review artifact replay conflicts with its original binding"
+            )
+        return existing
+
+    latest_event_id, latest_payload = _latest_rework_event_for_review(
+        conn, review_task_id,
+    )
+    if latest_event_id != source_rework_event_id:
+        raise ReviewArtifactError(
+            "review artifact source rework event is no longer current"
+        )
+    if str(latest_payload.get("fix_task_id") or "").strip() != source_fix_task_id:
+        raise ReviewArtifactError(
+            "review artifact source rework event names a different fix task"
+        )
+
+    review_row = conn.execute(
+        "SELECT id FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone()
+    if review_row is None:
+        raise ReviewArtifactError(f"unknown review task {review_task_id}")
+    current_row = conn.execute(
+        "SELECT MAX(generation) AS generation FROM review_artifact_bindings "
+        "WHERE review_task_id = ?",
+        (review_task_id,),
+    ).fetchone()
+    current_generation = int(current_row["generation"] or 0)
+    if current_generation != expected_generation:
+        raise ReviewArtifactError(
+            "review_artifact_generation_conflict: expected "
+            f"{expected_generation}, current {current_generation}"
+        )
+    next_generation = current_generation + 1
+    conn.execute(
+        """INSERT INTO review_artifact_bindings
+           (review_task_id, generation, attachment_id, sha256, source_task_id,
+            source_run_id, source_rework_event_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            review_task_id, next_generation, attachment.id, digest,
+            source_fix_task_id, source_run_id, source_rework_event_id,
+            normalized_now,
+        ),
+    )
+    _append_event(
+        conn,
+        review_task_id,
+        "review_artifact_rebound",
+        {
+            "review_task_id": review_task_id,
+            "generation": next_generation,
+            "attachment_id": attachment.id,
+            "sha256": digest,
+            "source_task_id": source_fix_task_id,
+            "source_run_id": source_run_id,
+            "source_rework_event_id": source_rework_event_id,
+        },
+        run_id=source_run_id,
+        created_at=normalized_now,
+    )
+    _invalidate_review_artifact_authorizations_in_txn(
+        conn,
+        review_task_id,
+        reason="review_artifact_rebound",
+        now=normalized_now,
+    )
+    bound = get_current_review_artifact(conn, review_task_id)
+    if bound is None or bound.generation != next_generation:
+        raise ReviewArtifactError("review artifact binding was not persisted")
+    return bound
+
+
+def _verify_review_artifact_binding(
+    conn: sqlite3.Connection,
+    binding: ReviewArtifactBinding,
+) -> Attachment:
+    """Authenticate the current binding against its live attachment bytes."""
+    attachment, digest = _validate_review_attachment(
+        conn,
+        binding.attachment_id,
+        owner_task_id=binding.source_task_id,
+    )
+    if digest != binding.sha256:
+        raise ReviewArtifactError(
+            f"review artifact digest mismatch for generation {binding.generation}: "
+            f"expected {binding.sha256}, got {digest}"
+        )
+    return attachment
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
@@ -8109,6 +9050,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    created_at: Optional[int] = None,
 ) -> int:
     """Record an event row.  Called from within an already-open txn.
 
@@ -8117,7 +9059,7 @@ def _append_event(
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
     """
-    now = int(time.time())
+    now = int(time.time()) if created_at is None else int(created_at)
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -8974,6 +9916,40 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            return None
+        try:
+            review_binding = _ensure_review_artifact_binding_in_txn(
+                conn,
+                task_id,
+                now=now,
+                require_if_referenced=True,
+            )
+            if review_binding is not None:
+                _verify_review_artifact_binding(conn, review_binding)
+        except ReviewArtifactError as exc:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                "claim_lock = NULL, claim_expires = NULL, current_run_id = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn,
+                    task_id,
+                    "artifact_selection_required",
+                    {"reason": str(exc)},
+                )
+            _append_event(
+                conn,
+                task_id,
+                "claim_blocked",
+                {"reason": "review_artifact_unavailable", "detail": str(exc)},
+            )
+            return None
         gate = get_delivery_architecture_gate(conn, task_id)
         if gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
             issued = conn.execute(
@@ -9673,6 +10649,80 @@ def _read_publication_remote_ref(contract: _PublicationContract) -> dict[str, An
     return details
 
 
+def _normalize_review_outputs(
+    review_outputs: Optional[Iterable[dict[str, Any]]],
+) -> dict[str, int]:
+    """Validate the completion's exact attachment-selection manifest."""
+    if review_outputs is None:
+        return {}
+    if isinstance(review_outputs, (str, bytes, dict)):
+        raise ReviewArtifactError("review_outputs must be an array of objects")
+    try:
+        items = list(review_outputs)
+    except TypeError as exc:
+        raise ReviewArtifactError("review_outputs must be an array of objects") from exc
+    selected: dict[str, int] = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ReviewArtifactError(f"review_outputs[{index}] must be an object")
+        raw_review_id = item.get("review_task_id")
+        review_id = raw_review_id.strip() if isinstance(raw_review_id, str) else ""
+        if not review_id:
+            raise ReviewArtifactError(
+                f"review_outputs[{index}].review_task_id is required"
+            )
+        if "attachment_id" not in item or item.get("attachment_id") is None:
+            raise ReviewArtifactError(
+                f"review_outputs[{index}].attachment_id is required"
+            )
+        if type(item["attachment_id"]) is not int:
+            raise ReviewArtifactError(
+                f"review_outputs[{index}].attachment_id must be an integer"
+            )
+        attachment_id = item["attachment_id"]
+        if attachment_id <= 0:
+            raise ReviewArtifactError(
+                f"review_outputs[{index}].attachment_id must be positive"
+            )
+        if review_id in selected:
+            raise ReviewArtifactError(
+                f"review_outputs selects review {review_id} more than once"
+            )
+        selected[review_id] = attachment_id
+    return selected
+
+
+def _current_rework_reviews_for_fix(
+    conn: sqlite3.Connection,
+    fix_task_id: str,
+) -> list[tuple[str, int, dict[str, Any]]]:
+    """Return reviews whose latest rework request still names this fix."""
+    rows = conn.execute(
+        "SELECT id, task_id, payload FROM task_events "
+        "WHERE kind = 'rework_requested' ORDER BY id DESC"
+    ).fetchall()
+    seen_reviews: set[str] = set()
+    matches: list[tuple[str, int, dict[str, Any]]] = []
+    for row in rows:
+        review_id = str(row["task_id"])
+        if review_id in seen_reviews:
+            continue
+        seen_reviews.add(review_id)
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("fix_task_id") or "").strip() != fix_task_id:
+            continue
+        if payload.get("escalated") or payload.get("fix_action") == "escalated":
+            continue
+        matches.append((review_id, int(row["id"]), payload))
+    matches.sort(key=lambda item: (item[0], item[1]))
+    return matches
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9681,6 +10731,7 @@ def complete_task(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
+    review_outputs: Optional[Iterable[dict[str, Any]]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
@@ -9705,6 +10756,10 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    ``review_outputs`` selects exactly one attachment for each current
+    artifact-bound review rework. The selection and byte-level binding happen
+    in this same transaction before the fix completion wakes its reviewer.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -9712,6 +10767,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    normalized_review_outputs = _normalize_review_outputs(review_outputs)
     delivery_withheld = False
     delivery_gate_id: Optional[str] = None
     delivery_digest: Optional[str] = None
@@ -9875,6 +10931,96 @@ def complete_task(
                     run_id=_current_run_id(conn, task_id),
                 )
                 return False
+
+        reviewer_binding = get_current_review_artifact(conn, task_id)
+        if reviewer_binding is not None:
+            _verify_review_artifact_binding(conn, reviewer_binding)
+
+        # Artifact-bound rework is resolved before the task status CAS.  A
+        # rejected selection therefore rolls back the binding, the run close,
+        # and every event written by this completion attempt together.
+        source_run_id = _current_run_id(conn, task_id)
+        task_state = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_state is None or task_state["status"] not in {
+            "running", "ready", "blocked",
+        }:
+            return False
+        if expected_run_id is not None and (
+            task_state["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+
+        current_rework_reviews = _current_rework_reviews_for_fix(conn, task_id)
+        current_review_ids = {item[0] for item in current_rework_reviews}
+        all_rework_rows = conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            "WHERE kind = 'rework_requested'"
+        ).fetchall()
+        historical_review_ids: set[str] = set()
+        for row in all_rework_rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and str(
+                payload.get("fix_task_id") or ""
+            ).strip() == task_id:
+                historical_review_ids.add(str(row["task_id"]))
+
+        bound_review_outputs: list[dict[str, Any]] = []
+        for review_id in sorted(historical_review_ids):
+            binding = _ensure_review_artifact_binding_in_txn(
+                conn,
+                review_id,
+                now=now,
+                require_if_referenced=True,
+            )
+            if binding is None:
+                continue
+            if review_id not in current_review_ids:
+                raise ReviewArtifactError(
+                    f"review artifact source rework event for {review_id} "
+                    "is no longer current"
+                )
+            _verify_review_artifact_binding(conn, binding)
+            selected_attachment_id = normalized_review_outputs.get(review_id)
+            if selected_attachment_id is None:
+                raise ReviewArtifactError(
+                    f"artifact_selection_required: review {review_id} requires "
+                    "exactly one selected completion attachment"
+                )
+            current_request = next(
+                item for item in current_rework_reviews if item[0] == review_id
+            )
+            rebound = bind_review_artifact_in_txn(
+                conn,
+                review_id,
+                selected_attachment_id,
+                task_id,
+                source_run_id,
+                current_request[1],
+                binding.generation,
+                now,
+            )
+            bound_review_outputs.append(
+                {
+                    "review_task_id": review_id,
+                    "generation": rebound.generation,
+                    "attachment_id": rebound.attachment_id,
+                    "sha256": rebound.sha256,
+                    "source_rework_event_id": current_request[1],
+                }
+            )
+
+        unknown_output_reviews = set(normalized_review_outputs) - current_review_ids
+        if unknown_output_reviews:
+            raise ReviewArtifactError(
+                "review_outputs names a review that is not the current rework "
+                "target: " + ", ".join(sorted(unknown_output_reviews))
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -9994,6 +11140,8 @@ def complete_task(
             completed_payload["publication_readback"] = publication_verification
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if bound_review_outputs:
+            completed_payload["review_artifact_bindings"] = bound_review_outputs
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -10017,11 +11165,24 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
+        completed_event_id = _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
         )
+        if reviewer_binding is not None:
+            attestation = {
+                "review_task_id": task_id,
+                "review_completion_event_id": completed_event_id,
+                "artifact_generation": reviewer_binding.generation,
+                "artifact_attachment_id": reviewer_binding.attachment_id,
+                "artifact_sha256": reviewer_binding.sha256,
+            }
+            completed_payload["review_artifact_attestation"] = attestation
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(completed_payload, ensure_ascii=False), completed_event_id),
+            )
         # A successful completion starts a fresh breaker window. The event
         # log is the audit trail and is never deleted; the breaker query
         # instead ignores failure signatures recorded at or before the
@@ -12869,6 +14030,8 @@ class DispatchResult:
     dependency_waits_rearmed: int = 0
     dependency_legacy_recovered: int = 0
     dependency_waits_timed_out: int = 0
+    review_artifacts_backfilled: int = 0
+    review_artifact_selections_required: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -15326,6 +16489,204 @@ def _record_dependency_wait(
     return info
 
 
+def _mark_review_artifact_selection_required_in_txn(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    reason: str,
+    source_rework_event_id: Optional[int] = None,
+    fix_task_id: Optional[str] = None,
+) -> bool:
+    """Hold a review so the dispatcher cannot send it back to stale bytes."""
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (review_task_id,),
+    ).fetchone()
+    if row is None or row["current_run_id"] is not None:
+        return False
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL "
+        "WHERE id = ? AND status IN ('review', 'todo', 'ready') "
+        "AND current_run_id IS NULL",
+        (review_task_id,),
+    )
+    if cur.rowcount != 1:
+        return False
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "failure_code": "artifact_selection_required",
+    }
+    if source_rework_event_id is not None:
+        payload["source_rework_event_id"] = int(source_rework_event_id)
+    if fix_task_id:
+        payload["fix_task_id"] = fix_task_id
+    _append_event(conn, review_task_id, "artifact_selection_required", payload)
+    _append_event(
+        conn,
+        review_task_id,
+        "blocked",
+        {"kind": "needs_input", **payload},
+    )
+    return True
+
+
+def _legacy_review_artifact_reconcile_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    limit: int,
+    requested_ids: Optional[set[str]],
+) -> tuple[int, int]:
+    """Backfill exact legacy paths and advance unambiguous completed fixes."""
+    if requested_ids is None:
+        scope = ""
+        params: list[Any] = []
+    elif not requested_ids:
+        return 0, 0
+    else:
+        placeholders = ",".join("?" for _ in requested_ids)
+        scope = f" AND id IN ({placeholders})"
+        params = sorted(requested_ids)
+
+    rows = conn.execute(
+        """SELECT id, status FROM tasks
+             WHERE (
+                 status IN ('review', 'todo', 'ready', 'running', 'done', 'blocked')
+                 AND (
+                     instr(COALESCE(body, ''), '/attachments/') > 0
+                     OR EXISTS (
+                         SELECT 1 FROM task_events e
+                          WHERE e.task_id = tasks.id
+                            AND e.kind = 'rework_requested'
+                     )
+                 )
+             )""" + scope + " ORDER BY created_at, id LIMIT ?",
+        (*params, int(limit)),
+    ).fetchall()
+    seeded = 0
+    held = 0
+    for row in rows:
+        review_id = str(row["id"])
+        current = get_current_review_artifact(conn, review_id)
+        if current is None:
+            matches = _legacy_review_artifact_matches(conn, review_id)
+            if len(matches) == 1:
+                try:
+                    _seed_review_artifact_binding_in_txn(
+                        conn, review_id, matches[0], now=now,
+                    )
+                    seeded += 1
+                except ReviewArtifactError as exc:
+                    if _mark_review_artifact_selection_required_in_txn(
+                        conn, review_id, reason=str(exc),
+                    ):
+                        held += 1
+            elif len(matches) > 1:
+                if _mark_review_artifact_selection_required_in_txn(
+                    conn,
+                    review_id,
+                    reason=(
+                        f"{len(matches)} exact attachments match the pinned "
+                        "review path"
+                    ),
+                ):
+                    held += 1
+            elif _body_references_attachment_location(conn, review_id):
+                if _mark_review_artifact_selection_required_in_txn(
+                    conn,
+                    review_id,
+                    reason="no attachment row matches the pinned review path",
+                ):
+                    held += 1
+
+    # Completed historical fixes are eligible only when their latest rework
+    # request names them and exactly one attachment row belongs to that fix.
+    event_rows = conn.execute(
+        "SELECT id, task_id, payload FROM task_events "
+        "WHERE kind = 'rework_requested' ORDER BY id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    seen_reviews: set[str] = set()
+    for event in event_rows:
+        review_id = str(event["task_id"])
+        if review_id in seen_reviews:
+            continue
+        seen_reviews.add(review_id)
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        fix_id = str(payload.get("fix_task_id") or "").strip()
+        if not fix_id:
+            continue
+        fix = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (fix_id,)
+        ).fetchone()
+        if fix is None or fix["status"] not in {"done", "archived"}:
+            continue
+        binding = get_current_review_artifact(conn, review_id)
+        if binding is None:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM review_artifact_bindings "
+            "WHERE review_task_id = ? AND source_rework_event_id = ?",
+            (review_id, int(event["id"])),
+        ).fetchone() is not None:
+            continue
+        candidates = list_attachments(conn, fix_id)
+        if len(candidates) != 1:
+            if _mark_review_artifact_selection_required_in_txn(
+                conn,
+                review_id,
+                reason=(
+                    f"completed fix {fix_id} has {len(candidates)} attachment "
+                    "candidates; explicit artifact selection is required"
+                ),
+                source_rework_event_id=int(event["id"]),
+                fix_task_id=fix_id,
+            ):
+                held += 1
+            continue
+        completion_event = conn.execute(
+            "SELECT run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (fix_id,),
+        ).fetchone()
+        source_run_id = (
+            int(completion_event["run_id"])
+            if completion_event is not None and completion_event["run_id"] is not None
+            else None
+        )
+        try:
+            _verify_review_artifact_binding(conn, binding)
+            bind_review_artifact_in_txn(
+                conn,
+                review_id,
+                candidates[0].id,
+                fix_id,
+                source_run_id,
+                int(event["id"]),
+                binding.generation,
+                now,
+            )
+            seeded += 1
+        except ReviewArtifactError as exc:
+            if _mark_review_artifact_selection_required_in_txn(
+                conn,
+                review_id,
+                reason=str(exc),
+                source_rework_event_id=int(event["id"]),
+                fix_task_id=fix_id,
+            ):
+                held += 1
+    return seeded, held
+
+
 def reconcile_dependency_waits(
     conn: sqlite3.Connection,
     *,
@@ -15355,6 +16716,8 @@ def reconcile_dependency_waits(
     waits_rearmed = 0
     legacy_recovered = 0
     timed_out = 0
+    artifact_backfilled = 0
+    artifact_selection_required = 0
 
     def _payload(row: sqlite3.Row) -> dict:
         try:
@@ -15413,6 +16776,15 @@ def reconcile_dependency_waits(
         return cur.rowcount == 1
 
     with write_txn(conn):
+        (
+            artifact_backfilled,
+            artifact_selection_required,
+        ) = _legacy_review_artifact_reconcile_in_txn(
+            conn,
+            now=current_time,
+            limit=bounded_limit,
+            requested_ids=requested_ids,
+        )
         # Rework events are authoritative for the orientation and allow a
         # crashed reconciler or an older writer to repair the missing edge.
         event_scope, event_scope_params = _task_scope("task_id")
@@ -15672,6 +17044,8 @@ def reconcile_dependency_waits(
         waits_rearmed=waits_rearmed,
         legacy_recovered=legacy_recovered,
         timed_out=timed_out,
+        artifact_backfilled=artifact_backfilled,
+        artifact_selection_required=artifact_selection_required,
     )
 
 
@@ -17219,6 +18593,12 @@ def _dispatch_once_locked(
     result.dependency_waits_rearmed = result.dependency_reconciled.waits_rearmed
     result.dependency_legacy_recovered = result.dependency_reconciled.legacy_recovered
     result.dependency_waits_timed_out = result.dependency_reconciled.timed_out
+    result.review_artifacts_backfilled = (
+        result.dependency_reconciled.artifact_backfilled
+    )
+    result.review_artifact_selections_required = (
+        result.dependency_reconciled.artifact_selection_required
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -18670,6 +20050,22 @@ def build_worker_context(
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    current_artifact = get_current_review_artifact(conn, task_id)
+    if current_artifact is not None:
+        artifact_lines = [
+            "## Current review artifact — authoritative",
+            f"Generation: {current_artifact.generation}",
+            f"Attachment: {current_artifact.attachment_id}",
+            f"SHA-256: {current_artifact.sha256}",
+            f"Path: {current_artifact.stored_path or '(missing attachment row)'}",
+            "Supersedes artifact paths preserved in the historical task body.",
+        ]
+        try:
+            _verify_review_artifact_binding(conn, current_artifact)
+        except ReviewArtifactError as exc:
+            artifact_lines.append(f"Integrity check: FAILED — {exc}")
+        lines.extend([*artifact_lines, ""])
 
     if task.body and task.body.strip():
         lines.append("## Body")
