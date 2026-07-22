@@ -7,9 +7,11 @@ ledger, and re-alerts on a re-block after an unblock (new event id).
 """
 
 from gateway.kanban_watchers import (
+    _collect_unsubscribed_failure_events,
     _collect_human_blocked_events,
     _human_block_event_is_current,
 )
+from gateway.kanban_notifications import render_kanban_event
 from hermes_cli import kanban_db as kb
 
 
@@ -147,3 +149,34 @@ def test_alert_healed_before_send_is_suppressed(tmp_path):
 
     assert kb.unblock_task(conn, task_id)
     assert not _human_block_event_is_current(kb, items[0])
+
+
+def test_rework_escalation_reaches_zero_subscription_home_sweep(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn, title="human approval")
+    payload = {
+        "human_gate_task_id": task_id,
+        "round_count": 5,
+        "blocker_digest": "exact-sha-checkout: checkout is still wrong",
+    }
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            kb.REWORK_ESCALATION_EVENT_KIND,
+            payload,
+        )
+
+    assert kb.REWORK_ESCALATION_EVENT_KIND in kb.FAILURE_KINDS
+    items = _collect_unsubscribed_failure_events(kb, conn)
+    assert len(items) == 1
+    assert items[0]["event"].kind == kb.REWORK_ESCALATION_EVENT_KIND
+    rendered = render_kanban_event(
+        task_id=task_id,
+        task=items[0]["task"],
+        event=items[0]["event"],
+    )
+    assert rendered is not None
+    assert "5 rounds" in rendered
+    assert task_id in rendered
+    assert "exact-sha-checkout" in rendered

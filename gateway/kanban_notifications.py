@@ -69,6 +69,17 @@ def render_kanban_event(
             f"🔁 {board_tag}{tag}Kanban {task_id} escalated to triage after "
             f"{recurrences} repeated blocks" + (f": {reason}" if reason else "")
         )
+    if kind == "rework_loop_escalated":
+        rounds = payload.get("round_count") or "?"
+        gate_id = str(payload.get("human_gate_task_id") or "").strip()
+        target = f"human gate {gate_id}" if gate_id else "human triage"
+        digest = _redact(payload.get("blocker_digest") or "").strip()
+        suffix = f"\n{digest}" if digest else ""
+        return (
+            f"⚠ {board_tag}{tag}Kanban {task_id} rework loop escalated after "
+            f"{rounds} rounds to {target}; autonomous review not approved."
+            f"{suffix}"
+        )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None

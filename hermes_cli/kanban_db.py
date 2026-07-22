@@ -137,6 +137,15 @@ CONTINUATION_RESOURCE_KINDS = {"tmux_session", "worktree", "child_process"}
 CONTINUATION_RESOURCE_CLEANUP_POLICIES = {"on_terminal", "manual", "preserve"}
 CONTINUATION_NONPROGRESS_LIMIT = 3
 
+# Reviewer rework is a separate bounded saga from dispatcher failures and the
+# block/unblock recurrence breaker. The event log is the source of truth for
+# both limits; these constants deliberately are not user-configurable.
+REWORK_NONPROGRESS_LIMIT = 2
+REWORK_ABSOLUTE_LIMIT = 5
+REWORK_ESCALATION_RESULT = "autonomous review escalated; not approved."
+REWORK_ESCALATION_EVENT_KIND = "rework_loop_escalated"
+REWORK_BLOCKER_DIGEST_MAX_CHARS = 4000
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -155,7 +164,7 @@ BLOCK_RECURRENCE_LIMIT = 2
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "spawn_failed", "block_loop_detected", "dependency_loop_detected",
-    "status", "archived", "unblocked",
+    "rework_loop_escalated", "status", "archived", "unblocked",
 )
 # The subset of TERMINAL_KINDS that represents a step actually going wrong,
 # as opposed to progressing normally (``completed``) or being administratively
@@ -1036,10 +1045,13 @@ class ReworkResult:
     """Committed outcome of one idempotent review-card rework request."""
 
     review_task_id: str
-    fix_task_id: str
-    fix_action: Literal["created", "adopted", "replayed"]
+    fix_task_id: Optional[str]
+    fix_action: Literal["created", "adopted", "replayed", "escalated"]
     review_status: str
     request_event_id: int
+    escalated: bool = False
+    escalation_target_task_id: Optional[str] = None
+    escalation_reason: Optional[str] = None
     # Only a replay from the run that originally committed the request may
     # end the caller's worker.  A later run using the same stable key gets the
     # stored result, but remains responsible for closing itself.
@@ -6354,13 +6366,14 @@ def _task_has_active_run_identity(row: sqlite3.Row, run: Optional[sqlite3.Row]) 
 def _rework_event_payload(
     *,
     review_task_id: str,
-    fix_task_id: str,
+    fix_task_id: Optional[str],
     request_key: str,
     actor: str,
     finding: str,
-    disposition: Literal["created", "adopted"],
+    disposition: Literal["created", "adopted", "escalated"],
     summary: Optional[str],
     metadata: Optional[dict],
+    human_gate_task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     return {
         "review_task_id": review_task_id,
@@ -6373,7 +6386,293 @@ def _rework_event_payload(
         "disposition": disposition,
         "summary": summary,
         "metadata": metadata,
+        "human_gate_task_id": human_gate_task_id,
     }
+
+
+def _normalize_rework_metadata(metadata: Optional[dict]) -> Optional[dict]:
+    """Validate and canonicalize the optional reviewer blocker snapshot."""
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict or None")
+
+    rework = metadata.get("rework")
+    if rework is None:
+        return dict(metadata)
+    if not isinstance(rework, dict):
+        raise ValueError("metadata.rework must be an object")
+    if "open_blockers" not in rework:
+        raise ValueError(
+            "metadata.rework.open_blockers must be a complete blocker snapshot"
+        )
+    blockers = rework["open_blockers"]
+    if not isinstance(blockers, list):
+        raise ValueError("metadata.rework.open_blockers must be an array")
+
+    normalized_blockers: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for index, blocker in enumerate(blockers):
+        if not isinstance(blocker, dict):
+            raise ValueError(
+                f"metadata.rework.open_blockers[{index}] must be an object"
+            )
+        key = blocker.get("key")
+        summary = blocker.get("summary")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(
+                f"metadata.rework.open_blockers[{index}].key is required"
+            )
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError(
+                f"metadata.rework.open_blockers[{index}].summary is required"
+            )
+        key = key.strip()
+        if key in seen_keys:
+            raise ValueError(
+                f"metadata.rework.open_blockers contains duplicate key {key!r}"
+            )
+        seen_keys.add(key)
+        normalized_blockers.append(
+            {"key": key, "summary": summary.strip()}
+        )
+
+    normalized_rework = dict(rework)
+    normalized_rework["open_blockers"] = sorted(
+        normalized_blockers, key=lambda item: item["key"]
+    )
+    normalized = dict(metadata)
+    normalized["rework"] = normalized_rework
+    return normalized
+
+
+def _rework_blocker_snapshot(metadata: Any) -> Optional[list[dict[str, str]]]:
+    """Read a valid blocker snapshot, treating legacy/missing data as unknown."""
+    if not isinstance(metadata, dict):
+        return None
+    rework = metadata.get("rework")
+    if not isinstance(rework, dict):
+        return None
+    blockers = rework.get("open_blockers")
+    if not isinstance(blockers, list):
+        return None
+    snapshot: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            return None
+        key = blocker.get("key")
+        summary = blocker.get("summary")
+        if not isinstance(key, str) or not key.strip():
+            return None
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+        key = key.strip()
+        if key in seen_keys:
+            return None
+        seen_keys.add(key)
+        snapshot.append({"key": key, "summary": summary.strip()})
+    return sorted(snapshot, key=lambda item: item["key"])
+
+
+def _rework_history_rows(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+) -> list[dict[str, Any]]:
+    """Return the committed, unique rework requests for one review series."""
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'rework_requested' ORDER BY id ASC",
+        (review_task_id,),
+    ).fetchall()
+    history: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        request_key = str(payload.get("request_key") or "").strip()
+        if not request_key or request_key in seen_keys:
+            continue
+        seen_keys.add(request_key)
+        history.append({"id": int(row["id"]), "payload": payload})
+    return history
+
+
+def _rework_progress_state(
+    history: list[dict[str, Any]],
+    current_metadata: Optional[dict],
+) -> tuple[int, int]:
+    """Return ``(unique_round_count_after_current, nonprogress_streak)``."""
+    previous_snapshot: Optional[list[dict[str, str]]] = None
+    nonprogress_streak = 0
+    for item in history:
+        snapshot = _rework_blocker_snapshot(
+            item.get("payload", {}).get("metadata")
+        )
+        if snapshot is None:
+            previous_snapshot = None
+            nonprogress_streak = 0
+        elif previous_snapshot is None:
+            previous_snapshot = snapshot
+            nonprogress_streak = 0
+        elif {b["key"] for b in snapshot} < {
+            b["key"] for b in previous_snapshot
+        }:
+            previous_snapshot = snapshot
+            nonprogress_streak = 0
+        else:
+            previous_snapshot = snapshot
+            nonprogress_streak += 1
+
+    current_snapshot = _rework_blocker_snapshot(current_metadata)
+    if current_snapshot is None:
+        nonprogress_streak = 0
+    elif previous_snapshot is None:
+        nonprogress_streak = 0
+    elif {b["key"] for b in current_snapshot} < {
+        b["key"] for b in previous_snapshot
+    }:
+        nonprogress_streak = 0
+    else:
+        nonprogress_streak += 1
+    return len(history) + 1, nonprogress_streak
+
+
+def _rework_blocker_digest(
+    history: list[dict[str, Any]],
+    current_payload: dict[str, Any],
+    *,
+    round_count: int,
+) -> str:
+    """Build a bounded, deterministic digest from every rework request."""
+    entries: list[tuple[str, str]] = []
+    positions: dict[str, int] = {}
+    for item in (*history, {"payload": current_payload}):
+        payload = item.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        finding = str(payload.get("finding") or "").strip()
+        if finding:
+            entry_key = f"finding:{finding}"
+            if entry_key not in positions:
+                positions[entry_key] = len(entries)
+                entries.append(("finding", finding))
+        blockers = _rework_blocker_snapshot(payload.get("metadata"))
+        if blockers is None:
+            continue
+        for blocker in blockers:
+            key = blocker["key"]
+            entry_key = f"blocker:{key}"
+            value = f"{key}: {blocker['summary']}"
+            if entry_key in positions:
+                entries[positions[entry_key]] = ("blocker", value)
+            else:
+                positions[entry_key] = len(entries)
+                entries.append(("blocker", value))
+
+    lines = [
+        f"Autonomous rework loop escalated after {round_count} unique rounds.",
+        "Accumulated findings and blockers:",
+    ]
+    if not entries:
+        lines.append("- No structured blocker snapshot was supplied.")
+    else:
+        lines.extend(f"- {value}" for _kind, value in entries)
+    digest = "\n".join(lines)
+    if len(digest) <= REWORK_BLOCKER_DIGEST_MAX_CHARS:
+        return digest
+    truncated = digest[: REWORK_BLOCKER_DIGEST_MAX_CHARS - 1].rstrip()
+    return truncated + "…"
+
+
+def _validate_rework_human_gate(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    human_gate_task_id: Optional[str],
+) -> tuple[bool, str]:
+    """Fail closed unless the named gate is the sole releasable child."""
+    gate_id = str(human_gate_task_id or "").strip()
+    if not gate_id:
+        return False, "no human gate was declared"
+    gate = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (gate_id,)
+    ).fetchone()
+    if gate is None:
+        return False, f"unknown human gate task: {gate_id}"
+    if gate["status"] in {"done", "archived"}:
+        return False, f"human gate {gate_id} is terminal"
+    if gate["policy_quarantined"] or gate["policy_invalidated"]:
+        return False, f"human gate {gate_id} is quarantined or invalidated"
+    if not conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (review_task_id, gate_id),
+    ).fetchone():
+        return False, f"human gate {gate_id} is not a direct child of the review"
+    if gate["status"] != "todo" or gate["current_run_id"] is not None:
+        return False, f"human gate {gate_id} is not dependency-gated and idle"
+
+    if gate["block_kind"] not in (None, "dependency"):
+        return False, f"human gate {gate_id} is not a plain dependency wait"
+    if any(
+        gate[key] is not None
+        for key in (
+            "claim_lock", "claim_expires", "worker_pid", "worker_started_at",
+            "worker_pgid", "worker_sid",
+        )
+    ):
+        return False, f"human gate {gate_id} still carries worker ownership"
+
+    other_children = conn.execute(
+        "SELECT t.id, t.status FROM tasks t "
+        "JOIN task_links l ON l.child_id = t.id "
+        "WHERE l.parent_id = ? AND t.id != ?",
+        (review_task_id, gate_id),
+    ).fetchall()
+    unsafe = [
+        row["id"] for row in other_children
+        if row["status"] not in {"done", "archived"}
+    ]
+    if unsafe:
+        return False, (
+            "review has another nonterminal direct child: "
+            + ", ".join(sorted(unsafe))
+        )
+    return True, ""
+
+
+def _promote_rework_gate_in_txn(
+    conn: sqlite3.Connection,
+    gate_task_id: str,
+) -> bool:
+    """Promote a validated gate when all of its parents are satisfied."""
+    gate = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (gate_task_id,)
+    ).fetchone()
+    if gate is None or gate["status"] != "todo":
+        return False
+    parents = conn.execute(
+        "SELECT p.status, p.policy_quarantined, p.policy_invalidated "
+        "FROM tasks p JOIN task_links l ON l.parent_id = p.id "
+        "WHERE l.child_id = ?",
+        (gate_task_id,),
+    ).fetchall()
+    if not all(_parent_is_satisfied(parent) for parent in parents):
+        return False
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready', block_kind = NULL, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL "
+        "WHERE id = ? AND status = 'todo'",
+        (gate_task_id,),
+    )
+    if cur.rowcount == 1:
+        _append_event(conn, gate_task_id, "promoted", None)
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -6381,10 +6680,13 @@ class _DependencyTransitionResult:
     """Shared result for a card-parent handoff transition."""
 
     requester_task_id: str
-    dependency_task_id: str
-    dependency_action: Literal["created", "adopted", "replayed"]
+    dependency_task_id: Optional[str]
+    dependency_action: Literal["created", "adopted", "replayed", "escalated"]
     requester_status: str
     request_event_id: int
+    escalated: bool = False
+    escalation_target_task_id: Optional[str] = None
+    escalation_reason: Optional[str] = None
     replayed_same_run: bool = False
 
 
@@ -6414,6 +6716,12 @@ def _transition_to_dependency(
     ),
     expected_run_id: Optional[int] = None,
     require_no_active_run: bool = False,
+    pre_materialization: Optional[
+        Callable[
+            [sqlite3.Connection, sqlite3.Row, Optional[sqlite3.Row]],
+            Optional[_DependencyTransitionResult],
+        ]
+    ] = None,
     mutation_context: Optional[MutationContext] = None,
 ) -> _DependencyTransitionResult:
     """Atomically bind a dependency card as parent and park its requester.
@@ -6434,18 +6742,6 @@ def _transition_to_dependency(
         ).fetchone()
         if requester_row is None:
             raise ValueError(unknown_error)
-        if requester_row["status"] in {"done", "archived"}:
-            raise ValueError(terminal_error)
-        if requester_row["policy_quarantined"] or requester_row["policy_invalidated"]:
-            raise ValueError(quarantine_error)
-
-        active_run = None
-        if requester_row["current_run_id"] is not None:
-            active_run = conn.execute(
-                "SELECT * FROM task_runs WHERE id = ?",
-                (int(requester_row["current_run_id"]),),
-            ).fetchone()
-
         prior = conn.execute(
             f"""SELECT id, run_id, payload FROM task_events
                  WHERE task_id = ? AND kind = ?
@@ -6461,6 +6757,33 @@ def _transition_to_dependency(
             dependency_id = str(
                 prior_payload.get(dependency_id_payload_key) or ""
             ).strip()
+            if not dependency_id and (
+                prior_payload.get("fix_action") == "escalated"
+                or prior_payload.get("disposition") == "escalated"
+            ):
+                current = get_task(conn, requester_task_id)
+                current_status = current.status if current else "triage"
+                return _DependencyTransitionResult(
+                    requester_task_id=requester_task_id,
+                    dependency_task_id=None,
+                    dependency_action="escalated",
+                    requester_status=current_status,
+                    request_event_id=int(prior["id"]),
+                    escalated=True,
+                    escalation_target_task_id=(
+                        str(prior_payload.get("human_gate_task_id") or "").strip()
+                        or None
+                    ),
+                    escalation_reason=(
+                        str(prior_payload.get("escalation_reason") or "").strip()
+                        or None
+                    ),
+                    replayed_same_run=(
+                        expected_run_id is not None
+                        and prior["run_id"] is not None
+                        and int(prior["run_id"]) == int(expected_run_id)
+                    ),
+                )
             if not dependency_id:
                 raise ValueError(
                     f"{request_event_kind} event has no {dependency_id_payload_key}"
@@ -6480,6 +6803,18 @@ def _transition_to_dependency(
                 ),
             )
 
+        if requester_row["status"] in {"done", "archived"}:
+            raise ValueError(terminal_error)
+        if requester_row["policy_quarantined"] or requester_row["policy_invalidated"]:
+            raise ValueError(quarantine_error)
+
+        active_run = None
+        if requester_row["current_run_id"] is not None:
+            active_run = conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?",
+                (int(requester_row["current_run_id"]),),
+            ).fetchone()
+
         if expected_run_id is not None:
             if requester_row["current_run_id"] != int(expected_run_id):
                 raise ValueError("stale expected_run_id")
@@ -6491,6 +6826,11 @@ def _transition_to_dependency(
             raise ValueError(active_run_error)
         elif require_no_active_run and requester_row["current_run_id"] is not None:
             raise ValueError("requester task still has an active run")
+
+        if pre_materialization is not None:
+            escalated = pre_materialization(conn, requester_row, active_run)
+            if escalated is not None:
+                return escalated
 
         dependency_task_id, disposition = materialize_dependency(conn)
         _link_tasks_in_txn(
@@ -6566,6 +6906,7 @@ def request_rework(
     actor: str,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    human_gate_task_id: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     require_no_active_run: bool = False,
     mutation_context: Optional[MutationContext] = None,
@@ -6590,8 +6931,10 @@ def request_rework(
         raise ValueError("request_key is required")
     if not actor:
         raise ValueError("actor is required")
-    if metadata is not None and not isinstance(metadata, dict):
-        raise ValueError("metadata must be a dict or None")
+    metadata = _normalize_rework_metadata(metadata)
+    if human_gate_task_id is not None and not isinstance(human_gate_task_id, str):
+        raise ValueError("human_gate_task_id must be a string or None")
+    human_gate_task_id = str(human_gate_task_id or "").strip() or None
     if not isinstance(fix, (NewFixTask, ExistingFixTask)):
         raise TypeError("fix must be NewFixTask or ExistingFixTask")
 
@@ -6650,6 +6993,202 @@ def request_rework(
             disposition=disposition,
             summary=summary,
             metadata=metadata,
+            human_gate_task_id=human_gate_task_id,
+        )
+
+    def pre_materialization(
+        conn_in: sqlite3.Connection,
+        requester_row: sqlite3.Row,
+        active_run: Optional[sqlite3.Row],
+    ) -> Optional[_DependencyTransitionResult]:
+        if requester_row["status"] == "triage":
+            raise ValueError("review task is awaiting human triage")
+        history = _rework_history_rows(conn_in, review_task_id)
+        round_count, nonprogress_streak = _rework_progress_state(
+            history, metadata,
+        )
+        if (
+            round_count < REWORK_ABSOLUTE_LIMIT
+            and nonprogress_streak < REWORK_NONPROGRESS_LIMIT
+        ):
+            return None
+
+        escalation_reason = (
+            "absolute_limit"
+            if round_count >= REWORK_ABSOLUTE_LIMIT
+            else "nonprogress_limit"
+        )
+        current_payload = _rework_event_payload(
+            review_task_id=review_task_id,
+            fix_task_id=None,
+            request_key=request_key,
+            actor=actor,
+            finding=finding,
+            disposition="escalated",
+            summary=summary,
+            metadata=metadata,
+            human_gate_task_id=human_gate_task_id,
+        )
+        digest = _rework_blocker_digest(
+            history,
+            current_payload,
+            round_count=round_count,
+        )
+        gate_valid, gate_reason = _validate_rework_human_gate(
+            conn_in, review_task_id, human_gate_task_id,
+        )
+        target_gate_id = human_gate_task_id if gate_valid else None
+        escalation_metadata = dict(metadata or {})
+        escalation_metadata["rework_escalation"] = {
+            "round_count": round_count,
+            "nonprogress_streak": nonprogress_streak,
+            "reason": escalation_reason,
+            "human_gate_task_id": target_gate_id,
+            "blocker_digest": digest,
+            "gate_validation": gate_reason or "validated",
+        }
+        run_id = _end_run(
+            conn_in,
+            review_task_id,
+            outcome="rework_escalated",
+            status="rework_escalated",
+            summary=digest,
+            metadata=escalation_metadata,
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn_in,
+                review_task_id,
+                outcome="rework_escalated",
+                summary=digest,
+                metadata=escalation_metadata,
+            )
+
+        now = int(time.time())
+        review_status = "done" if gate_valid else "triage"
+        review_result = (
+            REWORK_ESCALATION_RESULT
+            if gate_valid
+            else f"Rework loop requires human triage: {digest}"
+        )
+        if gate_valid:
+            cur = conn_in.execute(
+                "UPDATE tasks SET status = 'done', result = ?, "
+                "completed_at = ?, block_kind = NULL, block_recurrences = 0, "
+                "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_started_at = NULL, "
+                "worker_pgid = NULL, worker_sid = NULL "
+                "WHERE id = ? AND status NOT IN ('done', 'archived')",
+                (review_result, now, review_task_id),
+            )
+        else:
+            cur = conn_in.execute(
+                "UPDATE tasks SET status = 'triage', result = ?, "
+                "block_kind = 'needs_input', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL "
+                "WHERE id = ? AND status NOT IN ('done', 'archived')",
+                (review_result, review_task_id),
+            )
+        if cur.rowcount != 1:
+            raise ValueError("review task could not be escalated")
+
+        current_payload.update(
+            {
+                "escalated": True,
+                "round_count": round_count,
+                "nonprogress_streak": nonprogress_streak,
+                "escalation_reason": escalation_reason,
+                "human_gate_task_id": target_gate_id,
+                "blocker_digest": digest,
+                "gate_validation": gate_reason or "validated",
+            }
+        )
+        request_event_id = _append_event(
+            conn_in,
+            review_task_id,
+            "rework_requested",
+            current_payload,
+            run_id=run_id,
+        )
+
+        if gate_valid:
+            _append_event(
+                conn_in,
+                review_task_id,
+                "completed",
+                {
+                    "result_len": len(review_result),
+                    "summary": REWORK_ESCALATION_RESULT,
+                    "outcome": "rework_escalated",
+                    "human_gate_task_id": target_gate_id,
+                },
+                run_id=run_id,
+            )
+            comment = (
+                f"{digest}\n\n"
+                f"Human gate: {target_gate_id}\n"
+                f"Autonomous review result: {REWORK_ESCALATION_RESULT}"
+            )
+            _add_comment_in_txn(
+                conn_in,
+                target_gate_id,
+                author="kernel",
+                body=comment,
+                created_at=now,
+            )
+            _append_event(
+                conn_in,
+                target_gate_id,
+                REWORK_ESCALATION_EVENT_KIND,
+                {
+                    "review_task_id": review_task_id,
+                    "human_gate_task_id": target_gate_id,
+                    "round_count": round_count,
+                    "nonprogress_streak": nonprogress_streak,
+                    "escalation_reason": escalation_reason,
+                    "blocker_digest": digest,
+                    "review_result": REWORK_ESCALATION_RESULT,
+                },
+                run_id=run_id,
+            )
+            _promote_rework_gate_in_txn(conn_in, target_gate_id)
+        else:
+            _add_comment_in_txn(
+                conn_in,
+                review_task_id,
+                author="kernel",
+                body=(
+                    f"{digest}\n\n"
+                    f"Automation stopped: {gate_reason}."
+                ),
+                created_at=now,
+            )
+            _append_event(
+                conn_in,
+                review_task_id,
+                REWORK_ESCALATION_EVENT_KIND,
+                {
+                    "review_task_id": review_task_id,
+                    "human_gate_task_id": None,
+                    "round_count": round_count,
+                    "nonprogress_streak": nonprogress_streak,
+                    "escalation_reason": escalation_reason,
+                    "blocker_digest": digest,
+                    "gate_validation": gate_reason,
+                    "review_result": review_result,
+                },
+                run_id=run_id,
+            )
+        return _DependencyTransitionResult(
+            requester_task_id=review_task_id,
+            dependency_task_id=None,
+            dependency_action="escalated",
+            requester_status=review_status,
+            request_event_id=request_event_id,
+            escalated=True,
+            escalation_target_task_id=target_gate_id,
+            escalation_reason=escalation_reason,
         )
 
     transition = _transition_to_dependency(
@@ -6675,6 +7214,7 @@ def request_rework(
         ),
         expected_run_id=expected_run_id,
         require_no_active_run=require_no_active_run,
+        pre_materialization=pre_materialization,
         mutation_context=mutation_context,
     )
     return ReworkResult(
@@ -6683,6 +7223,9 @@ def request_rework(
         fix_action=transition.dependency_action,
         review_status=transition.requester_status,
         request_event_id=transition.request_event_id,
+        escalated=transition.escalated,
+        escalation_target_task_id=transition.escalation_target_task_id,
+        escalation_reason=transition.escalation_reason,
         replayed_same_run=transition.replayed_same_run,
     )
 
@@ -7177,6 +7720,38 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+def _add_comment_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    body: str,
+    created_at: Optional[int] = None,
+) -> int:
+    """Insert one comment while the caller owns the write transaction."""
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+    now = int(time.time()) if created_at is None else int(created_at)
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), now),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "commented",
+        {"author": author.strip(), "len": len(body.strip())},
+    )
+    return int(cur.lastrowid or 0)
+
+
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
@@ -7184,19 +7759,10 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+        return _add_comment_in_txn(
+            conn, task_id, author=author, body=body,
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:

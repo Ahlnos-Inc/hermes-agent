@@ -1220,6 +1220,60 @@ def test_worker_request_rework_adopts_fix_and_stops_loop(worker_env):
         ).fetchone() is not None
 
 
+def test_worker_request_rework_escalation_is_terminal_control(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        gate_id = kb.create_task(
+            conn, title="human approval", assignee="nicholas"
+        )
+        kb.link_tasks(conn, worker_env, gate_id)
+
+    for round_number in range(1, 5):
+        out = kt._handle_request_rework({
+            "finding": f"finding {round_number}",
+            "request_key": f"tool-round-{round_number}",
+            "fix": {
+                "title": f"tool fix {round_number}",
+                "body": "apply the correction",
+                "assignee": "coder",
+            },
+            "human_gate_task_id": gate_id,
+        })
+        assert isinstance(out, kt.KanbanTerminalControl)
+        payload = json.loads(out)
+        assert payload["escalated"] is False
+        fix_id = payload["fix_task_id"]
+        with kb.connect_closing() as conn:
+            assert kb.complete_task(conn, fix_id, result="fixed")
+            claimed = kb.claim_task(conn, worker_env, claimer="test-worker")
+            assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = kt._handle_request_rework({
+        "finding": "finding 5",
+        "request_key": "tool-round-5",
+        "fix": {
+            "title": "tool fix 5 must not exist",
+            "body": "apply the correction",
+            "assignee": "coder",
+        },
+        "human_gate_task_id": gate_id,
+    })
+    assert isinstance(out, kt.KanbanTerminalControl)
+    assert out.action is kt.KanbanTerminalAction.REWORK
+    payload = json.loads(out)
+    assert payload["escalated"] is True
+    assert payload["fix_task_id"] is None
+    assert payload["escalation_target_task_id"] == gate_id
+
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'tool fix 5 must not exist'"
+        ).fetchone()[0] == 0
+
+
 def test_worker_request_publication_adopts_releaser_card_and_stops_loop(
     worker_env, tmp_path,
 ):

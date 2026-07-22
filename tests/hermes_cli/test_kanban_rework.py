@@ -13,11 +13,25 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    values = {"wall": 1_800_000_000.0, "monotonic": 900_000.0}
+    monkeypatch.setattr(kb.time, "time", lambda: values["wall"])
+    monkeypatch.setattr(kb.time, "monotonic", lambda: values["monotonic"])
+    return values
+
+
+@pytest.fixture
+def board(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: dict[str, float],
+) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
     db = home / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db(db)
@@ -32,6 +46,48 @@ def _claim(conn, task_id: str, *, claimer: str = "worker") -> int:
     claimed = kb.claim_task(conn, task_id, claimer=claimer)
     assert claimed is not None and claimed.current_run_id is not None
     return int(claimed.current_run_id)
+
+
+def _blocker_metadata(*keys: str) -> dict:
+    return {
+        "rework": {
+            "open_blockers": [
+                {"key": key, "summary": f"summary for {key}"}
+                for key in keys
+            ]
+        }
+    }
+
+
+def _request_round(
+    conn,
+    review: str,
+    round_number: int,
+    *,
+    gate: str | None = None,
+    metadata: dict | None = None,
+    assignee: str = "coder",
+):
+    run_id = _claim(conn, review, claimer="reviewer")
+    result = kb.request_rework(
+        conn,
+        review,
+        finding=f"finding {round_number}",
+        fix=kb.NewFixTask(
+            title=f"fix {round_number}",
+            body="apply the correction",
+            assignee=assignee,
+        ),
+        request_key=f"round-{round_number}",
+        actor="reviewer",
+        metadata=metadata,
+        human_gate_task_id=gate,
+        expected_run_id=run_id,
+    )
+    if not result.escalated:
+        assert result.fix_task_id
+        assert kb.complete_task(conn, result.fix_task_id, result="fixed")
+    return result
 
 
 def test_new_fix_request_is_atomic_and_parks_review(board: Path) -> None:
@@ -103,10 +159,345 @@ def test_adopt_request_and_done_fix_rearms_review_immediately(board: Path) -> No
         ).fetchone() is not None
 
 
+def test_fifth_unique_rework_escalates_to_valid_human_gate(
+    board: Path, clock: dict[str, float]
+) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
+
+        for round_number in range(1, 6):
+            if round_number == 1:
+                run_id = _claim(conn, review, claimer="reviewer")
+            else:
+                run_id = _claim(conn, review, claimer="reviewer")
+            result = kb.request_rework(
+                conn,
+                review,
+                finding=f"finding {round_number}",
+                fix=kb.NewFixTask(
+                    title=f"fix {round_number}",
+                    body="apply the correction",
+                    assignee="coder",
+                ),
+                request_key=f"round-{round_number}",
+                actor="reviewer",
+                human_gate_task_id=gate,
+                expected_run_id=run_id,
+            )
+            if round_number < 5:
+                assert result.escalated is False
+                assert result.fix_task_id
+                assert kb.complete_task(conn, result.fix_task_id, result="fixed")
+            else:
+                assert result.escalated is True
+                assert result.fix_task_id is None
+                assert result.fix_action == "escalated"
+                assert result.escalation_target_task_id == gate
+                assert result.review_status == "done"
+
+        review_row = kb.get_task(conn, review)
+        gate_row = kb.get_task(conn, gate)
+        assert review_row is not None
+        assert review_row.status == "done"
+        assert review_row.result == "autonomous review escalated; not approved."
+        assert gate_row is not None and gate_row.status == "ready"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (review, gate),
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'fix 5'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id = ?", (review,)
+        ).fetchone()[0] == 4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = 'rework_requested'", (review,),
+        ).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'rework_escalated'", (review,),
+        ).fetchone()[0] == 1
+        run = conn.execute(
+            "SELECT outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (review,),
+        ).fetchone()
+        assert run is not None
+        assert run["outcome"] == "rework_escalated"
+        assert run["ended_at"] is not None
+        comments = kb.list_comments(conn, gate)
+        assert len(comments) == 1
+        assert comments[0].author == "kernel"
+        assert "finding 1" in comments[0].body
+        assert comments[0].created_at == int(clock["wall"])
+        escalation_event = next(
+            event
+            for event in kb.list_events(conn, gate)
+            if event.kind == kb.REWORK_ESCALATION_EVENT_KIND
+        )
+        assert escalation_event.created_at == int(clock["wall"])
+        assert run["ended_at"] == int(clock["wall"])
+
+
+def test_valid_gate_waits_for_other_parent_before_promotion(board: Path) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        other_parent = kb.create_task(conn, title="other prerequisite", assignee="coder")
+        kb.link_tasks(conn, review, gate)
+        kb.link_tasks(conn, other_parent, gate)
+        gate_row = kb.get_task(conn, gate)
+        assert gate_row is not None and gate_row.status == "todo"
+
+        for round_number in range(1, 5):
+            _request_round(conn, review, round_number, gate=gate)
+        result = _request_round(conn, review, 5, gate=gate)
+        assert result.escalated is True
+
+        gate_row = kb.get_task(conn, gate)
+        assert gate_row is not None and gate_row.status == "todo"
+        assert kb.complete_task(conn, other_parent, result="prerequisite done")
+        gate_row = kb.get_task(conn, gate)
+        assert gate_row is not None and gate_row.status == "ready"
+        assert len(kb.list_comments(conn, gate)) == 1
+
+
+def test_request_key_replay_does_not_consume_rework_round(board: Path) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
+
+        first = _request_round(conn, review, 1, gate=gate)
+        replay = kb.request_rework(
+            conn,
+            review,
+            finding="duplicate finding must not create a round",
+            fix=kb.NewFixTask(
+                title="duplicate fix must not exist",
+                body="not materialized",
+                assignee="coder",
+            ),
+            request_key="round-1",
+            actor="reviewer",
+            human_gate_task_id=gate,
+            require_no_active_run=True,
+        )
+        assert first.escalated is False
+        assert replay.fix_action == "replayed"
+        assert replay.escalated is False
+        assert replay.request_event_id == first.request_event_id
+
+        for round_number in range(2, 5):
+            _request_round(conn, review, round_number, gate=gate)
+        fifth = _request_round(conn, review, 5, gate=gate)
+        assert fifth.escalated is True
+        assert fifth.escalation_reason == "absolute_limit"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'duplicate fix must not exist'"
+        ).fetchone()[0] == 0
+
+
+def test_malformed_blocker_snapshot_is_rejected_without_writes(board: Path) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        with pytest.raises(ValueError, match="summary is required"):
+            kb.request_rework(
+                conn,
+                review,
+                finding="malformed blocker metadata",
+                fix=kb.NewFixTask(title="must not exist", body=None, assignee="coder"),
+                request_key="malformed-metadata",
+                actor="reviewer",
+                metadata={"rework": {"open_blockers": [{"key": "missing-summary"}]}},
+                require_no_active_run=True,
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'must not exist'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = 'rework_requested'", (review,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("snapshots", "trip_round"),
+    [
+        (
+            [_blocker_metadata("same"), _blocker_metadata("same"), _blocker_metadata("same")],
+            3,
+        ),
+        (
+            [
+                _blocker_metadata("root"),
+                _blocker_metadata("root", "new"),
+                _blocker_metadata("root", "new"),
+            ],
+            3,
+        ),
+    ],
+)
+def test_rework_nonprogress_bound_covers_unchanged_and_growing_snapshots(
+    board: Path,
+    snapshots: list[dict],
+    trip_round: int,
+) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
+
+        results = [
+            _request_round(
+                conn,
+                review,
+                round_number,
+                gate=gate,
+                metadata=metadata,
+            )
+            for round_number, metadata in enumerate(snapshots, start=1)
+        ]
+
+        assert results[trip_round - 1].escalated is True
+        assert results[trip_round - 1].escalation_reason == "nonprogress_limit"
+        assert all(
+            not result.escalated for result in results[: trip_round - 1]
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'fix %'"
+        ).fetchone()[0] == trip_round - 1
+
+
+def test_strictly_shrinking_blocker_keys_reset_nonprogress_streak(board: Path) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
+        snapshots = [
+            _blocker_metadata("a", "b"),
+            _blocker_metadata("a", "b"),
+            _blocker_metadata("a"),
+            _blocker_metadata("a"),
+        ]
+        results = [
+            _request_round(
+                conn,
+                review,
+                round_number,
+                gate=gate,
+                metadata=metadata,
+            )
+            for round_number, metadata in enumerate(snapshots, start=1)
+        ]
+        assert all(not result.escalated for result in results)
+
+        fifth = _request_round(
+            conn,
+            review,
+            5,
+            gate=gate,
+            metadata=_blocker_metadata("a"),
+        )
+        assert fifth.escalated is True
+        assert fifth.escalation_reason == "absolute_limit"
+
+
+@pytest.mark.parametrize("gate_mode", ["missing", "invalid", "ambiguous"])
+def test_unsafe_or_missing_human_gate_routes_review_to_triage(
+    board: Path, gate_mode: str
+) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        if gate_mode != "invalid":
+            kb.link_tasks(conn, review, gate)
+        if gate_mode == "ambiguous":
+            other = kb.create_task(conn, title="accidental child", assignee="coder")
+            kb.link_tasks(conn, review, other)
+
+        for round_number in range(1, 6):
+            result = _request_round(
+                conn,
+                review,
+                round_number,
+                gate=None if gate_mode == "missing" else gate,
+            )
+            if round_number < 5:
+                assert result.escalated is False
+            else:
+                assert result.escalated is True
+                assert result.escalation_target_task_id is None
+                assert result.review_status == "triage"
+
+        review_row = kb.get_task(conn, review)
+        gate_row = kb.get_task(conn, gate)
+        assert review_row is not None and review_row.status == "triage"
+        assert gate_row is not None
+        assert gate_row.status == ("ready" if gate_mode == "invalid" else "todo")
+        assert review_row.result and "human" in review_row.result.lower()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = ?",
+            (gate, kb.REWORK_ESCALATION_EVENT_KIND),
+        ).fetchone()[0] == 0
+
+
+def test_concurrent_threshold_requests_emit_one_escalation_and_comment(
+    board: Path,
+) -> None:
+    with kb.connect_closing(board) as conn:
+        review = _create_review(conn)
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
+        for round_number in range(1, 5):
+            _request_round(conn, review, round_number, gate=gate)
+
+    def submit(index: int):
+        try:
+            with kb.connect_closing(board) as worker_conn:
+                return kb.request_rework(
+                    worker_conn,
+                    review,
+                    finding=f"concurrent finding {index}",
+                    fix=kb.NewFixTask(
+                        title=f"concurrent fix {index}",
+                        body="apply the correction",
+                        assignee="coder",
+                    ),
+                    request_key=f"concurrent-{index}",
+                    actor="reviewer",
+                    human_gate_task_id=gate,
+                    require_no_active_run=True,
+                )
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(submit, range(2)))
+
+    assert sum(result is not None and result.escalated for result in results) == 1
+    with kb.connect_closing(board) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+            (gate, kb.REWORK_ESCALATION_EVENT_KIND),
+        ).fetchone()[0] == 1
+        assert len(kb.list_comments(conn, gate)) == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title LIKE 'concurrent fix %'"
+        ).fetchone()[0] == 0
+
+
 def test_request_key_replay_has_no_duplicate_writes(board: Path) -> None:
     with kb.connect_closing(board) as conn:
         review = _create_review(conn)
         fix = kb.create_task(conn, title="fix", assignee="coder")
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
         first = kb.request_rework(
             conn, review, finding="same", fix=kb.ExistingFixTask(fix),
             request_key="same-key", actor="reviewer", require_no_active_run=True,
@@ -293,6 +684,8 @@ def test_cli_rework_adopt_supports_dry_run_and_json(board: Path, capsys) -> None
     with kb.connect_closing(board) as conn:
         review = _create_review(conn)
         fix = kb.create_task(conn, title="fix", assignee="coder")
+        gate = kb.create_task(conn, title="human approval", assignee="nicholas")
+        kb.link_tasks(conn, review, gate)
 
     root = argparse.ArgumentParser()
     subparsers = root.add_subparsers(dest="command")
@@ -302,12 +695,14 @@ def test_cli_rework_adopt_supports_dry_run_and_json(board: Path, capsys) -> None
         "--reason", "adopt this fix",
         "--fix-task", fix,
         "--request-key", "cli-key",
+        "--human-gate", gate,
         "--dry-run", "--json",
     ])
     assert kanban_cli._cmd_rework(args) == 0
     dry = json.loads(capsys.readouterr().out)
     assert dry["dry_run"] is True
     assert dry["fix_task_id"] == fix
+    assert dry["human_gate_task_id"] == gate
     with kb.connect_closing(board) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE kind = 'rework_requested'"
@@ -318,6 +713,7 @@ def test_cli_rework_adopt_supports_dry_run_and_json(board: Path, capsys) -> None
         "--reason", "adopt this fix",
         "--fix-task", fix,
         "--request-key", "cli-key",
+        "--human-gate", gate,
         "--json",
     ])
     assert kanban_cli._cmd_rework(args) == 0

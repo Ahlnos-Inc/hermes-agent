@@ -531,6 +531,13 @@ class KanbanTerminalControl(str):
         if self.action is KanbanTerminalAction.COMPLETE:
             return "Kanban task completed."
         if self.action is KanbanTerminalAction.REWORK:
+            try:
+                payload = json.loads(str(self))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get("escalated"):
+                target = payload.get("escalation_target_task_id") or "human triage"
+                return f"Kanban review escalated to {target}; human approval is required."
             return "Kanban rework requested; review task parked until the fix is delivered."
         if self.action is KanbanTerminalAction.PUBLICATION:
             return "Kanban publication handoff requested; task parked until the remote ref is verified."
@@ -1955,6 +1962,11 @@ def _handle_request_rework(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    human_gate_task_id = args.get("human_gate_task_id")
+    if human_gate_task_id is not None:
+        if not isinstance(human_gate_task_id, str):
+            return tool_error("human_gate_task_id must be a string")
+        human_gate_task_id = human_gate_task_id.strip() or None
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
@@ -2013,6 +2025,7 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 actor=actor,
                 summary=summary,
                 metadata=metadata,
+                human_gate_task_id=human_gate_task_id,
                 expected_run_id=expected_run_id,
                 require_no_active_run=expected_run_id is None,
             )
@@ -2021,6 +2034,9 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 "fix_action": result.fix_action,
                 "review_status": result.review_status,
                 "request_event_id": result.request_event_id,
+                "escalated": result.escalated,
+                "escalation_target_task_id": result.escalation_target_task_id,
+                "escalation_reason": result.escalation_reason,
             }
             # A replay from a later run is idempotent data access, not a
             # lifecycle transition for this worker.  Returning ordinary tool
@@ -4037,11 +4053,17 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
     "name": "kanban_request_rework",
     "description": (
         "Reviewer/verifier terminal action. Atomically record a finding, "
-        "create or adopt exactly one fix card, link fix→review, close the "
+        "create or adopt one fix card when continuing automation, or escalate "
+        "without a fix when the bounded loop trips; link fix→review, close the "
         "current review run, and park or re-arm the review card. Use this "
         "when changes are requested; use kanban_block with kind='needs_input' "
         "only when a genuine human decision is required. request_key is "
-        "mandatory so retries cannot duplicate the fix or edge."
+        "mandatory so retries cannot duplicate the fix or edge. When a "
+        "reviewer has a declared human approval card downstream, pass its "
+        "stable task id as human_gate_task_id. Provide a complete stable "
+        "metadata.rework.open_blockers snapshot when blocker progress is "
+        "known; the kernel bounds repeated non-progress and escalates to "
+        "that gate without minting another fix."
     ),
     "parameters": {
         "type": "object",
@@ -4086,7 +4108,21 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
-                "description": "Optional structured review metadata.",
+                "description": (
+                    "Optional structured review metadata. For blocker progress, "
+                    "use {rework: {open_blockers: [{key, summary}, ...]}}; "
+                    "open_blockers must be the full stable snapshot for this "
+                    "round, not prose or a delta."
+                ),
+            },
+            "human_gate_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional existing human approval task id. It must be a "
+                    "nonterminal direct child of this review, dependency-gated "
+                    "on it, and the review must have no other nonterminal direct "
+                    "child that would be released accidentally."
+                ),
             },
             "board": _board_schema_prop(),
         },
