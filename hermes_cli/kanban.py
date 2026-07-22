@@ -658,6 +658,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--request-key", default=None,
         help="Stable idempotency key (generated deterministically when omitted)",
     )
+    p_rework.add_argument(
+        "--human-gate", dest="human_gate_task_id", default=None,
+        help=(
+            "Existing human approval task to receive a bounded rework-loop "
+            "escalation"
+        ),
+    )
     p_rework.add_argument("--dry-run", action="store_true")
     p_rework.add_argument("--json", action="store_true")
 
@@ -2286,6 +2293,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
 def _cmd_rework(args: argparse.Namespace) -> int:
     """Atomically request review rework from the CLI surface."""
     reason = str(args.reason or "").strip()
+    human_gate_task_id = getattr(args, "human_gate_task_id", None)
     if not reason:
         print("kanban rework: --reason is required", file=sys.stderr)
         return 2
@@ -2356,6 +2364,7 @@ def _cmd_rework(args: argparse.Namespace) -> int:
                     "review_task_id": args.review_task_id,
                     "reason": reason,
                     "fix": fix_input,
+                    "human_gate_task_id": human_gate_task_id,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -2386,6 +2395,7 @@ def _cmd_rework(args: argparse.Namespace) -> int:
                 "review_status": review.status,
                 "fix_action": "adopted" if has_adopt else "created",
                 "reason": reason,
+                "human_gate_task_id": human_gate_task_id,
             }
             if args.json:
                 print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -2413,6 +2423,7 @@ def _cmd_rework(args: argparse.Namespace) -> int:
             actor=_profile_author(),
             summary=args.summary,
             metadata=metadata,
+            human_gate_task_id=human_gate_task_id,
             expected_run_id=expected_run_id,
             require_no_active_run=expected_run_id is None,
         )
@@ -2423,14 +2434,24 @@ def _cmd_rework(args: argparse.Namespace) -> int:
             "review_status": result.review_status,
             "request_event_id": result.request_event_id,
             "request_key": request_key,
+            "escalated": result.escalated,
+            "escalation_target_task_id": result.escalation_target_task_id,
+            "escalation_reason": result.escalation_reason,
         }
         if args.json:
             print(json.dumps(output, indent=2, ensure_ascii=False))
         else:
-            print(
-                f"Rework {result.fix_action}: {result.fix_task_id}; "
-                f"review {result.review_task_id} → {result.review_status}"
-            )
+            if result.escalated:
+                target = result.escalation_target_task_id or "triage"
+                print(
+                    f"Rework escalated to {target}; review "
+                    f"{result.review_task_id} → {result.review_status}"
+                )
+            else:
+                print(
+                    f"Rework {result.fix_action}: {result.fix_task_id}; "
+                    f"review {result.review_task_id} → {result.review_status}"
+                )
     return 0
 
 
