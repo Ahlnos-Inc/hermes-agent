@@ -14269,6 +14269,17 @@ class DispatchResult:
 _QUOTA_RESPAWN_GUARD_REASONS = frozenset({"blocker_auth", "rate_limit_cooldown"})
 CAPACITY_ONLY_CAUSES = frozenset({"concurrency_cap", "concurrency_cap(per_profile)"})
 
+# Routing steady-states that also must never page an operator. An assignee that
+# maps to no spawnable profile -- a human / control-plane lane (``nonspawnable``)
+# -- or a task with no assignee at all (``unassigned``) is not a dispatcher
+# stall: no worker will EVER spawn these, and a running worker finishing won't
+# change that (unlike a capacity deferral, which drains on its own). Both are
+# documented as the expected steady state (see summarize_dispatch_causes); a
+# zero-spawn streak whose causes are only these -- with or without capacity
+# deferrals -- is benign and must be logged, never escalated to Telegram.
+ROUTING_STEADY_STATE_CAUSES = frozenset({"nonspawnable", "unassigned"})
+BENIGN_CAUSES = CAPACITY_ONLY_CAUSES | ROUTING_STEADY_STATE_CAUSES
+
 
 @dataclass
 class DispatchHealthLogCooldowns:
@@ -14330,6 +14341,19 @@ def dispatch_cause_counts(
 def dispatch_causes_capacity_only(counts: "dict[str, int]") -> bool:
     """Whether ``counts`` contains only intentional concurrency deferrals."""
     return bool(counts) and CAPACITY_ONLY_CAUSES.issuperset(counts)
+
+
+def dispatch_causes_benign_only(counts: "dict[str, int]") -> bool:
+    """Whether every zero-spawn cause is benign -- a capacity deferral or a
+    routing steady-state (nonspawnable/unassigned).
+
+    A benign streak warrants a log line but never an operator page: capacity
+    deferrals drain when a worker frees a slot, and routing steady-states are
+    the expected condition for human / control-plane lanes. Only a cause
+    OUTSIDE this set (spawn_exception, quota, workspace_collision, claim_race,
+    dispatch_lock_contended, respawn_guarded, ...) indicates a real stall.
+    """
+    return bool(counts) and BENIGN_CAUSES.issuperset(counts)
 
 
 def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> str:

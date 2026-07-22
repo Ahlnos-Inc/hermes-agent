@@ -321,3 +321,20 @@ def test_dispatch_cause_counts_aggregates_quota_and_skips_none_entries():
 )
 def test_dispatch_causes_capacity_only(counts, expected):
     assert kb.dispatch_causes_capacity_only(counts) is expected
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ({}, False),
+        ({"concurrency_cap": 3}, True),  # capacity is benign
+        ({"nonspawnable": 5}, True),  # control-plane steady-state is benign
+        ({"unassigned": 2}, True),  # unrouted is benign (no page)
+        ({"concurrency_cap(per_profile)": 2, "nonspawnable": 1}, True),  # the paged case
+        ({"nonspawnable": 1, "spawn_exception": 1}, False),  # a real fault -> not benign
+        ({"quota": 1}, False),
+        ({"claim_race": 1}, False),
+    ],
+)
+def test_dispatch_causes_benign_only(counts, expected):
+    assert kb.dispatch_causes_benign_only(counts) is expected

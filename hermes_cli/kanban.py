@@ -3204,22 +3204,36 @@ def _cmd_daemon_run(args: argparse.Namespace) -> int:
             # INFO and one actionable WARN per 5 minutes.
             counts = kb.dispatch_cause_counts(health_state["results"])
             capacity_only = kb.dispatch_causes_capacity_only(counts)
+            benign_only = kb.dispatch_causes_benign_only(counts)
             if health_state["log_cooldowns"].should_emit(
-                capacity_only=capacity_only, now=now,
+                capacity_only=benign_only, now=now,
             ):
-                if capacity_only:
+                if benign_only:
                     # Counts accumulate across the streak, so no per-task
                     # figure here — the causes breakdown carries the
                     # cumulative counts, same convention as the WARN path.
+                    # Benign (capacity + routing steady-states): log, never warn.
                     causes = kb.summarize_dispatch_causes(health_state["results"])
-                    print(
-                        f"[{_fmt_ts(now)}] INFO dispatcher at capacity: "
-                        f"ready tasks deferred by concurrency caps for "
-                        f"{health_state['bad_ticks']} consecutive ticks "
-                        f"(causes: {causes}) — healthy; drains when a running worker "
-                        f"finishes.",
-                        file=sys.stderr, flush=True,
-                    )
+                    if capacity_only:
+                        print(
+                            f"[{_fmt_ts(now)}] INFO dispatcher at capacity: "
+                            f"ready tasks deferred by concurrency caps for "
+                            f"{health_state['bad_ticks']} consecutive ticks "
+                            f"(causes: {causes}) — healthy; drains when a running worker "
+                            f"finishes.",
+                            file=sys.stderr, flush=True,
+                        )
+                    else:
+                        print(
+                            f"[{_fmt_ts(now)}] INFO dispatcher: ready queue "
+                            f"non-empty for {health_state['bad_ticks']} consecutive "
+                            f"ticks but every deferral is benign (capacity deferral or "
+                            f"routing steady-state; causes: {causes}) — the routing "
+                            f"ones (human/control-plane assignee or unassigned) will "
+                            f"never spawn a worker and await a human or reassignment; "
+                            f"not a dispatcher fault.",
+                            file=sys.stderr, flush=True,
+                        )
                 else:
                     print(
                         f"[{_fmt_ts(now)}] WARN dispatcher stuck: "

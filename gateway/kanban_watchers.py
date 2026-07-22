@@ -998,12 +998,24 @@ def dispatcher_singleton_lock_path() -> Path:
     return _kb.kanban_home() / "kanban" / ".dispatcher.lock"
 
 
-def classify_stuck_streak(results) -> "tuple[bool, str]":
-    """Return whether a zero-spawn streak is only concurrency deferrals."""
+def classify_stuck_streak(results) -> "tuple[bool, bool, str]":
+    """Classify a zero-spawn streak.
+
+    Returns ``(capacity_only, benign_only, causes)``:
+    * ``capacity_only`` -- every cause is a concurrency deferral (drains on its
+      own when a worker finishes).
+    * ``benign_only`` -- every cause is capacity OR a routing steady-state
+      (nonspawnable/unassigned); still no operator page, but it will NOT drain
+      by itself (needs a human / assignment). ``capacity_only`` implies
+      ``benign_only``.
+    * ``causes`` -- the formatted cause breakdown.
+    Only a streak that is not ``benign_only`` warrants a stuck WARN + escalation.
+    """
     from hermes_cli import kanban_db as _kb
     counts = _kb.dispatch_cause_counts(results)
     return (
         _kb.dispatch_causes_capacity_only(counts),
+        _kb.dispatch_causes_benign_only(counts),
         _kb.summarize_dispatch_causes(results),
     )
 
@@ -3142,23 +3154,39 @@ class GatewayKanbanWatchersMixin:
                     bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
-                    capacity_only, causes = classify_stuck_streak(stuck_tick_results)
+                    capacity_only, benign_only, causes = classify_stuck_streak(
+                        stuck_tick_results
+                    )
                     causes_suffix = f" causes: {causes}" if causes else ""
-                    if capacity_only:
+                    if benign_only:
                         # Cause counts accumulate across the streak window, so
                         # a per-task "N deferred" figure would inflate with
                         # streak length — the causes breakdown carries the
                         # cumulative counts, same convention as the WARN path.
+                        # Benign streaks (capacity + routing steady-states) log
+                        # but never page. Use the quiet cooldown bucket.
                         if health_log_cooldowns.should_emit(
                             capacity_only=True, now=now,
                         ):
-                            logger.info(
-                                "kanban dispatcher at capacity: ready tasks "
-                                "deferred by concurrency caps for %d consecutive "
-                                "ticks (causes: %s) — healthy; drains when a "
-                                "running worker finishes.",
-                                bad_ticks, causes,
-                            )
+                            if capacity_only:
+                                logger.info(
+                                    "kanban dispatcher at capacity: ready tasks "
+                                    "deferred by concurrency caps for %d consecutive "
+                                    "ticks (causes: %s) — healthy; drains when a "
+                                    "running worker finishes.",
+                                    bad_ticks, causes,
+                                )
+                            else:
+                                logger.info(
+                                    "kanban dispatcher: ready queue non-empty for %d "
+                                    "consecutive ticks but every deferral is benign "
+                                    "(capacity deferral or routing steady-state; "
+                                    "causes: %s) — the routing ones (human/control-plane "
+                                    "assignee or unassigned) will never spawn a worker "
+                                    "and await a human or reassignment; not a dispatcher "
+                                    "fault.",
+                                    bad_ticks, causes,
+                                )
                     else:
                         if health_log_cooldowns.should_emit(
                             capacity_only=False, now=now,

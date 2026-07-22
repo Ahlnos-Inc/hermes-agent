@@ -104,8 +104,25 @@ def test_classify_stuck_streak_recognizes_per_profile_capacity_only():
     ]
 
     assert classify_stuck_streak(results) == (
-        True, "concurrency_cap(per_profile)=2",
+        True, True, "concurrency_cap(per_profile)=2",
     )
+
+
+def test_classify_stuck_streak_nonspawnable_is_benign_not_actionable():
+    # A human/control-plane card (nonspawnable) mixed with a capacity deferral
+    # must NOT page: capacity_only is False (it won't drain on its own) but
+    # benign_only is True (no worker will ever spawn it -- awaits a human).
+    # This is the false-alarm that paged the operator on 2026-07-22.
+    results = [
+        DispatchResult(
+            skipped_per_profile_capped=[("t1", "coder", 2)],
+            skipped_nonspawnable=["t_human_approval"],
+        ),
+    ]
+    capacity_only, benign_only, causes = classify_stuck_streak(results)
+    assert capacity_only is False
+    assert benign_only is True
+    assert "nonspawnable=1" in causes
 
 
 def test_classify_stuck_streak_rejects_mixed_capacity_and_spawn_exception():
@@ -114,22 +131,23 @@ def test_classify_stuck_streak_rejects_mixed_capacity_and_spawn_exception():
         spawn_errors=[("t1", "boom")],
     )]
 
-    capacity_only, causes = classify_stuck_streak(results)
+    capacity_only, benign_only, causes = classify_stuck_streak(results)
     assert capacity_only is False
+    assert benign_only is False
     assert causes == "concurrency_cap=1, spawn_exception=1"
 
 
 @pytest.mark.parametrize("results", [[], [None]])
 def test_classify_stuck_streak_treats_empty_or_none_results_as_suspicious(results):
-    assert classify_stuck_streak(results) == (False, "")
+    assert classify_stuck_streak(results) == (False, False, "")
 
 
 def test_health_log_cooldowns_do_not_hide_actionable_transition_or_spam():
     cooldowns = DispatchHealthLogCooldowns(cooldown_seconds=300)
-    capacity_only, _ = classify_stuck_streak([
+    capacity_only, _, _ = classify_stuck_streak([
         DispatchResult(max_in_progress_deferred=1),
     ])
-    actionable, _ = classify_stuck_streak([
+    actionable, _, _ = classify_stuck_streak([
         DispatchResult(max_in_progress_deferred=1),
         DispatchResult(spawn_errors=[("t-failed", "boom")]),
     ])
@@ -143,6 +161,28 @@ def test_health_log_cooldowns_do_not_hide_actionable_transition_or_spam():
     assert cooldowns.should_emit(capacity_only=capacity_only, now=1002) is False
     assert cooldowns.should_emit(capacity_only=capacity_only, now=1300) is True
     assert cooldowns.should_emit(capacity_only=actionable, now=1301) is True
+
+
+def test_health_log_cooldowns_routing_benign_transitions_to_actionable():
+    # A routing-benign streak (nonspawnable) uses the quiet bucket like
+    # capacity; a subsequent actionable streak must still emit immediately via
+    # the independent actionable bucket. (Sol review — the capacity→actionable
+    # case above didn't cover the routing-benign path.)
+    cooldowns = DispatchHealthLogCooldowns(cooldown_seconds=300)
+    _cap, benign_only, _causes = classify_stuck_streak([
+        DispatchResult(skipped_nonspawnable=["t_human"]),
+    ])
+    _cap2, actionable_benign, _c2 = classify_stuck_streak([
+        DispatchResult(spawn_errors=[("t-failed", "boom")]),
+    ])
+
+    assert benign_only is True
+    assert actionable_benign is False
+    # Benign uses the quiet bucket.
+    assert cooldowns.should_emit(capacity_only=benign_only, now=2000) is True
+    assert cooldowns.should_emit(capacity_only=benign_only, now=2001) is False
+    # An actionable transition is not silenced by the benign streak's cooldown.
+    assert cooldowns.should_emit(capacity_only=actionable_benign, now=2001) is True
 
 
 # ---------------------------------------------------------------------------
