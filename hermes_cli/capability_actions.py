@@ -16,23 +16,26 @@ import stat
 import subprocess
 import sys
 import time
+from datetime import datetime
 from dataclasses import replace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from hermes_constants import get_default_hermes_root
+from hermes_cli import google_ads_activation_manifest as activation_contract
 from hermes_cli.sqlite_util import write_txn
 from hermes_cli.worker_credentials import (
     CAPABILITIES,
     CONTRACT_VERSION,
+    GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV,
     GOOGLE_ADS_ACTIVATION_FILENAME,
     WorkerCredentialManifest,
     load_manifest,
 )
 
 CAPABILITY_NAME = "google_ads_campaign_status_read"
-ACTIVATION_SCHEMA_VERSION = 1
+ACTIVATION_SCHEMA_VERSION = activation_contract.SCHEMA_VERSION
 HELPER_PROTOCOL_VERSION = 1
 MAX_HELPER_PROTOCOL_BYTES = 16 * 1024
 HELPER_TIMEOUT_SECONDS = 75
@@ -74,66 +77,11 @@ ERROR_TO_INCIDENT = {
     "capability_internal_error": "source_unavailable",
     "action_budget_exhausted": "action_budget_exhausted",
 }
-_ACTIVATION_FIELDS = frozenset(
-    {
-        "schema_version",
-        "activation_id",
-        "capability",
-        "profile",
-        "live_activation_authorized",
-        "synthetic_only",
-        "task_principal",
-        "operation",
-        "customer_id",
-        "campaign_resource_name",
-        "api_major",
-        "backend",
-        "source_project_id",
-        "source_key_names",
-        "response_schema_sha256",
-        "implementation_sha256",
-        "runtime_sha256",
-        "core_commit_sha",
-        "config_commit_sha",
-        "installed_runtime_sha",
-        "test_commands_sha256",
-        "test_results_sha256",
-        "leak_scan_sha256",
-        "helper_toolchain",
-        "action_budget",
-        "receipt_ttl_seconds",
-        "google_account_role",
-        "approved_by",
-        "approved_at",
-        "approval_surface",
-    }
-)
-_PRINCIPAL_FIELDS = frozenset(
-    {
-        "board_identity",
-        "task_id",
-        "created_at",
-        "creator_principal",
-        "body_sha256",
-        "approval_gate_ids",
-        "lineage_ids",
-    }
-)
-_TOOLCHAIN_FIELDS = frozenset(
-    {
-        "interpreter_path",
-        "interpreter_sha256",
-        "stdlib_probe_path",
-        "stdlib_probe_sha256",
-        "site_probe_path",
-        "site_probe_sha256",
-        "helper_path",
-        "helper_sha256",
-        "bws_path",
-        "bws_sha256",
-    }
-)
-_BUDGET_FIELDS = frozenset({"successful_receipts", "provider_attempts"})
+_ACTIVATION_FIELDS = activation_contract.ACTIVATION_FIELDS
+_PRINCIPAL_FIELDS = activation_contract.PRINCIPAL_FIELDS
+_TOOLCHAIN_FIELDS = activation_contract.TOOLCHAIN_FIELDS
+_BUDGET_FIELDS = activation_contract.BUDGET_FIELDS
+_TEST_EVIDENCE_FIELDS = activation_contract.TEST_EVIDENCE_FIELDS
 _DIGEST_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 _CUSTOMER_RE = __import__("re").compile(r"^[0-9]{1,20}$")
@@ -163,6 +111,15 @@ class ReceiptDelivery:
     run_id: int
     reused: bool
     receipt: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class VerifiedToolchain:
+    """Immutable execution material captured at authorization time."""
+
+    interpreter_path: str
+    bws_path: str
+    helper_source: bytes = field(repr=False)
 
 
 HelperRunner = Callable[[Mapping[str, Any], Mapping[str, Any], str], Mapping[str, Any]]
@@ -224,6 +181,7 @@ def runtime_sha256() -> str:
     paths = (
         _runtime_path(),
         Path(__file__).resolve(),
+        Path(activation_contract.__file__).resolve(),
         Path(__file__).with_name("kanban_db.py").resolve(),
         (root / "tools" / "google_ads_receipt_tool.py").resolve(),
     )
@@ -232,6 +190,69 @@ def runtime_sha256() -> str:
         for path in paths
     ]
     return _sha256_bytes(_canonical_json(payload).encode("ascii"))
+
+
+def _runtime_commit_sha() -> str | None:
+    """Resolve the checked-out/baked commit without spawning a subprocess."""
+    root = Path(__file__).resolve().parent.parent
+    baked = root / ".hermes_build_sha"
+    try:
+        if baked.is_file():
+            value = baked.read_text(encoding="ascii").strip()
+            if _COMMIT_RE.fullmatch(value):
+                return value
+        dotgit = root / ".git"
+        if dotgit.is_file():
+            marker = dotgit.read_text(encoding="utf-8").strip()
+            if not marker.startswith("gitdir: "):
+                return None
+            gitdir = Path(marker.removeprefix("gitdir: "))
+            if not gitdir.is_absolute():
+                gitdir = (root / gitdir).resolve()
+        elif dotgit.is_dir():
+            gitdir = dotgit
+        else:
+            return None
+        head = (gitdir / "HEAD").read_text(encoding="ascii").strip()
+        if _COMMIT_RE.fullmatch(head):
+            return head
+        if not head.startswith("ref: "):
+            return None
+        ref = head.removeprefix("ref: ")
+        loose = gitdir / ref
+        if loose.is_file():
+            value = loose.read_text(encoding="ascii").strip()
+            return value if _COMMIT_RE.fullmatch(value) else None
+        common_dir_file = gitdir / "commondir"
+        common = gitdir
+        if common_dir_file.is_file():
+            common = (
+                gitdir / common_dir_file.read_text(encoding="ascii").strip()
+            ).resolve()
+        common_loose = common / ref
+        if common_loose.is_file():
+            value = common_loose.read_text(encoding="ascii").strip()
+            return value if _COMMIT_RE.fullmatch(value) else None
+        packed = common / "packed-refs"
+        for line in packed.read_text(encoding="ascii").splitlines():
+            if not line or line.startswith(("#", "^")):
+                continue
+            value, name = line.split(" ", 1)
+            if name == ref and _COMMIT_RE.fullmatch(value):
+                return value
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return None
+
+
+def _parse_aware_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def response_schema_sha256() -> str:
@@ -317,7 +338,114 @@ def _path_is_outside_workspace(path: Path, workspace: str) -> bool:
         return False
 
 
-def _validate_toolchain(toolchain: Any, workspace: str, grant_digest: str) -> None:
+def _same_uid_can_replace(metadata: os.stat_result) -> bool:
+    """Return whether this process's uid/group can mutate a path entry."""
+    if metadata.st_uid == os.geteuid():
+        # An owner can chmod a read-only inode before modifying it.
+        return True
+    if metadata.st_mode & stat.S_IWOTH:
+        return True
+    groups = {os.getegid(), *os.getgroups()}
+    return bool(metadata.st_mode & stat.S_IWGRP and metadata.st_gid in groups)
+
+
+def _read_verified_file(
+    path: Path,
+    *,
+    require_same_uid_immutable: bool,
+    executable: bool,
+    grant_digest: str,
+) -> tuple[str, bytes]:
+    """Read through a pinned O_NOFOLLOW directory/inode chain exactly once."""
+    fail = lambda: ControllerActionFailure("capability_not_authorized", grant_digest)
+    if not path.is_absolute() or not path.parts or path.parts[0] != os.sep:
+        raise fail()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    current_fd = -1
+    file_fd = -1
+    chain: list[os.stat_result] = []
+    try:
+        current_fd = os.open(os.sep, directory_flags)
+        chain.append(os.fstat(current_fd))
+        for component in path.parts[1:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            entry = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+            opened = os.fstat(next_fd)
+            if not stat.S_ISDIR(opened.st_mode) or (
+                entry.st_dev,
+                entry.st_ino,
+            ) != (opened.st_dev, opened.st_ino):
+                os.close(next_fd)
+                raise fail()
+            os.close(current_fd)
+            current_fd = next_fd
+            chain.append(opened)
+        filename = path.parts[-1]
+        file_fd = os.open(filename, file_flags, dir_fd=current_fd)
+        entry = os.stat(filename, dir_fd=current_fd, follow_symlinks=False)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or (
+            entry.st_dev,
+            entry.st_ino,
+        ) != (before.st_dev, before.st_ino):
+            raise fail()
+        if executable and not before.st_mode & (
+            stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        ):
+            raise fail()
+        if before.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise fail()
+        if require_same_uid_immutable and any(
+            _same_uid_can_replace(item) for item in (*chain, before)
+        ):
+            raise fail()
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise fail()
+        return digest.hexdigest(), b"".join(chunks)
+    except (OSError, ValueError):
+        raise fail() from None
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _validate_toolchain(
+    toolchain: Any,
+    workspace: str,
+    grant_digest: str,
+    *,
+    synthetic: bool,
+) -> VerifiedToolchain:
     if not isinstance(toolchain, dict) or set(toolchain) != _TOOLCHAIN_FIELDS:
         raise ControllerActionFailure("capability_not_authorized", grant_digest)
     expected_paths = {
@@ -330,6 +458,7 @@ def _validate_toolchain(toolchain: Any, workspace: str, grant_digest: str) -> No
         candidate = Path(str(toolchain.get(name) or ""))
         if not candidate.is_absolute() or candidate.resolve(strict=False) != expected:
             raise ControllerActionFailure("capability_not_authorized", grant_digest)
+    captured: dict[str, bytes] = {}
     for name in (
         "interpreter_path",
         "stdlib_probe_path",
@@ -349,15 +478,28 @@ def _validate_toolchain(toolchain: Any, workspace: str, grant_digest: str) -> No
             or not path.is_file()
             or not _path_is_outside_workspace(path, workspace)
             or not _is_digest(toolchain.get(digest_name))
-            or _sha256_file(path) != toolchain[digest_name]
         ):
             raise ControllerActionFailure("capability_not_authorized", grant_digest)
-        mode = path.stat().st_mode
-        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        immutable_live_path = name in {
+            "interpreter_path",
+            "stdlib_probe_path",
+            "site_probe_path",
+            "bws_path",
+        }
+        actual_digest, content = _read_verified_file(
+            path,
+            require_same_uid_immutable=immutable_live_path and not synthetic,
+            executable=name in {"interpreter_path", "bws_path"},
+            grant_digest=grant_digest,
+        )
+        if actual_digest != toolchain[digest_name]:
             raise ControllerActionFailure("capability_not_authorized", grant_digest)
-    bws_path = Path(str(toolchain["bws_path"]))
-    if not os.access(bws_path, os.X_OK):
-        raise ControllerActionFailure("capability_not_authorized", grant_digest)
+        captured[name] = content
+    return VerifiedToolchain(
+        interpreter_path=str(toolchain["interpreter_path"]),
+        bws_path=str(toolchain["bws_path"]),
+        helper_source=captured["helper_path"],
+    )
 
 
 def _validate_activation(
@@ -373,6 +515,20 @@ def _validate_activation(
 ) -> dict[str, Any]:
     fail = lambda: ControllerActionFailure("capability_not_authorized", activation_digest)
     if set(activation) != _ACTIVATION_FIELDS or activation.get("schema_version") != ACTIVATION_SCHEMA_VERSION:
+        raise fail()
+    constant_bindings = {
+        "manifest_kind": activation_contract.MANIFEST_KIND,
+        "activation_schema_sha256": activation_contract.schema_sha256(),
+        "design_artifact_set_id": activation_contract.DESIGN_ARTIFACT_SET_ID,
+        "design_adr_sha256": activation_contract.DESIGN_ADR_SHA256,
+        "design_consensus_sha256": activation_contract.DESIGN_CONSENSUS_SHA256,
+        "design_manifest_sha256": activation_contract.DESIGN_MANIFEST_SHA256,
+        "design_approval_task_id": activation_contract.DESIGN_APPROVAL_TASK_ID,
+        "design_approval_scope": activation_contract.DESIGN_APPROVAL_SCOPE,
+    }
+    if any(activation.get(key) != value for key, value in constant_bindings.items()):
+        raise fail()
+    if not activation_contract.evidence_bindings_are_valid(activation):
         raise fail()
     definition = CAPABILITIES[CAPABILITY_NAME]
     if activation.get("capability") != CAPABILITY_NAME:
@@ -400,11 +556,25 @@ def _validate_activation(
     if any(
         not _is_digest(activation.get(field))
         for field in (
+            "api_sunset_evidence_sha256",
+            "google_account_role_evidence_sha256",
+            "oauth_refresh_token_rotation_evidence_sha256",
             "test_commands_sha256",
             "test_results_sha256",
             "leak_scan_sha256",
         )
     ):
+        raise fail()
+    evidence = activation.get("test_evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _TEST_EVIDENCE_FIELDS:
+        raise fail()
+    if not _is_digest(activation.get("test_commands_sha256")) or activation[
+        "test_commands_sha256"
+    ] != _sha256_bytes(_canonical_json(evidence["commands"]).encode("ascii")):
+        raise fail()
+    approved_at = _parse_aware_timestamp(activation.get("approved_at"))
+    sunset_checked = _parse_aware_timestamp(activation.get("api_sunset_checked_at"))
+    if approved_at is None or sunset_checked is None:
         raise fail()
     if not isinstance(activation.get("activation_id"), str) or not activation["activation_id"]:
         raise fail()
@@ -426,6 +596,14 @@ def _validate_activation(
         if activation.get("synthetic_only") is not False or activation.get("live_activation_authorized") is not True:
             raise fail()
         if activation.get("backend") != "local-darwin" or sys.platform != "darwin":
+            raise fail()
+        current_commit = _runtime_commit_sha()
+        if current_commit is None or activation.get("core_commit_sha") != current_commit:
+            raise fail()
+        wall_now = datetime.now().astimezone()
+        if sunset_checked.timestamp() > wall_now.timestamp() + 300:
+            raise fail()
+        if wall_now.timestamp() - sunset_checked.timestamp() > 30 * 86400:
             raise fail()
     customer_id = activation.get("customer_id")
     campaign = activation.get("campaign_resource_name")
@@ -451,7 +629,6 @@ def _validate_activation(
     ttl = activation.get("receipt_ttl_seconds")
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 300:
         raise fail()
-    _validate_toolchain(activation.get("helper_toolchain"), workspace, activation_digest)
     if manifest.version != CONTRACT_VERSION:
         raise fail()
     return activation
@@ -716,16 +893,28 @@ def _helper_request(activation: Mapping[str, Any], bindings: Mapping[str, Any]) 
     }
 
 
-def _launch_helper(request: Mapping[str, Any], activation: Mapping[str, Any], workspace: str) -> Mapping[str, Any]:
-    del workspace
-    token = os.environ.get("BWS_ACCESS_TOKEN", "")
-    if not token:
+def _launch_helper(
+    request: Mapping[str, Any],
+    activation: Mapping[str, Any],
+    workspace: str,
+    *,
+    verified_toolchain: VerifiedToolchain | None = None,
+) -> Mapping[str, Any]:
+    token = os.environ.get(GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "")
+    if not token or token == os.environ.get("BWS_ACCESS_TOKEN", ""):
         return {
             "version": HELPER_PROTOCOL_VERSION,
             "ok": False,
             "category": "capability_source_unavailable",
         }
     toolchain = activation["helper_toolchain"]
+    if verified_toolchain is None:
+        verified_toolchain = _validate_toolchain(
+            toolchain,
+            workspace,
+            str(request.get("activation_digest") or "0" * 64),
+            synthetic=True,
+        )
     env = {
         "BWS_ACCESS_TOKEN": token,
         "PYTHONNOUSERSITE": "1",
@@ -736,18 +925,43 @@ def _launch_helper(request: Mapping[str, Any], activation: Mapping[str, Any], wo
 
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
+    bootstrap = (
+        "import sys;"
+        "source=open(int(sys.argv[1]),'rb',closefd=True).read();"
+        "scope={'__name__':'__main__','__file__':'<verified-google-ads-helper>',"
+        "'__package__':None};"
+        "exec(compile(source,'<verified-google-ads-helper>','exec'),scope,scope)"
+    )
+    read_fd = -1
+    write_fd = -1
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        read_fd, write_fd = os.pipe()
         proc = subprocess.Popen(
-            [toolchain["interpreter_path"], "-I", "-S", toolchain["helper_path"]],
+            [
+                verified_toolchain.interpreter_path,
+                "-I",
+                "-S",
+                "-c",
+                bootstrap,
+                str(read_fd),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
             cwd="/",
             close_fds=True,
+            pass_fds=(read_fd,),
             start_new_session=True,
             preexec_fn=disable_core_dumps if os.name == "posix" else None,
         )
+        os.close(read_fd)
+        read_fd = -1
+        helper_stream = os.fdopen(write_fd, "wb", closefd=True)
+        write_fd = -1
+        with helper_stream:
+            helper_stream.write(verified_toolchain.helper_source)
         try:
             stdout, stderr = proc.communicate(
                 input=activation_bytes(request), timeout=HELPER_TIMEOUT_SECONDS
@@ -767,12 +981,26 @@ def _launch_helper(request: Mapping[str, Any], activation: Mapping[str, Any], wo
                 "category": "capability_source_unavailable",
             }
     except OSError:
+        if proc is not None:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:  # pragma: no cover - live backend is local Darwin
+                    proc.kill()
+                proc.communicate()
+            except (OSError, ProcessLookupError):
+                pass
         return {
             "version": HELPER_PROTOCOL_VERSION,
             "ok": False,
             "category": "capability_source_unavailable",
         }
-    if stderr or len(stdout) > MAX_HELPER_PROTOCOL_BYTES:
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+    if proc is None or stderr or len(stdout) > MAX_HELPER_PROTOCOL_BYTES:
         return {
             "version": HELPER_PROTOCOL_VERSION,
             "ok": False,
@@ -943,6 +1171,7 @@ def prepare_controller_action(
     helper_runner: HelperRunner | None = None,
     synthetic: bool = False,
     now: int | None = None,
+    clock: Callable[[], int | float] | None = None,
 ) -> ReceiptDelivery | None:
     """Prepare the granted controller action or return ``None`` when absent."""
     if task.current_run_id is None:
@@ -969,15 +1198,38 @@ def prepare_controller_action(
         workspace=workspace,
         synthetic=synthetic,
     )
+    verified_toolchain = _validate_toolchain(
+        parsed_activation.get("helper_toolchain"),
+        workspace,
+        activation_digest,
+        synthetic=synthetic,
+    )
     bindings = _binding_payload(
         parsed_activation,
         contract_digest=contract.digest,
         activation_digest=activation_digest,
     )
     binding_digest = _sha256_bytes(activation_bytes(bindings))
-    current_now = int(time.time()) if now is None else int(now)
-    runner = helper_runner or _launch_helper
+    if now is not None and clock is not None:
+        raise ValueError("now and clock are mutually exclusive")
+    read_clock: Callable[[], int | float]
+    if clock is not None:
+        read_clock = clock
+    elif now is not None:
+        read_clock = lambda: int(now)
+    else:
+        read_clock = time.time
+    if helper_runner is None:
+        runner: HelperRunner = lambda request, activation, workspace: _launch_helper(
+            request,
+            activation,
+            workspace,
+            verified_toolchain=verified_toolchain,
+        )
+    else:
+        runner = helper_runner
     while True:
+        current_now = int(read_clock())
         delivery, use_id = _reserve_or_reuse(
             conn,
             task_id=task.id,
@@ -1005,7 +1257,7 @@ def prepare_controller_action(
             result = runner(request, parsed_activation, workspace)
             receipt = _validate_helper_result(result, bindings, contract.digest)
         except ControllerActionFailure as exc:
-            _record_failed_use(conn, use_id, exc.category, current_now)
+            _record_failed_use(conn, use_id, exc.category, int(read_clock()))
             if exc.category in {"capability_source_unavailable", "google_ads_transient"}:
                 attempt_count = int(
                     conn.execute(
@@ -1021,10 +1273,20 @@ def prepare_controller_action(
                 continue
             raise
         except Exception:
-            _record_failed_use(conn, use_id, "capability_internal_error", current_now)
+            _record_failed_use(
+                conn, use_id, "capability_internal_error", int(read_clock())
+            )
             raise ControllerActionFailure(
                 "capability_internal_error", contract.digest
             ) from None
+        acceptance_now = int(read_clock())
+        if acceptance_now < current_now:
+            _record_failed_use(
+                conn, use_id, "capability_internal_error", acceptance_now
+            )
+            raise ControllerActionFailure(
+                "capability_internal_error", contract.digest
+            )
         return _record_success(
             conn,
             task_id=task.id,
@@ -1034,7 +1296,7 @@ def prepare_controller_action(
             bindings=bindings,
             receipt=receipt,
             activation=parsed_activation,
-            now=current_now,
+            now=acceptance_now,
         )
 
 

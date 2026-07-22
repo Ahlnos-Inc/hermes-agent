@@ -281,6 +281,7 @@ def test_worker_credential_strip_env_uses_configured_bitwarden_name(
     default_strip_env = wc.worker_credential_strip_env(tmp_path)
 
     assert wc.BWS_BOOTSTRAP_ENV in default_strip_env
+    assert wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV in default_strip_env
     assert "CUSTOM_BWS_TOKEN" not in default_strip_env
 
     monkeypatch.setattr(
@@ -524,6 +525,69 @@ def test_bws_bootstrap_is_projected_only_for_granted_profile(tmp_path, monkeypat
     unknown = wc.resolve_worker_credentials("not-listed", root=tmp_path)
     unknown_env = wc.build_worker_environment(dict(os.environ), unknown)
     assert wc.BWS_BOOTSTRAP_ENV not in unknown_env
+
+
+def test_google_ads_controller_source_token_is_never_projected_to_any_worker(
+    tmp_path, monkeypatch
+):
+    _github_manifest(tmp_path)
+    marker = "dedicated-google-ads-source-token-must-stay-controller-only"
+    monkeypatch.setenv(wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, marker)
+
+    for profile in ("marketing-operator", "releaser", "verifier", "unknown"):
+        plan = wc.resolve_worker_credentials(profile, root=tmp_path)
+        worker_env = wc.build_worker_environment(dict(os.environ), plan)
+        assert wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV not in worker_env
+        assert marker not in worker_env.values()
+    assert (
+        wc.get_consumed_worker_credential("google_ads_campaign_status_read")
+        is None
+    )
+
+
+def test_real_v2_co_grant_keeps_google_source_token_controller_only(
+    tmp_path, monkeypatch
+):
+    _write_manifest(
+        tmp_path,
+        """version: 2
+profiles:
+  marketing-operator:
+    actions:
+      bws_bootstrap: {}
+      google_ads_campaign_status_read:
+        activation_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+""",
+    )
+    bootstrap = "unrelated-worker-bootstrap-token"
+    google_source = "dedicated-google-source-token"
+    base_env = {
+        "SAFE": "yes",
+        wc.BWS_BOOTSTRAP_ENV: bootstrap,
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV: google_source,
+    }
+
+    plan = wc.resolve_worker_credentials(
+        "marketing-operator", root=tmp_path, base_env=base_env
+    )
+    worker_env = wc.build_worker_environment(base_env, plan)
+
+    assert plan.ok
+    assert plan.capabilities == (
+        "bws_bootstrap",
+        "google_ads_campaign_status_read",
+    )
+    assert worker_env["SAFE"] == "yes"
+    assert worker_env[wc.BWS_BOOTSTRAP_ENV] == bootstrap
+    assert wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV not in worker_env
+    assert google_source not in worker_env.values()
+
+    wc.consume_worker_credential_handoff(worker_env)
+    assert wc.get_consumed_worker_credential("bws_bootstrap") == bootstrap
+    assert (
+        wc.get_consumed_worker_credential("google_ads_campaign_status_read")
+        is None
+    )
 
 
 def test_missing_bootstrap_and_secret_are_safe_failures(tmp_path, monkeypatch):

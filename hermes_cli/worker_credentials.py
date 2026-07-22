@@ -40,6 +40,10 @@ MANIFEST_FILENAME = "worker-credential-contract.yaml"
 GOOGLE_ADS_ACTIVATION_FILENAME = "google-ads-campaign-status.activation.json"
 
 BWS_BOOTSTRAP_ENV = "BWS_ACCESS_TOKEN"
+# Dedicated controller-only source authority for the Google Ads one-shot
+# helper.  This value is intentionally not a capability source_key/handoff and
+# therefore has no worker accessor or projection path.
+GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV = "HERMES_GOOGLE_ADS_CONTROLLER_BWS_TOKEN"
 # Ambient name that must always be STRIPPED from workers (kept in
 # UNCONDITIONAL_STRIP_ENV below). It is NOT the resolve source anymore.
 GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
@@ -84,6 +88,7 @@ GIT_ENV_TOKEN_HELPER = (
 UNCONDITIONAL_STRIP_ENV = frozenset(
     {
         BWS_BOOTSTRAP_ENV,
+        GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV,
         "GH_TOKEN",
         "GH_ENTERPRISE_TOKEN",
         "GITHUB_TOKEN",
@@ -148,6 +153,7 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
         # variable names. Strip conventional aliases too so a stale controller
         # environment can never become an ambient worker handoff.
         ambient_strip_env=(
+            GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV,
             "GOOGLE_ADS_DEVELOPER_TOKEN",
             "GOOGLE_ADS_MANAGER_CUSTOMER_ID",
             "GOOGLE_ADS_LOGIN_CUSTOMER_ID",

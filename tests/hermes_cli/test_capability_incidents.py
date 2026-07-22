@@ -4,6 +4,7 @@ import contextlib
 from argparse import Namespace
 import hashlib
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -188,6 +189,83 @@ def test_incident_fault_injection_rolls_back_every_statement(tmp_path, failure_p
         assert kb.list_capability_incidents(conn, task.id) == []
         assert kb.list_comments(conn, task.id) == []
         assert [e for e in kb.list_events(conn, task.id) if e.kind == "blocked"] == []
+
+
+def test_repeat_observer_fault_rolls_back_counter_and_timestamps(tmp_path):
+    with contextlib.closing(kb.connect(tmp_path / "repeat-observer.db")) as conn:
+        task = _claimed(conn)
+        first = _open(conn, task)
+
+        def fail(point):
+            if point == "after_observer":
+                raise RuntimeError("injected repeat observer")
+
+        with pytest.raises(RuntimeError, match="injected repeat observer"):
+            kb.open_capability_incident(
+                conn,
+                task.id,
+                run_id=None,
+                capability_name=CAPABILITY,
+                incident_class="missing_secret",
+                grant_digest=GRANT,
+                fault_injector=fail,
+            )
+
+        unchanged = kb.get_capability_incident(conn, first.id)
+        assert unchanged is not None
+        assert unchanged.observer_count == first.observer_count == 1
+        assert unchanged.miss_count == first.miss_count == 1
+        assert unchanged.last_seen_at == first.last_seen_at
+        assert unchanged.last_miss_at == first.last_miss_at
+        assert len(kb.list_comments(conn, task.id)) == 1
+
+
+def test_busy_begin_immediate_writes_nothing_and_preserves_claimed_run(tmp_path):
+    db_path = tmp_path / "busy.db"
+    with contextlib.closing(kb.connect(db_path)) as setup:
+        task = _claimed(setup)
+        run_id = task.current_run_id
+
+    with contextlib.closing(kb.connect(db_path)) as lock_conn, contextlib.closing(
+        kb.connect(db_path)
+    ) as observer:
+        lock_conn.execute("BEGIN IMMEDIATE")
+        observer.execute("PRAGMA busy_timeout=1")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            _open(observer, task)
+        lock_conn.execute("ROLLBACK")
+
+        current = kb.get_task(observer, task.id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_run_id == run_id
+        assert kb.list_capability_incidents(observer, task.id) == []
+        assert kb.list_comments(observer, task.id) == []
+
+
+def test_faulted_connection_rolls_back_before_second_connection_opens_incident(
+    tmp_path,
+):
+    db_path = tmp_path / "two-connection-fault.db"
+    with contextlib.closing(kb.connect(db_path)) as setup:
+        task = _claimed(setup)
+
+    def fail(point):
+        if point == "after_event":
+            raise RuntimeError("injected first connection")
+
+    with contextlib.closing(kb.connect(db_path)) as first:
+        with pytest.raises(RuntimeError, match="injected first connection"):
+            _open(first, task, fault_injector=fail)
+    with contextlib.closing(kb.connect(db_path)) as second:
+        incident = _open(second, task)
+        assert incident.observer_count == 1
+        assert incident.miss_count == 1
+        assert len(kb.list_capability_incidents(second, task.id)) == 1
+        assert len(kb.list_comments(second, task.id)) == 1
+        assert len(
+            [e for e in kb.list_events(second, task.id) if e.kind == "blocked"]
+        ) == 1
 
 
 def test_two_connections_create_one_open_incident_and_one_block_evidence(tmp_path):

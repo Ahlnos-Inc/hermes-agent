@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ import time
 import pytest
 
 from hermes_cli import capability_actions as actions
+from hermes_cli import google_ads_activation_manifest as activation_contract
 from hermes_cli import google_ads_action_helper as helper
 from hermes_cli import kanban_db as kb
 from hermes_cli import worker_credentials as wc
@@ -53,9 +55,20 @@ def _task_and_activation(conn, tmp_path: Path, *, attempts: int = 3, ttl: int = 
     task = kb.claim_task(conn, task_id)
     assert task is not None and task.current_run_id is not None
     principal = actions._task_principal(conn, task, "default")
+    test_commands = [
+        "scripts/run_tests.sh tests/hermes_cli/test_capability_actions.py"
+    ]
     activation = {
         "schema_version": 1,
+        "manifest_kind": activation_contract.MANIFEST_KIND,
+        "activation_schema_sha256": activation_contract.schema_sha256(),
         "activation_id": "synthetic-test",
+        "design_artifact_set_id": activation_contract.DESIGN_ARTIFACT_SET_ID,
+        "design_adr_sha256": activation_contract.DESIGN_ADR_SHA256,
+        "design_consensus_sha256": activation_contract.DESIGN_CONSENSUS_SHA256,
+        "design_manifest_sha256": activation_contract.DESIGN_MANIFEST_SHA256,
+        "design_approval_task_id": activation_contract.DESIGN_APPROVAL_TASK_ID,
+        "design_approval_scope": activation_contract.DESIGN_APPROVAL_SCOPE,
         "capability": actions.CAPABILITY_NAME,
         "profile": "marketing-operator",
         "live_activation_authorized": False,
@@ -65,6 +78,8 @@ def _task_and_activation(conn, tmp_path: Path, *, attempts: int = 3, ttl: int = 
         "customer_id": "1234567890",
         "campaign_resource_name": "customers/1234567890/campaigns/77",
         "api_major": "v24",
+        "api_sunset_checked_at": "2026-07-22T00:00:00Z",
+        "api_sunset_evidence_sha256": "1" * 64,
         "backend": "synthetic",
         "source_project_id": "synthetic-project",
         "source_key_names": list(wc.CAPABILITIES[actions.CAPABILITY_NAME].source_keys),
@@ -74,13 +89,25 @@ def _task_and_activation(conn, tmp_path: Path, *, attempts: int = 3, ttl: int = 
         "core_commit_sha": "a" * 40,
         "config_commit_sha": "b" * 40,
         "installed_runtime_sha": "a" * 40,
-        "test_commands_sha256": "c" * 64,
+        "test_commands_sha256": actions._sha256_bytes(
+            actions._canonical_json(test_commands).encode("ascii")
+        ),
         "test_results_sha256": "d" * 64,
         "leak_scan_sha256": "e" * 64,
+        "test_evidence": {
+            "synthetic_only": True,
+            "commands": test_commands,
+            "results_sha256": "d" * 64,
+            "leak_scan_sha256": "e" * 64,
+            "source_adapter": "synthetic",
+            "http_adapter": "synthetic",
+        },
         "helper_toolchain": actions.build_toolchain_manifest(fake_bws),
         "action_budget": {"successful_receipts": 1, "provider_attempts": attempts},
         "receipt_ttl_seconds": ttl,
         "google_account_role": "READ_ONLY",
+        "google_account_role_evidence_sha256": "2" * 64,
+        "oauth_refresh_token_rotation_evidence_sha256": "3" * 64,
         "approved_by": "test-controller",
         "approved_at": "2026-07-22T00:00:00Z",
         "approval_surface": "synthetic-test",
@@ -108,6 +135,23 @@ def _success(request, _activation, _workspace):
             "response_schema_digest": request["response_schema_digest"],
         },
     }
+
+
+def _verified_script(script: Path) -> actions.VerifiedToolchain:
+    return actions.VerifiedToolchain(
+        interpreter_path=str(Path(sys.executable).resolve()),
+        bws_path="/synthetic/bws",
+        helper_source=script.read_bytes(),
+    )
+
+
+def test_activation_schema_export_is_canonical_and_closed():
+    schema = json.loads(activation_contract.schema_bytes())
+    assert set(schema["required"]) == actions._ACTIVATION_FIELDS
+    assert schema["additionalProperties"] is False
+    assert actions._is_digest(activation_contract.schema_sha256())
+    assert activation_contract.schema_bytes() == activation_contract.schema_bytes()
+    assert actions._runtime_commit_sha() is not None
 
 
 def test_controller_action_persists_receipt_delivery_and_reuses_it(tmp_path, monkeypatch):
@@ -194,6 +238,31 @@ def test_controller_action_persists_receipt_delivery_and_reuses_it(tmp_path, mon
         assert reused.receipt_id == first.receipt_id
         assert len(calls) == 1
         assert conn.execute("SELECT COUNT(*) AS n FROM capability_action_uses").fetchone()["n"] == 1
+
+
+def test_receipt_timestamps_start_when_helper_result_is_accepted(tmp_path):
+    with contextlib.closing(kb.connect(tmp_path / "acceptance-clock.db")) as conn:
+        task, activation, manifest, workspace = _task_and_activation(
+            conn, tmp_path, ttl=10
+        )
+        readings = iter((1000, 1060))
+        delivery = actions.prepare_controller_action(
+            conn,
+            task,
+            board_identity="default",
+            workspace=str(workspace),
+            manifest=manifest,
+            activation=activation,
+            helper_runner=_success,
+            synthetic=True,
+            clock=lambda: next(readings),
+        )
+        assert delivery is not None
+        receipt = conn.execute(
+            "SELECT checked_at, expires_at FROM capability_action_receipts"
+        ).fetchone()
+        assert (receipt["checked_at"], receipt["expires_at"]) == (1060, 1070)
+        assert delivery.receipt["checked_at"] == 1060
 
 
 def test_transient_attempts_are_bounded_then_succeed(tmp_path):
@@ -290,6 +359,7 @@ def test_mismatched_activation_never_reuses_an_old_receipt(tmp_path):
 
         changed = json.loads(json.dumps(activation))
         changed["test_results_sha256"] = "f" * 64
+        changed["test_evidence"]["results_sha256"] = "f" * 64
         changed_manifest = _manifest_for_activation(changed)
         calls = 0
 
@@ -390,14 +460,28 @@ def test_synthetic_leak_matrix_keeps_fixture_values_out_of_durable_surfaces(
     }
     access_token = f"access-{marker}"
     bootstrap_token = f"bootstrap-{marker}"
+    dedicated_source_token = f"dedicated-source-{marker}"
     private_values = [
         value
         for key, value in bundle.items()
         if key != "google-ads-manager-customer-id"
-    ] + [access_token, bootstrap_token]
+    ] + [access_token, bootstrap_token, dedicated_source_token]
     monkeypatch.setenv("BWS_ACCESS_TOKEN", bootstrap_token)
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, dedicated_source_token
+    )
+    source_calls = []
+    http_calls = []
+
+    def denied_real_adapter(*_args, **_kwargs):
+        pytest.fail("real credential/network adapter reached by synthetic matrix")
+
+    run_worker = subprocess.run
+    monkeypatch.setattr(helper.subprocess, "run", denied_real_adapter)
+    monkeypatch.setattr(helper.urllib.request, "urlopen", denied_real_adapter)
 
     def http(_method, url, _headers, _body, _timeout):
+        http_calls.append(url)
         if url == helper.OAUTH_URL:
             return helper.HttpResponse(
                 200,
@@ -427,10 +511,14 @@ def test_synthetic_leak_matrix_keeps_fixture_values_out_of_durable_surfaces(
     with contextlib.closing(kb.connect(tmp_path / "kanban.db")) as conn:
         task, activation, manifest, workspace = _task_and_activation(conn, tmp_path)
 
+        def source(_request):
+            source_calls.append("synthetic")
+            return bundle
+
         def runner(request, _activation, _workspace):
             return helper.run_action(
                 request,
-                source_fetcher=lambda _request: bundle,
+                source_fetcher=source,
                 http_client=http,
             )
 
@@ -447,7 +535,11 @@ def test_synthetic_leak_matrix_keeps_fixture_values_out_of_durable_surfaces(
         )
         assert delivery is not None
 
-        ambient = {"SAFE": "yes", "BWS_ACCESS_TOKEN": bootstrap_token}
+        ambient = {
+            "SAFE": "yes",
+            "BWS_ACCESS_TOKEN": bootstrap_token,
+            wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV: dedicated_source_token,
+        }
         for index, name in enumerate(sorted(wc.CAPABILITY_SENSITIVE_ENV)):
             ambient[name] = private_values[index % len(private_values)]
         plan = wc.prepare_worker_credentials(
@@ -457,15 +549,53 @@ def test_synthetic_leak_matrix_keeps_fixture_values_out_of_durable_surfaces(
             run_id=task.current_run_id,
         )
         worker_env = wc.build_worker_environment(ambient, plan)
+        probe = (
+            "import json,os;"
+            "print(json.dumps(dict(os.environ),sort_keys=True))"
+        )
+        foreground = run_worker(
+            [sys.executable, "-I", "-S", "-c", probe],
+            env=worker_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        background_process = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", probe],
+            env=worker_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        background, background_err = background_process.communicate(timeout=5)
+        assert background_process.returncode == 0 and not background_err
         (workspace / "worker-env.json").write_text(
             json.dumps(worker_env, sort_keys=True), encoding="utf-8"
         )
         (workspace / "receipt.json").write_text(
             json.dumps(delivery.receipt, sort_keys=True), encoding="utf-8"
         )
+        # These files model every worker-controlled output/export boundary:
+        # foreground/background output, hook/plugin/code execution output, and
+        # artifact export.  All receive only the sanitized worker environment.
+        for name, content in {
+            "foreground.out": foreground,
+            "background.out": background,
+            "hook.out": foreground,
+            "plugin.out": background,
+            "code-execution.out": foreground,
+            "artifact-export.json": json.dumps({"receipt": delivery.receipt}),
+        }.items():
+            (workspace / name).write_text(content, encoding="utf-8")
 
         durable = "\n".join(conn.iterdump())
         context = kb.build_worker_context(conn, task.id)
+        comment_event_metadata = repr(
+            (
+                kb.list_comments(conn, task.id),
+                [event.payload for event in kb.list_events(conn, task.id)],
+            )
+        )
         workspace_bytes = b"".join(
             path.read_bytes() for path in workspace.iterdir() if path.is_file()
         )
@@ -475,12 +605,18 @@ def test_synthetic_leak_matrix_keeps_fixture_values_out_of_durable_surfaces(
         [
             durable,
             context,
+            comment_event_metadata,
             caplog.text,
             captured.out,
             captured.err,
             workspace_bytes.decode("utf-8"),
         ]
     )
+    assert source_calls == ["synthetic"]
+    assert http_calls == [
+        helper.OAUTH_URL,
+        f"{helper.GOOGLE_ADS_ROOT}/v24/customers/1234567890:search",
+    ]
     for value in private_values:
         assert value not in observable
 
@@ -516,19 +652,38 @@ def test_activation_tamper_fails_before_helper(tmp_path):
 @pytest.mark.parametrize(
     ("path", "value"),
     [
+        (("manifest_kind",), "other"),
+        (("activation_schema_sha256",), "0" * 64),
+        (("design_artifact_set_id",), "other"),
+        (("design_adr_sha256",), "0" * 64),
+        (("design_consensus_sha256",), "0" * 64),
+        (("design_manifest_sha256",), "0" * 64),
+        (("design_approval_task_id",), "t_00000000"),
+        (("design_approval_scope",), "live"),
         (("profile",), "verifier"),
         (("operation",), "arbitrary_query"),
         (("customer_id",), "*"),
         (("campaign_resource_name",), "customers/999/campaigns/77"),
         (("api_major",), "v23"),
+        (("api_sunset_checked_at",), "not-a-time"),
+        (("api_sunset_evidence_sha256",), "0" * 63),
         (("backend",), "local-darwin"),
         (("source_project_id",), ""),
         (("source_key_names",), ["*"]),
         (("google_account_role",), "STANDARD"),
         (("core_commit_sha",), "a" * 39),
+        (("core_commit_sha",), "c" * 40),
         (("config_commit_sha",), "b" * 39),
         (("installed_runtime_sha",), "a" * 39),
         (("test_results_sha256",), None),
+        (("test_evidence", "results_sha256"), "f" * 64),
+        (("test_evidence", "leak_scan_sha256"), "f" * 64),
+        (("test_evidence", "source_adapter"), "real"),
+        (("test_evidence", "http_adapter"), "real"),
+        (("test_evidence", "synthetic_only"), False),
+        (("google_account_role_evidence_sha256",), "0" * 63),
+        (("oauth_refresh_token_rotation_evidence_sha256",), "0" * 63),
+        (("approved_at",), "not-a-time"),
         (("action_budget", "successful_receipts"), 2),
         (("action_budget", "provider_attempts"), 4),
         (("receipt_ttl_seconds",), 301),
@@ -635,6 +790,137 @@ def test_writable_or_workspace_injected_toolchain_fails_before_helper(tmp_path):
             )
 
 
+def _race_toolchain(monkeypatch, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    helper_path = tmp_path / "approved-helper.py"
+    approved = b'import sys;sys.stdout.write("{\\"version\\":1,\\"ok\\":true}")\n'
+    helper_path.write_bytes(approved)
+    helper_path.chmod(0o600)
+    bws_path = tmp_path / "bws"
+    bws_path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    bws_path.chmod(0o700)
+    monkeypatch.setattr(actions, "_helper_path", lambda: helper_path.resolve())
+    return (
+        workspace,
+        helper_path,
+        approved,
+        actions.build_toolchain_manifest(bws_path),
+    )
+
+
+def test_helper_replacement_before_validation_fails_closed(tmp_path, monkeypatch):
+    workspace, helper_path, _approved, toolchain = _race_toolchain(
+        monkeypatch, tmp_path
+    )
+    helper_path.write_text("raise SystemExit('replacement')\n", encoding="utf-8")
+    with pytest.raises(actions.ControllerActionFailure):
+        actions._validate_toolchain(
+            toolchain, str(workspace), "a" * 64, synthetic=True
+        )
+
+
+def test_verified_helper_snapshot_survives_path_replacement(tmp_path, monkeypatch):
+    workspace, helper_path, _approved, toolchain = _race_toolchain(
+        monkeypatch, tmp_path
+    )
+    verified = actions._validate_toolchain(
+        toolchain, str(workspace), "a" * 64, synthetic=True
+    )
+    helper_path.write_text(
+        "import sys;sys.stderr.write('replacement-executed')\n", encoding="utf-8"
+    )
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "dedicated-controller-token"
+    )
+    assert actions._launch_helper(
+        {},
+        {"helper_toolchain": toolchain},
+        str(workspace),
+        verified_toolchain=verified,
+    ) == {"version": 1, "ok": True}
+
+
+def test_concurrent_helper_replacement_never_executes_unapproved_bytes(
+    tmp_path, monkeypatch
+):
+    workspace, helper_path, approved, toolchain = _race_toolchain(
+        monkeypatch, tmp_path
+    )
+    malicious = b"import sys;sys.stderr.write('race-replacement-executed')\n"
+    stop = threading.Event()
+
+    def replace_loop():
+        index = 0
+        while not stop.is_set():
+            staged = tmp_path / f"staged-{index % 2}.py"
+            staged.write_bytes(approved if index % 2 == 0 else malicious)
+            staged.chmod(0o600)
+            os.replace(staged, helper_path)
+            index += 1
+
+    thread = threading.Thread(target=replace_loop)
+    thread.start()
+    snapshots = []
+    try:
+        for _ in range(30):
+            try:
+                snapshots.append(
+                    actions._validate_toolchain(
+                        toolchain, str(workspace), "a" * 64, synthetic=True
+                    )
+                )
+            except actions.ControllerActionFailure:
+                pass
+    finally:
+        stop.set()
+        thread.join(2)
+    if not snapshots:
+        helper_path.write_bytes(approved)
+        helper_path.chmod(0o600)
+        snapshots.append(
+            actions._validate_toolchain(
+                toolchain, str(workspace), "a" * 64, synthetic=True
+            )
+        )
+    assert all(snapshot.helper_source == approved for snapshot in snapshots)
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "dedicated-controller-token"
+    )
+    assert actions._launch_helper(
+        {},
+        {"helper_toolchain": toolchain},
+        str(workspace),
+        verified_toolchain=snapshots[0],
+    ) == {"version": 1, "ok": True}
+
+
+def test_live_toolchain_rejects_same_uid_mutable_parent_chain(tmp_path, monkeypatch):
+    workspace, _helper_path, _approved, toolchain = _race_toolchain(
+        monkeypatch, tmp_path
+    )
+    with pytest.raises(actions.ControllerActionFailure):
+        actions._validate_toolchain(
+            toolchain, str(workspace), "a" * 64, synthetic=False
+        )
+
+
+def test_read_only_inode_under_owner_controlled_parent_is_not_immutable(tmp_path):
+    controlled_parent = tmp_path / "controller-owned"
+    controlled_parent.mkdir(mode=0o700)
+    candidate = controlled_parent / "tool"
+    candidate.write_bytes(b"approved-tool-bytes")
+    candidate.chmod(0o500)
+
+    with pytest.raises(actions.ControllerActionFailure):
+        actions._read_verified_file(
+            candidate,
+            require_same_uid_immutable=True,
+            executable=True,
+            grant_digest="a" * 64,
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -701,21 +987,58 @@ def test_helper_launcher_enforces_exit_and_stderr_protocol(
 ):
     script = tmp_path / "synthetic_helper.py"
     script.write_text(program, encoding="utf-8")
-    monkeypatch.setenv("BWS_ACCESS_TOKEN", "synthetic-bootstrap")
-    activation = {
-        "helper_toolchain": {
-            "interpreter_path": sys.executable,
-            "helper_path": str(script),
-        }
-    }
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "synthetic-dedicated-token"
+    )
+    activation = {"helper_toolchain": {}}
 
-    assert actions._launch_helper({}, activation, str(tmp_path)) == expected
+    assert actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    ) == expected
+
+
+def test_helper_launcher_rejects_generic_or_reused_bootstrap_token(
+    tmp_path, monkeypatch
+):
+    script = tmp_path / "synthetic_helper.py"
+    script.write_text(
+        'import sys;sys.stdout.write("{\\"version\\":1,\\"ok\\":true}")',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "generic-controller-bootstrap")
+    activation = {"helper_toolchain": {}}
+    unavailable = {
+        "version": 1,
+        "ok": False,
+        "category": "capability_source_unavailable",
+    }
+    assert actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    ) == unavailable
+
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "generic-controller-bootstrap"
+    )
+    assert actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    ) == unavailable
 
 
 def test_helper_launcher_timeout_reaps_and_returns_fixed_category(tmp_path, monkeypatch):
     script = tmp_path / "sleeping_helper.py"
     script.write_text("import time;time.sleep(60)", encoding="utf-8")
-    monkeypatch.setenv("BWS_ACCESS_TOKEN", "synthetic-bootstrap")
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "synthetic-dedicated-token"
+    )
     monkeypatch.setattr(actions, "HELPER_TIMEOUT_SECONDS", 0.05)
     activation = {
         "helper_toolchain": {
@@ -724,7 +1047,12 @@ def test_helper_launcher_timeout_reaps_and_returns_fixed_category(tmp_path, monk
         }
     }
 
-    assert actions._launch_helper({}, activation, str(tmp_path)) == {
+    assert actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    ) == {
         "version": 1,
         "ok": False,
         "category": "capability_source_unavailable",
@@ -742,7 +1070,9 @@ def test_helper_launcher_disables_core_dumps(tmp_path, monkeypatch):
         "'isolated':sys.flags.isolated,'no_site':sys.flags.no_site}))",
         encoding="utf-8",
     )
-    monkeypatch.setenv("BWS_ACCESS_TOKEN", "synthetic-bootstrap")
+    monkeypatch.setenv(
+        wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, "synthetic-dedicated-token"
+    )
     activation = {
         "helper_toolchain": {
             "interpreter_path": sys.executable,
@@ -750,7 +1080,12 @@ def test_helper_launcher_disables_core_dumps(tmp_path, monkeypatch):
         }
     }
 
-    result = actions._launch_helper({}, activation, str(tmp_path))
+    result = actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    )
     assert result["core_limit"] == [0, 0]
     assert result["cwd"] == "/"
     assert result["isolated"] == 1
@@ -771,7 +1106,7 @@ def test_helper_launcher_discards_secret_bearing_protocol_noise(
         "sys.stderr.write(secret);sys.stdout.write(secret)",
         encoding="utf-8",
     )
-    monkeypatch.setenv("BWS_ACCESS_TOKEN", marker)
+    monkeypatch.setenv(wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV, marker)
     activation = {
         "helper_toolchain": {
             "interpreter_path": sys.executable,
@@ -779,7 +1114,12 @@ def test_helper_launcher_discards_secret_bearing_protocol_noise(
         }
     }
 
-    assert actions._launch_helper({}, activation, str(tmp_path)) == {
+    assert actions._launch_helper(
+        {},
+        activation,
+        str(tmp_path),
+        verified_toolchain=_verified_script(script),
+    ) == {
         "version": 1,
         "ok": False,
         "category": "response_invalid",

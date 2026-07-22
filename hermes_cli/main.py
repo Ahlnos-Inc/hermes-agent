@@ -511,6 +511,7 @@ load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 _WORKER_CREDENTIAL_FALLBACK_STRIP_ENV = frozenset(
     {
         "BWS_ACCESS_TOKEN",
+        "HERMES_GOOGLE_ADS_CONTROLLER_BWS_TOKEN",
         "GH_TOKEN",
         "GH_ENTERPRISE_TOKEN",
         "GITHUB_TOKEN",
