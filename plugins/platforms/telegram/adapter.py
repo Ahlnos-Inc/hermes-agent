@@ -5092,6 +5092,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Register callback routing before the external send. If Telegram
+        # accepts the visible prompt but its response races the gateway bridge
+        # timeout, the buttons still retain a resolver while delivery is unknown.
+        self._clarify_state[clarify_id] = session_key
+
         try:
             text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
@@ -5170,7 +5175,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             _redact_telegram_error_text(retry_err),
                         )
                     else:
-                        self._clarify_state[clarify_id] = session_key
                         return SendResult(success=True, message_id=str(msg.message_id))
                 else:
                     logger.warning(
@@ -5191,14 +5195,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 fallback_kwargs["text"] = f"{text}\n\n{reply_hint}"
                 from tools.clarify_gateway import mark_awaiting_text
                 if not mark_awaiting_text(clarify_id):
+                    self._clarify_state.pop(clarify_id, None)
                     return SendResult(
                         success=False,
                         error="Clarify request expired before fallback delivery",
                     )
                 msg = await self._send_message_with_thread_fallback(**fallback_kwargs)
-            self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._clarify_state.pop(clarify_id, None)
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 

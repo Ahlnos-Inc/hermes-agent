@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import concurrent.futures
 import dataclasses
+import enum
 import functools
 import inspect
 import json
@@ -72,6 +73,18 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+
+class _ClarifyDeliveryOutcome(enum.Enum):
+    SUCCESSFUL = "successful"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+_CLARIFY_DEFINITIVELY_ABSENT = frozenset(
+    {_ClarifyDeliveryOutcome.FAILED, _ClarifyDeliveryOutcome.CANCELLED}
+)
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -18030,7 +18043,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        send_ok = False
+        outcome_lock = threading.Lock()
+        delivery_outcome = _ClarifyDeliveryOutcome.CANCELLED
+
+        def _record_outcome(outcome: _ClarifyDeliveryOutcome) -> None:
+            nonlocal delivery_outcome
+            with outcome_lock:
+                delivery_outcome = outcome
+
+        def _current_outcome() -> _ClarifyDeliveryOutcome:
+            with outcome_lock:
+                return delivery_outcome
+
+        def _result_outcome(result) -> _ClarifyDeliveryOutcome:
+            if bool(getattr(result, "success", False)):
+                return _ClarifyDeliveryOutcome.SUCCESSFUL
+            return _ClarifyDeliveryOutcome.FAILED
+
         fut = safe_schedule_threadsafe(
             adapter.send_clarify(
                 chat_id=chat_id,
@@ -18045,25 +18074,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             log_message="Clarify send failed to schedule",
         )
         if fut is not None:
+            _record_outcome(_ClarifyDeliveryOutcome.UNKNOWN)
             try:
                 result = fut.result(timeout=CLARIFY_SEND_WAIT_TIMEOUT_SECONDS)
-                send_ok = bool(getattr(result, "success", False))
+                _record_outcome(_result_outcome(result))
             except concurrent.futures.TimeoutError:
-                # run_coroutine_threadsafe futures keep running after result()
-                # times out. Cancel before clearing the pending entry so a late
-                # adapter send cannot publish an orphaned prompt.
-                fut.cancel()
-                logger.warning("Clarify send timed out and was cancelled")
+                # The request may already have crossed its external side-effect
+                # boundary. Keep both the coroutine and resolver alive until a
+                # definitive SendResult arrives instead of orphaning an accepted
+                # prompt with best-effort cancellation.
+                def _capture_late_outcome(done_fut) -> None:
+                    try:
+                        late_outcome = _result_outcome(done_fut.result())
+                    except Exception:
+                        # Cancellation/exception cannot prove that a remote send
+                        # was absent after the request crossed the API boundary.
+                        late_outcome = _ClarifyDeliveryOutcome.UNKNOWN
+                    _record_outcome(late_outcome)
+                    if late_outcome in _CLARIFY_DEFINITIVELY_ABSENT:
+                        clarify_mod.clear_session(session_key)
+
+                fut.add_done_callback(_capture_late_outcome)
+                logger.warning(
+                    "Clarify send timed out with unknown delivery outcome; "
+                    "retaining the pending resolver"
+                )
+            except concurrent.futures.CancelledError:
+                # An accepted coroutine can be cancelled after its remote side
+                # effect, so its delivery outcome remains unknown.
+                _record_outcome(_ClarifyDeliveryOutcome.UNKNOWN)
+                logger.warning("Clarify send was cancelled with unknown delivery outcome")
             except Exception as exc:
+                # A raised transport exception likewise cannot retract a request
+                # that may already have reached the platform. Adapters return a
+                # failed SendResult when they can prove no prompt was delivered.
+                _record_outcome(_ClarifyDeliveryOutcome.UNKNOWN)
                 logger.warning("Clarify send failed: %s", exc)
 
-        if not send_ok:
+        if _current_outcome() in _CLARIFY_DEFINITIVELY_ABSENT:
             clarify_mod.clear_session(session_key)
             return "[clarify prompt could not be delivered]"
 
         timeout = clarify_mod.get_clarify_timeout()
         response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
         if response is None or response == "":
+            if _current_outcome() in _CLARIFY_DEFINITIVELY_ABSENT:
+                return "[clarify prompt could not be delivered]"
             return f"[user did not respond within {int(timeout / 60)}m]"
         return response
 
