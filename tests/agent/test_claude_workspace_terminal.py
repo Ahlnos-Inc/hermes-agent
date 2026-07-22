@@ -413,6 +413,29 @@ def test_workspace_terminal_preserves_process_controls(tmp_path):
     assert transformed["workdir"] == str(workspace.resolve())
 
 
+def test_workspace_terminal_exact_environment_disables_interactive_git(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    transformed = build_workspace_terminal_args(
+        {"command": "git status"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={
+            "PATH": "/usr/bin:/bin",
+            "GIT_TERMINAL_PROMPT": "1",
+            "GCM_INTERACTIVE": "always",
+        },
+        platform_name="Darwin",
+    )
+
+    argv = shlex.split(transformed["command"])
+    sandbox_index = argv.index("/usr/bin/sandbox-exec")
+    exact_env = dict(entry.split("=", 1) for entry in argv[2:sandbox_index])
+
+    assert exact_env["GIT_TERMINAL_PROMPT"] == "0"
+    assert exact_env["GCM_INTERACTIVE"] == "never"
+
+
 @pytest.mark.parametrize(
     "command",
     [

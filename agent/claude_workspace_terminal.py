@@ -894,6 +894,8 @@ def build_workspace_terminal_args(
     terminal_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
     terminal_tmp.chmod(0o700)
     terminal_env["TMPDIR"] = str(terminal_tmp)
+    terminal_env["GIT_TERMINAL_PROMPT"] = "0"
+    terminal_env["GCM_INTERACTIVE"] = "never"
     terminal_env["GIT_CONFIG_NOSYSTEM"] = "1"
     terminal_env["GIT_OPTIONAL_LOCKS"] = "0"
     terminal_env["GIT_CONFIG_COUNT"] = "2"

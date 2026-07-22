@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -513,3 +514,79 @@ def test_private_handoff_is_consumed_and_removed_from_os_environ(monkeypatch):
     assert consumed.capabilities == ("github_write",)
     assert SENTINEL not in repr(consumed)
     assert wc.get_consumed_worker_credential("github_write") == SENTINEL
+
+
+def _bootstrap_terminal_worker(
+    root: Path, monkeypatch, *, profile: str, handoff: str | None = None
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"task-{profile}")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "terminal-test")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(root).digest)
+    if handoff is not None:
+        monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, handoff)
+
+
+def test_granted_terminal_helper_beats_rejecting_askpass_without_prompt(
+    tmp_path, monkeypatch, caplog
+):
+    _github_manifest(tmp_path)
+    _bootstrap_terminal_worker(
+        tmp_path, monkeypatch, profile="releaser", handoff=SENTINEL
+    )
+    terminal_env = {"PATH": os.environ["PATH"]}
+
+    with caplog.at_level(logging.INFO, logger=wc._log.name):
+        assert wc.project_worker_terminal_environment(terminal_env)
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            env=terminal_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert terminal_env["GIT_TERMINAL_PROMPT"] == "0"
+    assert terminal_env["GCM_INTERACTIVE"] == "never"
+    askpass = Path(terminal_env["GIT_ASKPASS"])
+    assert askpass.is_file()
+    assert SENTINEL not in askpass.read_text(encoding="utf-8")
+    askpass_command = (
+        ["cmd.exe", "/d", "/c", str(askpass), "credential prompt"]
+        if os.name == "nt"
+        else [str(askpass), "credential prompt"]
+    )
+    askpass_result = subprocess.run(
+        askpass_command, capture_output=True, text=True, check=False
+    )
+    assert askpass_result.returncode != 0
+    assert not askpass_result.stdout
+    assert result.returncode == 0, result.stderr
+    assert f"password={SENTINEL}" in result.stdout
+    assert SENTINEL not in caplog.text
+
+
+def test_denied_terminal_fails_credential_fill_without_prompt(tmp_path, monkeypatch):
+    _github_manifest(tmp_path)
+    _bootstrap_terminal_worker(tmp_path, monkeypatch, profile="verifier")
+    terminal_env = {"PATH": os.environ["PATH"]}
+
+    assert wc.project_worker_terminal_environment(terminal_env)
+    result = subprocess.run(
+        ["git", "credential", "fill"],
+        input="protocol=https\nhost=github.com\n\n",
+        env=terminal_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert terminal_env["GIT_TERMINAL_PROMPT"] == "0"
+    assert terminal_env["GCM_INTERACTIVE"] == "never"
+    assert Path(terminal_env["GIT_ASKPASS"]).is_file()
+    assert result.returncode != 0
+    assert "password=" not in result.stdout
+    assert SENTINEL not in result.stdout
+    assert SENTINEL not in result.stderr

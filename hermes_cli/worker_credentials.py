@@ -496,8 +496,8 @@ def has_trusted_worker_action(
     return get_trusted_worker_credential(capability, environ=environ) is not None
 
 
-def _terminal_artifacts() -> tuple[Path, Path, Path]:
-    """Create (run_dir, gh_config_dir, global_git_config) atomically enough."""
+def _terminal_artifacts() -> tuple[Path, Path, Path, Path]:
+    """Create isolated terminal artifacts, including a rejecting askpass helper."""
     global _TERMINAL_ARTIFACT_DIR
 
     with _WORKER_CREDENTIAL_LOCK:
@@ -505,8 +505,14 @@ def _terminal_artifacts() -> tuple[Path, Path, Path]:
         if existing is not None:
             gh_dir = existing / "gh-config"
             git_config = existing / "gitconfig"
-            if existing.is_dir() and gh_dir.is_dir() and git_config.is_file():
-                return existing, gh_dir, git_config
+            askpass = existing / ("git-askpass.cmd" if os.name == "nt" else "git-askpass")
+            if (
+                existing.is_dir()
+                and gh_dir.is_dir()
+                and git_config.is_file()
+                and askpass.is_file()
+            ):
+                return existing, gh_dir, git_config, askpass
 
         runtime_root = worker_credential_runtime_root()
         runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -520,8 +526,14 @@ def _terminal_artifacts() -> tuple[Path, Path, Path]:
         git_config = run_dir / "gitconfig"
         git_config.write_text("[credential]\n\thelper =\n", encoding="utf-8")
         git_config.chmod(0o600)
+        askpass = run_dir / ("git-askpass.cmd" if os.name == "nt" else "git-askpass")
+        if os.name == "nt":
+            askpass.write_text("@exit /b 1\r\n", encoding="utf-8")
+        else:
+            askpass.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            askpass.chmod(0o700)
         _TERMINAL_ARTIFACT_DIR = run_dir
-        return run_dir, gh_dir, git_config
+        return run_dir, gh_dir, git_config, askpass
 
 
 def project_worker_terminal_environment(
@@ -542,7 +554,7 @@ def project_worker_terminal_environment(
 
     token = get_trusted_worker_credential("github_write", environ=os.environ)
     bws_bootstrap = get_trusted_worker_credential("bws_bootstrap", environ=os.environ)
-    _run_dir, gh_config_dir, git_config = _terminal_artifacts()
+    _run_dir, gh_config_dir, git_config, askpass = _terminal_artifacts()
     # Remove ambient command-scope config knobs before installing the exact
     # two entries below.  This is configuration isolation, not a credential
     # source, so it belongs after the general environment sanitization.
@@ -556,6 +568,11 @@ def project_worker_terminal_environment(
             environ.pop(key, None)
     environ.pop("GH_TOKEN", None)
     environ["GH_CONFIG_DIR"] = str(gh_config_dir)
+    # The platform-specific generated helper rejects any fallback credential
+    # prompt. Git's command-scoped github_write helper is exercised first.
+    environ["GIT_ASKPASS"] = str(askpass)
+    environ["GIT_TERMINAL_PROMPT"] = "0"
+    environ["GCM_INTERACTIVE"] = "never"
     environ["GIT_CONFIG_NOSYSTEM"] = "1"
     environ["GIT_CONFIG_GLOBAL"] = str(git_config)
     environ["GIT_CONFIG_COUNT"] = "2" if token is not None else "1"
