@@ -5429,6 +5429,9 @@ def compile_workflow_graph(
         model_provider_override = (
             str(raw.get("model_provider_override") or "").strip() or None
         )
+        model_provider_override, model_override = _sanitize_denied_routing_override(
+            model_provider_override, model_override, context="compile_workflow"
+        )
         model_reasoning_effort = (
             str(raw.get("model_reasoning_effort") or "").strip().lower() or None
         )
@@ -6308,6 +6311,9 @@ def _prepare_task_create(
     model_provider_override = (
         str(model_provider_override).strip() or None
         if model_provider_override is not None else None
+    )
+    model_provider_override, model_override = _sanitize_denied_routing_override(
+        model_provider_override, model_override, context="create_task"
     )
     if model_reasoning_effort is not None:
         model_reasoning_effort = str(model_reasoning_effort).strip().lower() or None
@@ -15167,6 +15173,65 @@ def _continuation_provider_policy(config: dict[str, Any]) -> dict[str, Any]:
             "deny": raw.get("deny", raw.get("denied_providers", [])),
         }
     )
+
+
+def _sanitize_denied_routing_override(
+    provider_override: Optional[str],
+    model_override: Optional[str],
+    *,
+    context: str,
+) -> "tuple[Optional[str], Optional[str]]":
+    """Drop a routing override the continuation provider_policy denies.
+
+    A card minted with a provider the policy forbids is deterministically
+    unspawnable: ``assert_provider_allowed()`` fails at ``pre_spawn_primary``,
+    the failure is charged to the task's budget, and the card human-blocks
+    hours later having done no work. Catch it at CREATION instead.
+
+    Fail-safe, not fail-closed: the override is dropped (provider AND the
+    coupled model together) rather than raised, so the autonomous loop keeps
+    the work item and routes it through the assignee profile's default
+    (allowed) provider. Raising here would risk the orchestrator discarding
+    the create call and losing the task entirely. The requested route is
+    logged so the drop is never silent. Deterministic, so idempotent
+    decompose retries converge on the same sanitized card.
+
+    Failure mode is fail-SAFE, not fail-open (Sol review): the override is
+    KEPT only when ``provider_allowed`` positively confirms it. If the policy
+    cannot be evaluated (import/read error), the override is DROPPED, not
+    preserved -- persisting an unverified override would let it survive
+    creation and then hard-block at ``pre_spawn_primary`` on a later
+    successful policy read, recreating the very block this guard prevents.
+    A card with no override always routes via the assignee default, which is
+    an allowed provider by construction. (Residual: an empty policy from a
+    disabled/unconfigured continuation legitimately keeps the override -- the
+    pre_spawn guard uses the same empty policy and agrees; the authority
+    remains ``assert_provider_allowed`` at spawn.)
+    """
+    if not provider_override:
+        return provider_override, model_override
+    try:
+        from hermes_cli.kanban_continuation import provider_allowed
+
+        allowed = provider_allowed(
+            provider_override,
+            _continuation_provider_policy(_continuation_config()),
+        )
+    except Exception:
+        # Cannot confirm the override is allowed -> treat as not-allowed and
+        # drop it (fail-safe). See docstring.
+        allowed = False
+    if allowed:
+        return provider_override, model_override
+    _log.warning(
+        "kanban %s: dropping continuation-policy-denied or unverifiable "
+        "routing override (provider=%r model=%r) -- routing via assignee "
+        "default provider",
+        context,
+        provider_override,
+        model_override,
+    )
+    return None, None
 
 
 def _continuation_references(

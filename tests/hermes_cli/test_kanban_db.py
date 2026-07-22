@@ -307,6 +307,72 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert "Branch:   wt/t6-wire" in context
 
 
+def test_create_task_drops_provider_policy_denied_routing_override(
+    kanban_home, monkeypatch
+):
+    """A denied provider override is dropped at creation, not left to block later.
+
+    A card minted with a provider the continuation policy denies is
+    deterministically unspawnable (assert_provider_allowed fails at
+    pre_spawn_primary, the failure budget is charged, the card human-blocks).
+    Sanitize it at creation: drop the denied provider AND its coupled model,
+    so the card routes through the assignee default. See
+    _sanitize_denied_routing_override.
+    """
+    monkeypatch.setattr(
+        kb, "_continuation_config", lambda: {"provider_policy": {"deny": ["nous"]}}
+    )
+    with kb.connect() as conn:
+        denied = kb.create_task(
+            conn,
+            title="verify something",
+            assignee="verifier",
+            model_provider_override="nous",
+            model_override="deepseek/deepseek-v4-flash:free",
+        )
+        allowed = kb.create_task(
+            conn,
+            title="verify something else",
+            assignee="verifier",
+            model_provider_override="anthropic",
+            model_override="claude-opus-4-8",
+        )
+        denied_task = kb.get_task(conn, denied)
+        allowed_task = kb.get_task(conn, allowed)
+
+    # Denied route: both fields cleared so the assignee default (allowed) is used.
+    assert denied_task.model_provider_override is None
+    assert denied_task.model_override is None
+    # Allowed route: preserved untouched.
+    assert allowed_task.model_provider_override == "anthropic"
+    assert allowed_task.model_override == "claude-opus-4-8"
+
+
+def test_create_task_drops_override_when_policy_unreadable(kanban_home, monkeypatch):
+    """Fail-safe: an unverifiable policy drops the override, never keeps it.
+
+    Keeping an override we could not confirm allowed would let it survive
+    creation and then hard-block at pre_spawn_primary on a later successful
+    policy read -- the exact block this guard exists to prevent (Sol review).
+    """
+    def _boom():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(kb, "_continuation_config", _boom)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="verify under broken policy",
+            assignee="verifier",
+            model_provider_override="nous",
+            model_override="deepseek/deepseek-v4-flash:free",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task.model_provider_override is None
+    assert task.model_override is None
+
+
 def test_worktree_create_rejects_anchor_outside_repo(kanban_home, tmp_path):
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
