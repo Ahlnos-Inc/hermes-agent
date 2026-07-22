@@ -4799,6 +4799,58 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
+@pytest.mark.parametrize("initial_status", ["ready", "review"])
+def test_dispatch_spawn_claim_race_preserves_reclaimed_run(
+    kanban_home, all_assignees_spawnable, initial_status,
+):
+    """A reclaim between claim and spawn must not become a spawn failure."""
+    contracts = []
+    aborted = []
+    released = []
+
+    def fake_spawn(task, workspace, board=None):
+        with kb.connect() as race_conn:
+            assert kb.reclaim_task(
+                race_conn, task.id, reason="test claim race",
+            )
+        contracts.append(kb._spawn_contract(task, board=board))
+        return kb.SpawnReceipt(
+            pid=42_000,
+            release=lambda: released.append(task.id),
+            abort=lambda: aborted.append(task.id),
+            process_started_at=1234.5,
+            process_group_id=42_000,
+            session_id=42_000,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="claim race", assignee="alice")
+        if initial_status == "review":
+            _set_task_status(conn, task_id, "review")
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert len(contracts) == 1
+    assert contracts[0][0] == "alice"
+    assert contracts[0][1]["model"] is None
+    assert aborted == [task_id]
+    assert released == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.worker_pid is None
+    assert task.consecutive_failures == 0
+    assert result.claim_race == [task_id]
+    assert result.spawn_errors == []
+    assert result.auto_blocked == []
+    assert len(runs) == 1
+    assert runs[0].outcome == "reclaimed"
+    assert runs[0].outcome not in {"spawn_failed", "gave_up"}
+
+
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
