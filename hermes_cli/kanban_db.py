@@ -4085,9 +4085,16 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
         file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
+        # Never plain-open the live DB here. On POSIX, close() cancels EVERY
+        # fcntl lock this process holds on that inode -- including the locks
+        # other SQLite connections in this process are actively relying on.
+        # This check runs at the post-commit boundary of every write_txn, so a
+        # plain open/close here revoked the gateway's kanban locks on every
+        # write, letting concurrent writers/checkpointers proceed without
+        # exclusion (board corruption + SQLITE_IOERR on a sibling connect()).
+        # Same hazard as the fast-path header guard fixed in 97a17b6c3; reuse
+        # the cached never-closed descriptor instead.
+        header_bytes = _read_db_header(Path(path), 32)[28:32]
         if len(header_bytes) < 4:
             return  # can't read header; skip
         header_page_count = int.from_bytes(header_bytes, "big")

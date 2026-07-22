@@ -5850,6 +5850,42 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
+def test_write_txn_post_commit_check_never_plain_opens_the_db(tmp_path):
+    """The post-commit invariant check must not open/close the live DB file.
+
+    On POSIX, close() cancels every fcntl lock the process holds on that inode,
+    including locks other SQLite connections in this process depend on. Because
+    this check runs after every write_txn commit, a plain open here revoked the
+    gateway's kanban locks on every write -- the source of the board-corruption
+    and SQLITE_IOERR-on-connect() class. Header reads must go through the
+    cached never-closed descriptor instead.
+    """
+    import builtins
+    from hermes_cli.kanban_db import connect, write_txn
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
+    db_real = os.path.realpath(str(db))
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def recording_open(file, *args, **kwargs):
+        try:
+            if os.path.realpath(str(file)) == db_real:
+                opened.append(str(file))
+        except (TypeError, ValueError):
+            pass
+        return real_open(file, *args, **kwargs)
+
+    with unittest.mock.patch.object(builtins, "open", recording_open):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_noopen01', 'no plain open', 'tester', 'todo', 0, 1234567890)"
+            )
+    assert opened == [], f"post-commit check plain-opened the live DB: {opened}"
+    conn.close()
+
+
 def test_connect_sets_wal_autocheckpoint_100(tmp_path):
     """connect() sets wal_autocheckpoint to 100."""
     from hermes_cli.kanban_db import connect
