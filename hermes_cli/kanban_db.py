@@ -132,6 +132,16 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # select it as a shortcut around the dependency/rework protocol.
 PERSISTED_BLOCK_KINDS = VALID_BLOCK_KINDS | {"dependency_pending"}
 DEFAULT_DEPENDENCY_MATERIALIZATION_SLA_SECONDS = 900
+CAPABILITY_INCIDENT_STATES = {"open", "resolved", "superseded", "cancelled"}
+CAPABILITY_INCIDENT_CLASSES = {
+    "missing_secret",
+    "source_unavailable",
+    "not_authorized",
+    "provider_authorization_failed",
+    "action_budget_exhausted",
+    "provider_transient_exhausted",
+}
+CAPABILITY_INCIDENT_MAX_OBSERVERS = 2_147_483_647
 CONTINUATION_BLOCKER_SEVERITIES = {"P0", "P1", "P2", "P3"}
 CONTINUATION_CRITICAL_SEVERITIES = {"P0", "P1"}
 CONTINUATION_RESOURCE_KINDS = {"tmux_session", "worktree", "child_process"}
@@ -1569,6 +1579,38 @@ class Event:
 
 
 @dataclass(frozen=True)
+class CapabilityIncident:
+    id: int
+    task_id: str
+    run_id: Optional[int]
+    capability_name: str
+    incident_class: str
+    grant_digest: str
+    fingerprint: str
+    episode: int
+    state: str
+    block_event_id: Optional[int]
+    evidence_comment_id: Optional[int]
+    observer_count: int
+    first_seen_at: int
+    last_seen_at: int
+    first_run_id: Optional[int]
+    last_run_id: Optional[int]
+    miss_count: int
+    first_miss_at: int
+    last_miss_at: int
+    resolved_at: Optional[int]
+    closed_at: Optional[int]
+    closed_by: Optional[str]
+    close_evidence: Optional[str]
+    row_version: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "CapabilityIncident":
+        return cls(**{name: row[name] for name in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True)
 class ContinuationManifest:
     run_id: int
     task_id: str
@@ -2166,6 +2208,113 @@ CREATE TABLE IF NOT EXISTS continuation_owned_resources (
     cleanup_error   TEXT,
     UNIQUE(run_id, kind, identity_digest)
 );
+
+-- Controller-owned capability incidents. A partial unique index enforces one
+-- open episode per stable authorization fingerprint across processes.
+CREATE TABLE IF NOT EXISTS capability_incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    capability_name TEXT NOT NULL,
+    incident_class TEXT NOT NULL,
+    grant_digest TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    episode INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open','resolved','superseded','cancelled')),
+    block_event_id INTEGER REFERENCES task_events(id) ON DELETE SET NULL,
+    evidence_comment_id INTEGER REFERENCES task_comments(id) ON DELETE SET NULL,
+    observer_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    first_run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    last_run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    miss_count INTEGER NOT NULL DEFAULT 1,
+    first_miss_at INTEGER NOT NULL,
+    last_miss_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    closed_at INTEGER,
+    closed_by TEXT,
+    close_evidence TEXT,
+    row_version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(fingerprint, episode)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_capability_incidents_one_open
+    ON capability_incidents(fingerprint) WHERE state = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_capability_incidents_one_open_task
+    ON capability_incidents(task_id) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS idx_capability_incidents_task_state
+    ON capability_incidents(task_id, state, id);
+
+-- Durable controller-action budget ledger and non-secret receipts.
+CREATE TABLE IF NOT EXISTS capability_action_uses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    capability_name TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    activation_digest TEXT NOT NULL,
+    contract_digest TEXT NOT NULL,
+    task_principal_digest TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    api_major TEXT NOT NULL,
+    response_schema_digest TEXT NOT NULL,
+    implementation_digest TEXT NOT NULL,
+    runtime_digest TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    outcome_category TEXT NOT NULL,
+    reserved_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    row_version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(binding_digest, attempt_number)
+);
+CREATE INDEX IF NOT EXISTS idx_capability_action_uses_binding
+    ON capability_action_uses(binding_digest, attempt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_capability_action_uses_one_reserved_binding
+    ON capability_action_uses(binding_digest) WHERE outcome_category = 'reserved';
+CREATE INDEX IF NOT EXISTS idx_capability_action_uses_task
+    ON capability_action_uses(task_id, capability_name, id);
+
+CREATE TABLE IF NOT EXISTS capability_action_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    capability_name TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    activation_digest TEXT NOT NULL,
+    contract_digest TEXT NOT NULL,
+    task_principal_digest TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    api_major TEXT NOT NULL,
+    response_schema_digest TEXT NOT NULL,
+    implementation_digest TEXT NOT NULL,
+    runtime_digest TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    provider_request_id TEXT,
+    checked_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    action_use_id INTEGER NOT NULL UNIQUE REFERENCES capability_action_uses(id),
+    row_version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(binding_digest, receipt_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_capability_action_receipts_reuse
+    ON capability_action_receipts(binding_digest, expires_at, checked_at);
+
+CREATE TABLE IF NOT EXISTS capability_receipt_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    capability_name TEXT NOT NULL,
+    receipt_id INTEGER NOT NULL REFERENCES capability_action_receipts(id),
+    receipt_digest TEXT NOT NULL,
+    delivered_at INTEGER NOT NULL,
+    reused INTEGER NOT NULL DEFAULT 0 CHECK(reused IN (0,1)),
+    UNIQUE(run_id, capability_name)
+);
+CREATE INDEX IF NOT EXISTS idx_capability_receipt_deliveries_task
+    ON capability_receipt_deliveries(task_id, run_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
@@ -9600,6 +9749,413 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _capability_incident_fingerprint(
+    task_id: str,
+    capability_name: str,
+    incident_class: str,
+    grant_digest: str,
+) -> str:
+    payload = json.dumps(
+        [
+            "capability-incident/v1",
+            task_id,
+            incident_class,
+            capability_name,
+            grant_digest,
+        ],
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _open_capability_incident_row(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM capability_incidents WHERE task_id = ? AND state = 'open' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def get_capability_incident(
+    conn: sqlite3.Connection, incident_id: int,
+) -> Optional[CapabilityIncident]:
+    row = conn.execute(
+        "SELECT * FROM capability_incidents WHERE id = ?", (int(incident_id),)
+    ).fetchone()
+    return CapabilityIncident.from_row(row) if row is not None else None
+
+
+def list_capability_incidents(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    state: Optional[str] = None,
+) -> list[CapabilityIncident]:
+    if state is not None and state not in CAPABILITY_INCIDENT_STATES:
+        raise ValueError("unsupported capability incident state")
+    if state is None:
+        rows = conn.execute(
+            "SELECT * FROM capability_incidents WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM capability_incidents WHERE task_id = ? AND state = ? "
+            "ORDER BY id",
+            (task_id, state),
+        ).fetchall()
+    return [CapabilityIncident.from_row(row) for row in rows]
+
+
+def open_capability_incident(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    capability_name: str,
+    incident_class: str,
+    grant_digest: str,
+    fault_injector=None,
+) -> CapabilityIncident:
+    """Atomically open/dedupe an incident, block the task, and close its run.
+
+    Repeated observations of an already-open fingerprint only update the
+    observation counter and close a newly claimed observer run. They never add
+    another evidence comment or terminal block event.
+    """
+    if incident_class not in CAPABILITY_INCIDENT_CLASSES:
+        raise ValueError("unsupported capability incident class")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,127}", capability_name or ""):
+        raise ValueError("invalid capability name")
+    if not re.fullmatch(r"[0-9a-f]{64}", grant_digest or ""):
+        raise ValueError("invalid capability grant digest")
+    fingerprint = _capability_incident_fingerprint(
+        task_id, capability_name, incident_class, grant_digest
+    )
+    now = int(time.time())
+
+    def fault(point: str) -> None:
+        if fault_injector is not None:
+            fault_injector(point)
+
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None:
+            raise ValueError(f"unknown task {task_id}")
+        current_run_id = (
+            int(task_row["current_run_id"])
+            if task_row["current_run_id"] is not None
+            else None
+        )
+        if run_id is not None and current_run_id not in {None, int(run_id)}:
+            raise ValueError("capability incident run is no longer current")
+        existing = conn.execute(
+            "SELECT * FROM capability_incidents WHERE task_id = ? AND state = 'open'",
+            (task_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise ValueError(
+                    "task already has a different open capability incident; "
+                    "controller supersession is required"
+                )
+            conn.execute(
+                "UPDATE capability_incidents SET observer_count = MIN(observer_count + 1, ?), "
+                "miss_count = MIN(miss_count + 1, ?), last_seen_at = ?, "
+                "last_miss_at = ?, last_run_id = COALESCE(?, last_run_id), "
+                "row_version = row_version + 1 WHERE id = ?",
+                (
+                    CAPABILITY_INCIDENT_MAX_OBSERVERS,
+                    CAPABILITY_INCIDENT_MAX_OBSERVERS,
+                    now,
+                    now,
+                    current_run_id if current_run_id is not None else run_id,
+                    int(existing["id"]),
+                ),
+            )
+            if current_run_id is not None:
+                _end_run(
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    status="blocked",
+                    summary="Existing controller capability incident observed before worker start.",
+                    metadata={"capability_incident_id": int(existing["id"])},
+                )
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+            fault("after_observer")
+            refreshed = conn.execute(
+                "SELECT * FROM capability_incidents WHERE id = ?",
+                (int(existing["id"]),),
+            ).fetchone()
+            assert refreshed is not None
+            return CapabilityIncident.from_row(refreshed)
+
+        episode_row = conn.execute(
+            "SELECT COALESCE(MAX(episode), 0) AS n FROM capability_incidents "
+            "WHERE fingerprint = ?",
+            (fingerprint,),
+        ).fetchone()
+        episode = int(episode_row["n"]) + 1
+        cur = conn.execute(
+            """INSERT INTO capability_incidents
+               (task_id, run_id, capability_name, incident_class, grant_digest,
+                fingerprint, episode, state, observer_count, first_seen_at,
+                last_seen_at, first_run_id, last_run_id, miss_count,
+                first_miss_at, last_miss_at, row_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 1, ?, ?, ?, ?, 1, ?, ?, 1)""",
+            (
+                task_id,
+                run_id,
+                capability_name,
+                incident_class,
+                grant_digest,
+                fingerprint,
+                episode,
+                now,
+                now,
+                run_id,
+                run_id,
+                now,
+                now,
+            ),
+        )
+        assert cur.lastrowid is not None
+        incident_id = int(cur.lastrowid)
+        fault("after_incident")
+        body = (
+            f"CAPABILITY INCIDENT OPEN: {capability_name} / {incident_class}; "
+            f"incident={incident_id}; episode={episode}; grant={grant_digest}. "
+            "Controller validation is required before retry."
+        )
+        comment_cur = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'controller', ?, ?)",
+            (task_id, body, now),
+        )
+        assert comment_cur.lastrowid is not None
+        comment_id = int(comment_cur.lastrowid)
+        fault("after_comment")
+        event_id = _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "kind": "capability",
+                "capability_incident_id": incident_id,
+                "capability_name": capability_name,
+                "incident_class": incident_class,
+                "fingerprint": fingerprint,
+                "episode": episode,
+                "grant_digest": grant_digest,
+            },
+            run_id=run_id,
+        )
+        fault("after_event")
+        conn.execute(
+            "UPDATE capability_incidents SET block_event_id = ?, "
+            "evidence_comment_id = ? WHERE id = ?",
+            (event_id, comment_id, incident_id),
+        )
+        if current_run_id is not None:
+            _end_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                status="blocked",
+                summary=(
+                    f"Controller capability incident {incident_id}: "
+                    f"{capability_name}/{incident_class}"
+                ),
+                metadata={
+                    "capability_incident_id": incident_id,
+                    "capability_name": capability_name,
+                    "incident_class": incident_class,
+                    "grant_digest": grant_digest,
+                },
+            )
+        fault("after_run")
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL, worker_pgid = NULL, worker_sid = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        fault("after_task")
+        row = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        assert row is not None
+        return CapabilityIncident.from_row(row)
+
+
+def _release_task_after_capability_close(
+    conn: sqlite3.Connection, task_id: str,
+) -> str:
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done','archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    target = "todo" if undone else "ready"
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, block_kind = NULL, block_recurrences = 0, "
+        "claim_lock = NULL, claim_expires = NULL WHERE id = ? "
+        "AND status = 'blocked' AND current_run_id IS NULL",
+        (target, task_id),
+    )
+    if cur.rowcount != 1:
+        raise ValueError("capability incident task is not safely releasable")
+    return target
+
+
+def resolve_capability_incident(
+    conn: sqlite3.Connection,
+    incident_id: int,
+    *,
+    actor: str,
+    evidence: str,
+    validated_capability_name: str,
+    validated_grant_digest: str,
+) -> CapabilityIncident:
+    """Resolve only after fresh controller validation of the exact grant."""
+    if not actor.strip() or not evidence.strip():
+        raise ValueError("actor and validation evidence are required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ? AND state = 'open'",
+            (int(incident_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("open capability incident not found")
+        if (
+            validated_capability_name != row["capability_name"]
+            or validated_grant_digest != row["grant_digest"]
+        ):
+            raise ValueError("fresh controller validation does not match incident grant")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE capability_incidents SET state = 'resolved', resolved_at = ?, closed_at = ?, "
+            "closed_by = ?, close_evidence = ?, row_version = row_version + 1 "
+            "WHERE id = ? AND state = 'open'",
+            (now, now, actor.strip(), evidence.strip(), int(incident_id)),
+        )
+        target = _release_task_after_capability_close(conn, row["task_id"])
+        _append_event(
+            conn,
+            row["task_id"],
+            "capability_incident_resolved",
+            {
+                "capability_incident_id": int(incident_id),
+                "capability_name": row["capability_name"],
+                "grant_digest": row["grant_digest"],
+                "released_to": target,
+                "actor": actor.strip(),
+            },
+        )
+        refreshed = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ?", (int(incident_id),)
+        ).fetchone()
+        assert refreshed is not None
+        return CapabilityIncident.from_row(refreshed)
+
+
+def supersede_capability_incident(
+    conn: sqlite3.Connection,
+    incident_id: int,
+    *,
+    actor: str,
+    evidence: str,
+    new_grant_digest: str,
+) -> CapabilityIncident:
+    """Close an old authorization episode when an approved digest changes."""
+    if not actor.strip() or not evidence.strip():
+        raise ValueError("actor and supersession evidence are required")
+    if not re.fullmatch(r"[0-9a-f]{64}", new_grant_digest or ""):
+        raise ValueError("invalid replacement grant digest")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ? AND state = 'open'",
+            (int(incident_id),),
+        ).fetchone()
+        if row is None or row["grant_digest"] == new_grant_digest:
+            raise ValueError("open incident requires a different replacement grant")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE capability_incidents SET state = 'superseded', resolved_at = ?, closed_at = ?, "
+            "closed_by = ?, close_evidence = ?, row_version = row_version + 1 "
+            "WHERE id = ? AND state = 'open'",
+            (now, now, actor.strip(), evidence.strip(), int(incident_id)),
+        )
+        target = _release_task_after_capability_close(conn, row["task_id"])
+        _append_event(
+            conn,
+            row["task_id"],
+            "capability_incident_superseded",
+            {
+                "capability_incident_id": int(incident_id),
+                "old_grant_digest": row["grant_digest"],
+                "new_grant_digest": new_grant_digest,
+                "released_to": target,
+            },
+        )
+        refreshed = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ?", (int(incident_id),)
+        ).fetchone()
+        assert refreshed is not None
+        return CapabilityIncident.from_row(refreshed)
+
+
+def cancel_capability_incident(
+    conn: sqlite3.Connection,
+    incident_id: int,
+    *,
+    actor: str,
+    evidence: str,
+) -> CapabilityIncident:
+    """Audit abandonment without restarting the protected task."""
+    if not actor.strip() or not evidence.strip():
+        raise ValueError("actor and cancellation evidence are required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ? AND state = 'open'",
+            (int(incident_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("open capability incident not found")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE capability_incidents SET state = 'cancelled', resolved_at = ?, closed_at = ?, "
+            "closed_by = ?, close_evidence = ?, row_version = row_version + 1 "
+            "WHERE id = ? AND state = 'open'",
+            (now, now, actor.strip(), evidence.strip(), int(incident_id)),
+        )
+        _append_event(
+            conn,
+            row["task_id"],
+            "capability_incident_cancelled",
+            {"capability_incident_id": int(incident_id), "actor": actor.strip()},
+        )
+        refreshed = conn.execute(
+            "SELECT * FROM capability_incidents WHERE id = ?", (int(incident_id),)
+        ).fetchone()
+        assert refreshed is not None
+        return CapabilityIncident.from_row(refreshed)
+
+
 def _delivery_policy_snapshot(
     gate: Optional[ArchitectureGate],
 ) -> dict[str, Any]:
@@ -10044,6 +10600,8 @@ def recompute_ready(
                 continue
             if row["policy_quarantined"]:
                 continue
+            if _open_capability_incident_row(conn, task_id) is not None:
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -10138,6 +10696,19 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_blocked",
                 {"reason": "dependency_materialization_pending"},
+            )
+            return None
+        if _open_capability_incident_row(conn, task_id) is not None:
+            _append_event(
+                conn,
+                task_id,
+                "claim_blocked",
+                {"reason": "open_controller_capability_incident"},
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
             )
             return None
         # Enforcement and the immutable delivery snapshot must use the same
@@ -13294,6 +13865,11 @@ def promote_task(
         return False, "task is policy quarantined and requires human disposition"
     if row["block_kind"] == "dependency_pending":
         return False, "dependency materialization is pending; wait for the reconciler"
+    if _open_capability_incident_row(conn, task_id) is not None:
+        return False, (
+            "task has an open controller capability incident; use "
+            "`hermes kanban capability-resolve` after fresh validation"
+        )
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -13343,6 +13919,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if _open_capability_incident_row(conn, task_id) is not None:
+            return False, "task gained an open controller capability incident"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, "
@@ -13375,6 +13953,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     task = get_task(conn, task_id)
     if task and task.policy_quarantined:
         return False
+    if task and _open_capability_incident_row(conn, task_id) is not None:
+        return False
     if task and task.status in ("blocked", "scheduled"):
         skill_validation_error = _forced_skill_validation_error(
             task.assignee,
@@ -13385,6 +13965,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     now = int(time.time())
     with write_txn(conn):
+        if _open_capability_incident_row(conn, task_id) is not None:
+            return False
         operator_fence = conn.execute(
             """SELECT 1
                  FROM tasks t
@@ -19473,6 +20055,39 @@ def _prepare_continuation_or_block(
         return f"continuation:{code}: {message}"
 
 
+def _prepare_controller_action_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    workspace: str,
+    board: Optional[str],
+) -> Optional[str]:
+    """Run a granted controller action or atomically open its incident."""
+    from hermes_cli.capability_actions import (
+        ControllerActionFailure,
+        prepare_controller_action,
+    )
+
+    try:
+        prepare_controller_action(
+            conn,
+            task,
+            board_identity=_normalize_board_slug(board) or get_current_board(),
+            workspace=workspace,
+        )
+        return None
+    except ControllerActionFailure as exc:
+        incident = open_capability_incident(
+            conn,
+            task.id,
+            run_id=task.current_run_id,
+            capability_name=exc.capability_name,
+            incident_class=exc.incident_class,
+            grant_digest=exc.grant_digest,
+        )
+        return f"capability_incident:{incident.id}:{incident.incident_class}"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -19987,6 +20602,13 @@ def _dispatch_once_locked(
                             run_id=claimed.current_run_id,
                         )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        action_error = _prepare_controller_action_or_block(
+            conn, claimed, workspace=str(workspace), board=board,
+        )
+        if action_error is not None:
+            result.spawn_errors.append((claimed.id, action_error))
+            result.auto_blocked.append(claimed.id)
+            continue
         continuation_error = _prepare_continuation_or_block(
             conn, claimed, config=_continuation_cfg,
         )
@@ -20144,6 +20766,13 @@ def _dispatch_once_locked(
                             run_id=claimed.current_run_id,
                         )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        action_error = _prepare_controller_action_or_block(
+            conn, claimed, workspace=str(workspace), board=board,
+        )
+        if action_error is not None:
+            result.spawn_errors.append((claimed.id, action_error))
+            result.auto_blocked.append(claimed.id)
+            continue
         continuation_error = _prepare_continuation_or_block(
             conn, claimed, config=_continuation_cfg,
         )
@@ -21179,6 +21808,34 @@ def build_worker_context(
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    if task.current_run_id is not None:
+        receipt_rows = conn.execute(
+            """SELECT d.capability_name, d.id AS delivery_id, d.receipt_digest,
+                      d.reused, r.receipt_json
+                 FROM capability_receipt_deliveries d
+                 JOIN capability_action_receipts r ON r.id = d.receipt_id
+                WHERE d.task_id = ? AND d.run_id = ?
+                ORDER BY d.capability_name""",
+            (task_id, int(task.current_run_id)),
+        ).fetchall()
+        if receipt_rows:
+            lines.append("## Controller action receipts")
+            lines.append(
+                "These are run-bound, non-secret receipts. Read the exact typed "
+                "record with the capability receipt tool; no credential bytes "
+                "are present in the worker environment."
+            )
+            for receipt_row in receipt_rows:
+                receipt_value = json.loads(receipt_row["receipt_json"])
+                lines.append(
+                    f"- `{receipt_row['capability_name']}` delivery="
+                    f"{receipt_row['delivery_id']} digest="
+                    f"`{receipt_row['receipt_digest']}` reused="
+                    f"{bool(receipt_row['reused'])}: "
+                    f"`{_cap(json.dumps(receipt_value, sort_keys=True), 2048)}`"
+                )
+            lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has

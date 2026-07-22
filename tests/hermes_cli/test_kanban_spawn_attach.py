@@ -169,6 +169,70 @@ def test_dispatch_releases_gate_only_after_pid_readback(
     assert aborted == []
 
 
+def test_controller_action_prepares_before_spawn(
+    kanban_home,
+    all_assignees_spawnable,
+    monkeypatch,
+):
+    from hermes_cli import capability_actions
+
+    order = []
+
+    def prepare(_conn, task, **_kwargs):
+        assert task.current_run_id is not None
+        order.append("controller-action")
+        return None
+
+    monkeypatch.setattr(capability_actions, "prepare_controller_action", prepare)
+
+    def spawn(_task, _workspace):
+        order.append("spawn")
+        return 31_002
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="prepare first", assignee="worker")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+
+    assert order == ["controller-action", "spawn"]
+
+
+def test_controller_action_failure_opens_incident_and_never_spawns(
+    kanban_home,
+    all_assignees_spawnable,
+    monkeypatch,
+):
+    from hermes_cli import capability_actions
+
+    def fail(_conn, _task, **_kwargs):
+        raise capability_actions.ControllerActionFailure(
+            "capability_source_missing",
+            grant_digest="d" * 64,
+        )
+
+    monkeypatch.setattr(capability_actions, "prepare_controller_action", fail)
+    spawned = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="fail closed",
+            assignee="marketing-operator",
+            created_by="orchestrator",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args: spawned.append(True) or 31_003,
+        )
+        task = kb.get_task(conn, task_id)
+        incidents = kb.list_capability_incidents(conn, task_id, state="open")
+
+    assert spawned == []
+    assert task is not None and task.status == "blocked"
+    assert len(incidents) == 1
+    assert incidents[0].incident_class == "missing_secret"
+    assert len(result.auto_blocked) == 1
+
+
 def test_dispatch_persists_exact_worker_process_identity(
     kanban_home,
     all_assignees_spawnable,

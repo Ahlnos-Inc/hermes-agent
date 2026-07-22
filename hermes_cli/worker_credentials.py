@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -32,8 +33,11 @@ from hermes_constants import get_default_hermes_root
 
 _log = logging.getLogger(__name__)
 
-CONTRACT_VERSION = 1
+LEGACY_CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+SUPPORTED_CONTRACT_VERSIONS = frozenset({LEGACY_CONTRACT_VERSION, CONTRACT_VERSION})
 MANIFEST_FILENAME = "worker-credential-contract.yaml"
+GOOGLE_ADS_ACTIVATION_FILENAME = "google-ads-campaign-status.activation.json"
 
 BWS_BOOTSTRAP_ENV = "BWS_ACCESS_TOKEN"
 # Ambient name that must always be STRIPPED from workers (kept in
@@ -104,9 +108,14 @@ class CapabilityDefinition:
     """Code-owned definition of one closed worker capability."""
 
     name: str
-    source_key: str
-    handoff_env: str
+    source_key: str | None = None
+    handoff_env: str | None = None
     projection_env: tuple[str, ...] = ()
+    projection_kind: str = "worker_environment"
+    source_keys: tuple[str, ...] = ()
+    ambient_strip_env: tuple[str, ...] = ()
+    operation: str | None = None
+    api_major: str | None = None
 
 
 # ``bws_bootstrap`` is transitional.  It exists only for the current
@@ -125,24 +134,83 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
         handoff_env=BWS_BOOTSTRAP_HANDOFF_ENV,
         projection_env=(BWS_BOOTSTRAP_ENV,),
     ),
+    "google_ads_campaign_status_read": CapabilityDefinition(
+        name="google_ads_campaign_status_read",
+        projection_kind="controller_action_receipt",
+        source_keys=(
+            "google-ads-developer-token",
+            "google-ads-manager-customer-id",
+            "vitatide-marketing-oauth-client-id",
+            "vitatide-marketing-oauth-client-secret",
+            "vitatide-marketing-oauth-refresh-token",
+        ),
+        # Source keys are Bitwarden record names, not necessarily environment
+        # variable names. Strip conventional aliases too so a stale controller
+        # environment can never become an ambient worker handoff.
+        ambient_strip_env=(
+            "GOOGLE_ADS_DEVELOPER_TOKEN",
+            "GOOGLE_ADS_MANAGER_CUSTOMER_ID",
+            "GOOGLE_ADS_LOGIN_CUSTOMER_ID",
+            "GOOGLE_ADS_CUSTOMER_ID",
+            "GOOGLE_ADS_CLIENT_ID",
+            "GOOGLE_ADS_CLIENT_SECRET",
+            "GOOGLE_ADS_REFRESH_TOKEN",
+            "VITATIDE_MARKETING_OAUTH_CLIENT_ID",
+            "VITATIDE_MARKETING_OAUTH_CLIENT_SECRET",
+            "VITATIDE_MARKETING_OAUTH_REFRESH_TOKEN",
+        ),
+        operation="campaign_status_read_v1",
+        api_major="v24",
+    ),
 }
+
+CAPABILITY_SENSITIVE_ENV = frozenset(
+    name
+    for definition in CAPABILITIES.values()
+    for name in (*definition.source_keys, *definition.ambient_strip_env)
+)
 
 
 def _canonical_manifest_payload(
     profiles: Mapping[str, tuple[str, ...]],
+    *,
+    version: int = LEGACY_CONTRACT_VERSION,
+    action_configs: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "version": CONTRACT_VERSION,
-        "profiles": {
+    if version == LEGACY_CONTRACT_VERSION:
+        normalized_profiles: dict[str, Any] = {
             profile: {"actions": list(actions)}
             for profile, actions in sorted(profiles.items())
-        },
+        }
+    else:
+        configs = action_configs or {}
+        normalized_profiles = {
+            profile: {
+                "actions": {
+                    action: dict(sorted((configs.get(profile, {}).get(action) or {}).items()))
+                    for action in actions
+                }
+            }
+            for profile, actions in sorted(profiles.items())
+        }
+    return {
+        "version": version,
+        "profiles": normalized_profiles,
     }
 
 
-def _manifest_digest(profiles: Mapping[str, tuple[str, ...]]) -> str:
+def _manifest_digest(
+    profiles: Mapping[str, tuple[str, ...]],
+    *,
+    version: int = LEGACY_CONTRACT_VERSION,
+    action_configs: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+) -> str:
     encoded = json.dumps(
-        _canonical_manifest_payload(profiles),
+        _canonical_manifest_payload(
+            profiles,
+            version=version,
+            action_configs=action_configs,
+        ),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -152,16 +220,24 @@ def _manifest_digest(profiles: Mapping[str, tuple[str, ...]]) -> str:
 
 @dataclass(frozen=True)
 class WorkerCredentialManifest:
-    """Normalized, digested v1 worker credential manifest."""
+    """Normalized, digested worker credential/action manifest."""
 
     version: int
     profiles: Mapping[str, tuple[str, ...]]
     digest: str
     path: Path | None = field(default=None, repr=False, compare=False)
+    action_configs: Mapping[str, Mapping[str, Mapping[str, str]]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def actions_for(self, profile: str) -> tuple[str, ...]:
         """Return grants for *profile*; absent profiles have no grants."""
         return self.profiles.get(_normalize_profile(profile), ())
+
+    def config_for(self, profile: str, capability: str) -> Mapping[str, str]:
+        """Return the closed, non-secret v2 config for one granted action."""
+        normalized = _normalize_profile(profile)
+        return self.action_configs.get(normalized, {}).get(capability, {})
 
 
 @dataclass(frozen=True)
@@ -230,6 +306,8 @@ class TrustedWorkerCredentialRuntime:
     task_id: str
     run_id: str
     manifest_digest: str
+    manifest_verified: bool
+    kanban_db_path: str
     capabilities: tuple[str, ...]
     _values: tuple[tuple[str, str], ...] = field(
         default=(), repr=False, compare=False
@@ -267,7 +345,8 @@ def _normalize_manifest(raw: Any, path: Path | None) -> WorkerCredentialManifest
         raise WorkerCredentialError("worker credential manifest is malformed")
     if set(raw) != {"version", "profiles"}:
         raise WorkerCredentialError("worker credential manifest has unsupported fields")
-    if raw.get("version") != CONTRACT_VERSION or isinstance(raw.get("version"), bool):
+    version = raw.get("version")
+    if version not in SUPPORTED_CONTRACT_VERSIONS or isinstance(version, bool):
         raise WorkerCredentialError("worker credential manifest version is unsupported")
 
     raw_profiles = raw.get("profiles")
@@ -275,6 +354,7 @@ def _normalize_manifest(raw: Any, path: Path | None) -> WorkerCredentialManifest
         raise WorkerCredentialError("worker credential manifest profiles are malformed")
 
     profiles: dict[str, tuple[str, ...]] = {}
+    action_configs: dict[str, dict[str, dict[str, str]]] = {}
     for raw_name, raw_grant in raw_profiles.items():
         try:
             profile = _normalize_profile(raw_name)
@@ -284,26 +364,78 @@ def _normalize_manifest(raw: Any, path: Path | None) -> WorkerCredentialManifest
             raise WorkerCredentialError("worker credential manifest has duplicate profiles")
         if not isinstance(raw_grant, dict) or set(raw_grant) != {"actions"}:
             raise WorkerCredentialError("worker credential profile grant is malformed")
-        actions = raw_grant.get("actions")
-        if not isinstance(actions, list) or any(
-            not isinstance(action, str) or action not in CAPABILITIES
-            for action in actions
-        ):
-            raise WorkerCredentialError("worker credential capability is unsupported")
-        if len(set(actions)) != len(actions):
-            raise WorkerCredentialError("worker credential capability is duplicated")
+        raw_actions = raw_grant.get("actions")
+        normalized_configs: dict[str, dict[str, str]] = {}
+        if version == LEGACY_CONTRACT_VERSION:
+            if not isinstance(raw_actions, list) or any(
+                not isinstance(action, str) or action not in CAPABILITIES
+                for action in raw_actions
+            ):
+                raise WorkerCredentialError("worker credential capability is unsupported")
+            if len(set(raw_actions)) != len(raw_actions):
+                raise WorkerCredentialError("worker credential capability is duplicated")
+            if any(
+                CAPABILITIES[action].projection_kind == "controller_action_receipt"
+                for action in raw_actions
+            ):
+                raise WorkerCredentialError(
+                    "worker credential controller action requires contract version 2"
+                )
+            actions = list(raw_actions)
+        else:
+            if not isinstance(raw_actions, dict):
+                raise WorkerCredentialError("worker credential v2 actions are malformed")
+            actions = []
+            for action, raw_config in raw_actions.items():
+                if not isinstance(action, str) or action not in CAPABILITIES:
+                    raise WorkerCredentialError(
+                        "worker credential capability is unsupported"
+                    )
+                if not isinstance(raw_config, dict):
+                    raise WorkerCredentialError(
+                        "worker credential capability config is malformed"
+                    )
+                definition = CAPABILITIES[action]
+                if definition.projection_kind == "controller_action_receipt":
+                    if set(raw_config) != {"activation_sha256"}:
+                        raise WorkerCredentialError(
+                            "worker credential controller action config is malformed"
+                        )
+                    activation_sha256 = raw_config.get("activation_sha256")
+                    if not isinstance(activation_sha256, str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", activation_sha256
+                    ):
+                        raise WorkerCredentialError(
+                            "worker credential activation digest is malformed"
+                        )
+                    normalized_configs[action] = {
+                        "activation_sha256": activation_sha256
+                    }
+                elif raw_config:
+                    raise WorkerCredentialError(
+                        "worker credential environment action config is unsupported"
+                    )
+                else:
+                    normalized_configs[action] = {}
+                actions.append(action)
         profiles[profile] = tuple(sorted(actions))
+        action_configs[profile] = normalized_configs
 
     return WorkerCredentialManifest(
-        version=CONTRACT_VERSION,
+        version=version,
         profiles=profiles,
-        digest=_manifest_digest(profiles),
+        digest=_manifest_digest(
+            profiles,
+            version=version,
+            action_configs=action_configs,
+        ),
         path=path,
+        action_configs=action_configs,
     )
 
 
 def load_manifest(root: Path | str | None = None) -> WorkerCredentialManifest:
-    """Load and normalize the machine-global v1 worker manifest.
+    """Load and normalize the machine-global worker action manifest.
 
     A missing manifest is the migration-safe empty contract.  Once present,
     the file is closed-schema and fail-closed: malformed versions, fields,
@@ -315,8 +447,9 @@ def load_manifest(root: Path | str | None = None) -> WorkerCredentialManifest:
         return WorkerCredentialManifest(
             version=CONTRACT_VERSION,
             profiles={},
-            digest=_manifest_digest({}),
+            digest=_manifest_digest({}, version=CONTRACT_VERSION),
             path=None,
+            action_configs={},
         )
     return _normalize_manifest(_load_yaml(path), path)
 
@@ -423,11 +556,13 @@ def bootstrap_worker_credential_context(
             manifest = WorkerCredentialManifest(
                 version=CONTRACT_VERSION,
                 profiles={},
-                digest=_manifest_digest({}),
+                digest=_manifest_digest({}, version=CONTRACT_VERSION),
                 path=None,
+                action_configs={},
             )
 
-        if expected_digest != manifest.digest:
+        manifest_verified = expected_digest == manifest.digest
+        if not manifest_verified:
             _log.warning(
                 "worker credential manifest digest mismatch; no capabilities admitted"
             )
@@ -454,6 +589,8 @@ def bootstrap_worker_credential_context(
             task_id=task_id,
             run_id=run_id,
             manifest_digest=manifest.digest,
+            manifest_verified=manifest_verified,
+            kanban_db_path=str(target.get("HERMES_KANBAN_DB") or "").strip(),
             capabilities=tuple(sorted(admitted)),
             _values=tuple(sorted(admitted.items())),
         )
@@ -472,6 +609,39 @@ def _runtime_matches_current_worker(
         return load_manifest().digest == runtime.manifest_digest
     except WorkerCredentialError:
         return False
+
+
+def trusted_worker_identity(
+    *, environ: Mapping[str, str] | None = None
+) -> tuple[str, int] | None:
+    """Return the bootstrap-sealed task/run identity for this worker.
+
+    Environment variables locate the initial worker, but later mutation cannot
+    switch this identity to another task or run. Receipt-reader tools use this
+    boundary instead of trusting mutable environment markers directly.
+    """
+    runtime = bootstrap_worker_credential_context()
+    if runtime is None or not runtime.manifest_verified:
+        return None
+    current_env = os.environ if environ is None else environ
+    if not _runtime_matches_current_worker(runtime, current_env):
+        return None
+    try:
+        run_id = int(runtime.run_id)
+    except ValueError:
+        return None
+    return (runtime.task_id, run_id) if run_id > 0 else None
+
+
+def trusted_worker_receipt_context(
+    *, environ: Mapping[str, str] | None = None
+) -> tuple[str, int, str] | None:
+    """Return task/run plus the bootstrap-sealed Kanban database path."""
+    identity = trusted_worker_identity(environ=environ)
+    runtime = _TRUSTED_WORKER_RUNTIME
+    if identity is None or runtime is None or not runtime.kanban_db_path:
+        return None
+    return identity[0], identity[1], runtime.kanban_db_path
 
 
 def get_trusted_worker_credential(
@@ -644,6 +814,7 @@ def worker_credential_strip_env(
             source_config.get("access_token_env") or BWS_BOOTSTRAP_ENV
         )
         strip_env = set(UNCONDITIONAL_STRIP_ENV)
+        strip_env.update(CAPABILITY_SENSITIVE_ENV)
         if (
             isinstance(configured_access_token_env, str)
             and configured_access_token_env
@@ -651,7 +822,12 @@ def worker_credential_strip_env(
             strip_env.add(configured_access_token_env)
         return frozenset(strip_env)
     except Exception:
-        return frozenset(UNCONDITIONAL_STRIP_ENV)
+        return frozenset(
+            {
+                *UNCONDITIONAL_STRIP_ENV,
+                *CAPABILITY_SENSITIVE_ENV,
+            }
+        )
 
 
 def _fetch_bitwarden_result(
@@ -726,6 +902,7 @@ def resolve_worker_credentials(
     handoff: dict[str, str] = {}
     source = "bitwarden" if needs_bitwarden else None
     strip_env = set(UNCONDITIONAL_STRIP_ENV)
+    strip_env.update(CAPABILITY_SENSITIVE_ENV)
     strip_env.add(access_token_env)
 
     if needs_bootstrap:

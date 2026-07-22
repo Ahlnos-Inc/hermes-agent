@@ -70,10 +70,81 @@ def test_manifest_normalizes_grants_and_digest_is_whitespace_stable(tmp_path):
     assert wc.load_manifest(tmp_path / "missing").profiles == {}
 
 
+def test_manifest_v2_supports_closed_controller_action_without_v1_regression(tmp_path):
+    activation_digest = "a" * 64
+    _write_manifest(
+        tmp_path,
+        """version: 2
+profiles:
+  marketing-operator:
+    actions:
+      google_ads_campaign_status_read:
+        activation_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  releaser:
+    actions:
+      github_write: {}
+""",
+    )
+    manifest = wc.load_manifest(tmp_path)
+    assert manifest.version == 2
+    assert manifest.actions_for("marketing-operator") == (
+        "google_ads_campaign_status_read",
+    )
+    assert manifest.config_for(
+        "marketing-operator", "google_ads_campaign_status_read"
+    ) == {"activation_sha256": activation_digest}
+    assert manifest.actions_for("releaser") == ("github_write",)
+    assert manifest.path == tmp_path / wc.MANIFEST_FILENAME
+
+
+def test_v1_cannot_grant_controller_action(tmp_path):
+    _write_manifest(
+        tmp_path,
+        """version: 1
+profiles:
+  marketing-operator:
+    actions: [google_ads_campaign_status_read]
+""",
+    )
+    with pytest.raises(wc.WorkerCredentialError, match="contract version 2"):
+        wc.load_manifest(tmp_path)
+
+
+def test_trusted_worker_identity_cannot_be_switched_by_environment_mutation(
+    tmp_path, monkeypatch
+):
+    _write_manifest(tmp_path, "version: 1\nprofiles:\n  releaser:\n    actions: []\n")
+    manifest = wc.load_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_receipt_owner")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "owner.db"))
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, manifest.digest)
+
+    assert wc.trusted_worker_identity() == ("t_receipt_owner", 42)
+    assert wc.trusted_worker_receipt_context() == (
+        "t_receipt_owner",
+        42,
+        str(tmp_path / "owner.db"),
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "other.db"))
+    assert wc.trusted_worker_receipt_context() == (
+        "t_receipt_owner",
+        42,
+        str(tmp_path / "owner.db"),
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "99")
+    assert wc.trusted_worker_identity() is None
+
+
 @pytest.mark.parametrize(
     ("manifest", "message"),
     [
-        ("version: 2\nprofiles: {}\n", "version is unsupported"),
+        ("version: 3\nprofiles: {}\n", "version is unsupported"),
         ("version: 1\nprofiles:\n  x:\n    actions: [not_a_capability]\n", "capability is unsupported"),
         ("version: 1\nprofiles:\n  x:\n    actions: [github_write, github_write]\n", "capability is duplicated"),
     ],
@@ -224,7 +295,10 @@ def test_worker_credential_strip_env_uses_configured_bitwarden_name(
 
     monkeypatch.setattr(wc, "_bitwarden_config", fail_config)
     assert wc.worker_credential_strip_env(tmp_path) == frozenset(
-        wc.UNCONDITIONAL_STRIP_ENV
+        {
+            *wc.UNCONDITIONAL_STRIP_ENV,
+            *wc.CAPABILITY_SENSITIVE_ENV,
+        }
     )
 
 
@@ -382,6 +456,7 @@ def test_manifest_digest_mismatch_admits_nothing(tmp_path, monkeypatch, caplog):
     assert runtime is not None
     assert runtime.capabilities == ()
     assert not wc.has_trusted_worker_action("github_write")
+    assert wc.trusted_worker_identity() is None
     assert "worker credential manifest digest mismatch" in caplog.text
     assert SENTINEL not in caplog.text
 
@@ -401,6 +476,7 @@ def test_manifest_digest_missing_admits_nothing(tmp_path, monkeypatch, caplog):
     assert runtime is not None
     assert runtime.capabilities == ()
     assert not wc.has_trusted_worker_action("github_write")
+    assert wc.trusted_worker_identity() is None
     assert wc.GITHUB_WRITE_HANDOFF_ENV not in os.environ
     assert "worker credential manifest digest mismatch" in caplog.text
 

@@ -747,6 +747,38 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_capability_resolve = sub.add_parser(
+        "capability-resolve",
+        help=(
+            "Freshly validate and resolve one controller-owned capability "
+            "incident; ordinary unblock cannot bypass it"
+        ),
+    )
+    p_capability_resolve.add_argument("incident_id", type=int)
+    capability_close_mode = p_capability_resolve.add_mutually_exclusive_group()
+    capability_close_mode.add_argument(
+        "--cancel",
+        action="store_true",
+        help="Audit explicit abandonment without restarting the protected task",
+    )
+    capability_close_mode.add_argument(
+        "--supersede-grant-digest",
+        default=None,
+        metavar="SHA256",
+        help="Close the old episode after an approved grant digest changed",
+    )
+    p_capability_resolve.add_argument(
+        "--reason",
+        default=None,
+        help="Required non-secret evidence for --cancel or --supersede-grant-digest",
+    )
+    p_capability_resolve.add_argument(
+        "--evidence",
+        default=None,
+        help="Optional operator evidence appended to the controller receipt proof",
+    )
+    p_capability_resolve.add_argument("--json", action="store_true")
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1135,6 +1167,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "publication-handoff": _cmd_publish,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "capability-resolve": _cmd_capability_resolve,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2787,6 +2820,93 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_capability_resolve(args: argparse.Namespace) -> int:
+    from hermes_cli.capability_actions import validate_capability_incident
+    from . import worker_credentials
+
+    actor = _profile_author()
+    cancel = bool(getattr(args, "cancel", False))
+    replacement_digest = (
+        getattr(args, "supersede_grant_digest", None) or ""
+    ).strip()
+    reason = (getattr(args, "reason", None) or "").strip()
+    operator_evidence = (getattr(args, "evidence", None) or "").strip()
+    if (cancel or replacement_digest) and not reason:
+        print(
+            "--reason is required for capability cancellation or supersession",
+            file=sys.stderr,
+        )
+        return 2
+    if (cancel or replacement_digest) and operator_evidence:
+        print("--evidence is only valid for fresh resolution", file=sys.stderr)
+        return 2
+    if replacement_digest:
+        current_grant_digest = worker_credentials.load_manifest().digest
+        if replacement_digest != current_grant_digest:
+            print(
+                "--supersede-grant-digest must equal the current validated "
+                "worker credential manifest digest",
+                file=sys.stderr,
+            )
+            return 2
+
+    with kb.connect_closing() as conn:
+        if cancel:
+            incident = kb.cancel_capability_incident(
+                conn,
+                int(args.incident_id),
+                actor=actor,
+                evidence=reason,
+            )
+            evidence = reason
+        elif replacement_digest:
+            incident = kb.supersede_capability_incident(
+                conn,
+                int(args.incident_id),
+                actor=actor,
+                evidence=reason,
+                new_grant_digest=replacement_digest,
+            )
+            evidence = reason
+        else:
+            capability_name, grant_digest, receipt_evidence = (
+                validate_capability_incident(
+                    conn,
+                    int(args.incident_id),
+                    board_identity=kb.get_current_board(),
+                )
+            )
+            evidence = receipt_evidence
+            if operator_evidence:
+                evidence = f"{receipt_evidence}; operator evidence: {operator_evidence}"
+            incident = kb.resolve_capability_incident(
+                conn,
+                int(args.incident_id),
+                actor=actor,
+                evidence=evidence,
+                validated_capability_name=capability_name,
+                validated_grant_digest=grant_digest,
+            )
+        task = kb.get_task(conn, incident.task_id)
+    payload = {
+        "incident_id": incident.id,
+        "task_id": incident.task_id,
+        "state": incident.state,
+        "capability_name": incident.capability_name,
+        "grant_digest": incident.grant_digest,
+        "task_status": task.status if task else None,
+        "evidence": evidence,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Closed capability incident {incident.id} as {incident.state}; "
+            f"{incident.task_id} -> {payload['task_status']}"
+        )
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

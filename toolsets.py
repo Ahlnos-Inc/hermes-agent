@@ -76,6 +76,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_compile_workflow", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # Run-bound and service-gated: hidden unless the controller delivered an
+    # exact non-secret receipt before this worker started.
+    "google_ads_campaign_status_receipt",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -275,6 +278,7 @@ TOOLSETS = {
             "kanban_create", "kanban_compile_workflow", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "google_ads_campaign_status_receipt",
         ],
         "includes": [],
     },
