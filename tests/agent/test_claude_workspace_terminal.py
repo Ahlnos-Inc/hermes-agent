@@ -1098,3 +1098,55 @@ def test_workspace_terminal_denies_homebrew_configuration_reads(tmp_path):
 
     assert result.returncode != 0
     assert "Operation not permitted" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# BUILD-700 Slice 1: benign introspection probes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git --version",
+        "git version",
+        "python --version",
+        "python3 -V",
+        "node --version",
+        "rg --version",
+        "sqlite3 --version",
+        "env",
+        "printenv",
+    ],
+)
+def test_benign_introspection_probes_are_admitted(command):
+    from agent.claude_workspace_terminal import _validate_read_only_terminal_command
+
+    # Returns False = admitted and needs no mirror.
+    assert _validate_read_only_terminal_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Payload smuggled after the version flag.
+        "python --version -c import os; os.system('id')",
+        "git --version --exec-path=/tmp/evil",
+        # Still-mutating git despite looking like a probe.
+        "git version-bump",
+        "git commit --version",
+        # env with an assignment runs a program under a modified environment.
+        "env FOO=bar sh",
+        "printenv PATH extra",
+        # Path override must stay rejected even for a version probe.
+        "/usr/bin/git --version",
+        "./python --version",
+        # Not on the introspection tool list.
+        "curl --version",
+        "bash --version",
+    ],
+)
+def test_introspection_allowlist_does_not_widen_anything_else(command):
+    from agent.claude_workspace_terminal import _validate_read_only_terminal_command
+
+    with pytest.raises(RuntimeError):
+        _validate_read_only_terminal_command(command)

@@ -39,6 +39,21 @@ _READ_ONLY_COMMANDS = frozenset(
         "wc",
     }
 )
+# BUILD-700 Slice 1. Verifier/reviewer lanes legitimately probe toolchain
+# versions before deciding they are capability-blocked, and rejecting
+# `git --version` taught them to report a false capability block instead.
+# These probes are admitted ONLY as an exact whole-command match — see
+# `_is_benign_introspection` — so this widens nothing else: no arguments, no
+# subcommands, no path overrides, and no shell metacharacters reach the tool.
+_INTROSPECTION_TOOLS = frozenset(
+    {
+        "cargo", "git", "go", "jq", "make", "node", "npm", "pnpm",
+        "python", "python3", "rg", "rustc", "sqlite3", "uv", "yarn",
+    }
+)
+_INTROSPECTION_FLAGS = frozenset({"--version", "-V", "version"})
+# Bare environment dumps carry no arguments and cannot mutate.
+_INTROSPECTION_BARE = frozenset({"env", "printenv"})
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset(
     {
         "blame",
@@ -153,6 +168,26 @@ def _has_option(
     return False
 
 
+def _is_benign_introspection(raw_executable: str, tokens: list[str]) -> bool:
+    """True only for an exact version/env probe that cannot carry a payload.
+
+    Whole-command exact match by construction: a bare `env`/`printenv`, or a
+    known tool followed by exactly one version flag. Anything with extra
+    arguments, a subcommand, or a path-qualified executable falls through to
+    the normal mutation-capable rejection.
+    """
+    if "/" in raw_executable:
+        return False
+    if len(tokens) == 1:
+        return tokens[0] in _INTROSPECTION_BARE
+    if len(tokens) == 2:
+        return (
+            tokens[0] in _INTROSPECTION_TOOLS
+            and tokens[1] in _INTROSPECTION_FLAGS
+        )
+    return False
+
+
 def _validate_read_only_terminal_command(command: str) -> bool:
     """Validate a reviewer/verifier command and return whether it needs a mirror."""
 
@@ -171,6 +206,10 @@ def _validate_read_only_terminal_command(command: str) -> bool:
         raise RuntimeError(
             "Read-only worker terminal rejected executable path override"
         )
+    # Admitted only after the shell-escape and path-override checks above, so an
+    # introspection probe can never smuggle a redirection or an absolute path.
+    if _is_benign_introspection(raw_executable, tokens):
+        return False
     if executable not in _READ_ONLY_COMMANDS and not _is_read_only_test_command(tokens):
         raise RuntimeError(
             f"Read-only worker terminal rejected mutation-capable command: {executable or '<empty>'}"
