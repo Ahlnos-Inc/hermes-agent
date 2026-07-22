@@ -2434,8 +2434,214 @@ def _trusted_front_door_architecture_context(
     )
 
 
+def _resolve_worker_attachment_path(
+    kb: Any,
+    conn: Any,
+    task_id: str,
+    raw_path: Any,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Resolve a worker-supplied path inside its task-owned workspace.
+
+    The dispatcher persists the materialized workspace on ``task.workspace_path``.
+    Legacy rows can still have that field unset, so the existing per-board
+    ``workspaces/<task-id>`` location is the only fallback. Both the root and
+    requested path are realpath-resolved before containment is checked; a
+    symlink to another tree is therefore not an escape hatch.
+    """
+    import stat
+
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"task {task_id} not found")
+
+    if task.workspace_path:
+        candidate_roots = [Path(task.workspace_path).expanduser()]
+    else:
+        candidate_roots = [kb.workspaces_root(board=board) / task_id]
+
+    owned_roots: list[Path] = []
+    for candidate_root in candidate_roots:
+        try:
+            root = candidate_root.resolve(strict=True)
+            root_stat = root.stat()
+        except (OSError, RuntimeError):
+            continue
+        if root.is_dir() and stat.S_ISDIR(root_stat.st_mode):
+            owned_roots.append(root)
+
+    if not owned_roots:
+        raise ValueError(
+            f"task {task_id} has no resolvable owned workspace; refusing path attach"
+        )
+
+    requested = str(raw_path or "").strip()
+    if not requested:
+        raise ValueError("path is required")
+    requested_path = Path(requested).expanduser()
+    candidates = (
+        [requested_path]
+        if requested_path.is_absolute()
+        else [root / requested_path for root in owned_roots]
+    )
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not any(
+            resolved == root or root in resolved.parents
+            for root in owned_roots
+        ):
+            continue
+        try:
+            file_stat = resolved.stat()
+        except OSError as exc:
+            raise ValueError(f"cannot inspect attachment path {resolved}: {exc}") from exc
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(
+                f"attachment path must be a regular file, not {resolved}"
+            )
+        return resolved
+
+    raise ValueError(
+        f"attachment path must resolve inside task {task_id}'s owned workspace"
+    )
+
+
+def _read_worker_attachment_file(
+    path: Path,
+    max_bytes: int,
+    *,
+    collect: bool,
+) -> tuple[bytes, int, str]:
+    """Read and hash a regular file while detecting short or changing reads."""
+    import stat
+    from hermes_cli import kanban_db as kb
+
+    try:
+        with path.open("rb") as source:
+            initial = os.fstat(source.fileno())
+            if not stat.S_ISREG(initial.st_mode):
+                raise ValueError(f"attachment path must be a regular file, not {path}")
+            if initial.st_size > max_bytes:
+                raise kb.AttachmentTooLarge(
+                    f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
+                )
+
+            chunks: list[bytes] = []
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise kb.AttachmentTooLarge(
+                        f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
+                    )
+                digest.update(chunk)
+                if collect:
+                    chunks.append(chunk)
+            final = os.fstat(source.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"could not read attachment path {path}: {exc}") from exc
+
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise ValueError(f"attachment path changed during read: {path}") from exc
+
+    identity_changed = (
+        initial.st_dev != final.st_dev
+        or initial.st_ino != final.st_ino
+        or initial.st_size != final.st_size
+        or current.st_dev != initial.st_dev
+        or current.st_ino != initial.st_ino
+        or current.st_size != initial.st_size
+    )
+    if total != initial.st_size or identity_changed:
+        raise ValueError(f"attachment path changed or was short-read during read: {path}")
+
+    return (b"".join(chunks) if collect else b""), total, digest.hexdigest()
+
+
+def _discard_failed_attachment(kb: Any, conn: Any, attachment_id: Any) -> None:
+    """Best-effort cleanup after an integrity check rejects a stored blob."""
+    try:
+        kb.delete_attachment(conn, int(attachment_id))
+    except Exception:
+        logger.warning(
+            "could not remove failed kanban attachment %s",
+            attachment_id,
+            exc_info=True,
+        )
+
+
+def _verify_worker_attachment(
+    kb: Any,
+    conn: Any,
+    task_id: str,
+    attachment_id: Any,
+    source_path: Path,
+    expected_size: int,
+    expected_sha256: str,
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Verify source stability and the stored blob before reporting success."""
+    attachment = kb.get_attachment(conn, int(attachment_id))
+    if attachment is None:
+        raise ValueError("attachment store returned no metadata row")
+
+    _, source_size, source_sha256 = _read_worker_attachment_file(
+        source_path,
+        kb.KANBAN_ATTACHMENT_MAX_BYTES,
+        collect=False,
+    )
+    if source_size != expected_size or source_sha256 != expected_sha256:
+        raise ValueError(
+            "source file changed while the attachment was being stored; retry the attach"
+        )
+
+    stored_path = Path(attachment.stored_path)
+    try:
+        stored_resolved = stored_path.resolve(strict=True)
+        attachment_root = kb.task_attachments_dir(task_id, board=board).resolve(
+            strict=False
+        )
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"stored attachment path cannot be resolved: {exc}") from exc
+    if not (
+        stored_resolved == attachment_root
+        or attachment_root in stored_resolved.parents
+    ):
+        raise ValueError("stored attachment path escaped the task attachment directory")
+
+    _, stored_size, stored_sha256 = _read_worker_attachment_file(
+        stored_resolved,
+        kb.KANBAN_ATTACHMENT_MAX_BYTES,
+        collect=False,
+    )
+    if (
+        stored_size != expected_size
+        or stored_sha256 != expected_sha256
+        or int(attachment.size) != stored_size
+    ):
+        raise ValueError(
+            "stored attachment integrity mismatch: "
+            f"expected {expected_size} bytes/{expected_sha256}, got "
+            f"{stored_size} bytes/{stored_sha256}"
+        )
+
+
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach an inline (base64) file or local workspace file to a task.
 
     Mirrors the dashboard's upload endpoint for the agent surface: decode
     the payload, enforce the shared size cap, write it under the per-task
@@ -2453,10 +2659,77 @@ def _handle_attach(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     filename = args.get("filename")
+    path = args.get("path")
+    content_b64 = args.get("content_base64")
+    has_path = bool(path and str(path).strip())
+    has_content = bool(content_b64 and str(content_b64).strip())
+    if has_path and has_content:
+        return tool_error("pass exactly one of path or content_base64")
+    if has_path:
+        board = args.get("board")
+        try:
+            _, conn = _connect(board=board)
+            try:
+                source_path = _resolve_worker_attachment_path(
+                    kb,
+                    conn,
+                    tid,
+                    path,
+                    board=board,
+                )
+                data, source_size, source_sha256 = _read_worker_attachment_file(
+                    source_path,
+                    kb.KANBAN_ATTACHMENT_MAX_BYTES,
+                    collect=True,
+                )
+                stored_name = str(filename).strip() if filename and str(filename).strip() else source_path.name
+                content_type = args.get("content_type")
+                if not content_type:
+                    import mimetypes
+
+                    content_type = mimetypes.guess_type(stored_name)[0]
+                att_id = kb.store_attachment_bytes(
+                    conn,
+                    tid,
+                    stored_name,
+                    data,
+                    content_type=content_type,
+                    uploaded_by="agent",
+                    board=board,
+                )
+                try:
+                    _verify_worker_attachment(
+                        kb,
+                        conn,
+                        tid,
+                        att_id,
+                        source_path,
+                        source_size,
+                        source_sha256,
+                        board=board,
+                    )
+                except Exception:
+                    _discard_failed_attachment(kb, conn, att_id)
+                    raise
+                return _ok(
+                    task_id=tid,
+                    attachment_id=att_id,
+                    size=source_size,
+                    sha256=source_sha256,
+                )
+            finally:
+                conn.close()
+        except kb.AttachmentTooLarge as e:
+            return tool_error(f"kanban_attach: {e}")
+        except (ValueError, OSError) as e:
+            return tool_error(f"kanban_attach: {e}")
+        except Exception as e:
+            logger.exception("kanban_attach path failed")
+            return tool_error(f"kanban_attach: {e}")
+
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
-    content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
+    if not has_content:
         return tool_error("content_base64 is required")
     import base64
     import binascii
@@ -3389,11 +3662,13 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
-        "be able to download — generated reports, images, exports. The "
-        "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
+        "Attach a file to a task by passing exactly one of: path (a local "
+        "file path read server-side from your task workspace) or "
+        "content_base64 (inline bytes). Use for genuine file artifacts the "
+        "next worker or a human should be able to download — generated "
+        "reports, images, exports. The file is stored as a real attachment "
+        "under the task's attachments dir, capped at 25 MB. For path, "
+        "filename is optional and defaults to the source file name. Prefer "
         "kanban_attach_url when you only have a URL."
     ),
     "parameters": {
@@ -3414,13 +3689,20 @@ KANBAN_ATTACH_SCHEMA = {
                 "type": "string",
                 "description": "The file contents, base64-encoded. Max 25 MB decoded.",
             },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Local filesystem path to a regular file inside this task's "
+                    "owned workspace. Read server-side; do not use for URLs."
+                ),
+            },
             "content_type": {
                 "type": "string",
                 "description": "Optional MIME type (e.g. 'application/pdf').",
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": [],
     },
 }
 
