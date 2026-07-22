@@ -6484,6 +6484,23 @@ def _prepare_task_create(
             f"board {anchor_board!r} default_workdir.",
         )
 
+    worktree_anchor_path = workspace_path or project_repo
+    if workspace_kind == "worktree" and worktree_anchor_path:
+        worktree_anchor = Path(str(worktree_anchor_path)).expanduser()
+        if not worktree_anchor.is_absolute():
+            raise WorkspaceContractError(
+                "worktree_bad_anchor",
+                f"worktree anchor {worktree_anchor_path!r} is not absolute; use an "
+                "absolute path to a git repo",
+            )
+        if _worktree_anchor_repo_root(worktree_anchor) is None:
+            raise WorkspaceContractError(
+                "worktree_bad_anchor",
+                f"worktree anchor {worktree_anchor_path!r} is not inside a git repo; "
+                "use an absolute path inside the repository that should contain "
+                "the lazy worktree",
+            )
+
     return _PreparedTaskCreate(
         title=title.strip(),
         body=body,
@@ -13368,6 +13385,21 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _worktree_anchor_repo_root(path: Path) -> Optional[Path]:
+    """Return the repository containing a worktree target, if any.
+
+    The target itself may not exist yet: worktrees are materialized lazily.
+    Keep the repo-root special case and containing-repo lookup in one helper so
+    creation-time validation and dispatch use the same anchor contract.
+    """
+    requested = path.expanduser()
+    requested_resolved = requested.resolve(strict=False)
+    repo_root = _git_toplevel(requested)
+    if repo_root is not None and requested_resolved == repo_root:
+        return repo_root
+    return _repo_root_for_worktree_target(requested.parent)
+
+
 def _exclude_managed_worktree_container(repo_root: Path, target: Path) -> None:
     """Hide Hermes's in-repo worktree container from source status output."""
     try:
@@ -13717,7 +13749,7 @@ def _resolve_worktree_workspace(
             repo_root=repo_root,
         )
 
-    repo_root = _git_toplevel(requested)
+    repo_root = _worktree_anchor_repo_root(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
         checkpoint_ref, checkpoint_sha, created = _ensure_git_worktree(
@@ -13732,7 +13764,6 @@ def _resolve_worktree_workspace(
             repo_root=repo_root,
         )
 
-    repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
         raise WorkspaceContractError(
             "worktree_bad_anchor",

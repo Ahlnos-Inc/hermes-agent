@@ -49,8 +49,10 @@ def _init_repo(path):
     )
 
 
-def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
-    proj = _make_project()
+def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn, tmp_path):
+    repo = tmp_path / "webapp"
+    _init_repo(repo)
+    proj = _make_project(repo=str(repo))
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
     task = kb.get_task(kanban_conn, tid)
 
@@ -63,8 +65,10 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert not task.branch_name.startswith("wt/")
 
 
-def test_explicit_branch_overrides_project_default(kanban_conn):
-    proj = _make_project()
+def test_explicit_branch_overrides_project_default(kanban_conn, tmp_path):
+    repo = tmp_path / "webapp"
+    _init_repo(repo)
+    proj = _make_project(repo=str(repo))
     tid = kb.create_task(
         kanban_conn,
         title="x",

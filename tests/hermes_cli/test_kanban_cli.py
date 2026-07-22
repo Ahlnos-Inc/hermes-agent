@@ -94,6 +94,15 @@ def test_run_slash_create_and_list(kanban_home):
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
+    # BUILD-713: a worktree anchor must resolve inside a real repository. This
+    # test covers the CLI wiring for `--workspace worktree:<path> --branch`, so
+    # give it a real repo to anchor in; the leaf is still absent, which is the
+    # normal lazy-materialization case.
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
     out = kc.run_slash(
