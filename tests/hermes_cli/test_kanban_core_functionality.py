@@ -4150,7 +4150,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
 
     messages = [record.getMessage() for record in caplog.records]
     assert sum("not a valid SQLite database" in msg for msg in messages) == 2
-    assert any("database fingerprint unchanged" in msg for msg in messages)
+    assert any("incident unchanged" in msg for msg in messages)
     assert calls["tick"] == 3
 
 

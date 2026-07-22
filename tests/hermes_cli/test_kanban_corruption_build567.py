@@ -74,7 +74,7 @@ def test_concurrent_spawn_on_corrupt_board_fails_closed_then_repairs(tmp_path):
     # Repair the board (stand-in for the recovery swap), then the task claims
     # exactly once across two more racers.
     db.write_bytes(healthy_bytes)
-    kb._INITIALIZED_PATHS.discard(str(db.resolve()))
+    assert kb.probe_corruption_incident(db) is True
 
     def _claim():
         conn = kb.connect(db)

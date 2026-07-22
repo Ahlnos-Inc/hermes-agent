@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import os
 import signal
@@ -164,7 +163,7 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     corrupt = home / "kanban.db"
     corrupt.write_bytes(b"SQLit" + bytes.fromhex("17 03 03 00 13") + b"x" * 32)
 
-    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
         kb.connect(board="default")
 
     msg = str(exc_info.value)
@@ -5026,15 +5025,8 @@ def test_cached_connect_quarantines_tls_page_one_overwrite(tmp_path):
     assert "TLS record header detected at byte offset 5" in excinfo.value.reason
 
 
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
-
-    Regression for the gateway dispatcher's 5-min retry loop on shared kanban
-    DBs across multi-profile fleets: each retry on an unchanged corrupt file
-    used to create a fresh ``.corrupt.<timestamp>.bak`` until disk filled. The
-    content-addressed backup name is deterministic in the DB's sha256, so
-    N retries of the same bytes share one backup.
-    """
+def test_repeated_corrupt_open_reuses_single_incident_and_backup(tmp_path):
+    """One file generation keeps one incident even as corrupt bytes change."""
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
 
@@ -5051,7 +5043,9 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert backup.exists()
     assert backup.read_bytes() == original
 
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    incident_id = kb.read_corruption_incident(db_path).incident_id
+    # Mutate the corrupt bytes in place. The marker is generation-stable, so
+    # fresh opens reuse the original incident and forensic image.
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
@@ -5060,43 +5054,40 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
         kb.connect(db_path=db_path)
     second_backup = excinfo2.value.backup_path
     assert second_backup is not None
-    assert second_backup != backup
+    assert excinfo2.value.incident_id == incident_id
+    assert second_backup == backup
     assert second_backup.exists()
+    assert second_backup.read_bytes() == original
 
 
 def test_corrupt_backup_does_not_publish_partial_copy(tmp_path, monkeypatch):
-    """An interrupted forensic copy must not masquerade as a reusable backup."""
+    """An interrupted forensic copy remains pending, never published."""
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
-    digest = hashlib.sha256(original).hexdigest()[:16]
-    expected_backup = tmp_path / f"kanban.db.corrupt.{digest}.bak"
-
-    def interrupted_copy(_source, destination, *args, **kwargs):
-        Path(destination).write_bytes(b"partial forensic copy")
-        raise OSError("simulated interrupted copy")
-
-    monkeypatch.setattr(kb.shutil, "copy2", interrupted_copy)
+    monkeypatch.setattr(kb, "_stage_off_lock", lambda _source: None)
 
     assert kb._backup_corrupt_db(db_path) is None
     assert db_path.read_bytes() == original
-    assert not expected_backup.exists()
-    assert list(tmp_path.glob(f".{expected_backup.name}.*.tmp")) == []
+    incident = kb.read_corruption_incident(db_path)
+    assert incident is not None
+    assert incident.preservation_status == kb.CORRUPTION_PRESERVATION_FAILED
+    assert incident.backup_path is not None
+    assert not incident.backup_path.exists()
+    assert list(tmp_path.glob("*.corrupt.*.bak")) == []
 
 
-def test_corrupt_backup_repairs_preexisting_partial_copy(tmp_path):
-    """A legacy partial backup is preserved, then replaced with complete bytes."""
+def test_corrupt_backup_reuses_the_published_incident_backup(tmp_path):
+    """A published canonical backup is reused for the same file generation."""
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
-    source_digest = hashlib.sha256(original).hexdigest()[:16]
-    expected_backup = tmp_path / f"kanban.db.corrupt.{source_digest}.bak"
-    partial = b"partial legacy forensic copy"
-    expected_backup.write_bytes(partial)
-    partial_digest = hashlib.sha256(partial).hexdigest()[:16]
-    preserved_partial = tmp_path / f"{expected_backup.name}.incomplete.{partial_digest}.bak"
+    expected_backup = kb._backup_corrupt_db(db_path)
+    assert expected_backup is not None
+    assert expected_backup.read_bytes() == original
 
+    expected_backup.write_bytes(b"partial legacy forensic copy")
     assert kb._backup_corrupt_db(db_path) == expected_backup
     assert expected_backup.read_bytes() == original
-    assert preserved_partial.read_bytes() == partial
+    assert list(tmp_path.glob("*.incomplete.*")) == []
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):

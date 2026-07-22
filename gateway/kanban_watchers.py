@@ -189,6 +189,20 @@ ORPHAN_FAILURE_RETRY_SECONDS = 900
 CORRUPT_ALERT_RETRY_SECONDS = 15 * 60
 
 
+def _is_corruption_db_error(kb: Any, exc: BaseException) -> bool:
+    """Return True only for the narrow structural-corruption error class."""
+    corrupt_guard_error = getattr(kb, "KanbanDbCorruptError", None)
+    if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+    )
+
+
 def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
     """Recent failure-kind events on tasks with NO notify subscription.
 
@@ -232,7 +246,9 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
                 payload = None
         try:
             task = kb.get_task(conn, row["task_id"])
-        except Exception:
+        except Exception as exc:
+            if _is_corruption_db_error(kb, exc):
+                raise
             task = None
         out.append({
             "task_id": row["task_id"],
@@ -346,7 +362,9 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
                 payload = None
         try:
             task = kb.get_task(conn, row["task_id"])
-        except Exception:
+        except Exception as exc:
+            if _is_corruption_db_error(kb, exc):
+                raise
             task = None
         out.append({
             "task_id": row["task_id"],
@@ -553,10 +571,11 @@ def _attempt_board_db_recovery(
     of this class is mechanically recoverable, so the dispatcher does it
     itself instead of waiting for a human to notice log spam.
 
-    Safety: the corrupt original (and its -wal/-shm sidecars) are renamed to
-    ``.corrupt-<ts>.bak`` before the recovered file is moved in, so nothing
-    is ever destroyed; the swap uses ``os.replace`` (atomic on POSIX). The
-    recovered DB must pass ``PRAGMA integrity_check`` before the swap.
+    Safety: the corrupt original (and its -wal/-shm sidecars) are retained in
+    the incident's canonical forensic backup before the recovered file is
+    moved in, so nothing is ever destroyed; the swap uses ``os.replace``
+    (atomic on POSIX). The recovered DB must pass ``PRAGMA integrity_check``
+    before the swap.
     ``before_guard`` is invoked only after the capability probe succeeds and
     immediately before the live-board guard is opened.
     Returns a :class:`RecoveryResult`; ``detail`` is diagnostic text only and
@@ -574,14 +593,20 @@ def _attempt_board_db_recovery(
             RecoveryStatus.UNAVAILABLE,
             "sqlite3 .recover capability unavailable: " + capability_detail,
         )
-    path = Path(kb.kanban_db_path(slug))
+    path = Path(kb.kanban_db_path(slug)).expanduser().resolve()
     if before_guard is not None:
         before_guard()
     if not path.exists():
         return RecoveryResult(RecoveryStatus.RETRY, f"{path} does not exist")
     ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time()))
-    recovered_tmp = path.with_name(path.name + f".recovered-{ts}.tmp")
+    read_incident = getattr(kb, "read_corruption_incident", None)
+    incident = read_incident(path) if callable(read_incident) else None
+    incident_id = getattr(incident, "incident_id", None)
+    recovery_token = incident_id or ts
+    recovered_tmp = path.with_name(path.name + f".recovered-{recovery_token}.tmp")
+    rollback_tmp = path.with_name(f".{path.name}.rollback-{recovery_token}.tmp")
     corrupt_bak = path.with_name(path.name + f".corrupt-{ts}.bak")
+    canonical_bak = getattr(incident, "backup_path", None)
 
     def _dev_ino(p: Path) -> "tuple[int, int] | None":
         try:
@@ -604,6 +629,68 @@ def _attempt_board_db_recovery(
     # slow .recover.
     ino_before = _dev_ino(path)
     guard = None
+    pre_swap_stages: list[tuple[Path, Path]] = []
+    moved_sidecars: list[tuple[Path, Path]] = []
+    recovered_installed = False
+    legacy_backup_published = False
+    recovery_succeeded = False
+
+    def _stage_forensic_sources() -> bool:
+        """Stage the locked pre-swap image without opening it in this process."""
+        stage_off_lock = getattr(kb, "_stage_off_lock", None)
+        if not callable(stage_off_lock) or canonical_bak is None:
+            return canonical_bak is None
+        staged_main = stage_off_lock(path)
+        if staged_main is None:
+            return False
+        pre_swap_stages.append((staged_main, canonical_bak))
+        for suffix in ("-wal", "-shm"):
+            sidecar = path.with_name(path.name + suffix)
+            if not sidecar.exists():
+                continue
+            staged_sidecar = stage_off_lock(sidecar)
+            if staged_sidecar is None:
+                return False
+            pre_swap_stages.append(
+                (staged_sidecar, canonical_bak.with_name(canonical_bak.name + suffix))
+            )
+        return True
+
+    def _restore_after_failed_swap() -> Optional[str]:
+        """Restore the corrupt inode when a swap boundary fails."""
+        errors: list[str] = []
+        failed_recovered = path.with_name(
+            f".{path.name}.failed-recovered-{recovery_token}.tmp"
+        )
+        try:
+            if recovered_installed and path.exists() and not rollback_tmp.exists():
+                os.replace(path, failed_recovered)
+        except OSError as exc:
+            errors.append(f"could not stage failed recovered DB: {exc}")
+        if not rollback_tmp.exists() and legacy_backup_published and corrupt_bak.exists():
+            try:
+                os.replace(corrupt_bak, rollback_tmp)
+            except OSError as exc:
+                errors.append(f"could not reclaim rollback DB: {exc}")
+        if rollback_tmp.exists() and not path.exists():
+            try:
+                os.replace(rollback_tmp, path)
+            except OSError as exc:
+                errors.append(f"could not restore original DB: {exc}")
+        for live_sidecar, rollback_sidecar in moved_sidecars:
+            if rollback_sidecar.exists() and not live_sidecar.exists():
+                try:
+                    os.replace(rollback_sidecar, live_sidecar)
+                except OSError as exc:
+                    errors.append(f"could not restore {live_sidecar.name}: {exc}")
+        try:
+            failed_recovered.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"could not remove failed recovered DB: {exc}")
+        return "; ".join(errors) if errors else None
+
     try:
         guard = sqlite3.connect(str(path), timeout=5.0)
         dv_before = guard.execute("PRAGMA data_version").fetchone()[0]
@@ -674,23 +761,75 @@ def _attempt_board_db_recovery(
                 "board changed during recovery; aborting swap "
                 "(a writer committed since the .recover snapshot; retry next tick)",
             )
-        os.replace(path, corrupt_bak)
+        if not _stage_forensic_sources():
+            return RecoveryResult(
+                RecoveryStatus.FAILED,
+                "could not stage the guarded pre-swap original for the canonical forensic backup",
+            )
+        if rollback_tmp.exists():
+            return RecoveryResult(
+                RecoveryStatus.RETRY,
+                "a prior recovery left rollback material beside the board; refusing to overwrite it",
+            )
+        os.replace(path, rollback_tmp)
         for suffix in ("-wal", "-shm"):
             sidecar = path.with_name(path.name + suffix)
             if sidecar.exists():
-                os.replace(sidecar, corrupt_bak.with_name(corrupt_bak.name + suffix))
+                rollback_sidecar = rollback_tmp.with_name(rollback_tmp.name + suffix)
+                os.replace(sidecar, rollback_sidecar)
+                moved_sidecars.append((sidecar, rollback_sidecar))
         os.replace(recovered_tmp, path)
+        recovered_installed = True
+        if canonical_bak is None:
+            # Direct callers from older integrations may invoke recovery before
+            # an incident marker exists. Keep that compatibility path, but all
+            # gateway-detected incidents use the durable canonical backup.
+            os.replace(rollback_tmp, corrupt_bak)
+            legacy_backup_published = True
+            for _live_sidecar, rollback_sidecar in moved_sidecars:
+                sidecar_suffix = _live_sidecar.name[len(path.name):]
+                os.replace(
+                    rollback_sidecar,
+                    corrupt_bak.with_name(corrupt_bak.name + sidecar_suffix),
+                )
+        else:
+            atomic_copy = getattr(kb, "_atomic_copy2", None)
+            if not callable(atomic_copy):
+                raise OSError("kanban DB backup publisher unavailable")
+            for staged_source, backup_destination in pre_swap_stages:
+                if not atomic_copy(staged_source, backup_destination):
+                    raise OSError(
+                        f"could not refresh canonical forensic backup at {backup_destination}"
+                    )
+            # The marker is cleared only after the recovered DB and its
+            # canonical pre-swap backup are both complete.
+            clear_incident = getattr(kb, "clear_corruption_incident", None)
+            if callable(clear_incident):
+                cleared = clear_incident(path, incident_id=incident_id)
+                if incident is not None and not cleared:
+                    raise OSError("canonical incident marker could not be cleared")
+        recovery_succeeded = True
         return RecoveryResult(
             RecoveryStatus.RECOVERED,
-            f"{capability_detail}; corrupt original preserved at {corrupt_bak}",
+            f"{capability_detail}; corrupt original preserved at "
+            f"{canonical_bak or corrupt_bak}",
         )
     except subprocess.TimeoutExpired:
-        return RecoveryResult(RecoveryStatus.FAILED, "recovery subprocess timed out")
+        restore_detail = _restore_after_failed_swap()
+        detail = "recovery subprocess timed out"
+        if restore_detail:
+            detail += f"; {restore_detail}"
+        return RecoveryResult(RecoveryStatus.FAILED, detail)
     except OSError as exc:
-        return RecoveryResult(RecoveryStatus.FAILED, f"recovery swap failed: {exc}")
+        restore_detail = _restore_after_failed_swap()
+        detail = f"recovery swap failed: {exc}"
+        if restore_detail:
+            detail += f"; {restore_detail}"
+        return RecoveryResult(RecoveryStatus.FAILED, detail)
     finally:
         # guard's fd references the pre-swap inode; closing it drops locks only
-        # on the discarded corrupt_bak, never on the freshly-installed DB.
+        # on the retained pre-swap/rollback image, never on a freshly-installed
+        # recovered DB.
         try:
             guard.rollback()
         except sqlite3.Error:
@@ -700,10 +839,33 @@ def _attempt_board_db_recovery(
         except sqlite3.Error:
             pass
         try:
-            if recovered_tmp.exists() and path.exists() and not recovered_tmp.samefile(path):
+            if (
+                recovered_tmp.exists()
+                and path.exists()
+                and not recovered_tmp.samefile(path)
+            ):
                 recovered_tmp.unlink()
         except OSError:
             pass
+        if recovery_succeeded:
+            try:
+                rollback_tmp.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            for _live_sidecar, rollback_sidecar in moved_sidecars:
+                try:
+                    rollback_sidecar.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        for staged_source, _destination in pre_swap_stages:
+            try:
+                staged_source.unlink()
+            except OSError:
+                pass
 
 
 def _resolve_auto_decompose_settings(
@@ -974,6 +1136,15 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        notifier_incidents: dict[str, str] = getattr(
+            self, "_kanban_notifier_corruption_incidents", {}
+        )
+        self._kanban_notifier_corruption_incidents = notifier_incidents
+        notifier_wall_clock = getattr(
+            self,
+            "_kanban_wall_clock",
+            getattr(self, "_kanban_corrupt_wall_clock", time.time),
+        )
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1015,6 +1186,40 @@ class GatewayKanbanWatchersMixin:
                 return True
             allowed = _allowed_notification_sources()
             return "*" in allowed or owner_profile in allowed
+
+        def _record_notifier_corruption(
+            slug: str,
+            db_path: str,
+            exc: Exception,
+        ) -> None:
+            """Publish the board incident without attempting recovery here."""
+            try:
+                if db_path.startswith("slug:"):
+                    db_path = str(_kb.kanban_db_path(slug))
+                path = Path(db_path)
+                incident = _kb.ensure_corruption_incident(
+                    path,
+                    str(exc),
+                    detected_at=notifier_wall_clock(),
+                )
+                previous_id = notifier_incidents.get(str(path.resolve()))
+                notifier_incidents[str(path.resolve())] = incident.incident_id
+                if previous_id != incident.incident_id:
+                    logger.warning(
+                        "kanban notifier: board %s corruption incident %s "
+                        "published; dispatcher owns recovery (backup=%s)",
+                        slug,
+                        incident.incident_id,
+                        incident.backup_path,
+                    )
+            except Exception as marker_exc:
+                logger.error(
+                    "kanban notifier: could not publish corruption incident "
+                    "for board %s: %s",
+                    slug,
+                    marker_exc,
+                    exc_info=True,
+                )
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -1066,7 +1271,16 @@ class GatewayKanbanWatchersMixin:
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            if _is_corruption_db_error(_kb, exc):
+                                _record_notifier_corruption(
+                                    slug, resolved_db_path, exc,
+                                )
+                            else:
+                                logger.debug(
+                                    "kanban notifier: cannot open board %s: %s",
+                                    slug,
+                                    exc,
+                                )
                             continue
                         try:
                             # `connect()` runs the schema + idempotent migration
@@ -1133,7 +1347,9 @@ class GatewayKanbanWatchersMixin:
                                         continue
                                     try:
                                         run = _kb.get_run(conn, int(run_id))
-                                    except Exception:
+                                    except Exception as run_exc:
+                                        if _is_corruption_db_error(_kb, run_exc):
+                                            raise
                                         run = None
                                     if run is not None:
                                         event_runs[ev.id] = run
@@ -1189,6 +1405,8 @@ class GatewayKanbanWatchersMixin:
                                     o["db_path"] = resolved_db_path
                                 orphan_failures.extend(orphans)
                             except Exception as exc:
+                                if _is_corruption_db_error(_kb, exc):
+                                    raise
                                 logger.debug(
                                     "kanban notifier: orphan failure sweep "
                                     "failed for board %s: %s", slug, exc,
@@ -1203,12 +1421,41 @@ class GatewayKanbanWatchersMixin:
                                         b["db_path"] = resolved_db_path
                                     human_blocked.extend(blocked)
                                 except Exception as exc:
+                                    if _is_corruption_db_error(_kb, exc):
+                                        raise
                                     logger.debug(
                                         "kanban notifier: human-block sweep "
                                         "failed for board %s: %s", slug, exc,
                                     )
+                        except Exception as exc:
+                            if _is_corruption_db_error(_kb, exc):
+                                # Close this board before publishing the
+                                # marker. The notifier never runs recovery;
+                                # the singleton dispatcher consumes the
+                                # marker on its next normal tick.
+                                try:
+                                    conn.close()
+                                except Exception:
+                                    logger.debug(
+                                        "kanban notifier: closing corrupt board %s failed",
+                                        slug,
+                                        exc_info=True,
+                                    )
+                                finally:
+                                    conn = None
+                                _record_notifier_corruption(
+                                    slug, resolved_db_path, exc,
+                                )
+                            else:
+                                logger.debug(
+                                    "kanban notifier: board %s collection failed: %s",
+                                    slug,
+                                    exc,
+                                    exc_info=True,
+                                )
                         finally:
-                            conn.close()
+                            if conn is not None:
+                                conn.close()
                     return deliveries, tui_sweeps, orphan_failures
 
                 human_blocked: list = []
@@ -2277,20 +2524,18 @@ class GatewayKanbanWatchersMixin:
             realert_seconds=_escalate_realert_seconds,
         )
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
-        # same-fingerprint retries forever: transient WAL/open races can
+        # same-incident retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
         CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
-        disabled_corrupt_boards: dict[
-            str, tuple[tuple[str, int | None, int | None], float]
-        ] = {}
-        # FAILED is one recovery attempt per distinct corrupt fingerprint;
+        disabled_corrupt_boards: dict[str, tuple[str, float]] = {}
+        # FAILED is one recovery attempt per durable incident;
         # UNAVAILABLE and RETRY remain eligible on the existing quarantine
         # cadence. Re-detections of the same state log at INFO so a
         # still-corrupt board doesn't ERROR-spam every quarantine expiry
         # (the 2026-07-18 vault-v2 incident logged the identical ERROR every
         # 5 minutes for 16 hours and never told the operator).
-        corrupt_recovery_attempted: set = set()
-        corrupt_recovery_states: dict = {}
+        corrupt_recovery_attempted: set[str] = set()
+        corrupt_recovery_states: dict[str, RecoveryStatus] = {}
         corrupt_alert_pending: dict[tuple, str] = {}
         corrupt_alert_delivered: set[tuple] = set()
         corrupt_alert_last_attempt: dict[tuple, float] = {}
@@ -2306,17 +2551,43 @@ class GatewayKanbanWatchersMixin:
         )
 
         def _queue_corrupt_alert(
-            fingerprint: tuple,
+            incident_id: str,
             event_kind: str,
             message: str,
             *,
             replace_pending: bool = False,
         ) -> None:
-            key = (fingerprint, event_kind)
+            key = (incident_id, event_kind)
             if key in corrupt_alert_delivered:
                 return
             if replace_pending or key not in corrupt_alert_pending:
                 corrupt_alert_pending[key] = message
+
+        def _clear_corrupt_incident_state(
+            incident_id: str,
+            *,
+            clear_alerts: bool = True,
+        ) -> None:
+            """Forget runtime quarantine/retry state after an epoch heals."""
+            corrupt_recovery_attempted.discard(incident_id)
+            corrupt_recovery_states.pop(incident_id, None)
+            for board_slug, disabled_entry in list(disabled_corrupt_boards.items()):
+                if disabled_entry[0] == incident_id:
+                    disabled_corrupt_boards.pop(board_slug, None)
+            if clear_alerts:
+                for alert_key in list(corrupt_alert_pending):
+                    if alert_key[0] == incident_id:
+                        corrupt_alert_pending.pop(alert_key, None)
+                for alert_key in list(corrupt_alert_last_attempt):
+                    if alert_key[0] == incident_id:
+                        corrupt_alert_last_attempt.pop(alert_key, None)
+                corrupt_alert_delivered.difference_update(
+                    {
+                        key
+                        for key in corrupt_alert_delivered
+                        if key[0] == incident_id
+                    }
+                )
 
         def _bounded_alert_detail(value: object, limit: int = 400) -> str:
             detail = str(value).strip()
@@ -2326,7 +2597,7 @@ class GatewayKanbanWatchersMixin:
 
         def _corrupt_failure_alert(
             slug: str,
-            fingerprint: tuple,
+            incident: Any,
             exc: Exception,
             result: RecoveryResult,
         ) -> str:
@@ -2342,11 +2613,16 @@ class GatewayKanbanWatchersMixin:
                 recovery_label = "RETRY (the board changed during recovery; no swap was applied)"
             else:
                 recovery_label = status
-            backup_path = getattr(exc, "backup_path", None)
+            incident_backup = getattr(incident, "backup_path", None)
+            if getattr(incident, "preservation_status", "published") != "published":
+                incident_backup = None
+            backup_path = getattr(exc, "backup_path", None) or incident_backup
             backup_detail = str(backup_path) if backup_path is not None else "not available"
+            db_path = getattr(incident, "db_path", None) or getattr(exc, "db_path", "")
             return (
                 f"🚨 Kanban board `{slug}` database is corrupt. "
-                f"Resolved path: `{fingerprint[0]}`. "
+                f"Incident: `{getattr(incident, 'incident_id', 'unknown')}`. "
+                f"Resolved path: `{db_path}`. "
                 f"Automatic recovery `{status}`: {recovery_label}. "
                 f"Detail: `{_bounded_alert_detail(result.detail)}`. "
                 f"Detection: `{_bounded_alert_detail(exc, 240)}`. "
@@ -2358,43 +2634,32 @@ class GatewayKanbanWatchersMixin:
 
         def _corrupt_recovered_alert(
             slug: str,
-            fingerprint: tuple,
+            incident: Any,
             result: RecoveryResult,
         ) -> str:
             return (
                 f"🛠 Kanban board `{slug}` database was corrupt and has been "
                 f"auto-recovered; dispatch resumes next tick. "
-                f"Resolved path: `{fingerprint[0]}`. "
+                f"Incident: `{getattr(incident, 'incident_id', 'unknown')}`. "
+                f"Resolved path: `{getattr(incident, 'db_path', '')}`. "
                 f"{_bounded_alert_detail(result.detail)}."
             )
 
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
+        def _board_corruption_incident(slug: str) -> Any:
+            path = Path(_kb.kanban_db_path(slug))
+            read_incident = getattr(_kb, "read_corruption_incident", None)
+            if not callable(read_incident):
+                return None
             try:
-                resolved = str(path.expanduser().resolve())
+                return read_incident(path)
             except Exception:
-                resolved = str(path)
-            try:
-                stat = path.stat()
-            except OSError:
-                return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
+                return None
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
+            return _is_corruption_db_error(_kb, exc)
 
         def _handle_corrupt_board(
             slug: str,
-            fingerprint: "tuple[str, int | None, int | None]",
             exc: Exception,
         ) -> None:
             """Corrupt board DB: attempt safe recovery, alert once per
@@ -2404,8 +2669,39 @@ class GatewayKanbanWatchersMixin:
             the pending alert map and flushed to the Telegram home channel by
             the async loop after the tick returns.
             """
-            previous_status = corrupt_recovery_states.get(fingerprint)
-            if fingerprint not in corrupt_recovery_attempted:
+            path = Path(_kb.kanban_db_path(slug))
+            incident = _board_corruption_incident(slug)
+            ensure_incident = getattr(_kb, "ensure_corruption_incident", None)
+            if incident is None and callable(ensure_incident):
+                try:
+                    incident = ensure_incident(
+                        path,
+                        str(exc),
+                        detected_at=corrupt_wall_clock(),
+                    )
+                except Exception:
+                    logger.error(
+                        "kanban dispatcher: could not publish a corruption "
+                        "incident for board %s",
+                        slug,
+                        exc_info=True,
+                    )
+            incident_id = getattr(incident, "incident_id", None)
+            if not incident_id:
+                # Compatibility fallback for test doubles or an unavailable
+                # marker filesystem. Real DB paths use random durable IDs.
+                incident_id = f"unpublished:{path.resolve()}"
+                incident = type(
+                    "UnpublishedIncident",
+                    (),
+                    {
+                        "incident_id": incident_id,
+                        "db_path": path.resolve(),
+                        "backup_path": getattr(exc, "backup_path", None),
+                    },
+                )()
+            previous_status = corrupt_recovery_states.get(incident_id)
+            if incident_id not in corrupt_recovery_attempted:
                 def _snapshot_before_recovery() -> None:
                     # BUILD-531 forensics: capture the fd table BEFORE recovery
                     # swaps files around, while the stray-writing fd (if any)
@@ -2435,27 +2731,27 @@ class GatewayKanbanWatchersMixin:
                 result = _attempt_board_db_recovery(
                     _kb, slug, before_guard=_snapshot_before_recovery,
                 )
-                corrupt_recovery_states[fingerprint] = result.status
+                corrupt_recovery_states[incident_id] = result.status
                 if result.status == RecoveryStatus.FAILED:
-                    corrupt_recovery_attempted.add(fingerprint)
+                    corrupt_recovery_attempted.add(incident_id)
                 else:
                     # UNAVAILABLE must be re-probed after the existing
                     # quarantine cadence; RETRY likewise remains retryable.
-                    corrupt_recovery_attempted.discard(fingerprint)
+                    corrupt_recovery_attempted.discard(incident_id)
                 if result.status == RecoveryStatus.RECOVERED:
                     logger.warning(
                         "kanban dispatcher: board %s database was corrupt (%s); "
                         "auto-recovered in place. %s",
                         slug, exc, result.detail,
                     )
+                    _clear_corrupt_incident_state(incident_id)
                     _queue_corrupt_alert(
-                        fingerprint,
+                        incident_id,
                         "recovered",
-                        _corrupt_recovered_alert(slug, fingerprint, result),
+                        _corrupt_recovered_alert(slug, incident, result),
                     )
-                    # Fingerprint changed on swap, so the normal
-                    # changed-fingerprint path re-enables dispatch.
-                    disabled_corrupt_boards.pop(slug, None)
+                    # The recovery helper clears the marker only after the
+                    # recovered DB and canonical backup are both published.
                     return
                 log_method = (
                     logger.error
@@ -2467,28 +2763,31 @@ class GatewayKanbanWatchersMixin:
                     "(not a valid SQLite database) and "
                     "automatic recovery is %s (%s); dispatch remains paused "
                     "until the file changes or the quarantine timer expires.",
-                    slug, fingerprint[0], result.status.value, result.detail,
+                    slug,
+                    getattr(incident, "db_path", path),
+                    result.status.value,
+                    result.detail,
                 )
             else:
                 result = RecoveryResult(
                     previous_status or RecoveryStatus.FAILED,
-                    "automatic recovery already attempted for this unchanged fingerprint",
+                    "automatic recovery already attempted for this unchanged incident",
                 )
                 logger.info(
                     "kanban dispatcher: board %s still corrupt (not a valid "
-                    "SQLite database; fingerprint unchanged); dispatch remains "
-                    "paused.", slug,
+                    "SQLite database; incident unchanged); dispatch remains "
+                    "paused. incident=%s", slug, incident_id,
                 )
             _queue_corrupt_alert(
-                fingerprint,
+                incident_id,
                 "failure",
-                _corrupt_failure_alert(slug, fingerprint, exc, result),
+                _corrupt_failure_alert(slug, incident, exc, result),
                 replace_pending=(
                     previous_status is not None
                     and previous_status != result.status
                 ),
             )
-            disabled_corrupt_boards[slug] = (fingerprint, corrupt_monotonic_clock())
+            disabled_corrupt_boards[slug] = (incident_id, corrupt_monotonic_clock())
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
@@ -2500,29 +2799,76 @@ class GatewayKanbanWatchersMixin:
             connection handle or accidentally claim across each other.
             """
             conn = None
-            fingerprint = _board_db_fingerprint(slug)
+            incident = _board_corruption_incident(slug)
+            incident_id = getattr(incident, "incident_id", None)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
-                disabled_fingerprint, disabled_at = disabled_entry
+                disabled_incident_id, disabled_at = disabled_entry
                 age = corrupt_monotonic_clock() - disabled_at
+                generation_changed = False
+                if incident is not None:
+                    try:
+                        stat = Path(_kb.kanban_db_path(slug)).stat()
+                        generation_changed = (
+                            getattr(incident, "dev", None) != stat.st_dev
+                            or getattr(incident, "ino", None) != stat.st_ino
+                        )
+                    except OSError:
+                        generation_changed = True
                 if (
-                    disabled_fingerprint == fingerprint
+                    disabled_incident_id == incident_id
                     and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    and not generation_changed
                 ):
                     return None
-                if disabled_fingerprint == fingerprint:
+                if disabled_incident_id == incident_id:
                     logger.info(
-                        "kanban dispatcher: board %s database fingerprint unchanged "
+                        "kanban dispatcher: board %s database incident unchanged "
                         "after %.0fs quarantine; retrying dispatch",
                         slug,
                         age,
                     )
+                    probe_health = getattr(_kb, "probe_corruption_incident", None)
+                    if callable(probe_health):
+                        try:
+                            healed = bool(probe_health(Path(_kb.kanban_db_path(slug))))
+                        except Exception as probe_exc:
+                            if _is_corrupt_board_db_error(probe_exc):
+                                healed = False
+                            else:
+                                logger.debug(
+                                    "kanban dispatcher: health probe failed on "
+                                    "board %s: %s",
+                                    slug,
+                                    probe_exc,
+                                    exc_info=True,
+                                )
+                                return None
+                        if healed:
+                            # A forced healthy probe is an explicit epoch
+                            # transition. Clear recovery state before opening
+                            # the repaired board on this same dispatcher.
+                            _clear_corrupt_incident_state(disabled_incident_id)
+                            incident = _board_corruption_incident(slug)
+                            incident_id = getattr(incident, "incident_id", None)
+                            logger.info(
+                                "kanban dispatcher: board %s health probe "
+                                "passed; corruption incident healed",
+                                slug,
+                            )
+                            # Fall through to the normal dispatch connect.
+                        else:
+                            # Still corrupt: let connect() route the same
+                            # incident through the recovery handler again.
+                            disabled_corrupt_boards.pop(slug, None)
+                    else:
+                        disabled_corrupt_boards.pop(slug, None)
                 else:
                     logger.info(
                         "kanban dispatcher: board %s database changed; retrying dispatch",
                         slug,
                     )
-                disabled_corrupt_boards.pop(slug, None)
+                    disabled_corrupt_boards.pop(slug, None)
             try:
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
@@ -2544,7 +2890,7 @@ class GatewayKanbanWatchersMixin:
                 )
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
-                    _handle_corrupt_board(slug, fingerprint, exc)
+                    _handle_corrupt_board(slug, exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
