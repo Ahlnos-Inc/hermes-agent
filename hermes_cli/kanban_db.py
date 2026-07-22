@@ -1203,6 +1203,14 @@ class Task:
     publication_expected_sha: Optional[str] = None
     publication_remote: Optional[str] = None
     publication_ref: Optional[str] = None
+    # Worktree lifecycle ownership. ``True`` means Hermes created the linked
+    # worktree for this task; a pre-existing checkout is borrowed and is never
+    # removed automatically.
+    workspace_managed: bool = False
+    workspace_repo_root: Optional[str] = None
+    workspace_repo_common_dir: Optional[str] = None
+    workspace_cleanup_lease: Optional[str] = None
+    workspace_cleanup_lease_expires: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1328,6 +1336,29 @@ class Task:
             ),
             publication_ref=(
                 row["publication_ref"] if "publication_ref" in keys else None
+            ),
+            workspace_managed=(
+                bool(row["workspace_managed"])
+                if "workspace_managed" in keys
+                else False
+            ),
+            workspace_repo_root=(
+                row["workspace_repo_root"] if "workspace_repo_root" in keys else None
+            ),
+            workspace_repo_common_dir=(
+                row["workspace_repo_common_dir"]
+                if "workspace_repo_common_dir" in keys
+                else None
+            ),
+            workspace_cleanup_lease=(
+                row["workspace_cleanup_lease"]
+                if "workspace_cleanup_lease" in keys
+                else None
+            ),
+            workspace_cleanup_lease_expires=(
+                row["workspace_cleanup_lease_expires"]
+                if "workspace_cleanup_lease_expires" in keys
+                else None
             ),
         )
 
@@ -1664,6 +1695,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at         INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
+    -- Exact ownership and repository identity for a materialized linked
+    -- worktree. Borrowed worktrees keep workspace_managed=0.
+    workspace_managed    INTEGER NOT NULL DEFAULT 0,
+    workspace_repo_root  TEXT,
+    workspace_repo_common_dir TEXT,
+    workspace_cleanup_lease TEXT,
+    workspace_cleanup_lease_expires INTEGER,
     branch_name          TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
@@ -3482,6 +3520,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "publication_ref" not in cols:
         _add_column_if_missing(
             conn, "tasks", "publication_ref", "publication_ref TEXT"
+        )
+    if "workspace_managed" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_managed",
+            "workspace_managed INTEGER NOT NULL DEFAULT 0",
+        )
+    if "workspace_repo_root" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "workspace_repo_root", "workspace_repo_root TEXT"
+        )
+    if "workspace_repo_common_dir" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_repo_common_dir",
+            "workspace_repo_common_dir TEXT",
+        )
+    if "workspace_cleanup_lease" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_cleanup_lease",
+            "workspace_cleanup_lease TEXT",
+        )
+    if "workspace_cleanup_lease_expires" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_cleanup_lease_expires",
+            "workspace_cleanup_lease_expires INTEGER",
         )
 
     discovery_table = conn.execute(
@@ -9992,6 +10062,9 @@ def complete_task(
     # Clean up the scratch workspace. Legacy assignee-derived tmux cleanup was
     # removed by BUILD-487 because a guessed session name is not ownership.
     _cleanup_workspace(conn, task_id)
+    # Reap a clean Hermes-owned linked worktree, or leave an auditable deferred
+    # event when another task/run or Git's dirty-state guard still owns it.
+    cleanup_terminal_task_worktrees(conn)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -10011,6 +10084,307 @@ def complete_task(
 # ---------------------------------------------------------------------------
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
+
+
+WORKSPACE_CLEANUP_LEASE_SECONDS = 60
+_TERMINAL_WORKSPACE_STATUSES = ("done", "archived")
+
+
+def _workspace_cleanup_now(
+    now: Optional[int],
+    clock: Optional[Callable[[], float]],
+) -> int:
+    if now is not None:
+        return int(now)
+    return int(clock() if clock is not None else time.time())
+
+
+def _registered_worktree_path(repo_root: Path, path: Path) -> bool:
+    """Return whether Git currently registers this exact worktree path."""
+
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain", "-z"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return False
+    if listed.returncode != 0:
+        return False
+    expected = str(path)
+    for record in (listed.stdout or "").split("\x00\x00"):
+        for field in record.split("\x00"):
+            if field == f"worktree {expected}":
+                return True
+    return False
+
+
+def _workspace_cleanup_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: int,
+    lease_seconds: int,
+) -> tuple[str, sqlite3.Row] | None:
+    """Acquire one task-level cleanup lease with a compare-and-swap."""
+
+    token = f"{_claimer_id()}:workspace:{secrets.token_hex(12)}"
+    expires = now + max(1, int(lease_seconds))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["workspace_kind"] != "worktree":
+            return None
+        if row["status"] not in _TERMINAL_WORKSPACE_STATUSES:
+            return None
+        if not bool(row["workspace_managed"]):
+            return None
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_cleanup_lease = ?, "
+            "workspace_cleanup_lease_expires = ? WHERE id = ? "
+            "AND status IN ('done', 'archived') AND workspace_managed = 1 "
+            "AND (workspace_cleanup_lease IS NULL "
+            "OR workspace_cleanup_lease_expires IS NULL "
+            "OR workspace_cleanup_lease_expires <= ?)",
+            (token, expires, task_id, now),
+        )
+        if cur.rowcount != 1:
+            return None
+        leased = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        return token, leased
+
+
+def _finish_workspace_cleanup_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+    token: str,
+    *,
+    kind: str,
+    payload: dict[str, Any],
+) -> None:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_cleanup_lease = NULL, "
+            "workspace_cleanup_lease_expires = NULL "
+            "WHERE id = ? AND workspace_cleanup_lease = ?",
+            (task_id, token),
+        )
+        if cur.rowcount == 1:
+            _append_event(conn, task_id, kind, payload)
+
+
+def _workspace_cleanup_defer_reason(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> str | None:
+    path = row["workspace_path"]
+    if not path:
+        return "workspace_path_missing"
+    try:
+        target_path = Path(str(path)).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return "workspace_path_unresolvable"
+    active_references = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE workspace_kind = 'worktree' "
+        "AND workspace_path IS NOT NULL "
+        "AND status NOT IN ('done', 'archived') AND id != ?",
+        (row["id"],),
+    ).fetchall()
+    for active_reference in active_references:
+        reference_path = Path(str(active_reference["workspace_path"])).expanduser()
+        try:
+            same_path = reference_path.resolve(strict=False) == target_path
+        except (OSError, RuntimeError):
+            return "active_workspace_reference_unresolvable"
+        if same_path:
+            return "active_task_references_workspace"
+    if row["current_run_id"] is not None:
+        return "active_run"
+    active_run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    if active_run is not None:
+        return "active_run"
+    return None
+
+
+def _revalidate_managed_worktree(row: sqlite3.Row) -> tuple[Path, Path, str | None]:
+    """Revalidate the registered path and Git identity before removal."""
+
+    raw_path = str(row["workspace_path"] or "")
+    raw_repo_root = str(row["workspace_repo_root"] or "")
+    raw_common_dir = str(row["workspace_repo_common_dir"] or "")
+    if not raw_path or not raw_repo_root or not raw_common_dir:
+        return Path(raw_path), Path(raw_repo_root), "workspace_identity_incomplete"
+    path = Path(raw_path).expanduser()
+    repo_root = Path(raw_repo_root).expanduser()
+    common_dir = Path(raw_common_dir).expanduser()
+    if (
+        not path.is_absolute()
+        or not repo_root.is_absolute()
+        or not common_dir.is_absolute()
+        or path.resolve(strict=False) != path
+        or repo_root.resolve(strict=False) != repo_root
+        or common_dir.resolve(strict=False) != common_dir
+    ):
+        return path, repo_root, "workspace_identity_changed"
+    if not path.exists():
+        if _registered_worktree_path(repo_root, path):
+            return path, repo_root, "workspace_path_missing_but_registered"
+        return path, repo_root, "workspace_already_absent"
+    if not path.is_dir() or not _is_linked_worktree_checkout(path):
+        return path, repo_root, "workspace_is_not_linked_worktree"
+    if _git_common_dir(path) != common_dir or _git_common_dir(repo_root) != common_dir:
+        return path, repo_root, "workspace_git_common_directory_mismatch"
+    if not _registered_worktree_path(repo_root, path):
+        return path, repo_root, "workspace_not_registered"
+    return path, repo_root, None
+
+
+def cleanup_terminal_task_worktrees(
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    now: Optional[int] = None,
+    clock: Optional[Callable[[], float]] = None,
+    lease_seconds: int = WORKSPACE_CLEANUP_LEASE_SECONDS,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Safely reap Hermes-owned linked worktrees after terminal transitions."""
+
+    effective_now = _workspace_cleanup_now(now, clock)
+    try:
+        bounded_limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        bounded_limit = 100
+    if task_id is None:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+            "AND workspace_kind = 'worktree' AND workspace_managed = 1 "
+            "ORDER BY id LIMIT ?",
+            (bounded_limit,),
+        ).fetchall()
+        task_ids = [str(row["id"]) for row in rows]
+    else:
+        reference = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if reference is not None and reference["workspace_path"]:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+                "AND workspace_kind = 'worktree' AND workspace_managed = 1 "
+                "AND workspace_path = ? ORDER BY id LIMIT ?",
+                (reference["workspace_path"], bounded_limit),
+            ).fetchall()
+            task_ids = [str(row["id"]) for row in rows]
+        else:
+            task_ids = [str(task_id)]
+
+    results: list[dict[str, Any]] = []
+    for current_task_id in task_ids:
+        leased = _workspace_cleanup_lease(
+            conn,
+            current_task_id,
+            now=effective_now,
+            lease_seconds=lease_seconds,
+        )
+        if leased is None:
+            continue
+        token, row = leased
+        path = Path(str(row["workspace_path"] or ""))
+        defer_reason = _workspace_cleanup_defer_reason(conn, row)
+        if defer_reason is not None:
+            payload = {
+                "path": str(path),
+                "reason": defer_reason,
+            }
+            _finish_workspace_cleanup_lease(
+                conn,
+                current_task_id,
+                token,
+                kind="workspace_cleanup_deferred",
+                payload=payload,
+            )
+            results.append({"task_id": current_task_id, "status": "deferred", **payload})
+            continue
+
+        path, repo_root, identity_error = _revalidate_managed_worktree(row)
+        if identity_error == "workspace_already_absent":
+            payload = {"path": str(path), "reason": identity_error}
+            _finish_workspace_cleanup_lease(
+                conn,
+                current_task_id,
+                token,
+                kind="workspace_cleaned",
+                payload=payload,
+            )
+            results.append({"task_id": current_task_id, "status": "absent", **payload})
+            continue
+        if identity_error is not None:
+            payload = {"path": str(path), "reason": identity_error}
+            _finish_workspace_cleanup_lease(
+                conn,
+                current_task_id,
+                token,
+                kind="workspace_cleanup_deferred",
+                payload=payload,
+            )
+            results.append({"task_id": current_task_id, "status": "deferred", **payload})
+            continue
+
+        try:
+            removed = subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "remove", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except OSError as exc:
+            removed = None
+            detail = f"git_worktree_remove_failed:{type(exc).__name__}"
+        else:
+            detail = (
+                "removed"
+                if removed.returncode == 0
+                else "git_worktree_remove_refused"
+            )
+        if removed is not None and removed.returncode == 0:
+            payload = {"path": str(path), "repo_root": str(repo_root)}
+            event_kind = "workspace_cleaned"
+            status = "cleaned"
+        else:
+            stderr = (
+                ((removed.stderr or removed.stdout or "").strip() if removed else "")
+                [:400]
+            )
+            payload = {
+                "path": str(path),
+                "repo_root": str(repo_root),
+                "reason": detail,
+                "detail": stderr or None,
+            }
+            event_kind = "workspace_cleanup_deferred"
+            status = "deferred"
+        _finish_workspace_cleanup_lease(
+            conn,
+            current_task_id,
+            token,
+            kind=event_kind,
+            payload=payload,
+        )
+        results.append({"task_id": current_task_id, "status": status, **payload})
+    return results
 
 
 def _merge_completion_prose_artifacts(
@@ -11658,6 +12032,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    cleanup_terminal_task_worktrees(conn)
     return True
 
 
@@ -11946,7 +12321,7 @@ def _ensure_git_worktree(
     branch_name: str,
     *,
     checkpoint_key: str,
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str], bool]:
     """Materialize a linked worktree from a recoverable source checkpoint."""
     target = target.expanduser()
     branch_check = subprocess.run(
@@ -11962,7 +12337,8 @@ def _ensure_git_worktree(
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
-            return _existing_checkpoint(repo_root, checkpoint_key)
+            checkpoint_ref, checkpoint_sha = _existing_checkpoint(repo_root, checkpoint_key)
+            return checkpoint_ref, checkpoint_sha, False
     _exclude_managed_worktree_container(repo_root, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_ref: Optional[str] = None
@@ -11993,11 +12369,66 @@ def _ensure_git_worktree(
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
-    return checkpoint_ref, checkpoint_sha
+    return checkpoint_ref, checkpoint_sha, True
+
+
+def _persist_worktree_materialization(
+    conn: sqlite3.Connection,
+    task: Task,
+    path: Path,
+    *,
+    managed: bool,
+    repo_root: Path,
+    repo_common_dir: Path,
+) -> None:
+    """Persist the exact worktree ownership and repository identity."""
+
+    task.workspace_path = str(path.resolve(strict=False))
+    task.workspace_managed = bool(managed)
+    task.workspace_repo_root = str(repo_root.resolve(strict=False))
+    task.workspace_repo_common_dir = str(repo_common_dir.resolve(strict=False))
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_managed = ?, "
+            "workspace_repo_root = ?, workspace_repo_common_dir = ? "
+            "WHERE id = ?",
+            (
+                task.workspace_path,
+                int(task.workspace_managed),
+                task.workspace_repo_root,
+                task.workspace_repo_common_dir,
+                task.id,
+            ),
+        )
+
+
+def _worktree_materialization_identity(
+    path: Path,
+    *,
+    fallback_repo_root: Path | None = None,
+) -> tuple[Path, Path]:
+    common_dir = _git_common_dir(path)
+    if common_dir is None:
+        raise WorkspaceContractError(
+            "worktree_bad_anchor",
+            f"materialized worktree {path} has no validated Git common directory",
+        )
+    repo_root = fallback_repo_root.resolve(strict=False) if fallback_repo_root else None
+    if repo_root is None or _git_common_dir(repo_root) != common_dir:
+        repo_root = common_dir.parent.resolve(strict=False)
+    if _git_common_dir(repo_root) != common_dir:
+        raise WorkspaceContractError(
+            "worktree_bad_anchor",
+            f"materialized worktree {path} has an unverifiable repository root",
+        )
+    return repo_root, common_dir
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[Path, str, Optional[str], Optional[str]]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -12009,6 +12440,56 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
+    def _finish(
+        path: Path,
+        resolved_branch: str,
+        checkpoint_ref: Optional[str],
+        checkpoint_sha: Optional[str],
+        *,
+        managed: bool,
+        repo_root: Path,
+    ) -> tuple[Path, str, Optional[str], Optional[str]]:
+        identity_root, common_dir = _worktree_materialization_identity(
+            path,
+            fallback_repo_root=repo_root,
+        )
+        # Reusing a worktree Hermes previously created must retain ownership,
+        # while a task whose requested path changed must not carry ownership
+        # over to an unrelated checkout.
+        previous_path: Path | None = None
+        previous_common_dir: Path | None = None
+        if task.workspace_managed and task.workspace_path:
+            try:
+                previous_path = Path(task.workspace_path).expanduser().resolve(strict=False)
+                previous_common_dir = (
+                    Path(task.workspace_repo_common_dir).expanduser().resolve(strict=False)
+                    if task.workspace_repo_common_dir
+                    else None
+                )
+            except (OSError, RuntimeError, ValueError):
+                previous_path = None
+                previous_common_dir = None
+        retained_ownership = (
+            previous_path == path.resolve(strict=False)
+            and previous_common_dir == common_dir
+        )
+        effective_managed = bool(managed or retained_ownership)
+        if conn is not None:
+            _persist_worktree_materialization(
+                conn,
+                task,
+                path,
+                managed=effective_managed,
+                repo_root=identity_root,
+                repo_common_dir=common_dir,
+            )
+        else:
+            task.workspace_path = str(path.resolve(strict=False))
+            task.workspace_managed = effective_managed
+            task.workspace_repo_root = str(identity_root)
+            task.workspace_repo_common_dir = str(common_dir)
+        return path, resolved_branch, checkpoint_ref, checkpoint_sha
+
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -12042,10 +12523,17 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo",
             )
         target = repo_root / ".worktrees" / task.id
-        checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+        checkpoint_ref, checkpoint_sha, created = _ensure_git_worktree(
             repo_root, target, branch_name, checkpoint_key=task.id,
         )
-        return target, branch_name, checkpoint_ref, checkpoint_sha
+        return _finish(
+            target,
+            branch_name,
+            checkpoint_ref,
+            checkpoint_sha,
+            managed=created,
+            repo_root=repo_root,
+        )
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -12058,15 +12546,30 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        return requested_resolved, actual_branch or branch_name, None, None
+        repo_root, _common_dir = _worktree_materialization_identity(requested_resolved)
+        return _finish(
+            requested_resolved,
+            actual_branch or branch_name,
+            None,
+            None,
+            managed=False,
+            repo_root=repo_root,
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+        checkpoint_ref, checkpoint_sha, created = _ensure_git_worktree(
             repo_root, target, branch_name, checkpoint_key=task.id,
         )
-        return target, branch_name, checkpoint_ref, checkpoint_sha
+        return _finish(
+            target,
+            branch_name,
+            checkpoint_ref,
+            checkpoint_sha,
+            managed=created,
+            repo_root=repo_root,
+        )
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -12075,13 +12578,25 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root",
         )
-    checkpoint_ref, checkpoint_sha = _ensure_git_worktree(
+    checkpoint_ref, checkpoint_sha, created = _ensure_git_worktree(
         repo_root, requested, branch_name, checkpoint_key=task.id,
     )
-    return requested, branch_name, checkpoint_ref, checkpoint_sha
+    return _finish(
+        requested,
+        branch_name,
+        checkpoint_ref,
+        checkpoint_sha,
+        managed=created,
+        repo_root=repo_root,
+    )
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: sqlite3.Connection | None = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -12139,7 +12654,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "worktree":
         p, _branch_name, _checkpoint_ref, _checkpoint_sha = (
-            _resolve_worktree_workspace(task, board=board)
+            _resolve_worktree_workspace(task, board=board, conn=conn)
         )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
@@ -16661,6 +17176,9 @@ def _dispatch_once_locked(
     # Exact-identity cleanup for runs ended by block/reclaim/crash paths. This
     # happens before any ready task can be claimed for its next epoch.
     cleanup_terminal_run_resources(conn)
+    # Crash recovery for managed terminal worktrees. The lease and identity
+    # checks make this sweep safe to run on every dispatcher tick.
+    cleanup_terminal_task_worktrees(conn)
     # Snapshot once per tick. New behavior is opt-in and the exact policy is
     # sealed into each run's immutable continuation manifest.
     _continuation_cfg = _continuation_config()
@@ -16969,7 +17487,7 @@ def _dispatch_once_locked(
                     resolved_branch_name,
                     checkpoint_ref,
                     checkpoint_sha,
-                ) = _resolve_worktree_workspace(claimed, board=board)
+                ) = _resolve_worktree_workspace(claimed, board=board, conn=conn)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except WorkspaceContractError as exc:
@@ -17120,7 +17638,7 @@ def _dispatch_once_locked(
                     resolved_branch_name,
                     checkpoint_ref,
                     checkpoint_sha,
-                ) = _resolve_worktree_workspace(claimed, board=board)
+                ) = _resolve_worktree_workspace(claimed, board=board, conn=conn)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except WorkspaceContractError as exc:

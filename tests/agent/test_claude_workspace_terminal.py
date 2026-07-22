@@ -7,8 +7,12 @@ from pathlib import Path
 
 import pytest
 
+import agent.claude_workspace_terminal as workspace_terminal
+from agent.claude_workspace_terminal import WorkspaceBoundaryProvisioningError
+from agent.claude_workspace_terminal import build_workspace_seatbelt_profile
 from agent.claude_workspace_terminal import build_workspace_terminal_args
 from agent.claude_workspace_terminal import dispatch_read_only_workspace_terminal
+from agent.claude_workspace_terminal import prepare_workspace_terminal_boundary
 
 
 def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
@@ -794,6 +798,172 @@ def test_workspace_terminal_preflight_rejects_hardlinked_regular_file(
             read_only=read_only,
             runtime_root=tmp_path / "runtime" if read_only else None,
         )
+
+
+def test_workspace_boundary_accepts_links_wholly_inside_writable_scope(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    source = workspace / "source.txt"
+    alias = workspace / "alias.txt"
+    source.write_text("inside", encoding="utf-8")
+    os.link(source, alias)
+
+    boundary = prepare_workspace_terminal_boundary(workspace)
+
+    assert boundary.root == workspace.resolve()
+    assert boundary.readonly_subtrees == ()
+
+
+def test_workspace_boundary_rejects_link_with_external_alias(tmp_path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    os.link(outside, workspace / "alias.txt")
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(workspace)
+
+
+def test_workspace_boundary_scans_directory_named_worktrees_without_git_attestation(
+    tmp_path,
+):
+    workspace = tmp_path / "work"
+    fake_worktrees = workspace / ".worktrees"
+    fake_worktrees.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    os.link(outside, fake_worktrees / "alias.txt")
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(workspace)
+
+
+def test_workspace_boundary_skips_attested_nested_worktree(tmp_path):
+    repo, nested = _linked_worktree(tmp_path)
+    nested_target = repo / "nested-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "nested-boundary", str(nested_target)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    nested_source = nested_target / "source.txt"
+    nested_alias = nested_target / "alias.txt"
+    nested_source.write_text("nested", encoding="utf-8")
+    os.link(nested_source, nested_alias)
+
+    boundary = prepare_workspace_terminal_boundary(repo)
+
+    assert boundary.readonly_subtrees == (nested_target.resolve(),)
+
+
+def test_workspace_boundary_rejects_alias_between_writable_root_and_nested_worktree(
+    tmp_path,
+):
+    repo, _ = _linked_worktree(tmp_path)
+    nested_target = repo / "nested-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "nested-boundary", str(nested_target)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source = repo / "source.txt"
+    source.write_text("shared", encoding="utf-8")
+    os.link(source, nested_target / "alias.txt")
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(repo)
+
+
+def test_prepared_workspace_boundary_is_not_recanned_by_terminal_dispatch(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    boundary = prepare_workspace_terminal_boundary(workspace)
+    calls = []
+
+    def census(_boundary):
+        calls.append(True)
+
+    monkeypatch.setattr(workspace_terminal, "_census_writable_workspace", census)
+
+    transformed = build_workspace_terminal_args(
+        {"command": "echo ok"},
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+        boundary=boundary,
+        platform_name="Darwin",
+    )
+
+    assert transformed["workdir"] == str(workspace.resolve())
+    assert calls == []
+
+
+def test_workspace_seatbelt_denies_nested_worktree_writes_and_file_links(tmp_path):
+    workspace = tmp_path / "work"
+    nested = workspace / "nested"
+    workspace.mkdir()
+    nested.mkdir()
+    profile = build_workspace_seatbelt_profile(
+        workspace=workspace,
+        host_home=tmp_path / "host",
+        allow_network=False,
+        denied_write_roots=[nested],
+    )
+
+    assert f'(deny file-write* (subpath "{nested.resolve()}"))' in profile
+    assert "(deny file-link)" in profile
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")
+def test_workspace_terminal_nested_worktree_and_file_link_writes_are_denied(
+    tmp_path,
+):
+    repo, _ = _linked_worktree(tmp_path)
+    nested = repo / "nested-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "nested-boundary", str(nested)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    boundary = prepare_workspace_terminal_boundary(repo)
+    transformed = build_workspace_terminal_args(
+        {
+            "command": (
+                "printf root > root.txt; "
+                "printf nested > nested/nested.txt; "
+                "ln root.txt nested/linked.txt"
+            )
+        },
+        workspace=repo,
+        host_home=tmp_path / "host",
+        exact_env={"PATH": "/usr/bin:/bin"},
+        boundary=boundary,
+        platform_name="Darwin",
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-lc", transformed["command"]],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode == 71 and "sandbox_apply: Operation not permitted" in result.stderr:
+        pytest.skip("Darwin Seatbelt is unavailable in this test environment")
+
+    assert result.returncode != 0
+    assert (repo / "root.txt").read_text(encoding="utf-8") == "root"
+    assert not (nested / "nested.txt").exists()
+    assert not (nested / "linked.txt").exists()
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS sandbox-exec")

@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from agent.claude_workspace_policy import is_workspace_credential_path
+from agent.claude_workspace_terminal import WorkspaceTerminalBoundary
 
 
 class WorkspaceFileBroker:
@@ -20,9 +21,18 @@ class WorkspaceFileBroker:
     MAX_TURN_WRITE_BYTES = 8 * 1024 * 1024
 
     def __init__(
-        self, workspace: str | Path, *, deny_credential_reads: bool = False
+        self,
+        workspace: str | Path,
+        *,
+        deny_credential_reads: bool = False,
+        boundary: WorkspaceTerminalBoundary | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        if boundary is not None and boundary.root != self.workspace:
+            raise RuntimeError(
+                "Workspace file boundary does not match the broker workspace"
+            )
+        self.boundary = boundary
         self.deny_credential_reads = deny_credential_reads
         self._root_fd = os.open(
             self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
@@ -98,6 +108,15 @@ class WorkspaceFileBroker:
 
     def _write(self, arguments: dict[str, Any]) -> dict[str, Any]:
         parts = self._parts(arguments.get("path"))
+        if self.boundary is not None:
+            candidate = self.workspace.joinpath(*parts).resolve(strict=False)
+            if any(
+                candidate == subtree or candidate.is_relative_to(subtree)
+                for subtree in self.boundary.readonly_subtrees
+            ):
+                raise RuntimeError(
+                    "Workspace writes are denied under a read-only worktree subtree"
+                )
         content = str(arguments.get("content") or "").encode("utf-8")
         if len(content) > self.MAX_FILE_BYTES:
             raise RuntimeError("Workspace write exceeds the 2 MiB safety limit")
