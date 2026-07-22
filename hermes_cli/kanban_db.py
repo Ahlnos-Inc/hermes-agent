@@ -962,6 +962,32 @@ class NewPublicationTask:
 
 
 @dataclass(frozen=True)
+class _PublicationContract:
+    """Raw publication fields captured for one completion attempt.
+
+    The values intentionally remain un-normalized so the contract can be
+    compared byte-for-byte with a second read inside the completion
+    transaction.  Normalization belongs only to the git readback command.
+    """
+
+    expected_sha: Any
+    remote: Any
+    ref: Any
+    workspace_path: Any
+
+    @property
+    def has_publication_fields(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.expected_sha,
+                self.remote,
+                self.ref,
+            )
+        )
+
+
+@dataclass(frozen=True)
 class _PreparedTaskCreate:
     """Validated, transaction-ready task fields.
 
@@ -8414,17 +8440,49 @@ class ArtifactPreservationError(RuntimeError):
 PUBLICATION_READBACK_TIMEOUT_SECONDS = 30
 
 
-def _read_publication_remote_ref(row: sqlite3.Row) -> dict[str, Any]:
+def _read_publication_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[_PublicationContract]:
+    """Read the publication contract without opening a write transaction."""
+    row = conn.execute(
+        "SELECT publication_expected_sha, publication_remote, publication_ref, "
+        "workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _PublicationContract(
+        expected_sha=row["publication_expected_sha"],
+        remote=row["publication_remote"],
+        ref=row["publication_ref"],
+        workspace_path=row["workspace_path"],
+    )
+
+
+def _publication_contract_payload(
+    contract: _PublicationContract,
+) -> dict[str, Any]:
+    """Return a stable, JSON-serializable view of a contract snapshot."""
+    return {
+        "expected_sha": contract.expected_sha,
+        "remote": contract.remote,
+        "ref": contract.ref,
+        "workspace_path": contract.workspace_path,
+    }
+
+
+def _read_publication_remote_ref(contract: _PublicationContract) -> dict[str, Any]:
     """Read the recorded remote ref from the publication card's checkout.
 
     This is intentionally a read-only ``git ls-remote``. A push report or a
     worker-supplied metadata flag never reaches this function; only the remote
     object database's ref value can satisfy the completion gate.
     """
-    expected = str(row["publication_expected_sha"] or "").strip().lower()
-    remote = str(row["publication_remote"] or "").strip()
-    ref = str(row["publication_ref"] or "").strip()
-    workspace = str(row["workspace_path"] or "").strip()
+    expected = str(contract.expected_sha or "").strip().lower()
+    remote = str(contract.remote or "").strip()
+    ref = str(contract.ref or "").strip()
+    workspace = str(contract.workspace_path or "").strip()
     details: dict[str, Any] = {
         "expected_sha": expected or None,
         "remote": remote or None,
@@ -8556,6 +8614,15 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Publication readback is deliberately outside the write transaction.
+    # The contract is immutable creation-time evidence, so the short write
+    # transaction below only needs to confirm that the fields it re-reads are
+    # byte-identical to this snapshot before applying the status CAS.
+    publication_contract = _read_publication_contract(conn, task_id)
+    if publication_contract is not None and publication_contract.has_publication_fields:
+        publication_verification = _read_publication_remote_ref(publication_contract)
+
     with write_txn(conn):
         quarantined = conn.execute(
             "SELECT policy_quarantined FROM tasks WHERE id = ?", (task_id,)
@@ -8629,34 +8696,43 @@ def complete_task(
                 _append_event(conn, task_id, "completion_blocked", {"reason": ARCHITECTURE_GATE_REASON_OPEN, "gate_id": gate.gate_id})
                 return False
         # Keep this gate in the DB completion kernel so CLI, model-tool, and
-        # any future writer cannot bypass it with a success flag. The
-        # readback is bounded and happens before the status CAS while this
-        # transaction holds the write lock, pairing the immutable contract
-        # read with the completion decision.
-        publication_row = conn.execute(
-            "SELECT workspace_path, publication_expected_sha, publication_remote, "
-            "publication_ref FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if publication_row is None:
+        # any future writer cannot bypass it with a success flag. Re-read the
+        # contract while this transaction owns the write lock and reject a
+        # stale remote verification before the status CAS.
+        current_publication_contract = _read_publication_contract(conn, task_id)
+        if current_publication_contract is None or publication_contract is None:
             return False
-        if any(
-            publication_row[name] is not None
-            for name in (
-                "publication_expected_sha",
-                "publication_remote",
-                "publication_ref",
+
+        if current_publication_contract != publication_contract:
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked",
+                {
+                    "reason": "publication_contract_changed_during_readback",
+                    "verified_contract": _publication_contract_payload(
+                        publication_contract
+                    ),
+                    "current_contract": _publication_contract_payload(
+                        current_publication_contract
+                    ),
+                    "publication_readback": publication_verification,
+                },
+                run_id=_current_run_id(conn, task_id),
             )
-        ):
-            publication_verification = _read_publication_remote_ref(publication_row)
+            return False
+
+        if current_publication_contract.has_publication_fields:
+            if publication_verification is None:
+                return False
             if not publication_verification.get("verified"):
                 blocked_payload = {
                     **publication_verification,
                     "reason": "publication_ref_not_verified",
                     "readback_reason": publication_verification.get("reason"),
-                    "expected_sha": publication_row["publication_expected_sha"],
-                    "remote": publication_row["publication_remote"],
-                    "remote_ref": publication_row["publication_ref"],
+                    "expected_sha": current_publication_contract.expected_sha,
+                    "remote": current_publication_contract.remote,
+                    "remote_ref": current_publication_contract.ref,
                 }
                 _append_event(
                     conn,

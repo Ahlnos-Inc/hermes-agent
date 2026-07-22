@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,34 @@ def _git(*args: str, cwd: Path | None = None) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _prepare_claimed_publication(
+    conn,
+    workspace: Path,
+    *,
+    request_key: str,
+) -> tuple[str, str, int]:
+    requester = _create_requester(conn)
+    handoff = kb.request_publication_handoff(
+        conn,
+        requester,
+        publication=kb.NewPublicationTask(
+            expected_sha=EXPECTED_SHA,
+            workspace_path=str(workspace),
+            remote_ref="refs/heads/main",
+        ),
+        request_key=request_key,
+        actor="coder",
+        expected_run_id=_claim(conn, requester),
+    )
+    publisher = kb.claim_task(
+        conn,
+        handoff.publication_task_id,
+        claimer="releaser-worker",
+    )
+    assert publisher is not None and publisher.current_run_id is not None
+    return requester, handoff.publication_task_id, int(publisher.current_run_id)
 
 
 def test_publication_handoff_creates_releaser_parent_and_parks_requester(
@@ -237,6 +266,268 @@ def test_publication_completion_succeeds_after_remote_ref_readback(
         payload = json.loads(completed["payload"])
         assert payload["publication_readback"]["verified"] is True
         assert payload["publication_readback"]["observed_sha"] == expected_sha
+
+
+def test_publication_completion_readback_does_not_hold_write_lock(
+    board: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second connection can commit while the remote readback is blocked."""
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "50")
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+
+    with kb.connect_closing(board) as conn:
+        requester, publication_id, run_id = _prepare_claimed_publication(
+            conn,
+            workspace,
+            request_key="publish-lock-free-success",
+        )
+        writer_task = kb.create_task(
+            conn,
+            title="task the concurrent writer updates",
+            assignee="notifier",
+        )
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                with kb.connect_closing(board) as writer_conn:
+                    with kb.write_txn(writer_conn):
+                        writer_conn.execute(
+                            "UPDATE tasks SET title = ? WHERE id = ?",
+                            ("updated during readback", writer_task),
+                        )
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+
+        def fake_run(command, *args, **kwargs):
+            assert not conn.in_transaction, "readback unexpectedly owns a DB transaction"
+            writer_thread.start()
+            assert writer_finished.wait(timeout=3), (
+                "second connection could not write during remote readback"
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=f"{EXPECTED_SHA} refs/heads/main\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+        try:
+            assert kb.complete_task(
+                conn,
+                publication_id,
+                result="published",
+                expected_run_id=run_id,
+            )
+        finally:
+            writer_thread.join(timeout=3)
+
+        assert not writer_thread.is_alive()
+        assert writer_errors == []
+        updated_writer_task = kb.get_task(conn, writer_task)
+        assert updated_writer_task is not None
+        assert updated_writer_task.title == "updated during readback"
+        completed_publication = kb.get_task(conn, publication_id)
+        assert completed_publication is not None
+        assert completed_publication.status == "done"
+        waiting_requester = kb.get_task(conn, requester)
+        assert waiting_requester is not None and waiting_requester.status == "ready"
+
+
+def test_publication_completion_rejects_contract_changed_after_readback(
+    board: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified ref cannot complete after another writer changes its contract."""
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "50")
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+
+    with kb.connect_closing(board) as conn:
+        requester, publication_id, run_id = _prepare_claimed_publication(
+            conn,
+            workspace,
+            request_key="publish-stale-contract",
+        )
+        readback_finished = threading.Event()
+        mutation_finished = threading.Event()
+        mutation_errors: list[BaseException] = []
+
+        def mutate_contract() -> None:
+            assert readback_finished.wait(timeout=3)
+            try:
+                with kb.connect_closing(board) as mutator_conn:
+                    with kb.write_txn(mutator_conn):
+                        mutator_conn.execute(
+                            "UPDATE tasks SET publication_ref = ? WHERE id = ?",
+                            ("refs/heads/release", publication_id),
+                        )
+            except BaseException as exc:
+                mutation_errors.append(exc)
+            finally:
+                mutation_finished.set()
+
+        mutation_thread = threading.Thread(target=mutate_contract, daemon=True)
+        mutation_thread.start()
+        original_readback = kb._read_publication_remote_ref
+
+        def readback_then_wait(contract):
+            verification = original_readback(contract)
+            # The underlying git readback has returned. Let a second writer
+            # mutate the contract before this function hands verification back
+            # to complete_task, which is the stale-read window under test.
+            readback_finished.set()
+            assert mutation_finished.wait(timeout=3)
+            return verification
+
+        def fake_run(command, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=f"{EXPECTED_SHA} refs/heads/main\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+        monkeypatch.setattr(kb, "_read_publication_remote_ref", readback_then_wait)
+        try:
+            assert not kb.complete_task(
+                conn,
+                publication_id,
+                result="must not complete stale verification",
+                expected_run_id=run_id,
+            )
+        finally:
+            mutation_thread.join(timeout=3)
+
+        assert not mutation_thread.is_alive()
+        assert mutation_errors == []
+        publication = kb.get_task(conn, publication_id)
+        assert publication is not None
+        assert publication.status == "running"
+        assert publication.current_run_id == run_id
+        assert publication.publication_ref == "refs/heads/release"
+        requester_after = kb.get_task(conn, requester)
+        assert requester_after is not None and requester_after.status == "todo"
+        blocked = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completion_blocked' ORDER BY id DESC LIMIT 1",
+            (publication_id,),
+        ).fetchone()
+        assert blocked is not None
+        payload = json.loads(blocked["payload"])
+        assert payload["reason"] == "publication_contract_changed_during_readback"
+        assert payload["verified_contract"]["ref"] == "refs/heads/main"
+        assert payload["current_contract"]["ref"] == "refs/heads/release"
+
+
+@pytest.mark.parametrize("failure_mode", ["unreachable", "timeout"])
+def test_publication_readback_failure_is_lock_free_and_leaves_board_open(
+    board: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """Readback failures do not hold the board lock or close the run."""
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "50")
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+
+    with kb.connect_closing(board) as conn:
+        requester, publication_id, run_id = _prepare_claimed_publication(
+            conn,
+            workspace,
+            request_key=f"publish-readback-{failure_mode}",
+        )
+        writer_task = kb.create_task(
+            conn,
+            title="task the concurrent writer updates",
+            assignee="notifier",
+        )
+        writer_finished = threading.Event()
+        writer_errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                with kb.connect_closing(board) as writer_conn:
+                    with kb.write_txn(writer_conn):
+                        writer_conn.execute(
+                            "UPDATE tasks SET title = ? WHERE id = ?",
+                            (f"writer survived {failure_mode}", writer_task),
+                        )
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+
+        def fake_run(command, *args, **kwargs):
+            assert not conn.in_transaction, "readback unexpectedly owns a DB transaction"
+            writer_thread.start()
+            assert writer_finished.wait(timeout=3), (
+                "second connection could not write during failed readback"
+            )
+            if failure_mode == "timeout":
+                raise subprocess.TimeoutExpired(command, timeout=30)
+            return subprocess.CompletedProcess(
+                command,
+                128,
+                stdout="",
+                stderr="fatal: unable to access remote",
+            )
+
+        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+        before = kb.get_task(conn, publication_id)
+        assert before is not None
+        try:
+            assert not kb.complete_task(
+                conn,
+                publication_id,
+                result="readback failed",
+                expected_run_id=run_id,
+            )
+        finally:
+            writer_thread.join(timeout=3)
+
+        assert not writer_thread.is_alive()
+        assert writer_errors == []
+        after = kb.get_task(conn, publication_id)
+        assert after is not None
+        assert after.status == before.status == "running"
+        assert after.current_run_id == before.current_run_id == run_id
+        assert after.result == before.result is None
+        assert after.completed_at == before.completed_at is None
+        updated_writer_task = kb.get_task(conn, writer_task)
+        assert updated_writer_task is not None
+        assert updated_writer_task.title == f"writer survived {failure_mode}"
+        completed_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (publication_id,),
+        ).fetchone()[0]
+        assert completed_count == 0
+        blocked = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completion_blocked' ORDER BY id DESC LIMIT 1",
+            (publication_id,),
+        ).fetchone()
+        assert blocked is not None
+        payload = json.loads(blocked["payload"])
+        assert payload["reason"] == "publication_ref_not_verified"
+        if failure_mode == "timeout":
+            assert payload["readback_reason"] == (
+                "git readback unavailable: TimeoutExpired"
+            )
 
 
 def test_publication_handoff_adopts_existing_publication_card(board: Path, tmp_path: Path) -> None:
