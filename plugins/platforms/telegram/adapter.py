@@ -252,6 +252,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -5152,34 +5153,49 @@ class TelegramAdapter(BasePlatformAdapter):
                 if hasattr(retry_after, "total_seconds"):
                     retry_after = retry_after.total_seconds()
                 wait = float(retry_after)
-                logger.warning(
-                    "[%s] Telegram flood control on clarify prompt, retrying in %.1fs: %s",
-                    self.name,
-                    wait,
-                    _redact_telegram_error_text(send_err),
-                )
-                await asyncio.sleep(wait)
-                try:
-                    msg = await self._send_message_with_thread_fallback(**kwargs)
-                except Exception as retry_err:
+                if wait <= CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS:
                     logger.warning(
-                        "[%s] Clarify button retry failed; sending plain-text fallback: %s",
+                        "[%s] Telegram flood control on clarify prompt, retrying in %.1fs: %s",
                         self.name,
-                        _redact_telegram_error_text(retry_err),
+                        wait,
+                        _redact_telegram_error_text(send_err),
                     )
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs.pop("reply_markup", None)
-                    reply_hint = (
-                        "Reply with the option number or your answer."
-                        if choices
-                        else "Reply with your answer."
+                    await asyncio.sleep(wait)
+                    try:
+                        msg = await self._send_message_with_thread_fallback(**kwargs)
+                    except Exception as retry_err:
+                        logger.warning(
+                            "[%s] Clarify button retry failed; sending plain-text fallback: %s",
+                            self.name,
+                            _redact_telegram_error_text(retry_err),
+                        )
+                    else:
+                        self._clarify_state[clarify_id] = session_key
+                        return SendResult(success=True, message_id=str(msg.message_id))
+                else:
+                    logger.warning(
+                        "[%s] Telegram clarify RetryAfter %.1fs exceeds %.1fs retry budget; "
+                        "sending plain-text fallback",
+                        self.name,
+                        wait,
+                        CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS,
                     )
-                    fallback_kwargs["text"] = (
-                        f"{text}\n\n{reply_hint}"
+
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("reply_markup", None)
+                reply_hint = (
+                    "Reply with the option number or your answer."
+                    if choices
+                    else "Reply with your answer."
+                )
+                fallback_kwargs["text"] = f"{text}\n\n{reply_hint}"
+                from tools.clarify_gateway import mark_awaiting_text
+                if not mark_awaiting_text(clarify_id):
+                    return SendResult(
+                        success=False,
+                        error="Clarify request expired before fallback delivery",
                     )
-                    msg = await self._send_message_with_thread_fallback(**fallback_kwargs)
-                    from tools.clarify_gateway import mark_awaiting_text
-                    mark_awaiting_text(clarify_id)
+                msg = await self._send_message_with_thread_fallback(**fallback_kwargs)
             self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:

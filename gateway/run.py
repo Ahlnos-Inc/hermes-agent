@@ -17998,6 +17998,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
+    def _run_clarify_callback_sync(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        session_key: str,
+        thread_metadata,
+        loop,
+        question: str,
+        choices,
+    ) -> str:
+        """Deliver one gateway clarify prompt from the agent worker thread."""
+        from tools import clarify_gateway as clarify_mod
+        import uuid
+
+        if not adapter:
+            return ""
+
+        choice_list = list(choices) if choices else None
+        clarify_id = uuid.uuid4().hex[:10]
+        clarify_mod.register(
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question=question,
+            choices=choice_list,
+        )
+
+        try:
+            adapter.pause_typing_for_chat(chat_id)
+        except Exception:
+            pass
+
+        send_ok = False
+        fut = safe_schedule_threadsafe(
+            adapter.send_clarify(
+                chat_id=chat_id,
+                question=question,
+                choices=choice_list,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=thread_metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="Clarify send failed to schedule",
+        )
+        if fut is not None:
+            try:
+                result = fut.result(timeout=CLARIFY_SEND_WAIT_TIMEOUT_SECONDS)
+                send_ok = bool(getattr(result, "success", False))
+            except concurrent.futures.TimeoutError:
+                # run_coroutine_threadsafe futures keep running after result()
+                # times out. Cancel before clearing the pending entry so a late
+                # adapter send cannot publish an orphaned prompt.
+                fut.cancel()
+                logger.warning("Clarify send timed out and was cancelled")
+            except Exception as exc:
+                logger.warning("Clarify send failed: %s", exc)
+
+        if not send_ok:
+            clarify_mod.clear_session(session_key)
+            return "[clarify prompt could not be delivered]"
+
+        timeout = clarify_mod.get_clarify_timeout()
+        response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+        if response is None or response == "":
+            return f"[user did not respond within {int(timeout / 60)}m]"
+        return response
+
     async def _run_agent_inner(
         self,
         message: str,
@@ -19551,66 +19620,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # rather than hang forever).
             # ------------------------------------------------------------------
             def _clarify_callback_sync(question: str, choices) -> str:
-                from tools import clarify_gateway as _clarify_mod
-                import uuid as _uuid
-
-                if not _status_adapter:
-                    return ""
-
-                clarify_id = _uuid.uuid4().hex[:10]
-                _clarify_mod.register(
-                    clarify_id=clarify_id,
+                return self._run_clarify_callback_sync(
+                    adapter=_status_adapter,
+                    chat_id=_status_chat_id,
                     session_key=session_key or "",
+                    thread_metadata=_status_thread_metadata,
+                    loop=_loop_for_step,
                     question=question,
-                    choices=list(choices) if choices else None,
+                    choices=choices,
                 )
-
-                # Pause typing — like approval, we don't want a "thinking..."
-                # status to obscure the prompt or block the user from typing
-                # an "Other" response on platforms that disable input while
-                # typing is active (Slack Assistant API).
-                try:
-                    _status_adapter.pause_typing_for_chat(_status_chat_id)
-                except Exception:
-                    pass
-
-                send_ok = False
-                fut = safe_schedule_threadsafe(
-                    _status_adapter.send_clarify(
-                        chat_id=_status_chat_id,
-                        question=question,
-                        choices=list(choices) if choices else None,
-                        clarify_id=clarify_id,
-                        session_key=session_key or "",
-                        metadata=_status_thread_metadata,
-                    ),
-                    _loop_for_step,
-                    logger=logger,
-                    log_message="Clarify send failed to schedule",
-                )
-                if fut is None:
-                    send_ok = False
-                else:
-                    try:
-                        result = fut.result(timeout=CLARIFY_SEND_WAIT_TIMEOUT_SECONDS)
-                        send_ok = bool(getattr(result, "success", False))
-                    except Exception as exc:
-                        logger.warning("Clarify send failed: %s", exc)
-                        send_ok = False
-
-                if not send_ok:
-                    # Couldn't deliver the prompt — clean up and return
-                    # sentinel so the agent can fall back to a sensible
-                    # default rather than hanging.
-                    _clarify_mod.clear_session(session_key or "")
-                    return "[clarify prompt could not be delivered]"
-
-                timeout = _clarify_mod.get_clarify_timeout()
-                response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
-                if response is None or response == "":
-                    # Timeout or session-boundary cancellation
-                    return f"[user did not respond within {int(timeout / 60)}m]"
-                return response
 
             agent.clarify_callback = _clarify_callback_sync
 
