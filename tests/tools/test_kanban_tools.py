@@ -8,12 +8,17 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+_REAL_HERMES_HOME = (Path.home() / ".hermes").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -3800,6 +3805,240 @@ def test_attach_roundtrips_bytes_to_row_and_disk(worker_env):
         assert Path(a.stored_path).resolve().is_relative_to(
             kb.task_attachments_dir(worker_env).resolve()
         )
+    finally:
+        conn.close()
+
+
+def _worker_workspace(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        if task.workspace_path:
+            workspace = Path(task.workspace_path).resolve()
+        else:
+            # ``worker_env`` creates a claimed task but deliberately does not
+            # run the dispatcher workspace-materialization step. Exercise the
+            # handler's existing board workspaces fallback explicitly.
+            workspace = (kb.workspaces_root() / worker_env).resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+    finally:
+        conn.close()
+    assert not workspace.is_relative_to(_REAL_HERMES_HOME)
+    return workspace
+
+
+def _assert_attachment_not_under_live_home(path):
+    assert not Path(path).resolve().is_relative_to(_REAL_HERMES_HOME)
+
+
+def test_attach_path_roundtrips_large_file_with_verified_digest(worker_env):
+    """Path attach reads a multi-MB artifact without model-side base64."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = _worker_workspace(worker_env)
+    source = workspace / "large-artifact.bin"
+    payload = (b"hermes-kanban-artifact\x00" * 120_000) + b"tail"
+    source.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+
+    out = kt._handle_attach({"path": str(source)})
+    result = json.loads(out)
+    assert result.get("ok") is True, out
+    assert result["size"] == len(payload)
+    assert result["sha256"] == expected_sha256
+
+    conn = kb.connect()
+    try:
+        attachments = kb.list_attachments(conn, worker_env)
+        assert len(attachments) == 1
+        attachment = attachments[0]
+        assert attachment.size == len(payload)
+        assert Path(attachment.stored_path).read_bytes() == payload
+        assert hashlib.sha256(Path(attachment.stored_path).read_bytes()).hexdigest() == expected_sha256
+        _assert_attachment_not_under_live_home(attachment.stored_path)
+    finally:
+        conn.close()
+
+
+def _run_git(*args, cwd):
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_attach_path_git_bundle_can_be_cloned_from_stored_attachment(worker_env, tmp_path):
+    """The durable artifact regression: a real bundle survives attach and clone."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = _worker_workspace(worker_env)
+    repository = workspace / "repo"
+    repository.mkdir()
+    _run_git("init", "-q", "-b", "main", cwd=repository)
+    _run_git("config", "user.email", "worker@example.test", cwd=repository)
+    _run_git("config", "user.name", "Kanban Worker", cwd=repository)
+    (repository / "README.md").write_text("durable bundle\n", encoding="utf-8")
+    _run_git("add", "README.md", cwd=repository)
+    _run_git("commit", "-q", "-m", "initial", cwd=repository)
+
+    bundle = workspace / "repository.bundle"
+    _run_git("bundle", "create", str(bundle), "--all", cwd=repository)
+
+    result = json.loads(kt._handle_attach({"path": str(bundle)}))
+    assert result.get("ok") is True, result
+
+    conn = kb.connect()
+    try:
+        attachment = kb.list_attachments(conn, worker_env)[0]
+        stored_path = Path(attachment.stored_path)
+        _assert_attachment_not_under_live_home(stored_path)
+    finally:
+        conn.close()
+
+    clone = tmp_path / "cloned-bundle"
+    _run_git("clone", "-q", str(stored_path), str(clone), cwd=tmp_path)
+    assert (clone / "README.md").read_text(encoding="utf-8") == "durable bundle\n"
+
+
+def test_attach_path_rejects_workspace_escape_and_symlink(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = _worker_workspace(worker_env)
+    outside = workspace.parent.parent / "outside-artifact.bin"
+    outside.write_bytes(b"outside")
+    traversal = workspace / ".." / ".." / outside.name
+
+    for candidate in (outside, traversal):
+        result = json.loads(kt._handle_attach({"path": str(candidate)}))
+        assert "error" in result, result
+
+    link = workspace / "outside-link.bin"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    result = json.loads(kt._handle_attach({"path": str(link)}))
+    assert "error" in result, result
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_path_fails_closed_without_resolvable_workspace(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    missing_workspace = tmp_path / "not-materialized"
+    source = tmp_path / "candidate.bin"
+    source.write_bytes(b"candidate")
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, missing_workspace)
+    finally:
+        conn.close()
+
+    result = json.loads(kt._handle_attach({"path": str(source)}))
+    assert "error" in result
+    assert "no resolvable owned workspace" in result["error"]
+
+
+def test_attach_path_and_inline_payload_are_mutually_exclusive(worker_env):
+    from tools import kanban_tools as kt
+
+    source = _worker_workspace(worker_env) / "artifact.bin"
+    source.write_bytes(b"artifact")
+    result = json.loads(kt._handle_attach({
+        "path": str(source),
+        "content_base64": "YXJ0aWZhY3Q=",
+    }))
+    assert "error" in result
+    assert "exactly one" in result["error"]
+
+
+def test_attach_path_rejects_directory_fifo_and_missing_file(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = _worker_workspace(worker_env)
+    directory = workspace / "directory"
+    directory.mkdir()
+    missing = workspace / "missing.bin"
+    fifo = workspace / "pipe"
+    try:
+        os.mkfifo(fifo)
+    except (AttributeError, NotImplementedError, OSError):
+        fifo = None
+
+    candidates = [directory, missing]
+    if fifo is not None:
+        candidates.append(fifo)
+    for candidate in candidates:
+        result = json.loads(kt._handle_attach({"path": str(candidate)}))
+        assert "error" in result, result
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_path_rejects_oversize_without_storing(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1024)
+    source = _worker_workspace(worker_env) / "too-large.bin"
+    source.write_bytes(b"x" * 1025)
+
+    result = json.loads(kt._handle_attach({"path": str(source)}))
+    assert "error" in result
+    assert "limit" in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_path_rejects_truncated_store(worker_env, monkeypatch):
+    """A partial write cannot be reported as a successful attachment."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    source = _worker_workspace(worker_env) / "complete-artifact.bin"
+    source.write_bytes(b"complete artifact bytes\n")
+    real_store = kb.store_attachment_bytes
+
+    def truncated_store(conn, task_id, filename, data, **kwargs):
+        attachment_id = real_store(conn, task_id, filename, data, **kwargs)
+        attachment = kb.get_attachment(conn, attachment_id)
+        assert attachment is not None
+        stored = Path(attachment.stored_path)
+        stored.write_bytes(stored.read_bytes()[:-1])
+        return attachment_id
+
+    monkeypatch.setattr(kb, "store_attachment_bytes", truncated_store)
+    result = json.loads(kt._handle_attach({"path": str(source)}))
+    assert "error" in result
+    assert "integrity" in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
     finally:
         conn.close()
 
