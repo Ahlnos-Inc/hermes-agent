@@ -488,6 +488,129 @@ def persist_claude_worker_availability_defer(
         return False
 
 
+# After this many CONSECUTIVE credential-resolution spin-defers with no
+# intervening progress, stop requeueing and block the card once for an
+# operator. Deferring auto-heals a transient outage (token refresh, a fallback
+# endpoint 503); a genuinely broken fallback_chain never heals, so an unbounded
+# spin would thrash a worker slot forever. Blocking on the (N+1)th attempt pages
+# a human with actionable detail. ponytail: constant, not config — no caller
+# tunes it and the threshold is not latency-sensitive.
+CREDENTIAL_RESOLUTION_DEFER_BLOCK_THRESHOLD = 3
+
+
+def _summarize_resolution_failures(failures: "list[BaseException]") -> str:
+    """Compact, operator-facing one-line summary of the resolution failures."""
+    parts = []
+    for exc in failures or []:
+        if exc is None:
+            continue
+        parts.append(f"{type(exc).__name__}: {exc}".strip())
+    return ("; ".join(parts) or "provider resolution returned no runtime")[:460]
+
+
+def persist_credential_resolution_exhaustion(
+    failures: "list[BaseException]",
+) -> bool:
+    """Durably record a fallback-exhausted credential resolution for a
+    dispatched Kanban worker so it cannot crash-loop into a 2-strike arrest.
+
+    ``_ensure_runtime_credentials`` resolves the runtime BEFORE any agent
+    exists, so unlike the post-agent SDK path
+    (:func:`persist_claude_worker_availability_defer`) there is no
+    ``RuntimeFailure`` to classify. Rather than guess transient-vs-terminal from
+    heterogeneous resolution exceptions (an unreliable taxonomy — a permanent
+    misconfig and a 5-minute endpoint outage can raise the same type), this
+    bounds the behavior:
+
+    * Default: a NO-FAILURE spin-defer (``PROVIDER_AVAILABILITY_UNAVAILABLE``) —
+      the card requeues and a transient outage (token refresh, a fallback 503,
+      a network blip) heals on the delivery cooldown without ever counting a
+      failure. Matches the SDK path's requeue for transient availability.
+    * After ``CREDENTIAL_RESOLUTION_DEFER_BLOCK_THRESHOLD`` consecutive such
+      defers with no intervening progress, a broken chain is proven non-transient
+      → BLOCK the card once (operator unblock) with the collected primary +
+      per-fallback errors, instead of spinning a worker slot forever (BUILD-573
+      AC2/AC4).
+
+    No-ops (returns False → caller keeps its plain ``return False``) unless this
+    is a dispatched worker (``HERMES_KANBAN_TASK`` + ``HERMES_KANBAN_RUN_ID``
+    both set). Best-effort: any DB error returns False. Both DB transitions are
+    run-scoped (``expected_run_id``) and clear the worker identity, so
+    ``detect_crashed_workers`` (which only selects ``status='running' AND
+    worker_pid IS NOT NULL``) skips the now-terminal run — the BUILD-735 exit
+    sidecar cannot double-count this exit.
+    """
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    raw_run_id = os.getenv("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return False
+
+    detail = _summarize_resolution_failures(failures)
+    try:
+        from hermes_cli import kanban_db
+
+        with kanban_db.connect_closing() as conn:
+            # Count the trailing streak of prior credential-resolution defers
+            # (this run is still 'running', not yet ended, so it isn't counted).
+            prior = conn.execute(
+                "SELECT outcome FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (task_id, CREDENTIAL_RESOLUTION_DEFER_BLOCK_THRESHOLD),
+            ).fetchall()
+            streak = 0
+            for row in prior:
+                if row["outcome"] == kanban_db.PROVIDER_AVAILABILITY_UNAVAILABLE:
+                    streak += 1
+                else:
+                    break
+
+            if streak >= CREDENTIAL_RESOLUTION_DEFER_BLOCK_THRESHOLD:
+                acted = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=(
+                        "Runtime provider resolution failed and no configured "
+                        f"fallback resolved after {streak} retries: {detail}. "
+                        "Check the profile's fallback_chain credentials / "
+                        "provider availability, then unblock."
+                    )[:480],
+                    metadata={"resolution_failures": detail, "defer_streak": streak},
+                    expected_run_id=run_id,
+                )
+                kind = "credential_resolution_block"
+            else:
+                acted = kanban_db.defer_task_for_delivery_authorization_retry(
+                    conn,
+                    task_id,
+                    expected_run_id=run_id,
+                    error=f"Runtime credential resolution unavailable: {detail}"[:480],
+                    outcome=kanban_db.PROVIDER_AVAILABILITY_UNAVAILABLE,
+                )
+                kind = "credential_resolution_defer"
+        if acted:
+            _runtime_events_logger.warning(
+                "%s %s",
+                kind,
+                json.dumps(
+                    {"task": task_id, "run_id": run_id, "defer_streak": streak},
+                    sort_keys=True,
+                ),
+            )
+        return bool(acted)
+    except Exception:
+        _runtime_events_logger.warning(
+            "credential_resolution_exhaustion_persist_failed task=%s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
 def run_claude_agent_sdk_attempt(
     agent: Any,
     *,

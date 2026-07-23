@@ -650,3 +650,131 @@ def test_worker_defer_skips_non_availability_reason(monkeypatch):
     )
     assert deferred is False
     assert "outcome" not in captured
+
+
+# --- BUILD-573 AC2/AC4: pre-agent credential-resolution exhaustion defer -----
+
+def _exhaustion_capture(monkeypatch, prior_outcomes):
+    """Patch kanban_db so ``persist_credential_resolution_exhaustion`` runs
+    against a fake DB. ``prior_outcomes`` is the list of trailing ended-run
+    outcomes (newest first) the streak query should observe. Captures which of
+    defer/block was chosen."""
+    import contextlib
+
+    from hermes_cli import kanban_db as _kb
+
+    captured = {}
+
+    class _FakeRow(dict):
+        pass
+
+    class _FakeCursor:
+        def fetchall(self):
+            return [_FakeRow(outcome=o) for o in prior_outcomes]
+
+    class _FakeConn:
+        def execute(self, *a, **k):
+            return _FakeCursor()
+
+    @contextlib.contextmanager
+    def _fake_conn():
+        yield _FakeConn()
+
+    def _fake_defer(conn, task_id, *, expected_run_id, error, outcome):
+        captured["action"] = "defer"
+        captured["outcome"] = outcome
+        captured["error"] = error
+        return True
+
+    def _fake_block(conn, task_id, *, reason, metadata=None, expected_run_id=None, **kw):
+        captured["action"] = "block"
+        captured["reason"] = reason
+        captured["metadata"] = metadata
+        return True
+
+    monkeypatch.setattr(_kb, "connect_closing", _fake_conn)
+    monkeypatch.setattr(_kb, "defer_task_for_delivery_authorization_retry", _fake_defer)
+    monkeypatch.setattr(_kb, "block_task", _fake_block)
+    return captured
+
+
+def test_credential_exhaustion_defers_by_default(monkeypatch):
+    """AC2: the first credential-resolution exhaustion in a dispatched worker
+    is a NO-FAILURE spin-defer (PROVIDER_AVAILABILITY_UNAVAILABLE), not a
+    counted give-up — so a transient outage auto-heals on requeue."""
+    from hermes_cli import kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-573")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "9")
+    captured = _exhaustion_capture(monkeypatch, prior_outcomes=[])
+
+    ok = external_runtime.persist_credential_resolution_exhaustion(
+        [RuntimeError("primary down"), RuntimeError("sol 503")]
+    )
+    assert ok is True
+    assert captured["action"] == "defer"
+    assert captured["outcome"] == _kb.PROVIDER_AVAILABILITY_UNAVAILABLE
+    # Both failures surface in the requeue error for diagnosability.
+    assert "primary down" in captured["error"] and "sol 503" in captured["error"]
+
+
+def test_credential_exhaustion_blocks_after_threshold(monkeypatch):
+    """AC4: once the trailing streak of credential-resolution defers reaches the
+    threshold, a proven-broken chain blocks ONCE (operator unblock) with the
+    collected per-fallback errors, instead of spinning a slot forever."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-573")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "9")
+    n = external_runtime.CREDENTIAL_RESOLUTION_DEFER_BLOCK_THRESHOLD
+    from hermes_cli import kanban_db as _kb
+
+    prior = [_kb.PROVIDER_AVAILABILITY_UNAVAILABLE] * n
+    captured = _exhaustion_capture(monkeypatch, prior_outcomes=prior)
+
+    ok = external_runtime.persist_credential_resolution_exhaustion(
+        [RuntimeError("policy reject"), RuntimeError("sol missing key")]
+    )
+    assert ok is True
+    assert captured["action"] == "block"
+    assert "policy reject" in captured["reason"]
+    assert captured["metadata"]["defer_streak"] == n
+
+
+def test_credential_exhaustion_streak_resets_on_progress(monkeypatch):
+    """A non-defer outcome in the trailing history breaks the streak, so a card
+    that made progress between blips defers again rather than blocking early."""
+    from hermes_cli import kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-573")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "9")
+    # Two defers, then a completed run, then a defer — trailing streak is 1.
+    prior = [
+        _kb.PROVIDER_AVAILABILITY_UNAVAILABLE,
+        "completed",
+        _kb.PROVIDER_AVAILABILITY_UNAVAILABLE,
+        _kb.PROVIDER_AVAILABILITY_UNAVAILABLE,
+    ]
+    captured = _exhaustion_capture(monkeypatch, prior_outcomes=prior)
+
+    ok = external_runtime.persist_credential_resolution_exhaustion(
+        [RuntimeError("blip")]
+    )
+    assert ok is True
+    assert captured["action"] == "defer"
+
+
+def test_credential_exhaustion_noops_outside_dispatched_worker(monkeypatch):
+    """No HERMES_KANBAN_* env → interactive CLI / background task, never a
+    dispatched worker: the helper must no-op and touch no DB."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    def _boom(*a, **k):
+        raise AssertionError("kanban_db must not be touched outside a worker")
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect_closing", _boom)
+    assert (
+        external_runtime.persist_credential_resolution_exhaustion(
+            [RuntimeError("x")]
+        )
+        is False
+    )

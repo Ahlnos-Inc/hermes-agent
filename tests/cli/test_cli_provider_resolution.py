@@ -352,6 +352,70 @@ def test_policy_rejection_and_auth_error_take_identical_fallback_path(monkeypatc
     assert shell_auth.model == shell_pol.model == "gpt-5.6-sol"
 
 
+def _drive_exhausted_chain(monkeypatch, *, defer_on_exhaustion, quiet):
+    """Drive ``_ensure_runtime_credentials`` where BOTH the moa primary AND the
+    single fallback entry fail to resolve. Returns the list of failures passed
+    to ``persist_credential_resolution_exhaustion`` (empty if it was never
+    invoked)."""
+    cli = _import_cli()
+    from agent.runtime_target import ClaudeRoutePolicyError, CLAUDE_ROUTE_POLICY_ERROR
+
+    def _runtime_resolve(**kwargs):
+        if kwargs.get("requested") == "moa":
+            raise ClaudeRoutePolicyError(CLAUDE_ROUTE_POLICY_ERROR)
+        raise RuntimeError("fallback endpoint 503")
+
+    captured = {"failures": None}
+
+    def _fake_persist(failures):
+        captured["failures"] = failures
+        return True
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None)
+    monkeypatch.setattr(
+        "agent.external_runtime.persist_credential_resolution_exhaustion", _fake_persist
+    )
+
+    shell = cli.HermesCLI(model="architect", compact=True, max_turns=1)
+    shell.requested_provider = "moa"
+    shell.provider = "moa"
+    shell.tool_progress_mode = "off" if quiet else "full"
+    shell._fallback_model = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+
+    ok = shell._ensure_runtime_credentials(defer_on_exhaustion=defer_on_exhaustion)
+    assert ok is False
+    return captured["failures"]
+
+
+def test_exhausted_chain_durably_defers_dispatched_worker(monkeypatch):
+    """BUILD-573 AC2/AC4: the initial worker-startup resolution, when the whole
+    chain is exhausted in a dispatched quiet worker, hands the primary + every
+    fallback error to the durable defer/block helper — not a bare give-up."""
+    from agent.runtime_target import ClaudeRoutePolicyError
+
+    failures = _drive_exhausted_chain(monkeypatch, defer_on_exhaustion=True, quiet=True)
+    assert failures is not None
+    # Primary policy rejection + the fallback 503 both reach the helper.
+    assert any(isinstance(f, ClaudeRoutePolicyError) for f in failures)
+    assert any("503" in str(f) for f in failures)
+
+
+def test_exhausted_chain_no_defer_on_per_turn_resolution(monkeypatch):
+    """A per-turn re-resolution (defer_on_exhaustion=False) must NEVER requeue
+    the card — its worker is alive mid-progress."""
+    failures = _drive_exhausted_chain(monkeypatch, defer_on_exhaustion=False, quiet=True)
+    assert failures is None
+
+
+def test_exhausted_chain_no_defer_for_interactive_shell(monkeypatch):
+    """An interactive (non-quiet) shell is not a dispatched worker even if the
+    startup flag is set — no durable card mutation."""
+    failures = _drive_exhausted_chain(monkeypatch, defer_on_exhaustion=True, quiet=False)
+    assert failures is None
+
+
 def test_policy_rejection_honors_fallback_chain_order(monkeypatch):
     """BUILD-573: architect's real chain is [claude-direct, gpt-5.6-sol]. A
     policy-rejected moa envelope routes into the chain and the FIRST resolvable

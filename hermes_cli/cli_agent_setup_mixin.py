@@ -22,12 +22,20 @@ from rich.markup import escape as _escape
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
-    def _ensure_runtime_credentials(self) -> bool:
+    def _ensure_runtime_credentials(self, *, defer_on_exhaustion: bool = False) -> bool:
         """
         Ensure runtime credentials are resolved before agent use.
         Re-resolves provider credentials so key rotation and token refresh
         are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
+
+        ``defer_on_exhaustion`` is set ONLY by the initial worker-startup call
+        (``_init_agent``). When True and this is a dispatched quiet Kanban
+        worker whose primary route AND fallback chain all fail to resolve, the
+        give-up durably requeues/blocks the card instead of exiting clean into
+        a dispatcher-counted crash (BUILD-573 AC2/AC4). It stays False for the
+        per-turn re-resolution and ``/background`` call sites, whose worker is
+        alive and mid-progress — deferring their card would be wrong.
         """
         from cli import ChatConsole, _cprint, logger
         from hermes_cli.runtime_provider import (
@@ -37,6 +45,7 @@ class CLIAgentSetupMixin:
 
         _primary_exc = None
         runtime = None
+        _fallback_excs: list = []  # collected per-fallback resolution errors (BUILD-573)
         # BUILD-589: re-resolution for a moa route must use the preset
         # identity, not the aggregator wire-model a prior resolution wrote
         # onto self.model (see the write-back below).
@@ -123,6 +132,7 @@ class CLIAgentSetupMixin:
                             "Fallback entry %s/%s failed to resolve, trying next: %s",
                             _fb_provider, _fb_model, _fb_exc,
                         )
+                        _fallback_excs.append(_fb_exc)
                         continue
 
         if runtime is None:
@@ -144,6 +154,28 @@ class CLIAgentSetupMixin:
                 exc_info=_primary_exc,
             )
             ChatConsole().print(f"[bold red]{message}[/]")
+            # BUILD-573 AC2/AC4: a dispatched quiet Kanban worker whose whole
+            # route (primary + fallback chain) failed to resolve must NOT exit
+            # clean into a dispatcher-counted crash → 2-strike self-arrest.
+            # Durably requeue (transient, auto-heals) or block-once after a
+            # bounded streak (proven-broken chain). Gated to the initial
+            # worker-startup call so a per-turn re-resolution or /background
+            # failure — whose worker is alive mid-progress — never defers the
+            # card. Best-effort; on any failure we keep the plain give-up.
+            _is_quiet_worker = getattr(self, "tool_progress_mode", "full") == "off"
+            if defer_on_exhaustion and _is_quiet_worker:
+                try:
+                    from agent.external_runtime import (
+                        persist_credential_resolution_exhaustion,
+                    )
+
+                    _failures = ([_primary_exc] if _primary_exc else []) + _fallback_excs
+                    persist_credential_resolution_exhaustion(_failures)
+                except Exception:
+                    logger.warning(
+                        "credential-resolution durable defer failed; "
+                        "falling through to give-up", exc_info=True,
+                    )
             return False
 
         api_key = runtime.get("api_key")
@@ -383,7 +415,7 @@ class CLIAgentSetupMixin:
         self._install_tool_callbacks()
         self._ensure_tirith_security()
 
-        if not self._ensure_runtime_credentials():
+        if not self._ensure_runtime_credentials(defer_on_exhaustion=True):
             return False
 
         from hermes_cli.mcp_startup import wait_for_mcp_discovery
