@@ -2460,6 +2460,53 @@ def test_provider_availability_defer_requeues_without_counting_failure(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_quota_defer_requeues_without_failure_on_long_cooldown(
+    kanban_home, monkeypatch,
+):
+    """A quota-reason self-defer (BUILD-734) requeues without a task failure and
+    is spaced by the LONG rate-limit cooldown (~300s), not the 30s delivery
+    cooldown — so a quota window is probed cheaply, not thrashed — and never
+    gets trapped by its quota-flavored ``last_failure_error``."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 6_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quota-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        before = kb.get_task(conn, tid).consecutive_failures
+
+        deferred = kb.defer_task_for_delivery_authorization_retry(
+            conn,
+            tid,
+            expected_run_id=run_id,
+            error="Claude runtime provider unavailable (rate_limit): 429 quota exceeded",
+            outcome=_kb.QUOTA_UNAVAILABLE,
+        )
+        assert deferred is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == before
+
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?", (now, run_id)
+        )
+        conn.commit()
+
+        # 5s in: still deferred, and via the QUOTA guard reason — NOT the 30s
+        # delivery cooldown (which would have released it by ~30s).
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 5)
+        assert kb.check_respawn_guard(conn, tid) == "quota_unavailable_cooldown"
+        # Past the 30s delivery cooldown but inside the 300s quota window: still
+        # deferred (proves it uses the long cooldown, not the short one).
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
+        assert kb.check_respawn_guard(conn, tid) == "quota_unavailable_cooldown"
+        # Past the 300s quota window: released, not trapped by the 429 text.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_defer_rejects_unknown_outcome(kanban_home):
     """The kernel no-failure defer refuses an outcome that is not a
     registered self-classifying requeue outcome."""

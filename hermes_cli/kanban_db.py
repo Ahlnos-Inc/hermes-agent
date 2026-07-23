@@ -12688,8 +12688,19 @@ def operator_block_task(
 # get trapped forever by the quota/auth ``last_failure_error`` text it stamps.
 DELIVERY_AUTHORIZATION_UNAVAILABLE = "delivery_authorization_unavailable"
 PROVIDER_AVAILABILITY_UNAVAILABLE = "provider_availability_unavailable"
+# A fallback-exhausted quiet worker whose terminal reason is a provider QUOTA
+# wall (rate_limit / billing / upstream_rate_limit). Same no-failure requeue as
+# PROVIDER_AVAILABILITY_UNAVAILABLE, but spaced by the long rate-limit cooldown
+# (~300s) instead of the short 30s delivery cooldown — a quota window recovers
+# on a timer, so probing it every 30s would thrash a worker slot for nothing
+# (BUILD-734: the quota subset the 2026-07-22 self-defer deliberately excluded).
+QUOTA_UNAVAILABLE = "quota_unavailable"
 _NO_FAILURE_DEFER_OUTCOMES = frozenset(
-    {DELIVERY_AUTHORIZATION_UNAVAILABLE, PROVIDER_AVAILABILITY_UNAVAILABLE}
+    {
+        DELIVERY_AUTHORIZATION_UNAVAILABLE,
+        PROVIDER_AVAILABILITY_UNAVAILABLE,
+        QUOTA_UNAVAILABLE,
+    }
 )
 
 
@@ -14281,7 +14292,9 @@ class DispatchResult:
 # `summarize_dispatch_causes` rather than `respawn_guarded(<reason>)`, since
 # operators reach for the same remediation (wait, or fix credentials)
 # regardless of which of the two paths stamped it.
-_QUOTA_RESPAWN_GUARD_REASONS = frozenset({"blocker_auth", "rate_limit_cooldown"})
+_QUOTA_RESPAWN_GUARD_REASONS = frozenset(
+    {"blocker_auth", "rate_limit_cooldown", "quota_unavailable_cooldown"}
+)
 CAPACITY_ONLY_CAUSES = frozenset({"concurrency_cap", "concurrency_cap(per_profile)"})
 
 # Routing steady-states that also must never page an operator. An assignee that
@@ -17637,9 +17650,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
-      about the task, exactly as it is neutral for the unified
-      ``consecutive_failures`` counter.
+    * ``rate_limited`` runs and the self-classifying no-failure defers
+      (``_NO_FAILURE_DEFER_OUTCOMES``: delivery-gate / provider-availability /
+      quota) are neutral and skipped: they say nothing about the task, exactly
+      as they are neutral for the unified ``consecutive_failures`` counter. An
+      intervening quota defer must not reset a genuine protocol-violation streak.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
       reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
       protocol violations — mixed failure kinds can neither consume nor
@@ -17659,7 +17674,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome == "rate_limited" or outcome in _NO_FAILURE_DEFER_OUTCOMES:
             continue
         if outcome == "crashed":
             is_violation = False
@@ -18589,17 +18604,28 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        # ended_at is second-resolution, so two runs closing in the same second
+        # can tie; break the tie by run id (monotonic) so the genuinely newest
+        # run wins and a quota defer is never masked by an older sibling.
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
         latest_run is not None
         and latest_run["outcome"] in _NO_FAILURE_DEFER_OUTCOMES
     ):
-        cooldown = _resolve_delivery_authorization_cooldown_seconds()
+        # QUOTA_UNAVAILABLE is a provider quota wall: space it by the long
+        # rate-limit cooldown (~300s), not the 30s delivery cooldown, so a
+        # long quota window is probed cheaply instead of thrashed (BUILD-734).
+        if latest_run["outcome"] == QUOTA_UNAVAILABLE:
+            cooldown = _resolve_rate_limit_cooldown_seconds()
+            guard_reason = "quota_unavailable_cooldown"
+        else:
+            cooldown = _resolve_delivery_authorization_cooldown_seconds()
+            guard_reason = "delivery_authorization_cooldown"
         ended_at = latest_run["ended_at"]
         if cooldown > 0 and ended_at is not None and now - int(ended_at) < cooldown:
-            return "delivery_authorization_cooldown"
+            return guard_reason
         # These outcomes are self-classifying. Once the cooldown expires they
         # must not fall into the generic auth-error regex and defer forever
         # (the requeue never increments the failure counter, so the breaker

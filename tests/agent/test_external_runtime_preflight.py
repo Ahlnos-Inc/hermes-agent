@@ -560,3 +560,93 @@ def test_claude_sdk_temp_dir_rejects_existing_wrong_owner(monkeypatch, tmp_path)
 
     with pytest.raises(RuntimeError, match="owner-only"):
         prepare_claude_sdk_temp_dir(temp_root=temp_root)
+
+
+def _defer_capture(monkeypatch):
+    """Patch the kernel defer + connection so the worker-defer helper runs
+    without a real DB, capturing the ``outcome`` it chose."""
+    import contextlib
+
+    from hermes_cli import kanban_db as _kb
+
+    captured = {}
+
+    def _fake_defer(conn, task_id, *, expected_run_id, error, outcome):
+        captured["outcome"] = outcome
+        captured["task_id"] = task_id
+        return True
+
+    @contextlib.contextmanager
+    def _fake_conn():
+        yield object()
+
+    monkeypatch.setattr(_kb, "defer_task_for_delivery_authorization_retry", _fake_defer)
+    monkeypatch.setattr(_kb, "connect_closing", _fake_conn)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_outcome_attr"),
+    [
+        (FailoverReason.rate_limit, "QUOTA_UNAVAILABLE"),
+        (FailoverReason.billing, "QUOTA_UNAVAILABLE"),
+        (FailoverReason.upstream_rate_limit, "QUOTA_UNAVAILABLE"),
+        (FailoverReason.auth, "PROVIDER_AVAILABILITY_UNAVAILABLE"),
+        (FailoverReason.timeout, "PROVIDER_AVAILABILITY_UNAVAILABLE"),
+        (FailoverReason.provider_unavailable, "PROVIDER_AVAILABILITY_UNAVAILABLE"),
+    ],
+)
+def test_worker_defer_maps_reason_to_outcome(
+    monkeypatch, reason, expected_outcome_attr
+):
+    """Quota reasons defer as QUOTA_UNAVAILABLE (long cooldown); availability
+    reasons as PROVIDER_AVAILABILITY_UNAVAILABLE (short cooldown) — BUILD-734."""
+    from hermes_cli import kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-734")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    captured = _defer_capture(monkeypatch)
+    agent = SimpleNamespace(quiet_mode=True, _turn_route_failures=None)
+
+    deferred = external_runtime.persist_claude_worker_availability_defer(
+        agent, RuntimeFailure(reason, "boom")
+    )
+    assert deferred is True
+    assert captured["outcome"] == getattr(_kb, expected_outcome_attr)
+
+
+def test_worker_defer_preserves_turn_quota_wall(monkeypatch):
+    """A quota wall seen on an earlier fallback, then masked by a trailing
+    timeout, still resolves to the QUOTA (long-cooldown) outcome via the
+    turn ledger — not the 30s availability path (Sol review)."""
+    from agent.turn_retry_state import RouteFailureLedger
+    from hermes_cli import kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-734")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    captured = _defer_capture(monkeypatch)
+
+    ledger = RouteFailureLedger()
+    ledger.record(FailoverReason.rate_limit, route={"provider": "anthropic", "model": "m"})
+    agent = SimpleNamespace(quiet_mode=True, _turn_route_failures=ledger)
+
+    deferred = external_runtime.persist_claude_worker_availability_defer(
+        agent, RuntimeFailure(FailoverReason.timeout, "then a timeout")
+    )
+    assert deferred is True
+    assert captured["outcome"] == _kb.QUOTA_UNAVAILABLE
+
+
+def test_worker_defer_skips_non_availability_reason(monkeypatch):
+    """A terminal, task-shaped reason (not availability/quota) is never
+    silently requeued as no-failure."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "BUILD-734")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    captured = _defer_capture(monkeypatch)
+    agent = SimpleNamespace(quiet_mode=True, _turn_route_failures=None)
+
+    deferred = external_runtime.persist_claude_worker_availability_defer(
+        agent, RuntimeFailure(FailoverReason.auth_permanent, "hard stop")
+    )
+    assert deferred is False
+    assert "outcome" not in captured

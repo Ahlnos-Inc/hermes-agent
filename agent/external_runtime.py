@@ -371,10 +371,6 @@ def persist_claude_workspace_boundary_block(
 # prepare_claude_agent_sdk_runtime). Deliberately EXCLUDED:
 #   * auth_permanent / model_not_found / provider_policy_blocked — genuinely
 #     terminal, unchanged-request failures that must count / block, never spin.
-#   * rate_limit / billing / upstream_rate_limit — quota walls with their own
-#     dedicated long (300s) cooldown + EX_TEMPFAIL exit path; requeuing them
-#     through the shorter delivery cooldown here would probe a quota window too
-#     aggressively. Left to their existing handling.
 def _worker_availability_defer_reasons() -> "frozenset[FailoverReason]":
     return frozenset(
         {
@@ -383,6 +379,24 @@ def _worker_availability_defer_reasons() -> "frozenset[FailoverReason]":
             FailoverReason.server_error,
             FailoverReason.timeout,
             FailoverReason.provider_unavailable,
+        }
+    )
+
+
+# Provider QUOTA walls that ALSO warrant a no-failure self-defer (BUILD-734).
+# The exit-75 EX_TEMPFAIL path already gives these a 300s cooldown, but a
+# session-detached quiet worker whose exit code the reaper cannot read still
+# self-arrests (cf++ → blocked) on the unreliable exit channel. Deferring the
+# card here too makes quota recovery independent of exit-code classification —
+# spaced by the SAME long (~300s) cooldown, not the 30s delivery cooldown, so a
+# quota window is probed cheaply rather than thrashed (that cooldown split is
+# resolved by the QUOTA_UNAVAILABLE outcome in check_respawn_guard).
+def _worker_quota_defer_reasons() -> "frozenset[FailoverReason]":
+    return frozenset(
+        {
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+            FailoverReason.upstream_rate_limit,
         }
     )
 
@@ -406,7 +420,22 @@ def persist_claude_worker_availability_defer(
 
     if getattr(failure, "provisioning", False):
         return False
-    if failure.reason not in _worker_availability_defer_reasons():
+    # Classify from the TURN-level resolved reason, not just this last failure:
+    # a quota wall hit on an earlier fallback (then masked by a trailing timeout
+    # / provider outage) must still land on the long quota cooldown, not the
+    # short 30s one. ``RouteFailureLedger.resolve`` preserves a concrete quota
+    # value when one was seen this turn and otherwise collapses to
+    # ``provider_unavailable`` (BUILD-734 / Sol review).
+    ledger = getattr(agent, "_turn_route_failures", None)
+    resolved = (
+        ledger.resolve(failure.reason)
+        if ledger is not None
+        else failure.reason.value
+    )
+    quota_values = {r.value for r in _worker_quota_defer_reasons()}
+    availability_values = {r.value for r in _worker_availability_defer_reasons()}
+    is_quota = resolved in quota_values
+    if resolved not in quota_values and resolved not in availability_values:
         return False
     if not getattr(agent, "quiet_mode", False):
         return False
@@ -421,6 +450,11 @@ def persist_claude_worker_availability_defer(
     try:
         from hermes_cli import kanban_db
 
+        outcome = (
+            kanban_db.QUOTA_UNAVAILABLE
+            if is_quota
+            else kanban_db.PROVIDER_AVAILABILITY_UNAVAILABLE
+        )
         with kanban_db.connect_closing() as conn:
             deferred = kanban_db.defer_task_for_delivery_authorization_retry(
                 conn,
@@ -430,7 +464,7 @@ def persist_claude_worker_availability_defer(
                     f"Claude runtime provider unavailable "
                     f"({failure.reason.value}): {failure.message}"
                 )[:480],
-                outcome=kanban_db.PROVIDER_AVAILABILITY_UNAVAILABLE,
+                outcome=outcome,
             )
         if deferred:
             _runtime_events_logger.warning(
