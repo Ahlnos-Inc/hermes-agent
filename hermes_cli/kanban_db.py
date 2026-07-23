@@ -5708,6 +5708,28 @@ def compile_workflow_graph(
     # of persisting a graph whose every step deterministically fails at
     # dispatch. Mirrors create_task's board-default fallback (current board
     # when no explicit board is threaded through the compiler today).
+    # A coder step writes a code fix — it MUST run in a repository worktree, not
+    # a scratch dir. Compiling a coder onto scratch is exactly what stranded the
+    # hermes-infra runtime-remediation fleet (BUILD-592/694/736): the coder had
+    # no repo to build in and the verifier had nothing to check out. Fail closed
+    # with an actionable message rather than guessing an anchor — the board is
+    # bi-repo (hermes-config config tickets AND the hermes-agent runtime fork),
+    # so the caller must name the target repo explicitly; a silent board-default
+    # anchor would misroute a runtime fix into the config repo. (Only "coder" is
+    # unambiguously repo-bound; "verifier" is reused by research swarms that
+    # legitimately run on scratch.)
+    if workspace_kind == "scratch" and not workspace_path and any(
+        step["role"] == "coder" for step in normalized_steps
+    ):
+        raise WorkspaceContractError(
+            "coder_needs_worktree",
+            "workflow has a coder step that must build in a repository, but "
+            "workspace_kind='scratch' provides none. Recompile with "
+            "workspace_kind='worktree' and workspace_path=<absolute repo root> "
+            "(the hermes-agent runtime fork for runtime fixes, or the "
+            "hermes-config checkout for config fixes).",
+        )
+
     if workspace_kind == "worktree" and not workspace_path:
         board_default = (
             read_board_metadata(get_current_board()).get("default_workdir") or ""
@@ -5769,6 +5791,17 @@ def compile_workflow_graph(
                     if all(by_key[parent]["initial_status"] == "done" for parent in step["parents"])
                     else "todo"
                 )
+            # A verifier with exactly one coder parent mirrors that coder's
+            # branch: its worktree is materialized detached at wt/<coder-id>'s
+            # tip (see _resolve_worktree_workspace), giving it the coder's exact
+            # commit with no LLM-typed SHA to truncate (BUILD-694).
+            step_branch_name = None
+            if workspace_kind == "worktree" and step["role"] == "verifier":
+                coder_parents = [
+                    p for p in step["parents"] if by_key[p]["role"] == "coder"
+                ]
+                if len(coder_parents) == 1:
+                    step_branch_name = f"wt/{task_ids[coder_parents[0]]}"
             conn.execute(
                 """INSERT INTO tasks (
                     id, title, body, assignee, status, priority, created_by,
@@ -5776,8 +5809,8 @@ def compile_workflow_graph(
                     session_id, workflow_key, current_step_key, result,
                     completed_at, skills, toolsets, model_override,
                     model_provider_override, model_reasoning_effort,
-                    max_runtime_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    max_runtime_seconds, branch_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_ids[step["key"]],
                     step["title"],
@@ -5805,6 +5838,7 @@ def compile_workflow_graph(
                     step["model_provider_override"],
                     step["model_reasoning_effort"],
                     step["max_runtime_seconds"],
+                    step_branch_name,
                 ),
             )
             _append_event(
@@ -13649,6 +13683,47 @@ def _existing_checkpoint(
     return checkpoint_ref, checkpoint_sha
 
 
+def _git_branch_checked_out_elsewhere(
+    repo_root: Path,
+    branch_name: str,
+    exclude_target: Path,
+) -> bool:
+    """True if ``branch_name`` is already checked out by a worktree other than
+    ``exclude_target``.
+
+    Git forbids the same branch being checked out in two linked worktrees, so
+    this is how we detect a verifier whose branch mirrors its still-live coder
+    sibling — the case that must materialize *detached* at the branch tip.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    want_ref = f"refs/heads/{branch_name}"
+    try:
+        exclude = exclude_target.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        exclude = exclude_target
+    current: Optional[Path] = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            raw = line[len("worktree "):].strip()
+            try:
+                current = Path(raw).resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                current = Path(raw)
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            if ref == want_ref and current != exclude:
+                return True
+    return False
+
+
 def _ensure_git_worktree(
     repo_root: Path,
     target: Path,
@@ -13656,7 +13731,15 @@ def _ensure_git_worktree(
     *,
     checkpoint_key: str,
 ) -> tuple[Optional[str], Optional[str], bool]:
-    """Materialize a linked worktree from a recoverable source checkpoint."""
+    """Materialize a linked worktree from a recoverable source checkpoint.
+
+    If ``branch_name`` names an existing branch that is already checked out by
+    another worktree (a verifier mirroring its still-live coder sibling), git
+    forbids a second checkout, so we materialize a fresh *detached* worktree
+    pinned to that branch's current tip. This gives the verifier an isolated,
+    independent checkout of the coder's exact commit — no new branch, no
+    checkpoint of the live tree, no LLM-typed SHA to truncate (BUILD-694).
+    """
     target = target.expanduser()
     branch_check = subprocess.run(
         ["git", "check-ref-format", "--branch", branch_name],
@@ -13677,7 +13760,18 @@ def _ensure_git_worktree(
     target.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_ref: Optional[str] = None
     checkpoint_sha: Optional[str] = None
-    if _git_branch_exists(repo_root, branch_name):
+    if (
+        _git_branch_exists(repo_root, branch_name)
+        and _git_branch_checked_out_elsewhere(repo_root, branch_name, target)
+    ):
+        cmd = [
+            "git", "-C", str(repo_root), "worktree", "add", "--detach",
+            str(target), branch_name,
+        ]
+        checkpoint_ref, checkpoint_sha = _existing_checkpoint(
+            repo_root, checkpoint_key,
+        )
+    elif _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
         checkpoint_ref, checkpoint_sha = _existing_checkpoint(
             repo_root, checkpoint_key,
