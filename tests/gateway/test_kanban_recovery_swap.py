@@ -494,3 +494,70 @@ def test_recovered_alert_is_delivered_once_for_an_incident(
     assert "auto-recovered" in attempts[0]
     assert "dispatch resumes next tick" in attempts[0]
     assert str(db.resolve()) in attempts[0]
+
+
+def test_wal_resident_bytes_are_preserved_before_recovery_mutation(
+    tmp_path, hermetic_home, monkeypatch
+):
+    """The forensic backup must capture the pre-recovery main+WAL image.
+
+    BUILD-578: the existing backup test checkpoints the WAL into the main DB
+    first, so it never proves the WAL path. Here a committed row is left
+    WAL-resident (uncheckpointed) when recovery runs; the canonical backup must
+    reproduce that exact pre-swap main+WAL byte image — i.e. the forensic copy
+    was taken before ``.recover``/the swap could checkpoint or replace the live
+    WAL. Asserted by content-address (sha256) equality, not just existence.
+    """
+    import hashlib
+
+    monkeypatch.setattr(kw.time, "time", lambda: 1_750_000_000.0)
+    monkeypatch.setattr(kw.time, "monotonic", lambda: 10_000.0)
+
+    db = tmp_path / "kanban.db"
+    kb.init_db(db)
+    with kb.connect(db) as conn:
+        kb.create_task(conn, title="base")
+    sqlite3.connect(str(db)).execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # A committed row that stays in the WAL (kb runs wal_autocheckpoint=0).
+    with kb.connect(db) as conn:
+        kb.create_task(conn, title="wal-resident-row")
+    wal = Path(str(db) + "-wal")
+    assert wal.exists() and wal.stat().st_size > 0, "row was not left WAL-resident"
+
+    incident = kb.ensure_corruption_incident(db, "simulated WAL-resident corruption")
+    assert incident.backup_path is not None
+    backup = Path(incident.backup_path)
+    backup_wal = Path(str(backup) + "-wal")
+
+    def _sha(p: Path) -> str:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    pre_main = _sha(db)
+    pre_wal = _sha(wal)
+
+    _install_sqlite_process_fake(monkeypatch, tmp_path, db)
+
+    def local_stage(source):
+        fd, name = tempfile.mkstemp(
+            dir=str(source.parent), prefix=f".{source.name}.test-stage.", suffix=".tmp"
+        )
+        Path(name).unlink()
+        shutil.copy2(source, name)
+        return Path(name)
+
+    monkeypatch.setattr(kb, "_stage_off_lock", local_stage)
+    result = kw._attempt_board_db_recovery(_FakeKb(db), "slug")
+
+    assert result.status == kw.RecoveryStatus.RECOVERED, result.detail
+    # Forensic backup reproduces the pre-recovery main + WAL bytes exactly.
+    assert backup.exists() and _sha(backup) == pre_main
+    assert backup_wal.exists() and _sha(backup_wal) == pre_wal
+    # And the WAL-resident committed row is reconstructable from that image —
+    # proving committed-but-uncheckpointed state was captured, not lost.
+    replay = tmp_path / "replay.db"
+    shutil.copy2(backup, replay)
+    shutil.copy2(backup_wal, str(replay) + "-wal")
+    with sqlite3.connect(str(replay)) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE title = 'wal-resident-row'"
+        ).fetchone()[0] == 1
