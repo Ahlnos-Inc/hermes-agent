@@ -6443,6 +6443,14 @@ def generate_launchd_plist() -> str:
     )
     prog_args_xml = "\n        ".join(prog_args)
 
+    # LimitLoadToSessionType below is "Aqua" only (NOT "Background"). The gateway
+    # spawns Claude Max subscription workers whose `claude auth status` must read
+    # the login keychain, which is only reachable from the GUI (Aqua) login
+    # session. Allowing "Background" lets launchd load this agent into the
+    # user/<uid> domain at login, where workers get subscriptionType=null ->
+    # attestation fails and architect cards stall (incident 2026-07-22). Aqua-only
+    # forces the gui/<uid> domain every login. A headless/no-GUI host would need
+    # the keychain-ACL path instead of re-adding "Background".
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -6471,7 +6479,6 @@ def generate_launchd_plist() -> str:
     <key>LimitLoadToSessionType</key>
     <array>
         <string>Aqua</string>
-        <string>Background</string>
     </array>
     
     <key>RunAtLoad</key>

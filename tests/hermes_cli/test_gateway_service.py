@@ -4462,13 +4462,21 @@ class TestProfileArg:
         assert "<string>--profile</string>" in plist
         assert "<string>mybot</string>" in plist
 
-    def test_launchd_plist_supports_aqua_and_background_sessions(self):
-        # macOS 26+ only loads the agent in non-Aqua sessions when the plist
-        # opts into Background as well (issue #23387).
+    def test_launchd_plist_loads_aqua_session_only(self):
+        # Aqua ONLY, NOT Background. The gateway spawns Claude Max subscription
+        # workers whose `claude auth status` must read the login keychain, which
+        # is only reachable from the GUI (Aqua) login session. Opting into
+        # "Background" (once added for macOS 26+ non-Aqua loading, #23387) lets
+        # launchd load the agent into the user/<uid> domain at login, where
+        # workers get subscriptionType=null -> attestation fails and architect
+        # cards stall (incident 2026-07-22). A gateway that can't reach the
+        # keychain is non-functional for this workload, so Aqua-only is the
+        # correct constraint here; a headless host needs the keychain-ACL path
+        # instead of re-adding Background.
         plist = gateway_cli.generate_launchd_plist()
         assert "<key>LimitLoadToSessionType</key>" in plist
         assert "<string>Aqua</string>" in plist
-        assert "<string>Background</string>" in plist
+        assert "<string>Background</string>" not in plist
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
