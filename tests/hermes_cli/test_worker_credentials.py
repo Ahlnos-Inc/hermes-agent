@@ -120,6 +120,66 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     assert child_env[wc.MANIFEST_DIGEST_ENV] == plan.manifest_digest
 
 
+@pytest.mark.parametrize(
+    ("fetch_result", "expected_error"),
+    [
+        # Bitwarden reached the source but the GitHub write secret is absent
+        # (e.g. rotated away / never provisioned) — the "unauthenticated"
+        # publication case: gh/git would have no usable token.
+        (
+            FetchResult(secrets={}),
+            "worker credential preflight GitHub write secret is missing",
+        ),
+        # The Bitwarden source itself failed (bootstrap wrong, network, adapter
+        # error) — also leaves the publisher without credentials.
+        (
+            FetchResult(error="bitwarden adapter failed"),
+            "worker credential preflight Bitwarden source failed",
+        ),
+    ],
+)
+def test_unauthenticated_publication_fails_closed_without_leaking_secrets(
+    tmp_path, monkeypatch, caplog, fetch_result, expected_error
+):
+    """BUILD-568: a releaser/verifier publication with no usable GitHub write
+    credential must fail closed with an ACTIONABLE, NON-SECRET diagnostic and
+    project NO token into the worker environment — so an unauthenticated publish
+    never silently proceeds and never discards work by pushing with a bogus or
+    ambient token. Regression fixture for the unauthenticated publication path.
+    """
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    # Ambient tokens that MUST NOT be treated as an authorized action source
+    # and MUST NOT leak into the diagnostic/log.
+    monkeypatch.setenv("GH_TOKEN", SENTINEL)
+    monkeypatch.setenv("GITHUB_TOKEN", SENTINEL)
+    monkeypatch.setenv("GH_TOKEN_SECRET_WRITE", SENTINEL)
+
+    monkeypatch.setattr(wc, "_fetch_bitwarden_result", lambda **_kw: fetch_result)
+    with caplog.at_level(logging.INFO, logger=wc._log.name):
+        plan = wc.resolve_worker_credentials(
+            "Releaser", root=tmp_path, base_env=os.environ
+        )
+
+    # Fail closed with an actionable, non-secret diagnostic.
+    assert not plan.ok
+    assert plan.error == expected_error
+    assert "github_write=missing" in plan.diagnostics
+    # No secret value anywhere in the plan or its logs.
+    assert SENTINEL not in repr(plan)
+    assert SENTINEL not in (plan.error or "")
+    assert SENTINEL not in caplog.text
+
+    # No github handoff is projected and ambient tokens are stripped, so the
+    # worker cannot publish with an unauthorized token (commit stays untouched).
+    child_env = wc.build_worker_environment(dict(os.environ), plan)
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in child_env
+    assert "GH_TOKEN" not in child_env
+    assert "GITHUB_TOKEN" not in child_env
+    assert wc.GITHUB_WRITE_SOURCE_KEY not in child_env
+
+
 def test_releaser_bootstrap_strips_ambient_credentials(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
