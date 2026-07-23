@@ -13301,6 +13301,21 @@ def cmd_claw(args):
 
 
 def main():
+    """Console entry point.
+
+    Wraps the CLI in ``worker_exit_recorder`` so a dispatcher-launched worker
+    durably records its own terminal exit disposition (BUILD-735). The recorder
+    is a no-op for every non-worker invocation, so this stays a transparent
+    passthrough that returns ``_run_cli()``'s value to callers that do
+    ``sys.exit(main())`` (container_boot / uninstall).
+    """
+    from hermes_cli.kanban_worker_exit import worker_exit_recorder
+
+    with worker_exit_recorder():
+        return _run_cli()
+
+
+def _run_cli():
     """Main entry point for hermes CLI."""
     # Dispatcher-launched workers begin behind a two-phase gate. Enforce it
     # before recovery, profile loading, plugin discovery, model setup, or any

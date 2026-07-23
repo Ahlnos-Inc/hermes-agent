@@ -706,6 +706,17 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "logs"
 
 
+def worker_exit_sidecar_dir(board: Optional[str] = None) -> Path:
+    """Directory holding per-pid worker exit sidecars (BUILD-735).
+
+    A dispatcher worker writes ``<dir>/<pid>`` with its terminal disposition
+    right before exiting; ``detect_crashed_workers`` reads it to classify a
+    session-detached exit. Resolved from the same board-pinned ``worker_logs_dir``
+    the worker was launched under, so both sides agree on the path.
+    """
+    return worker_logs_dir(board=board) / ".worker-exits"
+
+
 def board_metadata_path(board: Optional[str] = None) -> Path:
     """Return the path to ``board.json`` for ``board``.
 
@@ -14461,47 +14472,140 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
-    """Classify a recently-reaped worker by pid.
+def _classify_exit_code(code: int) -> "tuple[str, int]":
+    """Map a plain exit code to a ``(kind, code)`` classification."""
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", code)
+    return ("nonzero_exit", code)
+
+
+def _classify_worker_exit(
+    pid: int,
+    sidecar_dir: "Optional[Path]" = None,
+    *,
+    min_mtime: "Optional[float]" = None,
+) -> "tuple[str, Optional[int]]":
+    """Classify a dead worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
 
-    * ``"clean_exit"`` — ``WIFEXITED`` with ``WEXITSTATUS == 0``. When the
-      task is still ``running`` in the DB, this is a protocol violation
-      (worker exited without calling ``kanban_complete`` / ``kanban_block``)
-      and should be auto-blocked immediately — retrying will just loop.
-    * ``"rate_limited"`` — ``WIFEXITED`` with status
-      ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
-      provider rate-limited / exhausted quota, NOT because the task failed.
-      ``detect_crashed_workers`` releases the task back to ``ready`` without
-      counting a failure, so a long quota window can't trip the breaker.
-    * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
-    * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
-    * ``"unknown"`` — pid was not in the reap registry (either reaped by
-      something else, or died between reap tick and liveness check). Fall
-      back to existing crashed-counter behavior.
+    * ``"clean_exit"`` — exited with status 0. When the task is still
+      ``running`` in the DB, this is a protocol violation (worker exited
+      without calling ``kanban_complete`` / ``kanban_block``) and should be
+      auto-blocked immediately — retrying will just loop.
+    * ``"rate_limited"`` — exited with ``KANBAN_RATE_LIMIT_EXIT_CODE``. The
+      worker bailed because the provider rate-limited / exhausted quota, NOT
+      because the task failed. ``detect_crashed_workers`` releases the task
+      back to ``ready`` without counting a failure, so a long quota window
+      can't trip the breaker.
+    * ``"nonzero_exit"`` — exited with a non-zero status. Real error.
+    * ``"signaled"`` — killed by a signal (OOM killer, SIGKILL, etc). Real
+      crash.
+    * ``"unknown"`` — the exit could not be observed at all. Fall back to the
+      existing crashed-counter behavior.
+
+    Resolution order:
+
+    1. The in-memory ``_recent_worker_exits`` registry — populated by
+       ``reap_worker_zombies`` for children the dispatcher reaped directly
+       (attached path). Authoritative and freshest when present.
+    2. The durable per-pid exit sidecar the worker wrote (BUILD-735), consulted
+       only on a registry miss. This is the session-detached path: the worker
+       is reaped by init, so its status never lands in the registry — without
+       the sidecar every detached exit would classify ``"unknown"`` and be
+       miscounted as a crash. Survives a dispatcher restart (the registry does
+       not). The sidecar is consumed (unlinked) once read.
+    3. ``("unknown", None)`` — genuinely lost (SIGKILL/OOM/power loss, or a
+       race), which is the correct fallback to the crash counter.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
-    if entry is None:
+    if entry is not None:
+        raw, _ = entry
+        try:
+            if os.WIFEXITED(raw):
+                return _classify_exit_code(os.WEXITSTATUS(raw))
+            if os.WIFSIGNALED(raw):
+                return ("signaled", os.WTERMSIG(raw))
+        except Exception:
+            pass
         return ("unknown", None)
-    raw, _ = entry
-    try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
+
+    # Registry miss → the worker was session-detached (reaped by init). Consult
+    # the durable sidecar it wrote before exiting.
+    if sidecar_dir is not None:
+        classified = _read_worker_exit_sidecar(
+            sidecar_dir, int(pid), min_mtime=min_mtime,
+        )
+        if classified is not None:
+            return classified
     return ("unknown", None)
+
+
+def _read_worker_exit_sidecar(
+    sidecar_dir: "Path",
+    pid: int,
+    *,
+    min_mtime: "Optional[float]" = None,
+) -> "Optional[tuple[str, int]]":
+    """Read a worker's durable exit sidecar. See _classify_worker_exit.
+
+    Deliberately does NOT consume (unlink) the file: this runs inside
+    ``detect_crashed_workers``' write transaction, and unlinking there would
+    lose the disposition if the txn later rolled back. Once the task is
+    released its ``worker_pid`` is cleared and the same pid is never
+    re-classified for it, so leaving the file for the age-sweep is safe.
+
+    ``min_mtime`` (the worker's process start time) guards against pid reuse:
+    a sidecar written by a *previous* holder of this recycled pid predates the
+    current worker's launch, so it is ignored — the current worker either wrote
+    a fresher one (mtime ≥ its start) or died uncaptured (→ unknown fallback).
+    """
+    from hermes_cli.kanban_worker_exit import parse_sidecar
+
+    path = sidecar_dir / str(int(pid))
+    try:
+        st = path.stat()
+    except (FileNotFoundError, OSError):
+        return None
+    if min_mtime is not None and st.st_mtime < min_mtime:
+        # Stale sidecar from a prior owner of this recycled pid — not ours.
+        return None
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    parsed = parse_sidecar(payload)
+    if parsed is None:
+        return None
+    kind, value = parsed
+    if kind == "signal":
+        return ("signaled", value)
+    return _classify_exit_code(value)
+
+
+def _prune_worker_exit_sidecars(sidecar_dir: "Path") -> None:
+    """Drop exit sidecars older than the registry TTL.
+
+    Consumed sidecars are unlinked on read; this sweeps the ones left by a
+    worker whose crash the dispatcher never got to (e.g. the task was already
+    reclaimed by a different path), so the dir can't grow without bound.
+    """
+    try:
+        cutoff = time.time() - _RECENT_WORKER_EXIT_TTL_SECONDS
+        for child in sidecar_dir.iterdir():
+            try:
+                if child.stat().st_mtime < cutoff:
+                    child.unlink()
+            except OSError:
+                pass
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -17695,7 +17799,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -17733,6 +17840,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    # Durable per-pid exit sidecar dir for the session-detached path (BUILD-735).
+    # Resolved from the same board-pinned log dir the workers were spawned under.
+    sidecar_dir = worker_exit_sidecar_dir(board=board)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, current_run_id, worker_pid, worker_started_at, worker_pgid, worker_sid, "
@@ -17787,7 +17897,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            # worker_started_at is the process create_time — a sidecar older
+            # than it belongs to a prior holder of this recycled pid.
+            _started = row["worker_started_at"] if "worker_started_at" in row.keys() else None
+            kind, code = _classify_worker_exit(
+                pid, sidecar_dir=sidecar_dir, min_mtime=_started,
+            )
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -18003,6 +18118,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Age-sweep exit sidecars nothing consumed (e.g. a task reclaimed by another
+    # path), so the dir can't grow without bound. Cheap, once per pass.
+    _prune_worker_exit_sidecars(sidecar_dir)
     return crashed
 
 
@@ -18933,7 +19051,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -20216,6 +20334,14 @@ def _default_spawn(
     # dies or attach fails, no token appears and the child exits on timeout.
     gate_dir = log_dir / ".start-gates"
     gate_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Durable per-pid exit sidecar (BUILD-735). The worker writes its terminal
+    # disposition to <exit_dir>/<pid> before dying; detect_crashed_workers reads
+    # it to classify a session-detached exit instead of counting every exit as a
+    # crash. Resolved from the same board-pinned log_dir on both sides, so the
+    # dispatcher reads back exactly where the worker wrote.
+    exit_dir = worker_exit_sidecar_dir(board=board)
+    exit_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env["HERMES_KANBAN_EXIT_SIDECAR_DIR"] = str(exit_dir)
     gate_token = secrets.token_urlsafe(32)
     gate_name = hashlib.sha256(
         f"{task.id}:{task.current_run_id}:{gate_token}".encode("utf-8")

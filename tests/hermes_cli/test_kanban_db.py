@@ -1449,6 +1449,216 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+# ---------------------------------------------------------------------------
+# BUILD-735: durable per-pid exit sidecar for the session-detached path. A
+# worker reaped by init never lands in ``_recent_worker_exits``; without the
+# sidecar every detached exit classifies ``"unknown"`` and is miscounted as a
+# crash (cf++ → self-arrest). The worker writes its own disposition to
+# ``<sidecar_dir>/<pid>``; ``_classify_worker_exit`` reads it on a registry miss.
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar(sidecar_dir: Path, pid: int, payload: str) -> None:
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    (sidecar_dir / str(pid)).write_text(payload, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ("exit:0", ("clean_exit", 0)),
+        ("exit:75", ("rate_limited", 75)),
+        ("exit:1", ("nonzero_exit", 1)),
+        ("exit:137", ("nonzero_exit", 137)),
+        ("signal:15", ("signaled", 15)),
+        ("signal:9", ("signaled", 9)),
+    ],
+)
+def test_classify_reads_exit_sidecar_on_registry_miss(
+    kanban_home, tmp_path, payload, expected,
+):
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    pid = 424242  # never in the in-memory registry
+    _write_sidecar(sidecar_dir, pid, payload)
+
+    assert _kb._classify_worker_exit(pid, sidecar_dir=sidecar_dir) == expected
+    # Not consumed on read (would be lost on a txn rollback); the age-sweep
+    # reclaims it. Idempotent: a second read gives the same answer.
+    assert (sidecar_dir / str(pid)).exists()
+    assert _kb._classify_worker_exit(pid, sidecar_dir=sidecar_dir) == expected
+
+
+def test_classify_ignores_stale_sidecar_from_recycled_pid(kanban_home, tmp_path):
+    """A sidecar older than the worker's launch belongs to a prior holder of a
+    recycled pid and must NOT classify the current worker."""
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    pid = 717171
+    _write_sidecar(sidecar_dir, pid, "exit:0")
+    stale = time.time() - 10_000
+    os.utime(sidecar_dir / str(pid), (stale, stale))
+
+    # Worker launched well after the stale sidecar → ignore it → unknown.
+    assert _kb._classify_worker_exit(
+        pid, sidecar_dir=sidecar_dir, min_mtime=time.time() - 100,
+    ) == ("unknown", None)
+    # No freshness bound → still read (back-compat for callers without a start).
+    assert _kb._classify_worker_exit(pid, sidecar_dir=sidecar_dir) == ("clean_exit", 0)
+
+
+def test_classify_registry_beats_sidecar(kanban_home, tmp_path):
+    """An attached child's fresh reap-registry status wins over any sidecar."""
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    pid = 515151
+    _kb._record_worker_exit(pid, _exited_status(0))  # registry: clean
+    _write_sidecar(sidecar_dir, pid, "exit:1")  # sidecar disagrees
+
+    assert _kb._classify_worker_exit(pid, sidecar_dir=sidecar_dir) == ("clean_exit", 0)
+
+
+def test_classify_missing_sidecar_is_unknown(kanban_home, tmp_path):
+    """No registry entry AND no sidecar → the genuinely-lost fallback."""
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    sidecar_dir.mkdir()
+    assert _kb._classify_worker_exit(999001, sidecar_dir=sidecar_dir) == ("unknown", None)
+    # No sidecar dir passed at all → still unknown (attached-only callers).
+    assert _kb._classify_worker_exit(999002) == ("unknown", None)
+
+
+def test_classify_malformed_sidecar_is_unknown(kanban_home, tmp_path):
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    pid = 626262
+    _write_sidecar(sidecar_dir, pid, "not-a-disposition")
+    assert _kb._classify_worker_exit(pid, sidecar_dir=sidecar_dir) == ("unknown", None)
+    # Left for the age-sweep rather than unlinked inside the caller's txn.
+
+
+def test_prune_worker_exit_sidecars_drops_only_stale(kanban_home, tmp_path):
+    import hermes_cli.kanban_db as _kb
+
+    sidecar_dir = tmp_path / ".worker-exits"
+    _write_sidecar(sidecar_dir, 111, "exit:0")  # fresh
+    _write_sidecar(sidecar_dir, 222, "exit:0")  # will be aged
+    old = time.time() - _kb._RECENT_WORKER_EXIT_TTL_SECONDS - 60
+    os.utime(sidecar_dir / "222", (old, old))
+
+    _kb._prune_worker_exit_sidecars(sidecar_dir)
+    assert (sidecar_dir / "111").exists()
+    assert not (sidecar_dir / "222").exists()
+
+
+def test_detected_detached_clean_exit_is_protocol_violation_not_crash(
+    kanban_home, monkeypatch,
+):
+    """End-to-end: a session-detached worker that exits rc=0 while its task is
+    still ``running`` must be classified as a protocol violation via the
+    sidecar — NOT counted as a crash through the ``unknown`` channel. The reap
+    registry is deliberately empty (init reaped the worker), so only the durable
+    sidecar can rescue the classification."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="detached", assignee="a")
+        pid = 818181
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+
+        # Worker was reaped by init: nothing in the registry, but it left a
+        # durable rc=0 sidecar. detect_crashed_workers uses the default board.
+        sidecar_dir = _kb.worker_exit_sidecar_dir()
+        _write_sidecar(sidecar_dir, pid, "exit:0")
+        assert pid not in _kb._recent_worker_exits
+
+        crashed = _kb.detect_crashed_workers(conn)
+        assert tid in crashed  # released back to ready
+
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "protocol_violation" in kinds
+        assert "crashed" not in kinds  # NOT the unknown → crash miscount
+
+
+# ---------------------------------------------------------------------------
+# Worker-side recorder (hermes_cli.kanban_worker_exit): run real subprocesses
+# so the atexit / SystemExit / signal capture is exercised end to end, exactly
+# as a spawned worker would hit it. Reading the file back is the round-trip the
+# dispatcher's _read_worker_exit_sidecar does.
+# ---------------------------------------------------------------------------
+
+
+_RECORDER_SNIPPET = (
+    "import sys; from hermes_cli.kanban_worker_exit import worker_exit_recorder\n"
+    "with worker_exit_recorder():\n"
+    "    {body}\n"
+)
+
+
+def _run_recorder(tmp_path, body: str, env_dir="set"):
+    sidecar_dir = tmp_path / ".worker-exits"
+    sidecar_dir.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    if env_dir == "set":
+        env["HERMES_KANBAN_EXIT_SIDECAR_DIR"] = str(sidecar_dir)
+    else:
+        env.pop("HERMES_KANBAN_EXIT_SIDECAR_DIR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RECORDER_SNIPPET.format(body=body)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    files = list(sidecar_dir.iterdir())
+    payload = files[0].read_text(encoding="utf-8") if files else None
+    return proc, files, payload
+
+
+def test_recorder_clean_exit_writes_exit_zero(kanban_home, tmp_path):
+    proc, files, payload = _run_recorder(tmp_path, "pass")
+    assert proc.returncode == 0
+    assert len(files) == 1 and payload == "exit:0"
+
+
+def test_recorder_captures_systemexit_code(kanban_home, tmp_path):
+    proc, files, payload = _run_recorder(tmp_path, "sys.exit(75)")
+    assert proc.returncode == 75
+    assert payload == "exit:75"
+
+
+def test_recorder_uncaught_exception_is_exit_one(kanban_home, tmp_path):
+    proc, files, payload = _run_recorder(tmp_path, "raise RuntimeError('boom')")
+    assert proc.returncode == 1
+    assert payload == "exit:1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signals only")
+def test_recorder_captures_signal(kanban_home, tmp_path):
+    proc, files, payload = _run_recorder(
+        tmp_path, "import os, signal, time; os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)",
+    )
+    # Re-raised → real exit status reflects the signal (128 + SIGTERM).
+    assert proc.returncode == -signal.SIGTERM or proc.returncode == 128 + signal.SIGTERM
+    assert payload == f"signal:{int(signal.SIGTERM)}"
+
+
+def test_recorder_noop_without_env(kanban_home, tmp_path):
+    proc, files, payload = _run_recorder(tmp_path, "sys.exit(3)", env_dir="unset")
+    assert proc.returncode == 3
+    assert files == []  # no sidecar written outside a worker
+
+
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
