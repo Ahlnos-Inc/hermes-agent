@@ -12682,21 +12682,36 @@ def operator_block_task(
     return OperatorBlockResult(True, True, termination)
 
 
+# Self-classifying run outcomes that requeue a task WITHOUT counting a failure.
+# Each returns early in ``check_respawn_guard`` (before the auth-blocker regex)
+# and is spaced by its own cooldown, so a no-failure-counter requeue can never
+# get trapped forever by the quota/auth ``last_failure_error`` text it stamps.
+DELIVERY_AUTHORIZATION_UNAVAILABLE = "delivery_authorization_unavailable"
+PROVIDER_AVAILABILITY_UNAVAILABLE = "provider_availability_unavailable"
+_NO_FAILURE_DEFER_OUTCOMES = frozenset(
+    {DELIVERY_AUTHORIZATION_UNAVAILABLE, PROVIDER_AVAILABILITY_UNAVAILABLE}
+)
+
+
 def defer_task_for_delivery_authorization_retry(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     expected_run_id: int,
     error: str = "delivery gate lookup unavailable",
+    outcome: str = DELIVERY_AUTHORIZATION_UNAVAILABLE,
 ) -> bool:
     """End one attempt and requeue it without counting a task failure.
 
     This is a kernel-owned recovery transition for a transient authorization
-    resolver outage. It deliberately differs from ``kanban_block`` (which
-    requires an operator to unblock) and from ``_record_task_failure`` (which
-    can trip the task circuit breaker). The respawn guard spaces the next
-    attempt using a short, configurable cooldown.
+    resolver outage (delivery gate lookup or, via ``outcome``, a Claude Max
+    attestation / provider-availability blip). It deliberately differs from
+    ``kanban_block`` (which requires an operator to unblock) and from
+    ``_record_task_failure`` (which can trip the task circuit breaker). The
+    respawn guard spaces the next attempt using a short, configurable cooldown.
     """
+    if outcome not in _NO_FAILURE_DEFER_OUTCOMES:
+        raise ValueError(f"unsupported no-failure defer outcome: {outcome!r}")
     with write_txn(conn):
         cur = conn.execute(
             """UPDATE tasks
@@ -12712,15 +12727,15 @@ def defer_task_for_delivery_authorization_retry(
         run_id = _end_run(
             conn,
             task_id,
-            outcome="delivery_authorization_unavailable",
-            status="delivery_authorization_unavailable",
+            outcome=outcome,
+            status=outcome,
             error=error[:500],
             metadata={"retryable": True},
         )
         _append_event(
             conn,
             task_id,
-            "delivery_authorization_unavailable",
+            outcome,
             {"error": error[:500], "retryable": True},
             run_id=run_id,
         )
@@ -18579,14 +18594,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if (
         latest_run is not None
-        and latest_run["outcome"] == "delivery_authorization_unavailable"
+        and latest_run["outcome"] in _NO_FAILURE_DEFER_OUTCOMES
     ):
         cooldown = _resolve_delivery_authorization_cooldown_seconds()
         ended_at = latest_run["ended_at"]
         if cooldown > 0 and ended_at is not None and now - int(ended_at) < cooldown:
             return "delivery_authorization_cooldown"
-        # This outcome is self-classifying. Once its cooldown expires it must
-        # not fall into the generic auth-error regex and defer forever.
+        # These outcomes are self-classifying. Once the cooldown expires they
+        # must not fall into the generic auth-error regex and defer forever
+        # (the requeue never increments the failure counter, so the breaker
+        # could not free them).
         return None
     if (
         latest_run is not None

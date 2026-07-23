@@ -293,7 +293,11 @@ def prepare_claude_agent_sdk_runtime(agent: Any) -> RuntimeFailure | None:
             return RuntimeFailure(
                 FailoverReason.auth_permanent
                 if isinstance(exc, ClaudeAttestationRejectedError)
-                else FailoverReason.unknown,
+                # A transient attestation (unsettled / unconfirmed subscription
+                # state) is a provider-availability outage, not a permanent
+                # rejection — route it as retryable ``auth`` so a token-refresh
+                # blip cannot fail-close and self-arrest the card.
+                else FailoverReason.auth,
                 str(exc),
             )
         classified = classify_api_error(
@@ -355,6 +359,95 @@ def persist_claude_workspace_boundary_block(
     except Exception:
         _runtime_events_logger.warning(
             "claude_workspace_boundary_block_failed task=%s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
+# Short-transient provider-availability reasons for which a fallback-exhausted
+# quiet worker should requeue its card WITHOUT counting a failure. ``auth`` is
+# the incident case — a transient Claude Max attestation now lands here (see
+# prepare_claude_agent_sdk_runtime). Deliberately EXCLUDED:
+#   * auth_permanent / model_not_found / provider_policy_blocked — genuinely
+#     terminal, unchanged-request failures that must count / block, never spin.
+#   * rate_limit / billing / upstream_rate_limit — quota walls with their own
+#     dedicated long (300s) cooldown + EX_TEMPFAIL exit path; requeuing them
+#     through the shorter delivery cooldown here would probe a quota window too
+#     aggressively. Left to their existing handling.
+def _worker_availability_defer_reasons() -> "frozenset[FailoverReason]":
+    return frozenset(
+        {
+            FailoverReason.auth,
+            FailoverReason.overloaded,
+            FailoverReason.server_error,
+            FailoverReason.timeout,
+            FailoverReason.provider_unavailable,
+        }
+    )
+
+
+def persist_claude_worker_availability_defer(
+    agent: Any,
+    failure: RuntimeFailure,
+) -> bool:
+    """Requeue a fallback-exhausted quiet Kanban worker without a failure.
+
+    When the Claude runtime exhausts its fallback chain on a transient
+    provider-availability reason (a token-refresh attestation blip, a quota
+    wall, a provider outage) the worker process is about to exit. Left alone,
+    the dispatcher reaper later infers a generic crash from the dead PID and
+    increments ``consecutive_failures`` — two of those self-arrest the card
+    even though nothing about the task is wrong. Durably deferring the card
+    here (kernel-owned no-failure requeue) makes recovery independent of how
+    the reaper classifies the exit, so a temporary auth/availability window
+    can never whack-a-mole the card into a permanent block.
+    """
+
+    if getattr(failure, "provisioning", False):
+        return False
+    if failure.reason not in _worker_availability_defer_reasons():
+        return False
+    if not getattr(agent, "quiet_mode", False):
+        return False
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    raw_run_id = os.getenv("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return False
+    try:
+        from hermes_cli import kanban_db
+
+        with kanban_db.connect_closing() as conn:
+            deferred = kanban_db.defer_task_for_delivery_authorization_retry(
+                conn,
+                task_id,
+                expected_run_id=run_id,
+                error=(
+                    f"Claude runtime provider unavailable "
+                    f"({failure.reason.value}): {failure.message}"
+                )[:480],
+                outcome=kanban_db.PROVIDER_AVAILABILITY_UNAVAILABLE,
+            )
+        if deferred:
+            _runtime_events_logger.warning(
+                "claude_worker_availability_defer %s",
+                json.dumps(
+                    {
+                        "task": task_id,
+                        "run_id": run_id,
+                        "reason": failure.reason.value,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        return deferred
+    except Exception:
+        _runtime_events_logger.warning(
+            "claude_worker_availability_defer_failed task=%s",
             task_id,
             exc_info=True,
         )
@@ -438,7 +531,9 @@ def run_claude_agent_sdk_attempt(
                     reason = (
                         FailoverReason.auth_permanent
                         if isinstance(exc, ClaudeAttestationRejectedError)
-                        else FailoverReason.unknown
+                        # Transient attestation → retryable availability, never
+                        # a permanent fail-close (see prepare-path note above).
+                        else FailoverReason.auth
                     )
                     return ClaudeProjection(
                         failure=RuntimeFailure(reason, str(exc))

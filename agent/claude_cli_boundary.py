@@ -122,14 +122,38 @@ def invalidate_claude_auth_attestation(cli_wrapper: str | Path) -> None:
         _ATTESTATION_CACHE.pop(str(Path(cli_wrapper).resolve()), None)
 
 
+def _sanitize_observed(observed: "Mapping[str, object]") -> "dict[str, str]":
+    """Render observed auth fields for diagnostics.
+
+    ``loggedIn`` / ``authMethod`` / ``apiProvider`` / ``subscriptionType`` are
+    short non-secret enums, but stringify + cap length so a malformed probe
+    payload can never smuggle a large or structured value into a log line.
+    """
+
+    return {str(field): str(value)[:32] for field, value in observed.items()}
+
+
 def attest_claude_max_auth(
     cli_wrapper: str | Path,
     *,
     cache_ttl_seconds: float = 60,
     max_attempts: int = 2,
     retry_delay_seconds: float = 0.15,
+    mismatch_confirm_delay_seconds: float = 1.0,
 ) -> ClaudeMaxAttestation:
-    """Require same-binary, same-environment first-party Max authentication."""
+    """Require same-binary, same-environment first-party Max authentication.
+
+    A value mismatch against the required first-party Max tuple is classified,
+    not blindly treated as a permanent rejection. Claude Code transiently drops
+    subscription metadata (notably ``subscriptionType`` -> null) while a token
+    refresh fails its profile fetch, so a single non-authoritative snapshot must
+    NOT fail-close a card. Only ``loggedIn:true`` WITH concrete (non-null) wrong
+    values is authoritative, and even that is confirmed by a second re-probe
+    before it becomes permanent; everything else is transient (retryable). This
+    preserves exact-success-only billing — an attestation object is returned
+    solely on the complete Max tuple — while ending the fail-closed whack-a-mole
+    on architect cards (incident 2026-07-22).
+    """
 
     wrapper = Path(cli_wrapper).resolve()
     key = str(wrapper)
@@ -138,6 +162,10 @@ def attest_claude_max_auth(
         cached = _ATTESTATION_CACHE.get(key)
         if cached and now - cached.checked_at < cache_ttl_seconds:
             return cached
+    # Observed values of the first authoritative mismatch, held across attempts
+    # so a permanent rejection is only raised once a re-probe confirms the same
+    # concrete downgrade.
+    pending_authoritative_mismatch: "dict[str, str] | None" = None
     required = {
         "loggedIn": True,
         "authMethod": "claude.ai",
@@ -148,6 +176,9 @@ def attest_claude_max_auth(
     payload: dict[str, object] | None = None
     last_transient: ClaudeAttestationTransientError | None = None
     for attempt in range(1, attempts + 1):
+        # Default inter-attempt spacing; widened only when we need a real gap to
+        # let a transient token-refresh window clear before confirming a mismatch.
+        next_delay = float(retry_delay_seconds)
         try:
             result = subprocess.run(
                 [str(wrapper), "auth", "status"],
@@ -226,21 +257,72 @@ def attest_claude_max_auth(
                                 for field, expected in required.items()
                                 if raw_payload.get(field) != expected
                             )
-                            if mismatched:
+                            # ``loggedIn`` must match by identity, not equality:
+                            # a truthy non-bool (e.g. JSON ``1``) is ``== True``
+                            # and would otherwise slip through as a valid login
+                            # and be billed as included usage. Force it into the
+                            # mismatch path (where it resolves non-authoritative
+                            # → transient, never a silent success).
+                            if (
+                                raw_payload.get("loggedIn") is not True
+                                and "loggedIn" not in mismatched
+                            ):
+                                mismatched = sorted([*mismatched, "loggedIn"])
+                            if not mismatched:
+                                payload = raw_payload
+                                break
+                            # A field disagreed with the required Max tuple.
+                            # Only an authoritative reading — genuinely logged
+                            # in AND every wrong field carrying a concrete
+                            # (non-null) value — is a candidate for permanent
+                            # rejection. A ``loggedIn`` that is not True, or a
+                            # null subscription field, is a non-authoritative
+                            # snapshot (typically a token-refresh blip) and is
+                            # retried, not fail-closed.
+                            observed = _sanitize_observed(
+                                {field: raw_payload.get(field) for field in mismatched}
+                            )
+                            authoritative = raw_payload.get("loggedIn") is True and all(
+                                raw_payload.get(field) is not None for field in mismatched
+                            )
+                            diag = {
+                                "stage": "auth_status",
+                                "kind": "subscription_mismatch",
+                                "fields": mismatched,
+                                "observed": observed,
+                                "attempt": attempt,
+                            }
+                            if not authoritative:
+                                last_transient = ClaudeAttestationTransientError(
+                                    "Claude Max attestation returned a "
+                                    "non-authoritative subscription state",
+                                    diagnostic={**diag, "kind": "subscription_unsettled"},
+                                )
+                            elif pending_authoritative_mismatch == observed:
+                                # A prior attempt already reported this exact
+                                # concrete downgrade — it is stable, not a blip.
                                 invalidate_claude_auth_attestation(wrapper)
                                 raise ClaudeAttestationRejectedError(
                                     "Claude Max attestation rejected the exact-environment login",
+                                    diagnostic=diag,
+                                )
+                            else:
+                                # First authoritative mismatch: hold it and give
+                                # the login a real gap to settle before the
+                                # confirming re-probe decides permanence.
+                                pending_authoritative_mismatch = observed
+                                next_delay = max(
+                                    next_delay, float(mismatch_confirm_delay_seconds)
+                                )
+                                last_transient = ClaudeAttestationTransientError(
+                                    "Claude Max attestation awaiting mismatch confirmation",
                                     diagnostic={
-                                        "stage": "auth_status",
-                                        "kind": "subscription_mismatch",
-                                        "fields": mismatched,
-                                        "attempt": attempt,
+                                        **diag,
+                                        "kind": "subscription_mismatch_unconfirmed",
                                     },
                                 )
-                            payload = raw_payload
-                            break
         if attempt < attempts:
-            time.sleep(max(float(retry_delay_seconds), 0.0))
+            time.sleep(max(next_delay, 0.0))
 
     if payload is None:
         invalidate_claude_auth_attestation(wrapper)

@@ -1194,6 +1194,15 @@ def run_conversation(
             )
 
             persist_claude_workspace_boundary_block(agent, failure)
+        else:
+            # A transient provider-availability exhaustion (e.g. a Claude Max
+            # token-refresh attestation blip) must requeue the card without
+            # counting a failure, so a momentary outage cannot self-arrest it.
+            from agent.external_runtime import (
+                persist_claude_worker_availability_defer,
+            )
+
+            persist_claude_worker_availability_defer(agent, failure)
         error = f"Claude runtime failed and no fallback was available: {failure.message}"
         messages.append({"role": "assistant", "content": error})
         return finalize_external_turn(

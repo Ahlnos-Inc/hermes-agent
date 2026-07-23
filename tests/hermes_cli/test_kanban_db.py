@@ -2416,6 +2416,63 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
 
+def test_provider_availability_defer_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A provider-availability defer requeues the card to ready without a task
+    failure, is spaced by a cooldown, and — crucially — its auth-flavored
+    ``last_failure_error`` does NOT trap it in ``blocker_auth`` forever
+    (incident 2026-07-22: architect Claude Max attestation blips)."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 6_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="avail-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        before = kb.get_task(conn, tid).consecutive_failures
+
+        deferred = kb.defer_task_for_delivery_authorization_retry(
+            conn,
+            tid,
+            expected_run_id=run_id,
+            error="Claude runtime provider unavailable (auth): attestation unsettled",
+            outcome=_kb.PROVIDER_AVAILABILITY_UNAVAILABLE,
+        )
+        assert deferred is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        # No failure counted — the whole point (breaker cannot self-arrest).
+        assert task.consecutive_failures == before
+
+        # Stamp the run's ended_at so the cooldown math is deterministic.
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?", (now, run_id)
+        )
+        conn.commit()
+
+        # Inside cooldown → deferred; past it → allowed (None), never trapped
+        # by the auth-word regex despite "attestation"/"auth" in the error.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 5)
+        assert kb.check_respawn_guard(conn, tid) == "delivery_authorization_cooldown"
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10_000)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_defer_rejects_unknown_outcome(kanban_home):
+    """The kernel no-failure defer refuses an outcome that is not a
+    registered self-classifying requeue outcome."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bad-outcome", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        with pytest.raises(ValueError, match="unsupported no-failure defer outcome"):
+            kb.defer_task_for_delivery_authorization_retry(
+                conn, tid, expected_run_id=run_id, outcome="crashed"
+            )
+
+
 def test_respawn_guard_none_on_fresh_task(kanban_home):
     """A fresh task with no failures or runs is not guarded."""
     with kb.connect() as conn:

@@ -59,7 +59,10 @@ def test_missing_lazy_sdk_becomes_replay_safe_failure(monkeypatch, tmp_path):
             ClaudeAttestationTransientError(
                 "probe unavailable", diagnostic={"kind": "timeout"}
             ),
-            FailoverReason.unknown,
+            # A transient attestation is a retryable provider-availability
+            # outage, not an unclassifiable error — routed as ``auth`` so a
+            # token-refresh blip requeues instead of fail-closing the card.
+            FailoverReason.auth,
         ),
         (
             ClaudeAttestationRejectedError(

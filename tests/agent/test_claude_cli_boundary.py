@@ -144,13 +144,14 @@ def test_auth_attestation_requires_first_party_max_on_same_wrapper(tmp_path):
 @pytest.mark.parametrize(
     "override",
     [
-        {"loggedIn": False},
         {"authMethod": "apiKey"},
         {"apiProvider": "thirdParty"},
         {"subscriptionType": "pro"},
     ],
 )
-def test_auth_attestation_fails_closed_for_non_max_routes(tmp_path, override):
+def test_auth_attestation_fails_closed_for_authoritative_non_max_routes(tmp_path, override):
+    """An authoritative, STABLE non-Max login (loggedIn:true + concrete wrong
+    value, confirmed by a second probe) is a permanent rejection."""
     payload = {
         "loggedIn": True,
         "authMethod": "claude.ai",
@@ -166,8 +167,116 @@ def test_auth_attestation_fails_closed_for_non_max_routes(tmp_path, override):
         tmp_path / "bad-wrapper",
     )
 
+    # Default max_attempts=2 so the confirming re-probe agrees; drive the
+    # confirm delay to zero so the test does not sleep.
     with pytest.raises(ClaudeAttestationRejectedError, match="attestation rejected"):
-        attest_claude_max_auth(wrapper, cache_ttl_seconds=0)
+        attest_claude_max_auth(
+            wrapper,
+            cache_ttl_seconds=0,
+            retry_delay_seconds=0,
+            mismatch_confirm_delay_seconds=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"loggedIn": False},          # not logged in — not authoritative
+        {"subscriptionType": None},   # null subscription — token-refresh blip
+        {"apiProvider": None},        # null field — non-authoritative
+    ],
+)
+def test_auth_attestation_non_authoritative_mismatch_is_transient(tmp_path, override):
+    """A ``loggedIn`` that is not True, or a null required field, is a
+    non-authoritative snapshot (typically a token-refresh blip) and must be
+    retryable — never a permanent fail-close (incident 2026-07-22)."""
+    payload = {
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "subscriptionType": "max",
+    }
+    payload.update(override)
+    probe = tmp_path / "unsettled.py"
+    _write_probe(probe, payload)
+    wrapper = create_exact_env_cli_wrapper(
+        probe,
+        {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        tmp_path / "unsettled-wrapper",
+    )
+
+    with pytest.raises(ClaudeAttestationTransientError) as raised:
+        attest_claude_max_auth(
+            wrapper,
+            cache_ttl_seconds=0,
+            retry_delay_seconds=0,
+            mismatch_confirm_delay_seconds=0,
+        )
+    assert raised.value.diagnostic["kind"] == "subscription_unsettled"
+
+
+def test_auth_attestation_truthy_nonbool_loggedin_is_not_success(monkeypatch, tmp_path):
+    """A truthy non-bool ``loggedIn`` (e.g. JSON ``1``) is ``== True`` but must
+    NOT attest included-usage billing — it resolves non-authoritative/transient
+    rather than a silent success."""
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    payload = {
+        "loggedIn": 1,  # truthy int, not a real bool
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "subscriptionType": "max",
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(payload), ""),
+    )
+
+    with pytest.raises(ClaudeAttestationTransientError):
+        attest_claude_max_auth(
+            wrapper,
+            cache_ttl_seconds=0,
+            max_attempts=1,
+            retry_delay_seconds=0,
+            mismatch_confirm_delay_seconds=0,
+        )
+
+
+def test_auth_attestation_single_authoritative_mismatch_unconfirmed_is_transient(
+    monkeypatch, tmp_path
+):
+    """One authoritative mismatch that is NOT reproduced by the confirming
+    re-probe (a recovered blip) resolves transient, not permanent."""
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    good = {
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "subscriptionType": "max",
+    }
+    # First probe: concrete "pro" downgrade. Second probe: recovered to max.
+    downgraded = {**good, "subscriptionType": "pro"}
+    calls = iter(
+        [
+            subprocess.CompletedProcess([], 0, json.dumps(downgraded), ""),
+            subprocess.CompletedProcess([], 0, json.dumps(good), ""),
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(calls))
+
+    # Recovered second probe → success (exact Max tuple), not a rejection.
+    result = attest_claude_max_auth(
+        wrapper,
+        cache_ttl_seconds=0,
+        max_attempts=2,
+        retry_delay_seconds=0,
+        mismatch_confirm_delay_seconds=0,
+    )
+    assert result.included_usage is True
 
 
 def test_auth_attestation_retries_transient_nonzero_then_succeeds(monkeypatch, tmp_path):
