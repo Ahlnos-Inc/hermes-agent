@@ -62,3 +62,25 @@ def _no_host_claude_keychain(monkeypatch):
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr("agent.anthropic_adapter.subprocess.run", _guarded_run)
+
+
+@pytest.fixture(autouse=True)
+def _reset_aux_health_cache():
+    """Isolate the auxiliary-provider health blacklist between tests (BUILD-569).
+
+    ``agent.auxiliary_client`` keeps a PROCESS-GLOBAL unhealthy-provider cache
+    (``_aux_unhealthy_until`` / ``_aux_unhealthy_logged_at``, 120s TTL). A test
+    that marks openrouter/nous unhealthy (e.g. pool-exhaustion cases in
+    test_auxiliary_client.py) poisons it for the whole run, so a later file's
+    ``_resolve_auto`` sees those providers as unhealthy and returns ``None`` —
+    the order-dependent ``TestResolveAutoMainFirst`` failures that pass in
+    isolation. Clearing the cache before every test in this directory makes
+    aux-provider resolution deterministic regardless of collection order. No
+    test relies on the blacklist surviving across tests (the ones that exercise
+    it reset it themselves via ``_reset_aux_unhealthy_cache``).
+    """
+    from agent.auxiliary_client import _reset_aux_unhealthy_cache
+
+    _reset_aux_unhealthy_cache()
+    yield
+    _reset_aux_unhealthy_cache()
