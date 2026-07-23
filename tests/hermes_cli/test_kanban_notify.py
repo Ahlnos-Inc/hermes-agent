@@ -706,3 +706,126 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# BUILD-544: ad-hoc subscribe-time upstream (ancestor) fan-out
+# ---------------------------------------------------------------------------
+
+def _subs_for(conn, task_id, chat_id):
+    import hermes_cli.kanban_db as kb
+    return [s for s in kb.list_notify_subs(conn, task_id=task_id)
+            if s["chat_id"] == chat_id]
+
+
+def test_ad_hoc_subscribe_fans_out_to_blocked_parent(kanban_home):
+    """AC1: subscribing to a child fans a FAILURE_KINDS subscription out to a
+    blocked upstream parent with cursor 0, so the parent's pending block event
+    delivers to the same destination on the next notifier tick — the terminal-
+    only silent-block gap (gsthst-q2) closed for manual subscriptions."""
+    import json
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="apply")
+        child = kb.create_task(conn, title="verify", parents=[parent])
+        kb.block_task(conn, parent, reason="needs human", kind="needs_input")
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+
+        psubs = _subs_for(conn, parent, "chatA")
+        assert len(psubs) == 1
+        assert set(json.loads(psubs[0]["kinds_json"])) == set(kb.FAILURE_KINDS)
+        assert psubs[0]["last_event_id"] == 0  # blocked → deliver pending event
+        assert psubs[0]["platform"] == "telegram"
+    finally:
+        conn.close()
+
+
+def test_ad_hoc_subscribe_non_blocked_ancestor_is_go_forward(kanban_home):
+    """A non-blocked ancestor subscribes go-forward (cursor = its latest event
+    id) so historical, already-resolved failures don't replay as noise."""
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="apply")  # ready, not blocked
+        child = kb.create_task(conn, title="verify", parents=[parent])
+        max_before = conn.execute(
+            "SELECT COALESCE(MAX(id),0) m FROM task_events WHERE task_id=?",
+            (parent,),
+        ).fetchone()["m"]
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+
+        psubs = _subs_for(conn, parent, "chatA")
+        assert len(psubs) == 1
+        assert psubs[0]["last_event_id"] == max_before
+    finally:
+        conn.close()
+
+
+def test_ad_hoc_subscribe_skips_done_parent_but_subscribes_blocked_parent(kanban_home):
+    """A done/terminal ancestor is skipped (nothing to alert on) while a
+    sibling blocked ancestor of the same child is subscribed at cursor 0."""
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        p_done = kb.create_task(conn, title="p_done")
+        p_blocked = kb.create_task(conn, title="p_blocked")
+        child = kb.create_task(conn, title="child", parents=[p_done, p_blocked])
+        kb.complete_task(conn, p_done, result="ok")
+        kb.block_task(conn, p_blocked, reason="stuck", kind="needs_input")
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+
+        assert _subs_for(conn, p_done, "chatA") == []
+        blk = _subs_for(conn, p_blocked, "chatA")
+        assert len(blk) == 1 and blk[0]["last_event_id"] == 0
+    finally:
+        conn.close()
+
+
+def test_ad_hoc_subscribe_no_parents_creates_only_own_sub(kanban_home):
+    """A subscription to a standalone task (no upstream) fans out to nothing."""
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        t = kb.create_task(conn, title="solo")
+        kb.add_notify_sub(conn, task_id=t, platform="telegram", chat_id="chatA")
+        assert [s["task_id"] for s in kb.list_notify_subs(conn)] == [t]
+    finally:
+        conn.close()
+
+
+def test_ad_hoc_fan_out_is_per_destination_idempotent(kanban_home):
+    """AC5: re-subscribing the same destination is a no-op (INSERT OR IGNORE);
+    a second, distinct destination fans out independently."""
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="apply")
+        child = kb.create_task(conn, title="verify", parents=[parent])
+        kb.block_task(conn, parent, reason="x", kind="needs_input")
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+        assert len(_subs_for(conn, parent, "chatA")) == 1
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatB")
+        assert len(_subs_for(conn, parent, "chatB")) == 1
+    finally:
+        conn.close()
+
+
+def test_ad_hoc_subscribe_transitive_multilevel_walk(kanban_home):
+    """The fan-out is transitive: subscribing the leaf reaches a blocked
+    grandparent through a non-blocked intermediate."""
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        gp = kb.create_task(conn, title="grandparent")
+        mid = kb.create_task(conn, title="mid", parents=[gp])
+        leaf = kb.create_task(conn, title="leaf", parents=[mid])
+        kb.block_task(conn, gp, reason="deep block", kind="needs_input")
+        kb.add_notify_sub(conn, task_id=leaf, platform="telegram", chat_id="chatA")
+
+        assert len(_subs_for(conn, mid, "chatA")) == 1   # intermediate subscribed
+        gsubs = _subs_for(conn, gp, "chatA")
+        assert len(gsubs) == 1 and gsubs[0]["last_event_id"] == 0
+    finally:
+        conn.close()

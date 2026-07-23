@@ -3888,6 +3888,59 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _backfill_workflow_step_notify_subs(conn)
 
 
+def _subscribe_step_to_failure_kinds(
+    conn: sqlite3.Connection,
+    step_task_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    user_id: Optional[str],
+    notifier_profile: Optional[str],
+    now: int,
+) -> None:
+    """Give one upstream step a FAILURE_KINDS notify subscription for a
+    destination that subscribed downstream.
+
+    Shared by the compiled-workflow backfill
+    (:func:`_backfill_workflow_step_notify_subs`) and the ad-hoc subscribe-time
+    ancestor fan-out (:func:`add_notify_sub`, BUILD-544) so BOTH apply the
+    identical status gate + cursor policy — a drift here re-opens the
+    2026-07-18 gsthst-q2 silent-block incident (BUILD-503/544).
+
+    Skips a step already terminal (``done``/``archived``). Cursor policy: a
+    currently ``blocked`` step starts at 0 so its pending failure event delivers
+    on the next notifier tick; any other step subscribes go-forward
+    (cursor = latest event id) so historical, already-resolved failures don't
+    replay as noise. Idempotent + per-destination via the
+    ``(task, platform, chat, thread)`` primary key (``INSERT OR IGNORE``).
+    """
+    task_row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (step_task_id,)
+    ).fetchone()
+    if task_row is None or task_row["status"] in ("done", "archived"):
+        return
+    if task_row["status"] == "blocked":
+        cursor = 0
+    else:
+        cur_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM task_events"
+            " WHERE task_id = ?",
+            (step_task_id,),
+        ).fetchone()
+        cursor = int(cur_row["max_id"]) if cur_row else 0
+    conn.execute(
+        """INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id,
+             notifier_profile, created_at, last_event_id, kinds_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            step_task_id, platform, chat_id, thread_id or "", user_id,
+            notifier_profile, now, cursor, json.dumps(sorted(FAILURE_KINDS)),
+        ),
+    )
+
+
 def _backfill_workflow_step_notify_subs(conn: sqlite3.Connection) -> None:
     """Give every unfinished step of a compiled workflow the terminal task's
     notify subscription, narrowed to FAILURE_KINDS.
@@ -3913,7 +3966,6 @@ def _backfill_workflow_step_notify_subs(conn: sqlite3.Connection) -> None:
         return
     if not rows:
         return
-    failure_kinds_json = json.dumps(sorted(FAILURE_KINDS))
     now = int(time.time())
     for row in rows:
         try:
@@ -3935,32 +3987,12 @@ def _backfill_workflow_step_notify_subs(conn: sqlite3.Connection) -> None:
         for step_task_id in task_ids.values():
             if step_task_id == terminal_id:
                 continue
-            task_row = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (step_task_id,)
-            ).fetchone()
-            if task_row is None or task_row["status"] in ("done", "archived"):
-                continue
-            if task_row["status"] == "blocked":
-                cursor = 0
-            else:
-                cur_row = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) AS max_id FROM task_events"
-                    " WHERE task_id = ?",
-                    (step_task_id,),
-                ).fetchone()
-                cursor = int(cur_row["max_id"]) if cur_row else 0
             for sub in terminal_subs:
-                conn.execute(
-                    """INSERT OR IGNORE INTO kanban_notify_subs
-                        (task_id, platform, chat_id, thread_id, user_id,
-                         notifier_profile, created_at, last_event_id, kinds_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        step_task_id, sub["platform"], sub["chat_id"],
-                        sub["thread_id"] or "", sub["user_id"],
-                        sub["notifier_profile"], now, cursor,
-                        failure_kinds_json,
-                    ),
+                _subscribe_step_to_failure_kinds(
+                    conn, step_task_id,
+                    platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub["thread_id"] or "", user_id=sub["user_id"],
+                    notifier_profile=sub["notifier_profile"], now=now,
                 )
 
 
@@ -21184,6 +21216,32 @@ def add_notify_sub(
                 """,
                 (kinds_json, task_id, platform, chat_id, thread_id or ""),
             )
+        # BUILD-544: fan this subscription out to the task's transitive upstream
+        # ancestors, narrowed to FAILURE_KINDS, so a manual/ad-hoc subscription
+        # to a workflow task still alerts THIS destination when a parent blocks,
+        # fails, crashes, or is given up — not only when the subscribed task
+        # itself reaches a terminal state (the 2026-07-18 gsthst-q2 silent-block
+        # class). Compiled workflows already get this at compile time
+        # (BUILD-503) + via _backfill_workflow_step_notify_subs; this closes the
+        # same gap for subscriptions created outside the compiler. The walk
+        # continues THROUGH already-terminal ancestors (a done step may have a
+        # still-blocked parent) but the shared helper only subscribes
+        # non-terminal ones. Cycle-guarded — task_links can contain cycles
+        # (``dependency_loop_detected`` proves it). One-shot at subscribe time,
+        # so no per-tick cost; idempotent + per-destination via INSERT OR IGNORE.
+        seen = {task_id}
+        stack = list(parent_ids(conn, task_id))
+        while stack:
+            ancestor = stack.pop()
+            if ancestor in seen:
+                continue
+            seen.add(ancestor)
+            _subscribe_step_to_failure_kinds(
+                conn, ancestor,
+                platform=platform, chat_id=chat_id, thread_id=thread_id or "",
+                user_id=user_id, notifier_profile=notifier_profile, now=now,
+            )
+            stack.extend(parent_ids(conn, ancestor))
 
 
 def list_notify_subs(
