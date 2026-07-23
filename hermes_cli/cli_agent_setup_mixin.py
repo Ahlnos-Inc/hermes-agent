@@ -61,7 +61,25 @@ class CLIAgentSetupMixin:
         # Primary provider auth failed — try fallback providers before giving up.
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
-            if isinstance(_primary_exc, AuthError):
+            from agent.runtime_target import ClaudeRoutePolicyError
+
+            # A ``max_only`` Claude route-policy rejection is a PERMANENT
+            # Claude-auth-unavailability condition (the governed route can never
+            # satisfy first-party-Max-only), not a transient credential miss.
+            # Treat it exactly like an ``AuthError`` so it activates the
+            # configured non-Claude fallback chain (e.g. architect's moa
+            # envelope → gpt-5.6-sol) instead of crash-looping to a clean
+            # give-up. This reaches parity with the coder lane, whose direct
+            # claude_agent_sdk route classifies the same failure as
+            # ``auth_permanent`` and falls back via the runtime circuit
+            # (BUILD-573).
+            if isinstance(_primary_exc, ClaudeRoutePolicyError):
+                logger.warning(
+                    "Claude route rejected by max_only policy for provider=%r "
+                    "model=%r; activating configured fallback chain: %s",
+                    self.requested_provider, self.model, _primary_exc,
+                )
+            if isinstance(_primary_exc, (AuthError, ClaudeRoutePolicyError)):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -95,7 +113,16 @@ class CLIAgentSetupMixin:
                         self.model = _fb_model
                         _primary_exc = None
                         break
-                    except Exception:
+                    except Exception as _fb_exc:
+                        # Keep trying the rest of the chain, but never silently:
+                        # a skipped fallback (e.g. a mis-routed Claude entry that
+                        # itself trips the max_only policy) must be diagnosable
+                        # so an exhausted chain has actionable recovery breadcrumbs
+                        # instead of a bare give-up (BUILD-573).
+                        logger.warning(
+                            "Fallback entry %s/%s failed to resolve, trying next: %s",
+                            _fb_provider, _fb_model, _fb_exc,
+                        )
                         continue
 
         if runtime is None:

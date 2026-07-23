@@ -236,6 +236,142 @@ def test_cli_first_turn_without_kanban_task_keeps_native_moa(monkeypatch):
     assert shell.moa_config is None
 
 
+def test_architect_moa_policy_rejection_routes_to_configured_fallback(monkeypatch):
+    """BUILD-573: a permanent Claude route-policy rejection at PRIMARY
+    resolution (architect's ``max_only`` moa envelope) must fall through to the
+    configured non-Claude fallback chain, NOT crash-loop to a clean give-up.
+
+    Before the fix the primary ``ClaudeRoutePolicyError`` (a ``ValueError``, not
+    an ``AuthError``) skipped the fallback chain, ``_ensure_runtime_credentials``
+    returned False, and the worker exited clean ('Goodbye!') → dispatcher
+    recorded a crash. Parity with the coder lane requires the policy rejection
+    to activate ``gpt-5.6-sol`` exactly like an auth failure does.
+    """
+    cli = _import_cli()
+    from agent.runtime_target import ClaudeRoutePolicyError, CLAUDE_ROUTE_POLICY_ERROR
+
+    calls = {"count": 0}
+
+    def _runtime_resolve(**kwargs):
+        calls["count"] += 1
+        # First call = the architect moa primary → policy-rejected.
+        if kwargs.get("requested") == "moa":
+            raise ClaudeRoutePolicyError(CLAUDE_ROUTE_POLICY_ERROR)
+        # Fallback entry (gpt-5.6-sol) resolves cleanly.
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "sol-token",
+            "source": "fallback-chain",
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None)
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="architect", compact=True, max_turns=1)
+    shell.requested_provider = "moa"
+    shell.provider = "moa"
+    shell._fallback_model = [
+        {"provider": "openai-codex", "model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+    ]
+
+    assert shell._ensure_runtime_credentials() is True
+    # The policy-rejected primary handed off to the configured fallback.
+    assert shell.provider == "openai-codex"
+    assert shell.model == "gpt-5.6-sol"
+    assert calls["count"] == 2
+
+
+def _run_fallback_after_primary_error(monkeypatch, primary_exc, fallback_chain):
+    """Drive ``_ensure_runtime_credentials`` where the moa primary raises
+    ``primary_exc`` and ``fallback_chain`` entries resolve in order. Returns the
+    shell after resolution so callers can assert the chosen route."""
+    cli = _import_cli()
+    resolved = {}
+
+    def _runtime_resolve(**kwargs):
+        if kwargs.get("requested") == "moa":
+            raise primary_exc
+        # Echo the resolved fallback entry so the test can assert which won.
+        prov = kwargs.get("requested")
+        resolved["provider"] = prov
+        return {
+            "provider": "anthropic" if prov == "anthropic" else "openai-codex",
+            "api_mode": "anthropic_messages" if prov == "anthropic" else "codex_responses",
+            "runtime": "claude_agent_sdk" if prov == "anthropic" else "hermes",
+            # claude_agent_sdk is a subscription runtime (empty base_url/key ok);
+            # a codex fallback needs a concrete endpoint like the real chain.
+            "base_url": "" if prov == "anthropic" else "https://chatgpt.com/backend-api/codex",
+            "api_key": "" if prov == "anthropic" else "sol-token",
+            "source": "fallback-chain",
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None)
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="architect", compact=True, max_turns=1)
+    shell.requested_provider = "moa"
+    shell.provider = "moa"
+    shell._fallback_model = fallback_chain
+    ok = shell._ensure_runtime_credentials()
+    return shell, ok
+
+
+def test_policy_rejection_and_auth_error_take_identical_fallback_path(monkeypatch):
+    """BUILD-573 AC5: a ``ClaudeRoutePolicyError`` at the primary must activate
+    the configured fallback identically to an ``AuthError`` — the coder lane
+    already reaches fallback on Claude auth failure; the architect lane now has
+    parity from its startup credential resolution."""
+    from hermes_cli.auth import AuthError
+    from agent.runtime_target import ClaudeRoutePolicyError, CLAUDE_ROUTE_POLICY_ERROR
+
+    chain = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+
+    shell_auth, ok_auth = _run_fallback_after_primary_error(
+        monkeypatch, AuthError("primary auth failed"), chain
+    )
+    shell_pol, ok_pol = _run_fallback_after_primary_error(
+        monkeypatch, ClaudeRoutePolicyError(CLAUDE_ROUTE_POLICY_ERROR), chain
+    )
+
+    assert ok_auth is True and ok_pol is True
+    assert shell_auth.provider == shell_pol.provider == "openai-codex"
+    assert shell_auth.model == shell_pol.model == "gpt-5.6-sol"
+
+
+def test_policy_rejection_honors_fallback_chain_order(monkeypatch):
+    """BUILD-573: architect's real chain is [claude-direct, gpt-5.6-sol]. A
+    policy-rejected moa envelope routes into the chain and the FIRST resolvable
+    entry (claude-direct, which passes validate and defers attestation to the
+    SDK-attempt path) wins — so architect degrades to the same claude_agent_sdk
+    circuit the coder lane uses, rather than crash-looping."""
+    from agent.runtime_target import ClaudeRoutePolicyError, CLAUDE_ROUTE_POLICY_ERROR
+
+    chain = [
+        {"provider": "anthropic", "model": "claude-opus-4-8", "runtime": "claude_agent_sdk"},
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+    ]
+    shell, ok = _run_fallback_after_primary_error(
+        monkeypatch, ClaudeRoutePolicyError(CLAUDE_ROUTE_POLICY_ERROR), chain
+    )
+    assert ok is True
+    assert shell.provider == "anthropic"
+    assert shell.model == "claude-opus-4-8"
+
+
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)

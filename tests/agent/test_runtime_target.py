@@ -167,6 +167,24 @@ def test_max_only_policy_rejects_alternate_claude_routes(provider, runtime, base
         )
 
 
+def test_max_only_rejection_raises_typed_route_policy_error():
+    """BUILD-573: the max_only rejection is a typed ``ClaudeRoutePolicyError``
+    (a ``ValueError`` subclass) so credential resolution can key on it to
+    activate the configured fallback, while existing ``except ValueError``
+    sites keep catching it."""
+    from agent.runtime_target import ClaudeRoutePolicyError
+
+    with pytest.raises(ClaudeRoutePolicyError) as excinfo:
+        validate_claude_runtime_target(
+            provider="moa",
+            model="claude-opus-4-8",
+            runtime=HERMES_RUNTIME,
+            base_url="",
+            policy="max_only",
+        )
+    assert isinstance(excinfo.value, ValueError)
+
+
 def test_max_only_policy_accepts_exact_subscription_route():
     validate_claude_runtime_target(
         provider="anthropic",

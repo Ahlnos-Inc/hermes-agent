@@ -26,6 +26,18 @@ CLAUDE_ROUTE_POLICY_ERROR = (
 )
 
 
+class ClaudeRoutePolicyError(ValueError):
+    """A governed Claude route was rejected by the ``max_only`` auth policy.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` / ``pytest.raises
+    (ValueError)`` sites keep catching it, while giving callers a precise type to
+    key on. This is a PERMANENT Claude-auth-unavailability condition (the route
+    can never satisfy first-party-Max-only) — startup credential resolution must
+    treat it like an auth failure and route into the configured non-Claude
+    fallback chain, not surface it as a bare crash (BUILD-573).
+    """
+
+
 def claude_auth_policy() -> str:
     """Return the profile-scoped Claude credential policy."""
 
@@ -73,7 +85,7 @@ def validate_claude_runtime_target(
         or runtime_name != CLAUDE_AGENT_SDK_RUNTIME
         or bool((base_url or "").strip())
     ):
-        raise ValueError(CLAUDE_ROUTE_POLICY_ERROR)
+        raise ClaudeRoutePolicyError(CLAUDE_ROUTE_POLICY_ERROR)
 
 
 def attach_runtime_identity(
@@ -130,6 +142,7 @@ def resolve_runtime_identity(
 __all__ = [
     "CLAUDE_MAX_ONLY_POLICY",
     "CLAUDE_ROUTE_POLICY_ERROR",
+    "ClaudeRoutePolicyError",
     "CLAUDE_AGENT_SDK_RUNTIME",
     "CODEX_APP_SERVER_RUNTIME",
     "HERMES_RUNTIME",
