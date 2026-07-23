@@ -33,14 +33,14 @@ MAX_DECISION_PREVIEW_BYTES = 4096
 # Total budget for the projected decision set (first+last/sentinel window).
 MAX_DECISION_PREVIEWS_TOTAL_BYTES = 8 * 1024
 # Omission marker appended when a decision statement is truncated.
-_DECISION_TRUNCATION_MARKER = (
+_DECISION_TRUNCATION_MARKER_TEMPLATE = (
     "\n\n_[decision text truncated; full comment remains on the Kanban task; "
-    "sha256=<digest>; omitted_bytes=<n>]_"
+    "sha256={digest}; omitted_bytes={omitted_bytes}]_"
 )
 # Sentinel preview inserted when the projected set is trimmed.
-_DECISION_OMISSION_SENTINEL = (
-    "\n\n_[some decision comments omitted; retrieve full comments via the "
-    "authoritative Kanban task comments]_"
+_DECISION_OMISSION_SENTINEL_TEMPLATE = (
+    "\n\n_[{omitted_count} middle decision comments omitted; retrieve full comments "
+    "via the authoritative Kanban task comments]_"
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -395,21 +395,50 @@ def _truncate_utf8(value: str, maximum: int) -> tuple[str, int]:
     return rendered, len(raw) - len(prefix)
 
 
-def _truncate_decision_statement(statement: str) -> tuple[str, int]:
+def _decision_truncation_marker(*, digest: str, omitted_bytes: int) -> str:
+    return _DECISION_TRUNCATION_MARKER_TEMPLATE.format(
+        digest=digest,
+        omitted_bytes=omitted_bytes,
+    )
+
+
+def _decision_omission_sentinel(omitted_count: int) -> str:
+    return _DECISION_OMISSION_SENTINEL_TEMPLATE.format(
+        omitted_count=omitted_count,
+    )
+
+
+def _truncate_decision_statement(
+    statement: str,
+    *,
+    maximum_bytes: int = MAX_DECISION_PREVIEW_BYTES,
+) -> tuple[str, int]:
     """Byte-safe truncation of a single decision statement.
 
     Returns (truncated_statement, omitted_bytes).  The returned statement
-    always fits within ``MAX_DECISION_PREVIEW_BYTES`` including the
-    truncation marker.
+    always fits within ``maximum_bytes`` including the truncation marker when
+    the budget can represent its authority metadata.
     """
     raw = statement.encode("utf-8")
-    if len(raw) <= MAX_DECISION_PREVIEW_BYTES:
+    if len(raw) <= maximum_bytes:
         return statement, 0
-    marker_raw = _DECISION_TRUNCATION_MARKER.encode("utf-8")
-    prefix = raw[: max(0, MAX_DECISION_PREVIEW_BYTES - len(marker_raw))]
-    truncated = prefix.decode("utf-8", errors="ignore").rstrip()
-    omitted = len(raw) - len(prefix)
-    return truncated + _DECISION_TRUNCATION_MARKER, omitted
+    digest = text_digest(statement)
+    omitted = 0
+    # The number of omitted bytes is part of the marker, so a decimal-boundary
+    # change can alter the available prefix by one byte. Iterate to the stable
+    # value rather than publishing a placeholder or an off-by-one count.
+    for _ in range(8):
+        marker = _decision_truncation_marker(
+            digest=digest,
+            omitted_bytes=omitted,
+        )
+        prefix = raw[: max(0, maximum_bytes - len(marker.encode("utf-8")))]
+        truncated = prefix.decode("utf-8", errors="ignore").rstrip()
+        actual_omitted = len(raw) - len(truncated.encode("utf-8"))
+        if actual_omitted == omitted:
+            return truncated + marker, actual_omitted
+        omitted = actual_omitted
+    raise ContinuationContractError("decision_truncation_metadata_unstable")
 
 
 def _render_core(manifest: dict[str, Any]) -> str:
@@ -716,27 +745,59 @@ def decisions_from_comments(comments: Iterable[Any]) -> list[dict[str, str]]:
 
     # Byte-safe truncation of each statement.
     projected: list[dict[str, str]] = []
-    total_truncated = 0
     for dec in raw_decisions:
-        truncated, omitted = _truncate_decision_statement(dec["statement"])
+        truncated, _omitted = _truncate_decision_statement(dec["statement"])
         projected.append({"id": dec["id"], "statement": truncated})
-        total_truncated += omitted
 
-    # Bounded projection: if the projected set exceeds the total budget,
-    # keep a first+last window and insert a sentinel.
-    if len(projected) > MAX_DECISION_PREVIEW_COUNT:
-        # Calculate how many we can keep (leave room for sentinel).
-        keep_count = min(MAX_DECISION_PREVIEW_COUNT - 2, len(projected) - 1)
-        if keep_count < 0:
-            keep_count = 0
-        kept = projected[:keep_count] + projected[-1:]
-        omitted_count = len(projected) - len(kept)
-        kept.append(
-            {
-                "id": f"decision-omitted-{omitted_count}",
-                "statement": _DECISION_OMISSION_SENTINEL,
-            }
+    def _serialized_bytes(items: list[dict[str, str]]) -> int:
+        return len(canonical_json(items).encode("utf-8"))
+
+    if (
+        len(projected) <= MAX_DECISION_PREVIEW_COUNT
+        and _serialized_bytes(projected) <= MAX_DECISION_PREVIEWS_TOTAL_BYTES
+    ):
+        return projected
+
+    # The total-byte ceiling is independent of the per-decision ceiling. Keep
+    # the authoritative first/last ordering and an explicit middle-omission
+    # sentinel; trim those two statements further only when their serialized
+    # representation cannot coexist within the total projection budget.
+    first = raw_decisions[0]
+    last = raw_decisions[-1]
+    omitted_count = max(0, len(raw_decisions) - 2)
+
+    def _first_last_projection(statement_budget: int) -> list[dict[str, str]]:
+        first_statement, _ = _truncate_decision_statement(
+            first["statement"], maximum_bytes=statement_budget
         )
-        projected = kept
+        last_statement, _ = _truncate_decision_statement(
+            last["statement"], maximum_bytes=statement_budget
+        )
+        items = [
+            {"id": first["id"], "statement": first_statement},
+            {"id": last["id"], "statement": last_statement},
+        ]
+        if omitted_count:
+            items.append(
+                {
+                    "id": f"decision-omitted-{omitted_count}",
+                    "statement": _decision_omission_sentinel(omitted_count),
+                }
+            )
+        return items
+
+    low, high = 0, MAX_DECISION_PREVIEW_BYTES
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if (
+            _serialized_bytes(_first_last_projection(candidate))
+            <= MAX_DECISION_PREVIEWS_TOTAL_BYTES
+        ):
+            low = candidate
+        else:
+            high = candidate - 1
+    projected = _first_last_projection(low)
+    if _serialized_bytes(projected) > MAX_DECISION_PREVIEWS_TOTAL_BYTES:
+        raise ContinuationContractError("decision_projection_over_budget")
 
     return projected

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_continuation import (
     ContinuationContractError,
+    canonical_json,
     compile_context,
     decisions_from_comments,
     _render_core_with_decision_budget,
@@ -760,8 +762,9 @@ def test_multi_byte_oversized_decision_truncates_by_bytes_not_chars():
     assert len(statement.encode("utf-8")) <= MAX_DECISION_PREVIEW_BYTES
     # The truncation marker must be present.
     assert "truncated" in statement
-    assert "sha256=" in statement
-    assert "omitted_bytes=" in statement
+    assert f"sha256={hashlib.sha256(emoji_text.encode()).hexdigest()}" in statement
+    prefix = statement.split("\n\n_[decision text truncated", 1)[0]
+    assert f"omitted_bytes={len(emoji_text.encode()) - len(prefix.encode())}" in statement
 
 
 def test_ascii_decision_under_budget_is_unchanged():
@@ -782,26 +785,28 @@ def test_many_large_decisions_produce_bounded_projection():
     comments = [_Comment(f"Decision: {large}", id=f"dec-{i}") for i in range(100)]
     result = decisions_from_comments(comments)
 
-    # Should be bounded by MAX_DECISION_PREVIEW_COUNT.
+    # The total serialized projection is bounded as well as its item count.
     assert len(result) <= MAX_DECISION_PREVIEW_COUNT
+    assert len(canonical_json(result).encode("utf-8")) <= MAX_DECISION_PREVIEWS_TOTAL_BYTES
     # Should contain the sentinel for omitted decisions.
-    assert any("omitted" in dec["statement"] for dec in result)
+    assert "98 middle decision comments omitted" in result[-1]["statement"]
+    assert "authoritative Kanban task comments" in result[-1]["statement"]
     # First and last original decisions should be preserved.
     assert result[0]["id"] == "decision-dec-0"
     assert result[-2]["id"] == "decision-dec-99"
 
 
-def test_few_large_decisions_pass_through_without_sentinel():
-    """A small number of large decisions that fit within the preview budget
-    should pass through without a sentinel."""
+def test_few_large_decisions_are_projected_to_the_total_budget():
+    """The total-byte budget applies even when the count is small."""
     large = "y" * 3000
     comments = [_Comment(f"Decision: {large}", id=f"d-{i}") for i in range(5)]
     result = decisions_from_comments(comments)
 
-    assert len(result) == 5
-    assert not any("omitted" in dec["statement"] for dec in result)
+    assert len(result) == 3
+    assert len(canonical_json(result).encode("utf-8")) <= MAX_DECISION_PREVIEWS_TOTAL_BYTES
+    assert "3 middle decision comments omitted" in result[-1]["statement"]
     assert result[0]["id"] == "decision-d-0"
-    assert result[-1]["id"] == "decision-d-4"
+    assert result[-2]["id"] == "decision-d-4"
 
 
 def test_render_core_with_decision_budget_stays_within_limit():
