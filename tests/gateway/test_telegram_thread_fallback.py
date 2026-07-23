@@ -1529,3 +1529,46 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+# BUILD-566: a configured alerts topic with an inline "# comment" must parse to
+# its numeric value, not crash int() with "invalid literal for int()".
+def test_thread_id_with_inline_comment_parses_numeric():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    annotated = "2  # Alerts topic (was 1=General; moved 2026-07-19)"
+    # send: real topic id 2 is preserved (only General "1" is dropped)
+    assert TelegramAdapter._message_thread_id_for_send(annotated) == 2
+    # typing: preserves the same numeric value
+    assert TelegramAdapter._message_thread_id_for_typing(annotated) == 2
+
+
+def test_thread_id_general_topic_with_inline_comment_maps_to_none_on_send():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    annotated_general = "1  # General topic"
+    # send drops the General topic thread id even when annotated
+    assert TelegramAdapter._message_thread_id_for_send(annotated_general) is None
+    # typing preserves the General topic id (asymmetric, by design)
+    assert TelegramAdapter._message_thread_id_for_typing(annotated_general) == 1
+
+
+def test_thread_id_whitespace_and_unannotated_values():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    assert TelegramAdapter._message_thread_id_for_send("  7  ") == 7
+    assert TelegramAdapter._message_thread_id_for_send("12038") == 12038
+    assert TelegramAdapter._message_thread_id_for_send(12038) == 12038
+    # empty / comment-only / None → no thread id
+    assert TelegramAdapter._message_thread_id_for_send("   # only a comment") is None
+    assert TelegramAdapter._message_thread_id_for_send("") is None
+    assert TelegramAdapter._message_thread_id_for_send(None) is None
+
+
+def test_malformed_thread_id_fails_loud_before_send():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        TelegramAdapter._message_thread_id_for_send("not-a-number")
+    with pytest.raises(ValueError, match="must be numeric"):
+        TelegramAdapter._message_thread_id_for_typing("2b  # typo")

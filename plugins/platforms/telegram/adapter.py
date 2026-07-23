@@ -1158,10 +1158,38 @@ class TelegramAdapter(BasePlatformAdapter):
         return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
 
     @classmethod
-    def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
-        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
+    def _coerce_thread_id(cls, thread_id: Optional[str]) -> Optional[str]:
+        """Return the effective numeric thread-id string from a possibly
+        annotated configuration value.
+
+        A configured topic like ``TELEGRAM_HOME_CHANNEL_THREAD_ID=2  # Alerts
+        topic (was 1=General; moved 2026-07-19)`` reaches here as the whole
+        annotated string; passing it straight to ``int()`` raised
+        ``invalid literal for int() with base 10`` and blocked every send to the
+        home channel (BUILD-566). Strip an inline ``#`` comment and surrounding
+        whitespace to recover the effective value. An empty value yields
+        ``None``; a genuinely non-numeric value fails loud with an actionable
+        configuration error BEFORE any send is attempted.
+        """
+        if thread_id is None:
             return None
-        return int(thread_id)
+        cleaned = str(thread_id).split("#", 1)[0].strip()
+        if not cleaned:
+            return None
+        if not re.fullmatch(r"-?\d+", cleaned):
+            raise ValueError(
+                f"Telegram thread/topic id must be numeric, got {thread_id!r} "
+                f"(effective value after stripping any inline comment: "
+                f"{cleaned!r}). Fix the configured TELEGRAM_*_THREAD_ID value."
+            )
+        return cleaned
+
+    @classmethod
+    def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
+        cleaned = cls._coerce_thread_id(thread_id)
+        if cleaned is None or cleaned == cls._GENERAL_TOPIC_THREAD_ID:
+            return None
+        return int(cleaned)
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -1172,9 +1200,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # bubble in the General topic (omitting it hides the bubble entirely
         # from the client's view of that topic). Preserve the real id here —
         # sends still map "1" → None via _message_thread_id_for_send.
-        if not thread_id:
+        cleaned = cls._coerce_thread_id(thread_id)
+        if cleaned is None:
             return None
-        return int(thread_id)
+        return int(cleaned)
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
