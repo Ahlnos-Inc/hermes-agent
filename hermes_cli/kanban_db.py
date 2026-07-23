@@ -17554,7 +17554,17 @@ def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
         if not raw:
             return {"git_repo": True, "dirty": False}
         lines = raw.split("\n")
-        capped_lines = lines[:_WORKSPACE_DIAG_MAX_LINES]
+        # Filter out branch-header lines (start with "## ") — they are
+        # metadata, not file-level dirty signals.  If only branch headers
+        # remain the workspace is clean.
+        file_lines = [l for l in lines if not l.startswith("## ")]
+        if not file_lines:
+            branch = ""
+            first_line = lines[0] if lines else ""
+            if first_line.startswith("## "):
+                branch = first_line[3:].split("...")[0].strip()
+            return {"git_repo": True, "branch": branch or None, "dirty": False}
+        capped_lines = file_lines[:_WORKSPACE_DIAG_MAX_LINES]
         capped = "\n".join(capped_lines)
         if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
             capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
