@@ -26,6 +26,22 @@ DEFAULT_MAX_TOTAL_BYTES = 48 * 1024
 MAX_REFERENCE_COUNT = 256
 MAX_ACCEPTANCE_COUNT = 128
 MAX_DECISION_COUNT = 128
+# Bounded decision projection: hard parse ceiling.
+MAX_DECISION_PREVIEW_COUNT = 64
+# Per-decision preview budget (same as normalize_manifest statement limit).
+MAX_DECISION_PREVIEW_BYTES = 4096
+# Total budget for the projected decision set (first+last/sentinel window).
+MAX_DECISION_PREVIEWS_TOTAL_BYTES = 8 * 1024
+# Omission marker appended when a decision statement is truncated.
+_DECISION_TRUNCATION_MARKER = (
+    "\n\n_[decision text truncated; full comment remains on the Kanban task; "
+    "sha256=<digest>; omitted_bytes=<n>]_"
+)
+# Sentinel preview inserted when the projected set is trimmed.
+_DECISION_OMISSION_SENTINEL = (
+    "\n\n_[some decision comments omitted; retrieve full comments via the "
+    "authoritative Kanban task comments]_"
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _JIRA_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
@@ -379,6 +395,23 @@ def _truncate_utf8(value: str, maximum: int) -> tuple[str, int]:
     return rendered, len(raw) - len(prefix)
 
 
+def _truncate_decision_statement(statement: str) -> tuple[str, int]:
+    """Byte-safe truncation of a single decision statement.
+
+    Returns (truncated_statement, omitted_bytes).  The returned statement
+    always fits within ``MAX_DECISION_PREVIEW_BYTES`` including the
+    truncation marker.
+    """
+    raw = statement.encode("utf-8")
+    if len(raw) <= MAX_DECISION_PREVIEW_BYTES:
+        return statement, 0
+    marker_raw = _DECISION_TRUNCATION_MARKER.encode("utf-8")
+    prefix = raw[: max(0, MAX_DECISION_PREVIEW_BYTES - len(marker_raw))]
+    truncated = prefix.decode("utf-8", errors="ignore").rstrip()
+    omitted = len(raw) - len(prefix)
+    return truncated + _DECISION_TRUNCATION_MARKER, omitted
+
+
 def _render_core(manifest: dict[str, Any]) -> str:
     lines = [
         "# Durable continuation contract",
@@ -429,6 +462,95 @@ def _render_core(manifest: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _render_core_with_decision_budget(
+    manifest: dict[str, Any],
+    *,
+    max_core_bytes: int = DEFAULT_MAX_CORE_BYTES,
+) -> str:
+    """Render the core with a dynamic decision-section budget.
+
+    The decision section is capped at ``min(8 KiB, max_core_bytes // 2)``
+    so that decision-only oversize inputs recover with visible truncation
+    markers rather than blocking bootstrap.  Non-decision required core
+    fields still fail loudly as before.
+    """
+    # Build core without decisions first.
+    base_lines = [
+        "# Durable continuation contract",
+        "",
+        f"Task: `{manifest['task_id']}` | run: `{manifest['run_id']}`",
+        f"Objective: {manifest['objective']}",
+    ]
+    criteria = manifest["acceptance_criteria"]
+    if criteria:
+        base_lines.extend(["", "## Acceptance criteria"])
+        base_lines.extend(f"- [ ] {item}" for item in criteria)
+
+    policy = manifest["provider_policy"]
+    base_lines.extend(
+        [
+            "",
+            "## Runtime policy",
+            f"- provider allow: {', '.join(policy['allow']) or '(any not denied)'}",
+            f"- provider deny: {', '.join(policy['deny']) or '(none)'}",
+        ]
+    )
+    repository = manifest.get("repository")
+    if repository:
+        base_lines.extend(
+            [
+                "",
+                "## Repository checkpoint",
+                f"- path: `{repository['path']}`",
+                f"- head: `{repository.get('head') or '(unborn)'}`",
+                f"- branch: `{repository.get('branch') or '(detached/unborn)'}`",
+                f"- dirty: `{str(bool(repository.get('dirty'))).lower()}`",
+                f"- dirty digest: `{repository.get('dirty_digest') or '(clean)'}`",
+            ]
+        )
+    refs = manifest["references"]
+    if refs:
+        base_lines.extend(["", "## Evidence references"])
+        for ref in refs:
+            required = "required" if ref["required"] else "on-demand"
+            digest = f" sha256:{ref['digest']}" if ref.get("digest") else ""
+            label = f" — {ref['label']}" if ref.get("label") else ""
+            base_lines.append(
+                f"- [{ref['kind']}/{required}] `{ref['uri']}`{digest}{label}"
+            )
+
+    base_core = "\n".join(base_lines).rstrip() + "\n"
+    base_bytes = len(base_core.encode("utf-8"))
+
+    # Dynamic decision-section budget: min(8 KiB, max_core_bytes // 2).
+    decision_budget = min(8 * 1024, max_core_bytes // 2)
+    # Reserve room for the section header and an omission marker.
+    header_bytes = len("\n## Settled decisions\n".encode("utf-8"))
+    omission_marker = "\n\n_[some decision comments omitted; retrieve full comments via the authoritative Kanban task comments]_\n"
+    omission_bytes = len(omission_marker.encode("utf-8"))
+    available_for_decisions = max(0, decision_budget - header_bytes - omission_bytes)
+
+    decisions = manifest["decisions"]
+    if decisions:
+        base_lines.extend(["", "## Settled decisions"])
+        rendered_decisions: list[str] = []
+        decision_bytes_so_far = 0
+        for dec in decisions:
+            line = f"- `{dec['id']}`: {dec['statement']}"
+            line_bytes = len(line.encode("utf-8"))
+            if decision_bytes_so_far + line_bytes > available_for_decisions:
+                # Omit remaining decisions and add marker.
+                rendered_decisions.append(omission_marker)
+                break
+            rendered_decisions.append(line)
+            decision_bytes_so_far += line_bytes
+        lines = base_lines + rendered_decisions
+    else:
+        lines = base_lines
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def compile_context(
     manifest_value: Any,
     working_set: str,
@@ -453,7 +575,7 @@ def compile_context(
     if max_core_bytes <= 0 or max_total_bytes <= max_core_bytes:
         raise ContinuationContractError("invalid_context_budget")
 
-    core = _render_core(manifest)
+    core = _render_core_with_decision_budget(manifest, max_core_bytes=max_core_bytes)
     core_bytes = len(core.encode("utf-8"))
     if core_bytes > max_core_bytes:
         raise ContinuationContractError(
@@ -566,8 +688,16 @@ def assert_repository_compatible(repository: Any) -> None:
 
 
 def decisions_from_comments(comments: Iterable[Any]) -> list[dict[str, str]]:
-    """Extract explicit ``Decision:`` comments; ordinary prose is not promoted."""
-    decisions: list[dict[str, str]] = []
+    """Extract explicit ``Decision:`` comments; ordinary prose is not promoted.
+
+    Returns a bounded, deterministic preview set:
+    - Each statement is byte-safe truncated (UTF-8 bytes, not Python chars).
+    - Truncated statements carry an explicit marker with digest/omission info.
+    - When the source has more decisions than can fit in the total budget,
+      a deterministic first+last window is kept with a sentinel preview
+      indicating how many middle decisions were omitted.
+    """
+    raw_decisions: list[dict[str, str]] = []
     for comment in comments:
         body = str(getattr(comment, "body", "") or "").strip()
         if not body.lower().startswith("decision:"):
@@ -575,12 +705,38 @@ def decisions_from_comments(comments: Iterable[Any]) -> list[dict[str, str]]:
         statement = body.split(":", 1)[1].strip()
         if not statement:
             continue
-        decisions.append(
+        raw_decisions.append(
             {
-                "id": f"decision-{getattr(comment, 'id', len(decisions) + 1)}",
-                "statement": statement[:4096],
+                "id": f"decision-{getattr(comment, 'id', len(raw_decisions) + 1)}",
+                "statement": statement,
             }
         )
-        if len(decisions) >= MAX_DECISION_COUNT:
+        if len(raw_decisions) >= MAX_DECISION_COUNT:
             break
-    return decisions
+
+    # Byte-safe truncation of each statement.
+    projected: list[dict[str, str]] = []
+    total_truncated = 0
+    for dec in raw_decisions:
+        truncated, omitted = _truncate_decision_statement(dec["statement"])
+        projected.append({"id": dec["id"], "statement": truncated})
+        total_truncated += omitted
+
+    # Bounded projection: if the projected set exceeds the total budget,
+    # keep a first+last window and insert a sentinel.
+    if len(projected) > MAX_DECISION_PREVIEW_COUNT:
+        # Calculate how many we can keep (leave room for sentinel).
+        keep_count = min(MAX_DECISION_PREVIEW_COUNT - 2, len(projected) - 1)
+        if keep_count < 0:
+            keep_count = 0
+        kept = projected[:keep_count] + projected[-1:]
+        omitted_count = len(projected) - len(kept)
+        kept.append(
+            {
+                "id": f"decision-omitted-{omitted_count}",
+                "statement": _DECISION_OMISSION_SENTINEL,
+            }
+        )
+        projected = kept
+
+    return projected

@@ -13,6 +13,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_continuation import (
     ContinuationContractError,
     compile_context,
+    decisions_from_comments,
+    _render_core_with_decision_budget,
+    _truncate_decision_statement,
+    normalize_manifest,
+    MAX_DECISION_PREVIEW_COUNT,
+    MAX_DECISION_PREVIEW_BYTES,
+    MAX_DECISION_PREVIEWS_TOTAL_BYTES,
 )
 
 
@@ -721,3 +728,219 @@ def test_goal_wrapper_does_not_continue_after_first_turn_checkpoint(
     loop = pytest.fail
     monkeypatch.setattr(goals, "run_kanban_goal_loop", loop)
     _run_kanban_goal_loop_q(SimpleNamespace(), "checkpoint response")
+
+
+# ---------------------------------------------------------------------------
+# Decision-size validation regression tests (t_655ff33e)
+# ---------------------------------------------------------------------------
+
+
+class _Comment:
+    """Minimal mock for a Kanban comment with ``body`` and optional ``id``."""
+
+    def __init__(self, body: str, id: str | None = None):
+        self.body = body
+        self.id = id
+
+
+def test_multi_byte_oversized_decision_truncates_by_bytes_not_chars():
+    """Multi-byte oversized Decision: statements truncate by UTF-8 bytes.
+
+    The original bug sliced by Python characters (``statement[:4096]``),
+    so a 2,000-emoji statement passed extraction but then failed
+    ``normalize_manifest()`` which validates by UTF-8 bytes.
+    """
+    emoji_text = "\U0001f600" * 2000  # 2000 chars, 8000 bytes
+    comments = [_Comment(f"Decision: {emoji_text}")]
+    result = decisions_from_comments(comments)
+
+    assert len(result) == 1
+    statement = result[0]["statement"]
+    # The truncated statement must fit within the per-decision budget.
+    assert len(statement.encode("utf-8")) <= MAX_DECISION_PREVIEW_BYTES
+    # The truncation marker must be present.
+    assert "truncated" in statement
+    assert "sha256=" in statement
+    assert "omitted_bytes=" in statement
+
+
+def test_ascii_decision_under_budget_is_unchanged():
+    """Short ASCII decisions pass through without truncation."""
+    comments = [_Comment("Decision: This is a short decision")]
+    result = decisions_from_comments(comments)
+
+    assert len(result) == 1
+    assert result[0]["statement"] == "This is a short decision"
+    assert "truncated" not in result[0]["statement"]
+
+
+def test_many_large_decisions_produce_bounded_projection():
+    """Many individually valid but large decision statements produce a
+    bounded first+last/sentinel preview set rather than an unbounded list.
+    """
+    large = "x" * 4000  # 4000 bytes each, under per-decision limit
+    comments = [_Comment(f"Decision: {large}", id=f"dec-{i}") for i in range(100)]
+    result = decisions_from_comments(comments)
+
+    # Should be bounded by MAX_DECISION_PREVIEW_COUNT.
+    assert len(result) <= MAX_DECISION_PREVIEW_COUNT
+    # Should contain the sentinel for omitted decisions.
+    assert any("omitted" in dec["statement"] for dec in result)
+    # First and last original decisions should be preserved.
+    assert result[0]["id"] == "decision-dec-0"
+    assert result[-2]["id"] == "decision-dec-99"
+
+
+def test_few_large_decisions_pass_through_without_sentinel():
+    """A small number of large decisions that fit within the preview budget
+    should pass through without a sentinel."""
+    large = "y" * 3000
+    comments = [_Comment(f"Decision: {large}", id=f"d-{i}") for i in range(5)]
+    result = decisions_from_comments(comments)
+
+    assert len(result) == 5
+    assert not any("omitted" in dec["statement"] for dec in result)
+    assert result[0]["id"] == "decision-d-0"
+    assert result[-1]["id"] == "decision-d-4"
+
+
+def test_render_core_with_decision_budget_stays_within_limit():
+    """A manifest with many large decisions renders within the dynamic
+    decision-section budget and includes an omission marker."""
+    large = "z" * 4000
+    decisions = [
+        {"id": f"dec-{i}", "statement": large} for i in range(20)
+    ]
+    manifest = {
+        "version": 1,
+        "task_id": "t_test",
+        "run_id": 1,
+        "objective": "test objective",
+        "acceptance_criteria": [],
+        "decisions": decisions,
+        "references": [],
+        "provider_policy": {"allow": [], "deny": ["openrouter"]},
+        "repository": None,
+        "created_at": 1,
+    }
+    rendered = _render_core_with_decision_budget(manifest, max_core_bytes=4096)
+    rendered_bytes = len(rendered.encode("utf-8"))
+
+    # The core must stay within max_core_bytes.
+    assert rendered_bytes <= 4096
+    # The rendered text should include the omission marker.
+    assert "omitted" in rendered
+
+
+def test_compile_context_with_many_decisions_does_not_block():
+    """A valid manifest with many large decisions compiles successfully
+    rather than raising ``context_core_over_budget``.
+    """
+    large = "w" * 4000
+    decisions = [
+        {"id": f"dec-{i}", "statement": large} for i in range(10)
+    ]
+    manifest = {
+        "version": 1,
+        "task_id": "t_budget",
+        "run_id": 1,
+        "objective": "bounded core",
+        "acceptance_criteria": [],
+        "decisions": decisions,
+        "references": [],
+        "provider_policy": {"allow": [], "deny": ["openrouter"]},
+        "repository": None,
+        "created_at": 1,
+    }
+    bundle = compile_context(
+        manifest,
+        "small working set",
+        max_core_bytes=4096,
+        max_total_bytes=8192,
+    )
+
+    assert bundle["bytes"]["core"] <= 4096
+    assert bundle["bytes"]["total"] <= 8192
+    assert "omitted" in bundle["rendered"]
+
+
+def test_required_context_core_fails_loudly_with_many_decisions():
+    """Non-decision required core overflow still fails closed even when
+    decisions are bounded.
+    """
+    # Make the objective huge so the non-decision core exceeds budget.
+    huge_obj = "o" * 5000
+    decisions = [
+        {"id": f"dec-{i}", "statement": "small"} for i in range(3)
+    ]
+    manifest = {
+        "version": 1,
+        "task_id": "t_core_fail",
+        "run_id": 1,
+        "objective": huge_obj,
+        "acceptance_criteria": [],
+        "decisions": decisions,
+        "references": [],
+        "provider_policy": {"allow": [], "deny": ["openrouter"]},
+        "repository": None,
+        "created_at": 1,
+    }
+    with pytest.raises(ContinuationContractError, match="required context"):
+        compile_context(
+            manifest,
+            "working set",
+            max_core_bytes=128,
+            max_total_bytes=512,
+        )
+
+
+def test_normalize_manifest_accepts_byte_safe_truncated_decisions():
+    """Truncated decision statements (with markers) pass normalize_manifest()."""
+    emoji_text = "\U0001f600" * 2000
+    comments = [_Comment(f"Decision: {emoji_text}")]
+    decisions = decisions_from_comments(comments)
+
+    manifest = {
+        "version": 1,
+        "task_id": "t_normalize",
+        "run_id": 1,
+        "objective": "test",
+        "acceptance_criteria": [],
+        "decisions": decisions,
+        "references": [],
+        "provider_policy": {"allow": [], "deny": ["openrouter"]},
+        "repository": None,
+        "created_at": 1,
+    }
+    # This should NOT raise; the truncated statement fits within 4096 bytes.
+    normalized = normalize_manifest(manifest)
+    assert len(normalized["decisions"]) == 1
+    assert "truncated" in normalized["decisions"][0]["statement"]
+
+
+def test_empty_decisions_list_is_unchanged():
+    """Empty decisions list passes through without modification."""
+    comments = [_Comment("Some regular comment")]
+    result = decisions_from_comments(comments)
+    assert result == []
+
+
+def test_decision_truncation_helper_respects_exact_byte_boundary():
+    """_truncate_decision_statement returns the statement unchanged when
+    it is exactly at the byte limit."""
+    # Build a statement that is exactly MAX_DECISION_PREVIEW_BYTES bytes.
+    statement = "a" * MAX_DECISION_PREVIEW_BYTES
+    truncated, omitted = _truncate_decision_statement(statement)
+    assert truncated == statement
+    assert omitted == 0
+    assert len(truncated.encode("utf-8")) == MAX_DECISION_PREVIEW_BYTES
+
+
+def test_decision_truncation_helper_includes_marker_when_over_limit():
+    """_truncate_decision_statement appends the marker when the statement
+    exceeds the byte limit."""
+    statement = "a" * (MAX_DECISION_PREVIEW_BYTES + 100)
+    truncated, omitted = _truncate_decision_statement(statement)
+    assert omitted > 0
+    assert len(truncated.encode("utf-8")) <= MAX_DECISION_PREVIEW_BYTES
+    assert "truncated" in truncated
