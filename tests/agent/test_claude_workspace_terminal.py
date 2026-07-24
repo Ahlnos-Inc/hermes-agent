@@ -224,7 +224,13 @@ def test_workspace_terminal_cannot_retarget_head_between_invocations(tmp_path):
 def test_workspace_terminal_denies_non_loose_git_object_paths(tmp_path):
     repo, workspace = _linked_worktree(tmp_path)
     object_dir = repo / ".git" / "objects"
-    (object_dir / "aa").mkdir()
+    # Pick a loose-object fan-out prefix git has not already created for this
+    # repo's own objects — creating an existing one raised FileExistsError and
+    # made this test flaky. info/ and pack/ subdirs are not object fan-outs, so
+    # their names cannot collide.
+    existing = set(os.listdir(object_dir))
+    fanout = next(f"{i:02x}" for i in range(256) if f"{i:02x}" not in existing)
+    (object_dir / fanout).mkdir()
     (object_dir / "info" / "ab").mkdir()
     (object_dir / "pack" / "cd").mkdir()
     denied_paths = [
@@ -234,7 +240,7 @@ def test_workspace_terminal_denies_non_loose_git_object_paths(tmp_path):
         object_dir / "info" / "aa",
         object_dir / "info" / "ab" / "tmp_obj_ABC123",
         object_dir / "pack" / "cd" / ("e" * 38),
-        object_dir / "aa" / "bb",
+        object_dir / fanout / "bb",
     ]
     transformed = build_workspace_terminal_args(
         {
