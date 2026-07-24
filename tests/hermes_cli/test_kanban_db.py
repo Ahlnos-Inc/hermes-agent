@@ -7034,3 +7034,65 @@ def test_notify_sub_kinds_fails_open_on_unparseable_value(kanban_home):
     assert kb.notify_sub_kinds({"kinds_json": "not json"}) is None
     assert kb.notify_sub_kinds({"kinds_json": '"a string, not a list"'}) is None
     assert kb.notify_sub_kinds({}) is None
+
+
+def test_workspace_cleanup_reclaims_legacy_unmanaged_task_worktree(
+    kanban_home, tmp_path,
+):
+    """BUILD-749: a worktree from before workspace_managed still gets reclaimed.
+
+    Legacy fleet cards left 25 directories under the runtime fork's
+    ``.worktrees/`` — their rows carry only a path (no managed flag, no repo
+    identity), so the sweep skipped them forever while their hard-linked
+    node_modules trees kept tripping the workspace hardlink guard for unrelated
+    later tasks.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy worktree",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task, conn=conn)
+        assert workspace.exists()
+        # Exactly the legacy shape: canonical path, nothing else recorded.
+        conn.execute(
+            "UPDATE tasks SET status = 'done', workspace_managed = 0, "
+            "workspace_repo_root = NULL, workspace_repo_common_dir = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+
+        result = kb.cleanup_terminal_task_worktrees(conn, now=200)
+
+    assert result and result[0]["status"] == "cleaned"
+    assert not workspace.exists()
+
+
+def test_workspace_cleanup_leaves_borrowed_worktree_alone(kanban_home, tmp_path):
+    """A checkout the operator pointed a task at is never reclaimed."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    borrowed = tmp_path / "borrowed"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(borrowed)],
+        capture_output=True, check=True,
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="borrowed worktree")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', workspace_kind = 'worktree', "
+            "workspace_managed = 0, workspace_path = ? WHERE id = ?",
+            (str(borrowed), task_id),
+        )
+        conn.commit()
+
+        assert kb.cleanup_terminal_task_worktrees(conn, now=200) == []
+
+    assert borrowed.exists()

@@ -11661,6 +11661,28 @@ def _registered_worktree_path(repo_root: Path, path: Path) -> bool:
     return False
 
 
+def _is_canonical_task_worktree_path(path: Path, task_id: str) -> bool:
+    """Is ``path`` the worktree Hermes itself would create for ``task_id``?
+
+    ``_ensure_git_worktree`` always materializes ``<repo>/.worktrees/<task-id>``,
+    so a path with that exact shape is Hermes-owned even when the row predates
+    the ``workspace_managed`` flag. A borrowed checkout the operator pointed a
+    task at does not match, and is never reclaimed (BUILD-749).
+    """
+    return path.name == task_id and path.parent.name == ".worktrees"
+
+
+# Reclaimable = flagged managed, OR sitting at the canonical
+# ``.worktrees/<task_id>`` path this codebase creates. Legacy fleet cards left
+# 25 such directories behind in the runtime fork, and their hard-linked
+# node_modules trip the workspace hardlink guard for unrelated later tasks —
+# one wedged an architect card two weeks after its owner finished (BUILD-749).
+_RECLAIMABLE_WORKTREE_SQL = (
+    "(workspace_managed = 1 "
+    "OR workspace_path LIKE '%/.worktrees/' || id)"
+)
+
+
 def _workspace_cleanup_lease(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11681,12 +11703,14 @@ def _workspace_cleanup_lease(
             return None
         if row["status"] not in _TERMINAL_WORKSPACE_STATUSES:
             return None
-        if not bool(row["workspace_managed"]):
+        if not bool(row["workspace_managed"]) and not _is_canonical_task_worktree_path(
+            Path(str(row["workspace_path"] or "")), str(row["id"]),
+        ):
             return None
         cur = conn.execute(
             "UPDATE tasks SET workspace_cleanup_lease = ?, "
             "workspace_cleanup_lease_expires = ? WHERE id = ? "
-            "AND status IN ('done', 'archived') AND workspace_managed = 1 "
+            f"AND status IN ('done', 'archived') AND {_RECLAIMABLE_WORKTREE_SQL} "
             "AND (workspace_cleanup_lease IS NULL "
             "OR workspace_cleanup_lease_expires IS NULL "
             "OR workspace_cleanup_lease_expires <= ?)",
@@ -11762,6 +11786,19 @@ def _revalidate_managed_worktree(row: sqlite3.Row) -> tuple[Path, Path, str | No
     raw_path = str(row["workspace_path"] or "")
     raw_repo_root = str(row["workspace_repo_root"] or "")
     raw_common_dir = str(row["workspace_repo_common_dir"] or "")
+    if raw_path and not (raw_repo_root and raw_common_dir):
+        # Worktrees created before the identity columns existed carry only a
+        # path. Derive the missing identity from Hermes' own layout —
+        # ``<repo_root>/.worktrees/<task_id>`` — and let the checks below prove
+        # it: the derived root must genuinely contain this linked worktree and
+        # share its git common dir. Nothing is inferred for a borrowed path
+        # that isn't at the canonical location (BUILD-749).
+        derived_path = Path(raw_path).expanduser()
+        if _is_canonical_task_worktree_path(derived_path, str(row["id"])):
+            raw_repo_root = raw_repo_root or str(derived_path.parent.parent)
+            if not raw_common_dir:
+                derived_common = _git_common_dir(derived_path)
+                raw_common_dir = str(derived_common) if derived_common else ""
     if not raw_path or not raw_repo_root or not raw_common_dir:
         return Path(raw_path), Path(raw_repo_root), "workspace_identity_incomplete"
     path = Path(raw_path).expanduser()
@@ -11808,7 +11845,7 @@ def cleanup_terminal_task_worktrees(
     if task_id is None:
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status IN ('done', 'archived') "
-            "AND workspace_kind = 'worktree' AND workspace_managed = 1 "
+            f"AND workspace_kind = 'worktree' AND {_RECLAIMABLE_WORKTREE_SQL} "
             "ORDER BY id LIMIT ?",
             (bounded_limit,),
         ).fetchall()
@@ -11821,7 +11858,7 @@ def cleanup_terminal_task_worktrees(
         if reference is not None and reference["workspace_path"]:
             rows = conn.execute(
                 "SELECT id FROM tasks WHERE status IN ('done', 'archived') "
-                "AND workspace_kind = 'worktree' AND workspace_managed = 1 "
+                f"AND workspace_kind = 'worktree' AND {_RECLAIMABLE_WORKTREE_SQL} "
                 "AND workspace_path = ? ORDER BY id LIMIT ?",
                 (reference["workspace_path"], bounded_limit),
             ).fetchall()
