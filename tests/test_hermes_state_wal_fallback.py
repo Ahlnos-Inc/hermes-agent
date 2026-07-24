@@ -130,6 +130,64 @@ class TestApplyWalWithFallback:
             apply_wal_with_fallback(conn)
         conn.close()
 
+    def test_reraise_path_logs_sqlite_errorname(self, tmp_path, caplog):
+        """BUILD-718: an unexpected (non-WAL-marker) SQLite error at the probe is
+        logged with its extended error name before being re-raised, so a
+        SQLITE_IOERR_* subcode is recoverable from the log rather than lost as a
+        generic 'disk I/O error'."""
+        # Capture a REAL sqlite exception carrying sqlite_errorname (a
+        # hand-built OperationalError would have errorname=None). Rebind inside
+        # the except — Python unbinds the ``as`` target after the block.
+        captured_exc = None
+        try:
+            sqlite3.connect(":memory:").execute("SELECT 1 FROM missing_table")
+            raise AssertionError("expected OperationalError")
+        except sqlite3.OperationalError as e:
+            captured_exc = e
+        expected_name = captured_exc.sqlite_errorname
+        assert expected_name  # sanity: real exc is named
+
+        attempts = [0]
+
+        class _NamedRaiser(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode=wal" in sql.lower().replace(" ", ""):
+                    attempts[0] += 1
+                    raise captured_exc
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "named.db"), factory=_NamedRaiser, isolation_level=None
+        )
+        with caplog.at_level("ERROR", logger="hermes_state"):
+            with pytest.raises(sqlite3.OperationalError):
+                apply_wal_with_fallback(conn, db_label="named.db")
+        conn.close()
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert errors, "probe re-raise should log an ERROR"
+        msg = errors[0].getMessage()
+        assert expected_name in msg
+        assert "sqlite_errorname=" in msg
+
+
+class TestFormatSqliteError:
+    def test_extracts_name_from_real_sqlite_exception(self):
+        captured = None
+        try:
+            sqlite3.connect(":memory:").execute("SELECT 1 FROM missing_table")
+            raise AssertionError("expected OperationalError")
+        except sqlite3.OperationalError as e:
+            captured = e
+        out = hermes_state.format_sqlite_error(captured)
+        assert captured.sqlite_errorname in out
+        assert "sqlite_errorcode=" in out
+
+    def test_falls_back_to_bare_message_for_plain_exception(self):
+        # A hand-built exception carries neither attribute — no bracket suffix.
+        out = hermes_state.format_sqlite_error(ValueError("boom"))
+        assert out == "boom"
+
     def test_does_not_downgrade_when_disk_says_wal(self, tmp_path):
         """Refuse to downgrade an already-WAL DB even if the set-pragma path
         would have raised a downgrade-eligible marker.

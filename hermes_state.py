@@ -205,6 +205,26 @@ _FTS_TRIGGERS = (
 )
 
 
+def format_sqlite_error(exc: BaseException) -> str:
+    """Format a sqlite3 exception with its extended error code and name.
+
+    ``SQLITE_IOERR`` (``disk I/O error``) is the generic message for every
+    ``SQLITE_IOERR_*`` subcode — SHMOPEN, SHMSIZE, SHMMAP, FSTAT, LOCK all print
+    identically, so a corruption incident's actual subcode is unrecoverable from
+    the log unless it was recorded (BUILD-718). Python (3.11+) exposes
+    ``sqlite_errorcode`` / ``sqlite_errorname`` on every sqlite3 exception the C
+    layer raised; append them so boundaries log the exact subcode. Falls back to
+    the bare message for non-sqlite exceptions or hand-constructed ones that
+    carry neither attribute. Observability only — no behaviour change.
+    """
+    msg = str(exc)
+    code = getattr(exc, "sqlite_errorcode", None)
+    name = getattr(exc, "sqlite_errorname", None)
+    if code is None and name is None:
+        return msg
+    return f"{msg} [sqlite_errorcode={code} sqlite_errorname={name}]"
+
+
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
 
@@ -441,7 +461,16 @@ def apply_wal_with_fallback(
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
-            # Unrelated OperationalError — don't silently swallow.
+            # Unrelated OperationalError (e.g. a SQLITE_IOERR_* subcode) — don't
+            # silently swallow, and record the extended error name first so the
+            # exact subcode is recoverable from the log instead of the generic
+            # "disk I/O error" (BUILD-718).
+            logger.error(
+                "%s: WAL journal_mode probe failed with an unexpected SQLite "
+                "error: %s",
+                db_label,
+                format_sqlite_error(exc),
+            )
             raise
         # Don't downgrade if another process already set WAL on disk.
         existing = _on_disk_journal_mode(conn)
@@ -470,7 +499,7 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
         "https://www.sqlite.org/wal.html for details. This warning "
         "fires once per process per database.",
         db_label,
-        exc,
+        format_sqlite_error(exc),
     )
 
 # ---------------------------------------------------------------------------
@@ -578,7 +607,7 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
                 _copy(sidecar, backup_path.with_name(backup_path.name + suffix))
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        logger.warning("Could not back up malformed DB %s: %s", db_path, format_sqlite_error(exc))
         return None
 
 
@@ -712,7 +741,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+        logger.warning("state.db FTS in-place rebuild pass failed: %s", format_sqlite_error(exc))
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
@@ -742,7 +771,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db dedup repair pass failed: %s", exc)
+        logger.warning("state.db dedup repair pass failed: %s", format_sqlite_error(exc))
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
@@ -1449,7 +1478,7 @@ class SessionDB:
                         result[2], result[1],
                     )
         except Exception as exc:
-            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+            logger.warning("WAL checkpoint (PASSIVE) failed: %s", format_sqlite_error(exc))
 
     def _try_optimize_fts(self) -> None:
         """Best-effort FTS5 segment merge. Never raises.
@@ -7477,7 +7506,7 @@ class SessionDB:
         try:
             optimized = self.optimize_fts()
         except Exception as exc:
-            logger.warning("FTS optimize before VACUUM failed: %s", exc)
+            logger.warning("FTS optimize before VACUUM failed: %s", format_sqlite_error(exc))
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
             # Best-effort WAL checkpoint first, then VACUUM.
@@ -7541,7 +7570,7 @@ class SessionDB:
                     self.vacuum()
                     result["vacuumed"] = True
                 except Exception as exc:
-                    logger.warning("state.db VACUUM failed: %s", exc)
+                    logger.warning("state.db VACUUM failed: %s", format_sqlite_error(exc))
 
             # Record the attempt even if pruned == 0, so we don't retry
             # every startup within the min_interval_hours window.
@@ -7556,7 +7585,7 @@ class SessionDB:
                 )
         except Exception as exc:
             # Maintenance must never block startup. Log and return error marker.
-            logger.warning("state.db auto-maintenance failed: %s", exc)
+            logger.warning("state.db auto-maintenance failed: %s", format_sqlite_error(exc))
             result["error"] = str(exc)
 
         return result
