@@ -2007,6 +2007,12 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 toolsets=normalized_lists["toolsets"],
                 max_runtime_seconds=fix_spec.get("max_runtime_seconds"),
             )
+            # Reject an invented profile before it becomes a fix card the
+            # dispatcher can never spawn (BUILD-743; same untrusted tool
+            # ingress class as kanban_create's BUILD-661 guard). A typo like
+            # "publisher" would otherwise strand the remediation in 'ready'.
+            if fix.assignee and not kb.assignee_is_dispatchable(fix.assignee):
+                return tool_error(kb.unknown_assignee_error(fix.assignee))
         else:
             fix = kb.ExistingFixTask(task_id=str(fix_task_id).strip())
 

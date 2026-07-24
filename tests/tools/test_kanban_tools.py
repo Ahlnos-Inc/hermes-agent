@@ -1388,6 +1388,34 @@ def test_request_rework_requires_exactly_one_fix_form(worker_env):
     assert "exactly one" in both["error"]
 
 
+@pytest.mark.real_assignee_guard
+def test_request_rework_rejects_unknown_profile_fix_assignee(worker_env, monkeypatch):
+    """BUILD-743: a NewFixTask spawned via request_rework with an invented
+    profile name must be rejected up front — same guard as BUILD-661's
+    kanban_create — instead of stranding the fix card in 'ready' forever."""
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    out = json.loads(kt._handle_request_rework({
+        "finding": "review caught a P1 defect",
+        "request_key": "rework-guard-unknown",
+        "fix": {"title": "fix it", "assignee": "publisher"},
+    }))
+    assert out.get("error")
+    assert "publisher" in out["error"]
+
+    # A known lane clears the guard (may proceed to a terminal control, but
+    # never the unknown-assignee error).
+    ok = kt._handle_request_rework({
+        "finding": "review caught a P1 defect",
+        "request_key": "rework-guard-known",
+        "fix": {"title": "fix it", "assignee": "orion-cc"},
+    })
+    if isinstance(ok, str):
+        assert "orion-cc" not in json.loads(ok).get("error", "")
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:
