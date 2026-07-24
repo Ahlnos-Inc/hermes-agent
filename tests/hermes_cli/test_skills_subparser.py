@@ -3,7 +3,7 @@
 import argparse
 
 
-def test_no_duplicate_skills_subparser():
+def test_no_duplicate_skills_subparser(purged_hermes_modules):
     """Ensure 'skills' subparser is only registered once to avoid Python 3.11+ crash.
 
     Python 3.11 changed argparse to raise an exception on duplicate subparser
@@ -17,11 +17,9 @@ def test_no_duplicate_skills_subparser():
     # Force fresh import of the module where parser is constructed
     # If there are duplicate 'skills' subparsers, this import will raise
     # argparse.ArgumentError at module load time
-    import sys
-
-    # Remove cached module if present
-    if 'hermes_cli.main' in sys.modules:
-        del sys.modules['hermes_cli.main']
+    # The purged_hermes_modules fixture already cleared the cached module and
+    # restores the whole tree at teardown, so the fresh import below can't leak
+    # a second hermes_cli.main identity into the rest of the run (BUILD-632).
 
     try:
         import hermes_cli.main  # noqa: F401

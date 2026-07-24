@@ -2176,7 +2176,7 @@ class TestRunPreUpdateBackup:
     user-facing output."""
 
     @pytest.fixture
-    def hermes_home(self, tmp_path, monkeypatch):
+    def hermes_home(self, tmp_path, monkeypatch, purged_hermes_modules):
         root = tmp_path / ".hermes"
         root.mkdir()
         _make_hermes_tree(root)
@@ -2184,10 +2184,13 @@ class TestRunPreUpdateBackup:
         monkeypatch.setenv("HERMES_HOME", str(root))
         # Make Path.home() point at tmp_path for anything that uses it
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        # Bust caches for hermes_cli.config + hermes_constants so they pick up HERMES_HOME
-        for mod in list(__import__("sys").modules.keys()):
-            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del __import__("sys").modules[mod]
+        # purged_hermes_modules already cleared the hermes_cli tree so config +
+        # hermes_constants pick up this HERMES_HOME, and restores the whole tree
+        # at teardown. Without that restore the re-imported modules leaked into
+        # every later test in the process and their
+        # `patch("hermes_cli.config...")` targets resolved to a module the code
+        # under test wasn't calling (BUILD-632). _set_mode's mid-test purge is
+        # covered by the same teardown.
         return root
 
     @staticmethod

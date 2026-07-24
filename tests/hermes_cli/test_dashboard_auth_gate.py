@@ -15,6 +15,26 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _restore_app_state():
+    """Return ``web_server.app.state`` to what it was before each test.
+
+    ``web_server.app`` is a module-level FastAPI singleton, and the tests here
+    set ``auth_required`` / ``bound_host`` directly or via a real
+    ``start_server()`` call. Every leftover value is then read by
+    ``_require_token`` and ``host_header_middleware`` for the rest of the
+    process, which is why unrelated dashboard/web-server files 401 or 400 in a
+    wide run and pass in isolation (BUILD-632).
+    """
+    snapshot = dict(vars(web_server.app.state))
+    try:
+        yield
+    finally:
+        state = vars(web_server.app.state)
+        state.clear()
+        state.update(snapshot)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

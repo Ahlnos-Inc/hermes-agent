@@ -86,7 +86,9 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
 
 
-def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
+def test_main_import_applies_user_env_over_shell_values(
+    tmp_path, monkeypatch, purged_hermes_modules,
+):
     home = tmp_path / "hermes"
     home.mkdir()
     (home / ".env").write_text(
@@ -98,7 +100,9 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://old.example/v1")
     monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
 
-    sys.modules.pop("hermes_cli.main", None)
+    # purged_hermes_modules, not a raw pop: the whole re-imported tree must be
+    # dropped at teardown, or later tests patch one module object while the code
+    # under test calls another (BUILD-632).
     importlib.import_module("hermes_cli.main")
 
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
