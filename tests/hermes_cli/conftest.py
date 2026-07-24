@@ -5,6 +5,48 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _close_kanban_db_connections():
+    """Close every kanban.db connection a test opens (BUILD-710).
+
+    Tests overwhelmingly reach the DB via ``with kb.connect() as conn:`` (600+
+    call sites), but sqlite3's built-in connection context manager only
+    commits/rollbacks the transaction — it never closes the file descriptor
+    (this is exactly why ``kanban_db.connect_closing`` exists; see #33159). One
+    file at a time this is invisible, but across this package's ~9500 tests the
+    unclosed ``kanban.db`` + ``kanban.db-wal`` handles accumulate until the
+    process hits the fd limit and two threads wedge on the WAL lock, deadlocking
+    the whole suite so it can't run as a single merge-gate process.
+
+    Rather than rewrite every call site, wrap the single fd-opening funnel
+    ``_sqlite_connect`` to record each connection and close them all at test
+    teardown. Idempotent with ``connect_closing`` (double-close is a no-op) and
+    safe because the kernel keeps no connection pool — every ``connect()`` opens
+    an independent handle.
+    """
+    import hermes_cli.kanban_db as kdb
+
+    opened: list = []
+    real_sqlite_connect = kdb._sqlite_connect
+
+    def _tracking_sqlite_connect(*args, **kwargs):
+        conn = real_sqlite_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    kdb._sqlite_connect = _tracking_sqlite_connect
+    try:
+        yield
+    finally:
+        kdb._sqlite_connect = real_sqlite_connect
+        for conn in opened:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        opened.clear()
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
