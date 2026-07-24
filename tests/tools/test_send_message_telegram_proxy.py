@@ -100,23 +100,32 @@ class TestSendTelegramStandaloneProxy:
 
         # HTTPXRequest must have been invoked twice, both times with the
         # resolved proxy URL.
+        from tools.send_message_tool import _TELEGRAM_STANDALONE_TIMEOUTS
+
         assert httpx_request_factory.call_count == 2
         for call in httpx_request_factory.call_args_list:
             assert call.kwargs.get("proxy") == proxy_url, (
                 f"HTTPXRequest called without proxy={proxy_url!r}: {call.kwargs!r}"
             )
+            # Explicit bounded timeouts ride alongside the proxy (BUILD-731).
+            for key, value in _TELEGRAM_STANDALONE_TIMEOUTS.items():
+                assert call.kwargs.get(key) == value
 
         # And the bot was actually used to send.
         bot.send_message.assert_awaited_once()
 
-    def test_no_proxy_env_uses_plain_bot(
+    def test_no_proxy_env_uses_explicit_bounded_timeouts(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Without TELEGRAM_PROXY (and no inherited HTTPS_PROXY/etc), Bot()
-        is constructed plainly — no ``request``/``get_updates_request``
-        kwargs, and HTTPXRequest is not invoked at all.
+        """Without TELEGRAM_PROXY, the standalone path still constructs
+        HTTPXRequest with the explicit bounded connect/read/write/pool
+        timeouts (BUILD-731) — but with NO proxy — so a wedged connection
+        can't hang; it is not the old plain ``Bot(token=...)``.
         """
-        from tools.send_message_tool import _send_telegram
+        from tools.send_message_tool import (
+            _send_telegram,
+            _TELEGRAM_STANDALONE_TIMEOUTS,
+        )
 
         # Wipe every env var resolve_proxy_url() inspects so the host's
         # ambient proxy settings can't flip this test green-or-red.
@@ -151,7 +160,43 @@ class TestSendTelegramStandaloneProxy:
         call_args = bot_factory.call_args.args
         # token may be passed positionally or as a kwarg; either is fine.
         assert call_kwargs.get("token", call_args[0] if call_args else None) == "tok"
-        assert "request" not in call_kwargs
-        assert "get_updates_request" not in call_kwargs
-        httpx_request_factory.assert_not_called()
+        assert "request" in call_kwargs
+        assert "get_updates_request" in call_kwargs
+        # HTTPXRequest built twice, each with the explicit bounded timeouts and
+        # no proxy.
+        assert httpx_request_factory.call_count == 2
+        for call in httpx_request_factory.call_args_list:
+            assert call.kwargs.get("proxy") is None
+            for key, value in _TELEGRAM_STANDALONE_TIMEOUTS.items():
+                assert call.kwargs.get(key) == value
         bot.send_message.assert_awaited_once()
+
+    def test_send_timeout_is_bounded_structured_and_credential_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BUILD-731: a Telegram send timeout returns a structured error (no
+        unhandled exception), is bounded (a bare ``Timed out`` is not retried,
+        to avoid a duplicate), and never leaks the bot token."""
+        from tools.send_message_tool import _send_telegram
+
+        for var in ("TELEGRAM_PROXY", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=Exception("Timed out"))
+        bot_factory = MagicMock(return_value=bot)
+        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw))
+        _install_telegram_mock_with_request(monkeypatch, bot_factory, httpx_request_factory)
+
+        result: dict[str, Any] = asyncio.run(
+            _send_telegram("super-secret-token", "123", "hello world")
+        )
+
+        assert "error" in result and "Timed out" in result["error"]
+        # Bounded: a bare timeout is re-raised after a single attempt (never a
+        # retry loop) since the send may already be in flight.
+        assert bot.send_message.await_count == 1
+        # Credential-safe: the token must not appear in the surfaced error.
+        assert "super-secret-token" not in result["error"]

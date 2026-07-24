@@ -152,6 +152,22 @@ def _display_chat_id(platform_name: str, chat_id: str) -> str:
     return chat_id
 
 
+# Explicit, bounded HTTPX request timeouts for the STANDALONE Telegram send
+# path (BUILD-731). A cron/standalone delivery must not hang on a wedged
+# socket, and the effective connect/read/write/pool budget belongs pinned here
+# rather than inherited implicitly from python-telegram-bot's defaults (which
+# happen to match, but are not part of our contract). Seconds. A bare
+# ``Timed out`` from these is deliberately NOT retried (see
+# ``_telegram_retry_delay``) — the send may already be in flight, so retrying
+# risks a duplicate; the caller records a structured, bounded failure instead.
+_TELEGRAM_STANDALONE_TIMEOUTS = {
+    "connect_timeout": 5.0,
+    "read_timeout": 5.0,
+    "write_timeout": 5.0,
+    "pool_timeout": 1.0,
+}
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -1160,14 +1176,26 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 logger.info("send_message: standalone Telegram send routed through proxy %s", _tg_proxy)
                 bot = Bot(
                     token=token,
-                    request=HTTPXRequest(proxy=_tg_proxy),
-                    get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                    request=HTTPXRequest(proxy=_tg_proxy, **_TELEGRAM_STANDALONE_TIMEOUTS),
+                    get_updates_request=HTTPXRequest(proxy=_tg_proxy, **_TELEGRAM_STANDALONE_TIMEOUTS),
                 )
             except Exception as _proxy_err:
                 logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
                 bot = Bot(token=token)
         else:
-            bot = Bot(token=token)
+            # Pin explicit bounded request timeouts (BUILD-731) so a wedged
+            # connection surfaces as a bounded, structured failure instead of a
+            # hang. Falls back to library defaults if HTTPXRequest is
+            # unavailable (e.g. a stubbed telegram module in tests).
+            try:
+                from telegram.request import HTTPXRequest
+                bot = Bot(
+                    token=token,
+                    request=HTTPXRequest(**_TELEGRAM_STANDALONE_TIMEOUTS),
+                    get_updates_request=HTTPXRequest(**_TELEGRAM_STANDALONE_TIMEOUTS),
+                )
+            except Exception:
+                bot = Bot(token=token)
         from plugins.platforms.telegram.telegram_ids import (
             normalize_telegram_chat_id,
         )

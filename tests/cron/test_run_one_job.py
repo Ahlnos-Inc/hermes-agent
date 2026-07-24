@@ -274,3 +274,69 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_records_telegram_delivery_timeout_per_job(monkeypatch):
+    """BUILD-731: when the Telegram delivery times out, the scheduler records
+    the structured delivery failure against the affected job (delivery_error),
+    marks the run, and no exception escapes."""
+    marks = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        return (True, "out", "final response", None)
+
+    # Simulate _deliver_result surfacing the standalone Telegram timeout string
+    # (what _send_telegram returns on a bare "Timed out").
+    def timeout_deliver(job, content, adapters=None, loop=None):
+        return "telegram:-100123:0: Telegram send failed: Timed out"
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", timeout_deliver)
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append(
+            (jid, ok, delivery_error)
+        ),
+    )
+
+    ok = s.run_one_job({"id": "5ec10bfd9b43", "name": "reminder"})
+
+    assert ok is True  # the job itself succeeded; only delivery failed
+    assert len(marks) == 1
+    jid, run_ok, delivery_error = marks[0]
+    assert jid == "5ec10bfd9b43"
+    assert delivery_error is not None
+    assert "Timed out" in delivery_error
+
+
+def test_run_one_job_records_delivery_error_when_delivery_raises(monkeypatch):
+    """BUILD-731: even if _deliver_result raises, the scheduler still records a
+    bounded, job-tagged delivery_error rather than letting it escape."""
+    marks = []
+
+    monkeypatch.setattr(
+        s, "run_job",
+        lambda job, *, defer_agent_teardown=None: (True, "out", "final", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+
+    def raising_deliver(job, content, adapters=None, loop=None):
+        raise TimeoutError("Telegram send failed: Timed out")
+
+    monkeypatch.setattr(s, "_deliver_result", raising_deliver)
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append(
+            (jid, ok, delivery_error)
+        ),
+    )
+
+    ok = s.run_one_job({"id": "job-x", "name": "reminder"})
+
+    assert ok is True
+    assert len(marks) == 1
+    jid, _run_ok, delivery_error = marks[0]
+    assert jid == "job-x"
+    assert delivery_error is not None
+    assert "Timed out" in delivery_error
