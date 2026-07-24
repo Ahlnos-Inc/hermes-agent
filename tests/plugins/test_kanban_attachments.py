@@ -348,11 +348,14 @@ def test_store_attachment_bytes_resolves_collisions(kanban_home):
 def test_store_attachment_bytes_unknown_task_leaves_no_blob(kanban_home):
     conn = kb.connect()
     try:
+        # Use a well-formed but nonexistent task id: BUILD-711 rejects non-hex
+        # ids at the filesystem boundary, so the "unknown task" ValueError must
+        # come from the metadata insert, not id validation.
         with pytest.raises(ValueError):
-            kb.store_attachment_bytes(conn, "t_nope", "x.txt", b"x")
+            kb.store_attachment_bytes(conn, "t_deadbeef", "x.txt", b"x")
         # The per-task dir may get created, but no blob should survive the
         # failed metadata insert.
-        d = kb.task_attachments_dir("t_nope")
+        d = kb.task_attachments_dir("t_deadbeef")
         assert not d.exists() or list(d.iterdir()) == []
     finally:
         conn.close()
