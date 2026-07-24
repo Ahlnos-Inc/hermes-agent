@@ -189,3 +189,51 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
+
+
+# ---------------------------------------------------------------------------
+# BUILD-625: caught handler-exception text is force-redacted before it reaches
+# the tool JSON (the transport redaction pass runs only later).
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_comment_handler_exception_text_is_redacted(worker_env, monkeypatch):
+    """A credential-shaped value inside a caught handler exception must be
+    redacted in the returned tool error, not leaked into the tool JSON."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "ghp_" + "E" * 40
+
+    def boom(*_a, **_k):
+        raise RuntimeError(f"connection url leaked {secret}")
+
+    monkeypatch.setattr(kb, "add_comment", boom)
+
+    out = json.loads(kt._handle_comment({"task_id": worker_env, "body": "hi"}))
+    assert out.get("error"), out          # non-success result
+    assert "kanban_comment" in out["error"]  # actionable prefix preserved
+    assert secret not in json.dumps(out)   # credential redacted
+
+
+def test_kanban_comment_persists_exactly_once_and_shows(worker_env):
+    """A successful comment persists exactly once and is readable via show."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    body = "audit trail entry alpha"
+    out = json.loads(kt._handle_comment({"task_id": worker_env, "body": body}))
+    assert out.get("ok") is True and out.get("comment_id")
+
+    conn = kb.connect()
+    try:
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? AND body = ?",
+            (worker_env, body),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert count == 1
+
+    shown = kt._handle_show({"task_id": worker_env, "detail": "full"})
+    assert body in shown

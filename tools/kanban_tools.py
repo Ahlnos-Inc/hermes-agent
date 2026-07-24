@@ -495,6 +495,21 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
+def _redacted_tool_error(prefix: str, exc: BaseException) -> str:
+    """``tool_error`` for a caught Kanban-handler exception, with the exception
+    text routed through forced redaction (BUILD-625).
+
+    A generic handler ``except`` branch must never emit a raw exception string
+    into the tool JSON: an error message can echo a credential-shaped input (a
+    token in a connection URL, a secret in a rejected value), and that JSON is
+    produced BEFORE the transport/formatter redaction pass. We keep the
+    sanitized exception type + message — actionable for debugging — but never
+    the raw exception object or a traceback.
+    """
+    detail = redact_sensitive_text(f"{type(exc).__name__}: {exc}", force=True)
+    return tool_error(f"{prefix}: {detail}")
+
+
 class KanbanTerminalAction(str, Enum):
     """Worker lifecycle transitions that end the current agent run."""
 
@@ -1541,10 +1556,10 @@ def _handle_show(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         # Invalid board slug surfaces as ValueError from _normalize_board_slug.
-        return tool_error(f"kanban_show: {e}")
+        return _redacted_tool_error("kanban_show", e)
     except Exception as e:
         logger.exception("kanban_show failed")
-        return tool_error(f"kanban_show: {e}")
+        return _redacted_tool_error("kanban_show", e)
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -1604,10 +1619,10 @@ def _handle_list(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_list: {e}")
+        return _redacted_tool_error("kanban_list", e)
     except Exception as e:
         logger.exception("kanban_list failed")
-        return tool_error(f"kanban_list: {e}")
+        return _redacted_tool_error("kanban_list", e)
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -1840,10 +1855,10 @@ def _handle_complete(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_complete: {e}")
+        return _redacted_tool_error("kanban_complete", e)
     except Exception as e:
         logger.exception("kanban_complete failed")
-        return tool_error(f"kanban_complete: {e}")
+        return _redacted_tool_error("kanban_complete", e)
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1939,10 +1954,10 @@ def _handle_block(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_block: {e}")
+        return _redacted_tool_error("kanban_block", e)
     except Exception as e:
         logger.exception("kanban_block failed")
-        return tool_error(f"kanban_block: {e}")
+        return _redacted_tool_error("kanban_block", e)
 
 
 def _handle_request_rework(args: dict, **kw) -> str:
@@ -2070,10 +2085,10 @@ def _handle_request_rework(args: dict, **kw) -> str:
             if conn is not None:
                 conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_request_rework: {e}")
+        return _redacted_tool_error("kanban_request_rework", e)
     except Exception as e:
         logger.exception("kanban_request_rework failed")
-        return tool_error(f"kanban_request_rework: {e}")
+        return _redacted_tool_error("kanban_request_rework", e)
 
 
 def _handle_request_publication(args: dict, **kw) -> str:
@@ -2188,10 +2203,10 @@ def _handle_request_publication(args: dict, **kw) -> str:
             if conn is not None:
                 conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_request_publication: {e}")
+        return _redacted_tool_error("kanban_request_publication", e)
     except Exception as e:
         logger.exception("kanban_request_publication failed")
-        return tool_error(f"kanban_request_publication: {e}")
+        return _redacted_tool_error("kanban_request_publication", e)
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -2239,10 +2254,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_heartbeat: {e}")
+        return _redacted_tool_error("kanban_heartbeat", e)
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
-        return tool_error(f"kanban_heartbeat: {e}")
+        return _redacted_tool_error("kanban_heartbeat", e)
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -2331,10 +2346,10 @@ def _handle_comment(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_comment: {e}")
+        return _redacted_tool_error("kanban_comment", e)
     except Exception as e:
         logger.exception("kanban_comment failed")
-        return tool_error(f"kanban_comment: {e}")
+        return _redacted_tool_error("kanban_comment", e)
 
 
 def _worker_architecture_context(kb: Any, conn: Any) -> Any:
@@ -2700,10 +2715,10 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
         finally:
             conn.close()
     except (ValueError, TypeError) as e:
-        return tool_error(f"kanban_compile_workflow: {e}")
+        return _redacted_tool_error("kanban_compile_workflow", e)
     except Exception as e:
         logger.exception("kanban_compile_workflow failed")
-        return tool_error(f"kanban_compile_workflow: {e}")
+        return _redacted_tool_error("kanban_compile_workflow", e)
 
 
 def _trusted_front_door_architecture_context(
@@ -3031,12 +3046,12 @@ def _handle_attach(args: dict, **kw) -> str:
             finally:
                 conn.close()
         except kb.AttachmentTooLarge as e:
-            return tool_error(f"kanban_attach: {e}")
+            return _redacted_tool_error("kanban_attach", e)
         except (ValueError, OSError) as e:
-            return tool_error(f"kanban_attach: {e}")
+            return _redacted_tool_error("kanban_attach", e)
         except Exception as e:
             logger.exception("kanban_attach path failed")
-            return tool_error(f"kanban_attach: {e}")
+            return _redacted_tool_error("kanban_attach", e)
 
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
@@ -3066,12 +3081,12 @@ def _handle_attach(args: dict, **kw) -> str:
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
-        return tool_error(f"kanban_attach: {e}")
+        return _redacted_tool_error("kanban_attach", e)
     except ValueError as e:
-        return tool_error(f"kanban_attach: {e}")
+        return _redacted_tool_error("kanban_attach", e)
     except Exception as e:
         logger.exception("kanban_attach failed")
-        return tool_error(f"kanban_attach: {e}")
+        return _redacted_tool_error("kanban_attach", e)
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -3170,7 +3185,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
-        return tool_error(f"kanban_attach_url: {e}")
+        return _redacted_tool_error("kanban_attach_url", e)
     except Exception as e:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
@@ -3190,12 +3205,12 @@ def _handle_attach_url(args: dict, **kw) -> str:
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
-        return tool_error(f"kanban_attach_url: {e}")
+        return _redacted_tool_error("kanban_attach_url", e)
     except ValueError as e:
-        return tool_error(f"kanban_attach_url: {e}")
+        return _redacted_tool_error("kanban_attach_url", e)
     except Exception as e:
         logger.exception("kanban_attach_url failed")
-        return tool_error(f"kanban_attach_url: {e}")
+        return _redacted_tool_error("kanban_attach_url", e)
 
 
 def _handle_attachments(args: dict, **kw) -> str:
@@ -3231,10 +3246,10 @@ def _handle_attachments(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_attachments: {e}")
+        return _redacted_tool_error("kanban_attachments", e)
     except Exception as e:
         logger.exception("kanban_attachments failed")
-        return tool_error(f"kanban_attachments: {e}")
+        return _redacted_tool_error("kanban_attachments", e)
 
 
 
@@ -3470,10 +3485,10 @@ def _handle_create(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_create: {e}")
+        return _redacted_tool_error("kanban_create", e)
     except Exception as e:
         logger.exception("kanban_create failed")
-        return tool_error(f"kanban_create: {e}")
+        return _redacted_tool_error("kanban_create", e)
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -3597,10 +3612,10 @@ def _handle_unblock(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return tool_error(f"kanban_unblock: {e}")
+        return _redacted_tool_error("kanban_unblock", e)
     except Exception as e:
         logger.exception("kanban_unblock failed")
-        return tool_error(f"kanban_unblock: {e}")
+        return _redacted_tool_error("kanban_unblock", e)
 
 
 def _handle_link(args: dict, **kw) -> str:
@@ -3619,10 +3634,10 @@ def _handle_link(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         # Covers cycle + self-parent rejections
-        return tool_error(f"kanban_link: {e}")
+        return _redacted_tool_error("kanban_link", e)
     except Exception as e:
         logger.exception("kanban_link failed")
-        return tool_error(f"kanban_link: {e}")
+        return _redacted_tool_error("kanban_link", e)
 
 
 # ---------------------------------------------------------------------------
