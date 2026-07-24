@@ -900,6 +900,16 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+# Bounded retry for a *transient* filesystem error while acquiring the
+# embedded dispatcher's singleton lock (BUILD-634). The 2026-07-20 incident
+# was two detections 4s apart — a transient blip that a short retry recovers
+# from, instead of leaving the gateway permanently without dispatch until an
+# operator restart. Only the "error" state is retried; "contended" and
+# "unavailable" are stable and never retried.
+_SINGLETON_LOCK_RETRY_ATTEMPTS = 3
+_SINGLETON_LOCK_RETRY_DELAY_SECONDS = 0.5
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -929,8 +939,20 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     try:
         Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
         handle = open(str(lock_path), "a+", encoding="utf-8")
-    except OSError:
-        return None, "unavailable"
+    except OSError as exc:
+        # A filesystem error acquiring the lock (ENOSPC / EACCES / EROFS / EIO,
+        # or a transient blip) is distinct from "this platform cannot flock":
+        # it is often transient and worth a bounded retry, and the errno belongs
+        # in diagnostics. Classify it as "error" — separate from the stable
+        # "unavailable" (can't lock at all) and "contended" (a live holder)
+        # states — so the caller can retry it and only it. BUILD-634.
+        logger.warning(
+            "kanban dispatcher: filesystem error acquiring singleton lock at "
+            "%s: %s",
+            lock_path,
+            exc,
+        )
+        return None, "error"
     if not _try_acquire_file_lock(handle):
         handle.close()
         return None, "contended"
@@ -2324,6 +2346,26 @@ class GatewayKanbanWatchersMixin:
         _lock_path = dispatcher_singleton_lock_path()
         try:
             _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+            # Bounded retry for a *transient* filesystem error only — never for
+            # "contended" (a live holder) or "unavailable" (can't flock), which
+            # are stable. This keeps the singleton guarantee intact (a held lock
+            # is never overridden) while recovering from a filesystem blip
+            # instead of refusing dispatch until an operator restart. BUILD-634.
+            _attempt = 1
+            while (
+                _lock_state == "error"
+                and _attempt < _SINGLETON_LOCK_RETRY_ATTEMPTS
+            ):
+                logger.warning(
+                    "kanban dispatcher: singleton lock acquisition hit a "
+                    "filesystem error at %s; retrying (attempt %d/%d).",
+                    _lock_path,
+                    _attempt + 1,
+                    _SINGLETON_LOCK_RETRY_ATTEMPTS,
+                )
+                await asyncio.sleep(_SINGLETON_LOCK_RETRY_DELAY_SECONDS)
+                _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+                _attempt += 1
         except Exception as exc:
             logger.error(
                 "kanban dispatcher: refusing to start embedded dispatcher — "
@@ -2339,9 +2381,21 @@ class GatewayKanbanWatchersMixin:
                 "lock (%s); this gateway will NOT dispatch.", _lock_path,
             )
             return
-        if _lock_state == "held":
+        if _lock_state == "held" and _lock_handle is not None:
+            # Verified: we own the lock (non-None handle) before startup.
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+        elif _lock_state == "error":
+            logger.error(
+                "kanban dispatcher: refusing to start embedded dispatcher — "
+                "singleton lock at %s still failing with a filesystem error "
+                "after %d attempts; config kanban.dispatch_in_gateway=true "
+                "cannot be honored safely. Fix the locking filesystem and "
+                "restart the gateway.",
+                _lock_path,
+                _SINGLETON_LOCK_RETRY_ATTEMPTS,
+            )
+            return
         else:
             logger.error(
                 "kanban dispatcher: refusing to start embedded dispatcher — "

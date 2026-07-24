@@ -2931,10 +2931,13 @@ def _dispatcher_singleton_guard(*, command: str):
         yield False
         return
 
-    if lock_state == "unavailable":
+    if lock_state in ("unavailable", "error"):
+        detail = (
+            "hit a filesystem error" if lock_state == "error" else "is unavailable"
+        )
         print(
             f"hermes kanban {command}: refusing — the singleton lock at "
-            f"{lock_path} is unavailable. Dispatch cannot run without a "
+            f"{lock_path} {detail}. Dispatch cannot run without a "
             "working singleton lock; fix the locking environment and retry.",
             file=sys.stderr,
         )

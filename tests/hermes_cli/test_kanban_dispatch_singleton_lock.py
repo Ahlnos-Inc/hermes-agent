@@ -330,3 +330,119 @@ def test_run_slash_dispatch_accepts_force_flag(kanban_home):
     surface (not just via a hand-built argparse.Namespace)."""
     out = kb_cli.run_slash("dispatch --dry-run --force")
     assert "Spawned:" in out
+
+
+# ---------------------------------------------------------------------------
+# BUILD-634: embedded dispatcher singleton-lock filesystem-error handling
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_singleton_lock_classifies_filesystem_error(tmp_path):
+    """AC1: a filesystem error acquiring the lock returns the distinct
+    ``error`` state (retryable), not ``unavailable`` (can't-flock, stable)."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")  # a regular file where a directory would be needed
+    lock_path = blocker / ".dispatcher.lock"  # mkdir(parents=True) under a file → OSError
+
+    handle, state = _acquire_singleton_lock(lock_path)
+
+    assert handle is None
+    assert state == "error"
+
+
+def _make_dispatcher_runner(monkeypatch, *, running):
+    import gateway.kanban_watchers as watchers_mod
+    import hermes_cli.config as config_mod
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = running
+    monkeypatch.setattr(
+        config_mod, "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    # Zero the backoff so the retry loop doesn't add real wall-clock delay.
+    monkeypatch.setattr(watchers_mod, "_SINGLETON_LOCK_RETRY_DELAY_SECONDS", 0)
+
+    # Collapse the watcher's asyncio.sleep calls (retry backoff + the 5s
+    # startup delay before the dispatch loop) so the coroutine returns
+    # promptly. asyncio.wait_for doesn't use asyncio.sleep, so this is safe.
+    async def _instant_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(watchers_mod.asyncio, "sleep", _instant_sleep)
+    return runner, watchers_mod
+
+
+def test_gateway_dispatcher_retries_transient_lock_filesystem_error(
+    kanban_home, monkeypatch, caplog,
+):
+    """AC3: a transient filesystem error is retried; once the lock is acquired,
+    ownership is verified (non-None handle) before startup."""
+    import asyncio
+    import logging
+
+    # _running=False so the watcher returns after acquiring the lock without
+    # entering the dispatch loop — we only assert the retry+ownership outcome.
+    runner, watchers_mod = _make_dispatcher_runner(monkeypatch, running=False)
+
+    fake_handle = object()
+    seq = [(None, "error"), (fake_handle, "held")]
+    state = {"n": 0}
+
+    def flaky_acquire(_path):
+        result = seq[min(state["n"], len(seq) - 1)]
+        state["n"] += 1
+        return result
+
+    monkeypatch.setattr(watchers_mod, "_acquire_singleton_lock", flaky_acquire)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0)
+        )
+
+    # Retried exactly once after the transient error, then acquired + started.
+    # (The lock handle is released + nulled on watcher exit, so ownership is
+    # asserted via the log trail rather than the post-return attribute.)
+    assert state["n"] == 2
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("retrying" in m.lower() for m in messages)
+    assert any("holding singleton dispatcher lock" in m for m in messages)
+    assert any("embedded in gateway" in m for m in messages)
+
+
+def test_gateway_refuses_after_lock_filesystem_error_retries_exhausted(
+    kanban_home, monkeypatch, caplog,
+):
+    """AC2/AC4: a persistent filesystem error exhausts the bounded retry and
+    the gateway starts no embedded dispatcher (no second dispatcher)."""
+    import asyncio
+    import logging
+
+    runner, watchers_mod = _make_dispatcher_runner(monkeypatch, running=True)
+
+    monkeypatch.setattr(
+        watchers_mod, "_acquire_singleton_lock", lambda _p: (None, "error"),
+    )
+
+    dispatch_started = []
+
+    async def unexpected_dispatch(*_args, **_kwargs):
+        dispatch_started.append(True)
+        raise AssertionError("dispatcher loop must not start without its lock")
+
+    monkeypatch.setattr(watchers_mod.asyncio, "to_thread", unexpected_dispatch)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0)
+        )
+
+    assert dispatch_started == []
+    assert runner._kanban_dispatcher_lock_handle is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "filesystem error" in m and "refusing" in m.lower() and "attempts" in m
+        for m in messages
+    )
