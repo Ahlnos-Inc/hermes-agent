@@ -549,6 +549,16 @@ _UPDATER_START_TIMEOUT = 30.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
+# PTB's Updater.start_polling() runs an internal bootstrap (deleteWebhook +
+# initial getUpdates) whose network-retry-loop defaults to bootstrap_retries=0,
+# i.e. it aborts on the FIRST transient timeout ("Network Retry Loop (Bootstrap
+# delete Webhook): Timed out ... Failed run number 0 of 0. Aborting"). That
+# abort then bubbles to `_start_polling_resilient`, which schedules a full
+# background reconnect for what is usually a one-off blip. Giving the bootstrap
+# a small bounded retry budget lets these transient webhook/getUpdates timeouts
+# self-heal inside PTB before we escalate. Bounded so a genuinely unreachable
+# endpoint still fails fast into our own reconnect ladder. Refs: BUILD-586.
+_BOOTSTRAP_RETRIES = 2
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
@@ -2167,6 +2177,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
                     error_callback=_generation_error_callback,
+                    bootstrap_retries=_BOOTSTRAP_RETRIES,
                 ),
                 timeout=_UPDATER_START_TIMEOUT,
             )

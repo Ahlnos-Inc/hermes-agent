@@ -137,6 +137,49 @@ async def test_start_polling_success_path_unaffected(monkeypatch):
     app.updater.start_polling.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_bootstrap_start_polling_uses_bounded_retries(monkeypatch):
+    """BUILD-586: the bootstrap start_polling() must pass a bounded, non-zero
+    bootstrap_retries so PTB's internal deleteWebhook/getUpdates network-retry
+    loop self-heals a transient timeout instead of aborting on the first blip
+    ("Failed run number 0 of 0. Aborting"), which otherwise bubbles up and
+    triggers a full background reconnect for a one-off blip."""
+    monkeypatch.setattr(tg_adapter, "_UPDATER_START_TIMEOUT", 5.0)
+    a = _bare_adapter()
+
+    app = MagicMock()
+    app.updater = AsyncMock()
+    app.updater.start_polling = AsyncMock(return_value=None)
+    a._app = app
+
+    ok = await a._start_polling_resilient(drop_pending_updates=False, error_callback=None)
+    assert ok is True
+    _, kwargs = app.updater.start_polling.await_args
+    assert kwargs["bootstrap_retries"] == tg_adapter._BOOTSTRAP_RETRIES
+    # Bounded: non-zero (so it retries) but small (so an unreachable endpoint
+    # still fails fast into our own reconnect ladder, not an infinite loop).
+    assert 0 < tg_adapter._BOOTSTRAP_RETRIES <= 5
+
+
+def test_polling_request_timeouts_are_explicit_and_bounded():
+    """BUILD-585: the polling/get_updates HTTPXRequest must use explicit,
+    bounded connect/read/write/pool timeouts (not PTB's undocumented implicit
+    defaults, whose aggressive 1s pool timeout produced the get_updates
+    shutdown error). This documents the effective values in code and fails if a
+    future edit drops an explicit timeout back to the implicit default."""
+    import inspect
+
+    src = inspect.getsource(tg_adapter)
+    for key, default in (
+        ("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "10.0"),
+        ("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "20.0"),
+        ("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", "20.0"),
+        ("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", "8.0"),
+    ):
+        assert key in src, f"missing explicit timeout knob {key}"
+        assert f'"{key}", {default}' in src, f"{key} default drifted from documented {default}"
+
+
 def test_every_start_polling_call_site_is_time_bounded():
     """Bug-class contract: every `updater.start_polling(` await in the adapter
     must be wrapped in asyncio.wait_for. A new unbounded call site reintroduces
