@@ -2185,6 +2185,48 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_architecture_gates_active_scope
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+# The tables a healthy board must have, derived from SCHEMA_SQL so this set can
+# never drift from the DDL. A board that is readable (passes integrity_check)
+# but missing one of these — e.g. an interrupted table rebuild, or external
+# tooling that dropped a table — fails later with "no such table: <name>"
+# instead of at open. See BUILD-709.
+_CORE_TABLES: frozenset[str] = frozenset(
+    re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA_SQL)
+)
+
+
+def missing_core_tables(conn: sqlite3.Connection) -> list[str]:
+    """Return the core kanban tables absent from ``conn``'s DB (sorted).
+
+    ``PRAGMA integrity_check`` validates b-tree structure but passes a DB
+    that is simply missing a table, so this catalog scan is the detector for
+    the BUILD-709 failure class. Empty list = schema complete.
+    """
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    return sorted(_CORE_TABLES - present)
+
+
+def repair_missing_core_tables(conn: sqlite3.Connection) -> list[str]:
+    """Idempotently recreate any missing core kanban tables (BUILD-709).
+
+    Returns the tables that were missing (empty = no-op). Uses the canonical
+    ``CREATE TABLE IF NOT EXISTS`` schema, so existing tables and every row in
+    them are untouched — this is a repair, never a destructive replace. Also
+    re-runs the additive migration pass to restore indexes/columns (e.g.
+    ``idx_events_run``) that live outside SCHEMA_SQL.
+    """
+    missing = missing_core_tables(conn)
+    if missing:
+        conn.executescript(SCHEMA_SQL)
+        _migrate_add_optional_columns(conn)
+    return missing
+
+
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
@@ -3372,6 +3414,22 @@ def connect(
                 conn.execute("PRAGMA cell_size_check=ON")
                 needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
+                    # A readable board that is missing some core tables (but not
+                    # all) is a schema anomaly — an interrupted rebuild or an
+                    # external drop — not a fresh empty DB. Surface it loudly,
+                    # naming the tables, before the idempotent DDL recreates them
+                    # (BUILD-709). integrity_check passes such a board, so this
+                    # catalog scan is the only place it is detected. Scoped to
+                    # first-open-per-process (the _INITIALIZED_PATHS cache), so no
+                    # hot-path cost on subsequent cached connects.
+                    missing = missing_core_tables(conn)
+                    if missing and len(missing) < len(_CORE_TABLES):
+                        _log.warning(
+                            "kanban board %s is missing core table(s) %s — "
+                            "recreating idempotently; existing rows preserved "
+                            "(BUILD-709)",
+                            path.name, ", ".join(missing),
+                        )
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same
                     # process are cheap. The lock prevents same-process dispatcher

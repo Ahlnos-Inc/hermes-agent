@@ -163,6 +163,80 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
+def _make_board_missing_task_events(db_path: Path) -> None:
+    """Write a current-schema board, then drop ``task_events`` out of band to
+    simulate the BUILD-709 incident (board readable, task_events gone)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(kb.SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) "
+            "VALUES ('task-keep', 'keep me', 'ready', 1000)"
+        )
+        conn.execute("DROP TABLE task_events")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_missing_task_events_is_detected(tmp_path, monkeypatch):
+    """AC1: a board missing task_events is reported with a diagnostic naming
+    the missing table (integrity_check alone passes on a missing table)."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_board_missing_task_events(db_path)
+    raw = sqlite3.connect(str(db_path))
+    raw.row_factory = sqlite3.Row
+    try:
+        missing = kb.missing_core_tables(raw)
+    finally:
+        raw.close()
+    assert "task_events" in missing
+
+
+def test_connect_repairs_missing_task_events_preserving_rows(tmp_path, monkeypatch, caplog):
+    """AC2/AC5: opening an affected board idempotently recreates task_events
+    (and its index) preserving existing task rows; readback succeeds."""
+    import logging
+
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_board_missing_task_events(db_path)
+    with caplog.at_level(logging.WARNING):
+        with kb.connect(db_path) as conn:
+            tables = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            assert "task_events" in tables
+            idx = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            assert "idx_events_task" in idx
+            keep = kb.get_task(conn, "task-keep")
+            assert keep is not None and keep.title == "keep me"
+            # The write path that used to raise "no such table" now works.
+            kb._append_event(conn, "task-keep", "status", {})
+    assert any("task_events" in r.getMessage() for r in caplog.records)
+
+
+def test_repair_missing_core_tables_is_idempotent_no_op(tmp_path, monkeypatch):
+    """AC3: re-running repair on an already-healthy board changes nothing and
+    preserves rows."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_board_missing_task_events(db_path)
+    with kb.connect(db_path):
+        pass
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        first = kb.repair_missing_core_tables(conn)
+        assert first == []  # already healed → no-op
+        second = kb.repair_missing_core_tables(conn)
+        assert second == []
+        assert kb.get_task(conn, "task-keep") is not None
+
+
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
     """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
     gone after migration; the notifier query returns an integer cursor."""
