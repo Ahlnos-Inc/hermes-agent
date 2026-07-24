@@ -138,6 +138,30 @@ def _classify_dead_from_error_text(error_text: Optional[str]) -> Optional[str]:
     return kind
 
 
+def _classify_dead_from_result(result: Any) -> Optional[str]:
+    """Dead-target classification from a *returned* (not raised) SendResult.
+
+    The Telegram adapter catches provider errors like "Chat not found" and
+    returns ``SendResult(success=False, error_kind="not_found")`` instead of
+    raising, so ``deliver()``'s except-branch never sees them.  Prefer the
+    machine-readable ``error_kind`` when present, but still require a whole-chat
+    (not thread/topic/message-level) not_found before condemning the chat.
+    """
+    kind = _send_result_error_kind(result)
+    error_text = _send_result_error(result)
+    if kind and DeadTargetRegistry.is_dead_error_kind(kind):
+        if kind == "not_found":
+            try:
+                from .platforms.base import is_chat_level_not_found
+            except Exception:  # pragma: no cover - import guard
+                return None
+            if not is_chat_level_not_found(error_text=error_text or ""):
+                return None
+        return kind
+    # error_kind absent (e.g. dict results / older adapters) — fall back to text.
+    return _classify_dead_from_error_text(error_text)
+
+
 @dataclass
 class DeliveryTarget:
     """
@@ -293,10 +317,25 @@ class DeliveryRouter:
                     result = self._deliver_local(content, job_id, job_name, metadata)
                 else:
                     result = await self._deliver_to_platform(target, content, metadata)
-                    # Successful platform delivery — clear any stale dead flag.
-                    if target.chat_id and not _send_result_failed(result):
-                        self.dead_targets.clear(target.platform.value, target.chat_id)
-                
+                    if target.chat_id:
+                        if _send_result_failed(result):
+                            # The adapter caught a provider error (e.g. "Chat
+                            # not found") and *returned* a failed SendResult
+                            # rather than raising, so the except-branch below
+                            # never records it. Condemn a whole-chat death here
+                            # too, so future ticks short-circuit instead of
+                            # silently re-losing the alert every time.
+                            dead_kind = _classify_dead_from_result(result)
+                            if dead_kind:
+                                self.dead_targets.mark_dead(
+                                    target.platform.value, target.chat_id,
+                                    reason=f"{dead_kind}: "
+                                    f"{(_send_result_error(result) or '')[:120]}",
+                                )
+                        else:
+                            # Successful delivery — clear any stale dead flag.
+                            self.dead_targets.clear(target.platform.value, target.chat_id)
+
                 results[target.to_string()] = {
                     "success": True,
                     "result": result

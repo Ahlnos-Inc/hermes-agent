@@ -221,6 +221,70 @@ async def test_thread_or_message_level_not_found_does_not_mark_chat_dead(isolate
     assert router.dead_targets.is_dead("telegram", "200") is False
 
 
+# --------------------------------------------------------------------------
+# Returned (not raised) SendResult failures: the Telegram adapter catches
+# provider errors like "Chat not found" and RETURNS SendResult(success=False,
+# error_kind="not_found") instead of raising (BUILD-606). deliver() must still
+# condemn a whole-chat death on this path, else the alert is silently re-lost
+# every tick.
+# --------------------------------------------------------------------------
+
+class ReturningAdapter:
+    """Returns a fixed SendResult on every send (never raises)."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append(chat_id)
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_returned_chat_not_found_marks_target_dead(isolate):
+    from gateway.platforms.base import SendResult
+
+    adapter = ReturningAdapter(
+        SendResult(success=False, error="Bad Request: chat not found",
+                   error_kind="not_found")
+    )
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:300")
+
+    await router.deliver("hi", [target])
+    assert router.dead_targets.is_dead("telegram", "300") is True
+
+
+@pytest.mark.parametrize("message", _SUBCHAT_NOT_FOUND_MESSAGES)
+@pytest.mark.asyncio
+async def test_returned_subchat_not_found_does_not_mark_chat_dead(isolate, message):
+    from gateway.platforms.base import SendResult
+
+    adapter = ReturningAdapter(
+        SendResult(success=False, error=message, error_kind="not_found")
+    )
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:301")
+
+    await router.deliver("hi", [target])
+    assert router.dead_targets.is_dead("telegram", "301") is False
+
+
+@pytest.mark.asyncio
+async def test_returned_transient_failure_does_not_mark_chat_dead(isolate):
+    from gateway.platforms.base import SendResult
+
+    adapter = ReturningAdapter(
+        SendResult(success=False, error="Timed out", error_kind="timeout")
+    )
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:302")
+
+    await router.deliver("hi", [target])
+    assert router.dead_targets.is_dead("telegram", "302") is False
+
+
 class TestNotFoundBlastRadius:
     def test_is_chat_level_not_found_chat_level(self):
         from gateway.platforms.base import is_chat_level_not_found
