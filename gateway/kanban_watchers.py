@@ -211,6 +211,12 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
     crashes five times in a retry loop pings home once, and the ledger row
     survives restarts (unlike a subscription cursor, which unsubscribed
     tasks don't have).
+
+    A failure the board has since recovered from is NOT delivered: the sweep
+    reaches 72h back five events per tick, so without the superseded guard an
+    old, already-healed block still pages home days later (BUILD-748: seven
+    2026-07-24 02:13 alerts replayed 2026-07-22 blocks, two of which had been
+    resolved and unblocked on 2026-07-22).
     """
     kinds = sorted(FAILURE_KINDS)
     placeholders = ",".join("?" for _ in kinds)
@@ -224,12 +230,16 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
               AND t.status NOT IN ('done', 'archived')
               AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s
                               WHERE s.task_id = e.task_id)
+              AND {SUPERSEDED_EVENT_SQL}
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
                               WHERE nd.delivery_key =
                                   'home-sweep/' || e.task_id || '/' || e.kind)
             ORDER BY e.id
             LIMIT ?""",
-        (*kinds, cutoff, ORPHAN_FAILURE_BATCH_PER_TICK),
+        (
+            *kinds, cutoff, *SUPERSEDED_EVENT_PARAMS,
+            ORPHAN_FAILURE_BATCH_PER_TICK,
+        ),
     ).fetchall()
     out: list[dict] = []
     seen_task_kinds: set[tuple] = set()
@@ -280,6 +290,35 @@ HUMAN_BLOCK_HEALING_STATUSES = (
     "todo", "scheduled", "ready", "running", "done", "archived",
 )
 
+# Lifecycle events that make an EARLIER failure event stale: either the board
+# moved on (unblocked/promoted/dependency recovered/completed) or a newer
+# failure supersedes it as the thing worth reporting. Shared by both alert
+# collectors so the home sweep and the console queue can't drift on what
+# counts as "already handled" (BUILD-748).
+SUPERSEDING_EVENT_KINDS = (
+    "blocked", "block_loop_detected", "gave_up",
+    "unblocked", "promoted", "promoted_manual",
+    "dependency_recovered", "dependency_rearmed",
+    "dependency_materialized", "rework_requested",
+    "completed", "archived", "status",
+)
+SUPERSEDED_EVENT_SQL = f"""NOT EXISTS (
+                  SELECT 1 FROM task_events newer
+                   WHERE newer.task_id = e.task_id
+                     AND newer.id > e.id
+                     AND newer.kind IN (
+                         {",".join("?" for _ in SUPERSEDING_EVENT_KINDS)}
+                     )
+                     AND (
+                         newer.kind != 'status'
+                         OR json_extract(newer.payload, '$.status')
+                            IN ({",".join("?" for _ in HUMAN_BLOCK_HEALING_STATUSES)})
+                     )
+              )"""
+SUPERSEDED_EVENT_PARAMS = (
+    *SUPERSEDING_EVENT_KINDS, *HUMAN_BLOCK_HEALING_STATUSES,
+)
+
 
 def _is_human_block_state(status: Optional[str], block_kind: Optional[str]) -> bool:
     """Whether the task's live projection still requires human attention."""
@@ -306,7 +345,6 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
     placeholders = ",".join("?" for _ in kinds)
     auto_placeholders = ",".join("?" for _ in HUMAN_BLOCK_AUTO_KINDS)
     live_auto_placeholders = ",".join("?" for _ in HUMAN_BLOCK_AUTO_BLOCK_KINDS)
-    healing_placeholders = ",".join("?" for _ in HUMAN_BLOCK_HEALING_STATUSES)
     cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
     rows = conn.execute(
         f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
@@ -324,23 +362,7 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
               )
               AND COALESCE(json_extract(e.payload, '$.kind'), '')
                   NOT IN ({auto_placeholders})
-              AND NOT EXISTS (
-                  SELECT 1 FROM task_events newer
-                   WHERE newer.task_id = e.task_id
-                     AND newer.id > e.id
-                     AND newer.kind IN (
-                         'blocked', 'block_loop_detected', 'gave_up',
-                         'unblocked', 'promoted', 'promoted_manual',
-                         'dependency_recovered', 'dependency_rearmed',
-                         'dependency_materialized', 'rework_requested',
-                         'completed', 'archived', 'status'
-                     )
-                     AND (
-                         newer.kind != 'status'
-                         OR json_extract(newer.payload, '$.status')
-                            IN ({healing_placeholders})
-                     )
-              )
+              AND {SUPERSEDED_EVENT_SQL}
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
                               WHERE nd.delivery_key =
                                   'human-block/' || e.task_id || '/' || e.id)
@@ -348,7 +370,7 @@ def _collect_human_blocked_events(kb, conn) -> "list[dict]":
             LIMIT ?""",
         (
             *kinds, cutoff, *HUMAN_BLOCK_AUTO_BLOCK_KINDS,
-            *HUMAN_BLOCK_AUTO_KINDS, *HUMAN_BLOCK_HEALING_STATUSES,
+            *HUMAN_BLOCK_AUTO_KINDS, *SUPERSEDED_EVENT_PARAMS,
             ORPHAN_FAILURE_BATCH_PER_TICK,
         ),
     ).fetchall()

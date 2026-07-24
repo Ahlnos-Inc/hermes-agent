@@ -82,3 +82,32 @@ def test_archived_task_history_is_not_swept(tmp_path):
     kb._append_event(conn, task_id, "blocked", {"reason": "x"})
     conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
     assert _collect_unsubscribed_failure_events(kb, conn) == []
+
+
+def test_healed_failure_is_not_swept(tmp_path):
+    """BUILD-748: an unblock supersedes the block — don't page home days later.
+
+    Reproduces the 2026-07-24 02:13 batch: blocks from 2026-07-22 that had been
+    resolved and unblocked the same day still reached the home channel, because
+    the sweep only excluded done/archived tasks and never asked whether the
+    failure still stood.
+    """
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    kb._append_event(conn, task_id, "blocked", {"reason": "artifact path"})
+    kb._append_event(conn, task_id, "unblocked", {"status": "todo"})
+
+    assert _collect_unsubscribed_failure_events(kb, conn) == []
+
+
+def test_reblock_after_unblock_is_swept(tmp_path):
+    """The healing guard must not swallow a fresh failure."""
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    kb._append_event(conn, task_id, "blocked", {"reason": "first"})
+    kb._append_event(conn, task_id, "unblocked", {"status": "todo"})
+    kb._append_event(conn, task_id, "blocked", {"reason": "second"})
+
+    out = _collect_unsubscribed_failure_events(kb, conn)
+    assert [o["event"].kind for o in out] == ["blocked"]
+    assert out[0]["event"].payload["reason"] == "second"
