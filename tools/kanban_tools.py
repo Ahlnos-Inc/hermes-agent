@@ -3335,6 +3335,12 @@ def _handle_create(args: dict, **kw) -> str:
                 if mutation_context is not None:
                     # Scope identity must not come from a model-visible argument.
                     session_id = mutation_context.session_id
+            # Reject an invented profile name before it becomes a card the
+            # dispatcher can never spawn (BUILD-661). Agents fan out by naming
+            # the executing profile; a typo like "publisher" would otherwise
+            # stall in 'ready' forever. Give the model the valid options back.
+            if not kb.assignee_is_dispatchable(str(assignee)):
+                return tool_error(kb.unknown_assignee_error(str(assignee)))
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),

@@ -43,6 +43,28 @@ def register_all_web_providers():
         register_provider(cls())
 
 
+@pytest.fixture(autouse=True)
+def _assignees_dispatchable(request, monkeypatch):
+    """Treat every assignee as dispatchable by default (BUILD-661).
+
+    Tool-create tests fan out with synthetic profile names ("peer", "coder",
+    ...) that have no profile directory in the sandbox, so the create-time
+    assignee guard would reject them. Patch the guard (not ``profile_exists``,
+    which the workflow-compile validation still needs to see real) so those
+    tests exercise create behavior. Tests that assert the guard itself opt out
+    with ``@pytest.mark.real_assignee_guard``.
+    """
+    if request.node.get_closest_marker("real_assignee_guard"):
+        return
+    try:
+        from hermes_cli import kanban_db
+    except Exception:
+        return
+    monkeypatch.setattr(
+        kanban_db, "assignee_is_dispatchable", lambda _a: True, raising=False
+    )
+
+
 @pytest.fixture
 def web_registry_populated():
     """Populate the web-search-provider registry for one test, then reset."""

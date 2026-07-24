@@ -4290,6 +4290,55 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# Assignees that are legitimately NOT Hermes profiles: terminal / control-plane
+# "pull" lanes claimed by an interactive terminal via claim_task, and human gate
+# assignees. profile_exists() is False for these by design, so a create-time
+# validity check must allow them explicitly. Small literal set, verified against
+# every live board's DISTINCT assignee 2026-07-23 (BUILD-661).
+# ponytail: promote to a config key if the humans/lanes set starts churning.
+KNOWN_NON_PROFILE_ASSIGNEES = frozenset({
+    "nicholas", "nolan", "orion-cc", "orion-research",
+})
+
+
+def assignee_is_dispatchable(assignee: Optional[str]) -> bool:
+    """Whether *assignee* names something the board can actually route to: a
+    real Hermes profile, or a known non-profile lane / human gate.
+
+    Fail-open when the profiles module can't be introspected (partial installs,
+    exotic test envs) — mirrors :func:`has_spawnable_ready` — so validation
+    never blocks creation just because profile discovery is unavailable.
+    """
+    canon = _canonical_assignee(assignee)
+    if not canon:
+        return False
+    if canon in KNOWN_NON_PROFILE_ASSIGNEES:
+        return True
+    try:
+        from hermes_cli import profiles
+        return bool(profiles.profile_exists(canon))
+    except Exception:
+        return True
+
+
+def unknown_assignee_error(assignee: Optional[str]) -> str:
+    """Actionable message for a create-time assignee that maps to nothing
+    dispatchable — lists real profiles + known lanes so the caller (agent or
+    human) can correct the name instead of stranding a card in 'ready'."""
+    try:
+        from hermes_cli.profiles import list_profiles
+        profs = sorted(p.name for p in list_profiles())
+    except Exception:
+        profs = []
+    detail = f" Known profiles: {', '.join(profs)}." if profs else ""
+    detail += f" Known non-profile lanes: {', '.join(sorted(KNOWN_NON_PROFILE_ASSIGNEES))}."
+    return (
+        f"assignee {assignee!r} is not a Hermes profile or a known lane — the "
+        f"dispatcher can never spawn it, so the task would stall in 'ready' "
+        f"forever.{detail} Assign an existing profile, or a human / terminal lane."
+    )
+
+
 @dataclass(frozen=True)
 class ForcedSkillValidationIssue:
     """A task skill that would fail fatal CLI preload for an assignee profile."""
@@ -6846,8 +6895,19 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     mutation_context: Optional[MutationContext] = None,
+    validate_assignee: bool = False,
 ) -> str:
-    """Create a task through the normal validation and one write transaction."""
+    """Create a task through the normal validation and one write transaction.
+
+    ``validate_assignee`` (opt-in — default off keeps every existing caller and
+    the synthetic-assignee test suite unchanged) rejects an assignee that maps
+    to no dispatchable target, so an invented profile name (BUILD-661's
+    ``publisher``) fails fast at the untrusted ingress instead of stranding a
+    card the dispatcher can never spawn.
+    """
+    if validate_assignee and assignee is not None and str(assignee).strip():
+        if not assignee_is_dispatchable(assignee):
+            raise ValueError(unknown_assignee_error(assignee))
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "

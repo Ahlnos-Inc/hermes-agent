@@ -2549,6 +2549,22 @@ def test_create_rejects_no_assignee(worker_env):
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
 
 
+@pytest.mark.real_assignee_guard
+def test_create_rejects_unknown_profile_assignee(worker_env, monkeypatch):
+    """BUILD-661: an invented profile name (no profile dir, not a known lane) is
+    rejected with an actionable error instead of stalling in 'ready' forever."""
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    out = json.loads(kt._handle_create({"title": "t", "assignee": "publisher"}))
+    assert out.get("error")
+    assert "publisher" in out["error"]
+    # A known lane still passes the guard.
+    ok = json.loads(kt._handle_create({"title": "t2", "assignee": "orion-cc"}))
+    assert not ok.get("error")
+
+
 def test_create_rejects_non_list_parents(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})
