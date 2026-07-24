@@ -862,8 +862,8 @@ def test_read_worker_log_tail(kanban_home):
     assert tail is not None
     # Tail should not include line 0.
     assert "line 0" not in tail
-    # Missing log returns None.
-    assert kb.read_worker_log("t_missing") is None
+    # Missing log returns None (valid-format id, no file on disk).
+    assert kb.read_worker_log("t_dead") is None
 
 
 # ---------------------------------------------------------------------------

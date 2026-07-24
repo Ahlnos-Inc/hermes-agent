@@ -4142,8 +4142,8 @@ class TestSharedBoardPaths:
         assert kb.kanban_db_path() == default_home / "kanban.db"
         assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
         assert (
-            kb.worker_log_path("t_demo")
-            == default_home / "kanban" / "logs" / "t_demo.log"
+            kb.worker_log_path("t_dead")
+            == default_home / "kanban" / "logs" / "t_dead.log"
         )
 
     def test_profile_worker_resolves_to_shared_root(
@@ -4188,13 +4188,13 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
         dispatcher_db = kb.kanban_db_path()
         dispatcher_ws = kb.workspaces_root()
-        dispatcher_log = kb.worker_log_path("t_handoff")
+        dispatcher_log = kb.worker_log_path("t_c0ffee")
 
         # Worker's perspective (profile activated by `hermes -p coder`).
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         worker_db = kb.kanban_db_path()
         worker_ws = kb.workspaces_root()
-        worker_log = kb.worker_log_path("t_handoff")
+        worker_log = kb.worker_log_path("t_c0ffee")
 
         assert dispatcher_db == worker_db
         assert dispatcher_ws == worker_ws

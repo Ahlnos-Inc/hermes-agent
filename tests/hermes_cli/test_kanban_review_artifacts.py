@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -538,6 +539,88 @@ def test_hash_review_attachment_rejects_task_id_traversal(board: Path, tmp_path:
     )
     with pytest.raises(kb.ReviewArtifactError, match="escaped|unsafe"):
         kb._hash_review_attachment(conn, crafted)
+
+
+def test_open_attachment_nofollow_refuses_symlinked_final_component(tmp_path: Path) -> None:
+    """BUILD-727 item 1: a final component swapped to a symlink between path
+    validation and open must not be followed — the O_NOFOLLOW open fails instead
+    of redirecting the read outside the trusted root."""
+    root = tmp_path / "attachments"
+    (root / "t_aa").mkdir(parents=True)
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"secret\n")
+    # The attacker swaps the attachment file for a symlink pointing outside root.
+    os.symlink(outside, root / "t_aa" / "evil.md")
+    with pytest.raises(OSError):
+        kb._open_attachment_nofollow(root, "t_aa", "evil.md")
+
+
+def test_open_attachment_nofollow_refuses_symlinked_task_dir(tmp_path: Path) -> None:
+    """BUILD-727 item 1: a swapped intermediate (task-id) component is refused too
+    — O_NOFOLLOW on the directory walk fails rather than following the link."""
+    root = tmp_path / "attachments"
+    root.mkdir(parents=True)
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    (outside_dir / "x.md").write_bytes(b"x\n")
+    os.symlink(outside_dir, root / "t_bb")  # task dir is now a symlink
+    with pytest.raises(OSError):
+        kb._open_attachment_nofollow(root, "t_bb", "x.md")
+
+
+def test_open_attachment_nofollow_reads_legit_file(tmp_path: Path) -> None:
+    """Regression: a real, non-symlinked attachment opens normally."""
+    root = tmp_path / "attachments"
+    (root / "t_cc").mkdir(parents=True)
+    (root / "t_cc" / "ok.md").write_bytes(b"hello\n")
+    fd = kb._open_attachment_nofollow(root, "t_cc", "ok.md")
+    try:
+        assert os.read(fd, 64) == b"hello\n"
+    finally:
+        os.close(fd)
+
+
+def test_worker_log_path_rejects_unsafe_task_id() -> None:
+    """BUILD-727 item 2: an externally-routed task_id that is not a single safe
+    component is rejected before it can relocate the log path."""
+    assert kb.worker_log_path("t_beef").name == "t_beef.log"
+    for bad in ("../etc/passwd", "t_/../x", "t_a/b", ""):
+        with pytest.raises(ValueError):
+            kb.worker_log_path(bad)
+
+
+def test_delete_attachment_refuses_to_unlink_outside_trusted_root(
+    board: Path, tmp_path: Path
+) -> None:
+    """BUILD-727 item 3: a tampered stored_path pointing outside the owning task's
+    trusted attachments dir must not be unlinked by delete_attachment."""
+    conn = kb.connect(db_path=board)
+    src = kb.create_task(conn, title="src", assignee="architect")
+    aid, _ = _attach(conn, src, "ok.md", b"ok\n")
+    # Tamper the row to point at a host file outside the attachments root.
+    outside = tmp_path / "important.txt"
+    outside.write_bytes(b"do not delete\n")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_attachments SET stored_path = ? WHERE id = ?",
+            (str(outside), aid),
+        )
+    removed = kb.delete_attachment(conn, aid)
+    assert removed is not None  # the metadata row is still removed
+    assert outside.exists(), "delete_attachment must not unlink a file outside the trusted root"
+
+
+def test_delete_attachment_unlinks_legit_blob(board: Path) -> None:
+    """Regression: a normal attachment's blob is still removed on delete."""
+    conn = kb.connect(db_path=board)
+    src = kb.create_task(conn, title="src", assignee="architect")
+    aid, _ = _attach(conn, src, "ok.md", b"ok\n")
+    att = kb.get_attachment(conn, aid)
+    assert att is not None
+    blob = Path(att.stored_path)
+    assert blob.is_file()
+    kb.delete_attachment(conn, aid)
+    assert not blob.exists()
 
 
 def test_hash_review_attachment_validates_non_current_board(

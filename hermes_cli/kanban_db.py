@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import stat as _stat
 import shutil
 import sqlite3
 import subprocess
@@ -8726,12 +8727,34 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
         )
+    # Only unlink a blob that lives inside this board's trusted attachments root
+    # under the attachment's own validated task id. A tampered ``stored_path``
+    # row must never let delete_attachment unlink an arbitrary host file
+    # (BUILD-727). Failing the containment check leaves the file in place — the
+    # metadata row (already removed) is the source of truth for existence.
+    contained = False
+    resolved: Optional[Path] = None
     try:
-        p = Path(att.stored_path)
-        if p.is_file():
-            p.unlink()
-    except OSError:
-        pass
+        root = _trusted_attachments_root(conn)
+        owner = _validate_task_id_component(att.task_id)
+        resolved = Path(att.stored_path).resolve(strict=True)
+        rel = resolved.relative_to(root)
+        contained = len(rel.parts) == 2 and rel.parts[0] == owner
+    except (OSError, RuntimeError, ValueError, ReviewArtifactError):
+        contained = False
+    if contained and resolved is not None:
+        try:
+            if resolved.is_file():
+                resolved.unlink()
+        except OSError:
+            pass
+    else:
+        _log.warning(
+            "delete_attachment: refusing to unlink %r — not inside the owning "
+            "task's trusted attachments dir (attachment id=%s)",
+            att.stored_path,
+            attachment_id,
+        )
     return att
 
 
@@ -8832,6 +8855,36 @@ def _trusted_attachments_root(conn: sqlite3.Connection) -> Path:
     )
 
 
+def _open_attachment_nofollow(root: Path, task_id: str, name: str) -> int:
+    """Open ``<root>/<task_id>/<name>`` read-only, refusing to follow a symlink at
+    the ``task_id`` or ``name`` component.
+
+    ``resolve()`` + ``relative_to`` validate the path as a string, but a re-open
+    by path re-walks the components — an attacker with concurrent write access to
+    the attachments dir could swap a component to a symlink between validation and
+    open, redirecting the read outside the trusted root (BUILD-727). Walking from
+    a fd on the trusted root with ``O_NOFOLLOW`` on each attacker-controllable
+    component closes that window: any swapped component makes ``os.open`` fail
+    with ``ELOOP`` instead of following the link. The root itself is trusted, so
+    its own path may contain symlinks (e.g. ``/Users`` on macOS).
+    """
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    try:
+        task_fd = os.open(
+            task_id,
+            os.O_RDONLY | os.O_DIRECTORY | nofollow | cloexec,
+            dir_fd=root_fd,
+        )
+    finally:
+        os.close(root_fd)
+    try:
+        return os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=task_fd)
+    finally:
+        os.close(task_fd)
+
+
 def _hash_review_attachment(
     conn: sqlite3.Connection,
     attachment: Attachment,
@@ -8869,21 +8922,31 @@ def _hash_review_attachment(
             "review artifact path escaped its owning attachment directory"
         )
 
+    # Open by walking from the trusted root with O_NOFOLLOW on each
+    # attacker-controllable component, so a symlink swapped in between the
+    # resolve()/relative_to() validation above and this open cannot redirect the
+    # read outside the root (BUILD-727). All subsequent stats come from this held
+    # fd, never a path re-walk.
     try:
-        before = resolved.stat()
+        fd = _open_attachment_nofollow(root, owner_task_id, relative.parts[1])
     except OSError as exc:
         raise ReviewArtifactError(
-            f"review artifact is unavailable: {resolved}"
+            f"review artifact could not be safely opened "
+            f"(component symlinked or replaced?): {resolved}"
         ) from exc
-    if not resolved.is_file():
-        raise ReviewArtifactError(f"review artifact is not a regular file: {resolved}")
-    if before.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-        raise ReviewArtifactError("review artifact exceeds the attachment size limit")
 
     digest = hashlib.sha256()
     total = 0
     try:
-        with resolved.open("rb") as source:
+        before = os.fstat(fd)
+        if not _stat.S_ISREG(before.st_mode):
+            raise ReviewArtifactError(
+                f"review artifact is not a regular file: {resolved}"
+            )
+        if before.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+            raise ReviewArtifactError("review artifact exceeds the attachment size limit")
+        with os.fdopen(fd, "rb") as source:
+            fd = -1  # ownership transferred to the file object
             while True:
                 chunk = source.read(1024 * 1024)
                 if not chunk:
@@ -8895,22 +8958,21 @@ def _hash_review_attachment(
                     )
                 digest.update(chunk)
             after = os.fstat(source.fileno())
-        current = resolved.stat()
     except ReviewArtifactError:
         raise
     except OSError as exc:
         raise ReviewArtifactError(
             f"review artifact could not be read: {resolved}"
         ) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
     if (
         total != before.st_size
         or before.st_dev != after.st_dev
         or before.st_ino != after.st_ino
         or before.st_size != after.st_size
-        or current.st_dev != before.st_dev
-        or current.st_ino != before.st_ino
-        or current.st_size != before.st_size
     ):
         raise ReviewArtifactError(
             f"review artifact changed during read: {resolved}"
@@ -21689,7 +21751,9 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     current-board file → default). The dispatcher always passes the
     board explicitly to avoid any resolution ambiguity when multiple
     boards exist."""
-    return worker_logs_dir(board=board) / f"{task_id}.log"
+    # Validate the id as a single safe path component so an externally-routed
+    # task_id can never relocate the log path via traversal (BUILD-727).
+    return worker_logs_dir(board=board) / f"{_validate_task_id_component(task_id)}.log"
 
 
 def read_worker_log(
@@ -21699,7 +21763,12 @@ def read_worker_log(
     """Read the worker log for ``task_id``. Returns None if the file
     doesn't exist. If ``tail_bytes`` is set, only the last N bytes are
     returned (useful for the dashboard drawer which shouldn't page megabytes)."""
-    path = worker_log_path(task_id, board=board)
+    try:
+        path = worker_log_path(task_id, board=board)
+    except ValueError:
+        # An unsafe/malformed task id can address no log — a lookup returns None
+        # rather than raising (the path builder still refuses to construct it).
+        return None
     if not path.exists():
         return None
     try:
