@@ -38,6 +38,7 @@ def test_dispatchable_accepts_known_non_profile_lanes(monkeypatch):
         assert kb.assignee_is_dispatchable(a) is True, a
 
 
+@pytest.mark.real_assignee_guard
 def test_dispatchable_rejects_invented_role(monkeypatch):
     _no_real_profiles(monkeypatch)
     assert kb.assignee_is_dispatchable("publisher") is False
@@ -53,6 +54,7 @@ def test_dispatchable_fails_open_when_profiles_unimportable(monkeypatch):
     assert kb.assignee_is_dispatchable("publisher") is True
 
 
+@pytest.mark.real_assignee_guard
 def test_create_task_validate_rejects_unknown_assignee(tmp_path, monkeypatch):
     _no_real_profiles(monkeypatch)
     db = tmp_path / "kanban.db"

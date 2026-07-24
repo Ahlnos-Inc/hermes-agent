@@ -87,6 +87,53 @@ def purged_hermes_modules():
         sys.modules.update(saved)
 
 
+@pytest.fixture(autouse=True)
+def _assignees_dispatchable(request, monkeypatch):
+    """Treat every assignee as dispatchable by default (BUILD-661).
+
+    Mirrors the fixture of the same name in ``tests/tools/conftest.py``. The
+    create-time assignee guard landed with that stub in the tools package only,
+    but the kanban-create tests in THIS package call
+    ``kanban_tools._handle_create`` directly with synthetic assignees
+    ("worker", "coder") that have no profile directory in the sandbox, so they
+    started failing unconditionally — not from ordering. Tests that assert the
+    guard itself opt out with ``@pytest.mark.real_assignee_guard``.
+    """
+    if request.node.get_closest_marker("real_assignee_guard"):
+        return
+    try:
+        from hermes_cli import kanban_db
+    except Exception:
+        return
+    monkeypatch.setattr(
+        kanban_db, "assignee_is_dispatchable", lambda _a: True, raising=False
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_context():
+    """Clear the session ContextVars a test sets (BUILD-632).
+
+    pytest runs the whole session in ONE ``contextvars.Context``, and
+    ``clear_session_vars()`` resets the platform var to ``""`` rather than its
+    unset sentinel. An empty-string platform is not "unset", so
+    ``get_session_env`` stops falling back to the environment for every later
+    test in the process — that is how a kanban channel-affinity test breaks a
+    skills-config env-var test three files later.
+    """
+    try:
+        from gateway import session_context
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        reset = getattr(session_context, "reset_session_vars", None)
+        if callable(reset):
+            reset()
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

@@ -207,7 +207,9 @@ def test_init_agent_waits_for_mcp_discovery_before_agent_build(monkeypatch):
     cli.conversation_history = []
     cli._install_tool_callbacks = lambda: None
     cli._ensure_tirith_security = lambda: None
-    cli._ensure_runtime_credentials = lambda: True
+    # **_: the call site takes defer_on_exhaustion since BUILD-573; a
+    # zero-argument stub makes this test fail on its own, not from ordering.
+    cli._ensure_runtime_credentials = lambda **_: True
 
     monkeypatch.setattr(
         mcp_startup,
