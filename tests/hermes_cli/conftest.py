@@ -47,6 +47,46 @@ def _close_kanban_db_connections():
         opened.clear()
 
 
+HERMES_MODULE_PREFIXES = ("hermes_cli", "hermes_state", "hermes_constants")
+
+
+@pytest.fixture
+def purged_hermes_modules():
+    """Give one test a fresh ``hermes_cli`` import tree, then put the old one back.
+
+    Several kanban fixtures force a fresh import by deleting every
+    ``hermes_cli*`` entry from ``sys.modules`` — and never restore them. A later
+    test module that bound ``from hermes_cli import kanban_db as kb`` at import
+    time then holds a STALE module object while the code under test imports a
+    fresh one, so ``monkeypatch.setattr(kb, ...)`` patches a module nobody
+    calls. That is how ``test_cli_daemon_capacity_info_*`` ends up running the
+    REAL ``run_daemon()`` and hanging the whole process (BUILD-747), and it is a
+    source of the wider order-dependent failures in BUILD-632.
+
+    Teardown drops the whole fresh tree (including submodules imported for the
+    first time inside the test, which would otherwise leak the split identity in
+    the other direction) before reinstating the originals. Scoped to the hermes
+    prefixes so it can't resurrect unrelated fakes other tests inject into
+    ``sys.modules``.
+    """
+    import sys
+
+    saved = {
+        name: mod for name, mod in sys.modules.items()
+        if name.startswith(HERMES_MODULE_PREFIXES)
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield
+    finally:
+        for name in [
+            n for n in sys.modules if n.startswith(HERMES_MODULE_PREFIXES)
+        ]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
