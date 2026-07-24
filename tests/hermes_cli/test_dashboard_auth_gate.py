@@ -25,14 +25,18 @@ def _restore_app_state():
     ``_require_token`` and ``host_header_middleware`` for the rest of the
     process, which is why unrelated dashboard/web-server files 401 or 400 in a
     wide run and pass in isolation (BUILD-632).
+
+    Starlette keeps every attribute in ONE nested dict, so the snapshot has to
+    copy ``vars(state)["_state"]`` — ``dict(vars(state))`` copies the wrapper
+    whose ``_state`` key is the very dict being mutated, and restores nothing.
     """
-    snapshot = dict(vars(web_server.app.state))
+    live = vars(web_server.app.state)["_state"]
+    snapshot = dict(live)
     try:
         yield
     finally:
-        state = vars(web_server.app.state)
-        state.clear()
-        state.update(snapshot)
+        live.clear()
+        live.update(snapshot)
 
 
 @pytest.fixture

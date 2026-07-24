@@ -330,9 +330,12 @@ class TestCmdUpdateTermuxUvBootstrap:
 
         pkg_uv = "/data/data/com.termux/files/usr/bin/uv"
         monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
-        # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
-        # managed dir so the PATH probe is what surfaces the packaged uv.
-        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
+        # The autouse _patch_managed_uv fixture already replaces resolve_uv with
+        # a fake that defers to shutil.which, so patching it again here is
+        # redundant — and harmful: monkeypatch captures the fixture's mock as
+        # the "original" and restores THAT after the fixture exits, leaving a
+        # MagicMock as hermes_cli.managed_uv.resolve_uv for the rest of the
+        # process (all 13 test_managed_uv failures in a wide run — BUILD-632).
         monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
 
         uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
