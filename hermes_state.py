@@ -450,8 +450,20 @@ def apply_wal_with_fallback(
             _apply_macos_checkpoint_barrier(conn)
             _enforce_macos_synchronous_full(conn)
             return "wal"
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as exc:
+        # A FAILED read-only probe must NOT fall through to the mutating
+        # `PRAGMA journal_mode=WAL` below — that set-pragma unlinks/recreates
+        # -wal/-shm that other connections may hold open, so turning a transient
+        # read failure (e.g. a SQLITE_IOERR_*) into a destructive write on a DB
+        # that may already be in WAL mode is wrong on every axis. Log the
+        # extended SQLite code and re-raise so the caller can retry (BUILD-717).
+        logger.error(
+            "%s: read-only journal_mode probe failed — refusing to fall through "
+            "to the mutating WAL set-pragma: %s",
+            db_label,
+            format_sqlite_error(exc),
+        )
+        raise
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")

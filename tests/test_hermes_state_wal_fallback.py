@@ -171,6 +171,44 @@ class TestApplyWalWithFallback:
         assert "sqlite_errorname=" in msg
 
 
+    def test_failed_probe_never_reaches_mutating_set_pragma(self, tmp_path, caplog):
+        """BUILD-717: if the read-only journal_mode probe itself raises, the
+        function must re-raise (logging the extended code) and NEVER fall through
+        to the mutating `PRAGMA journal_mode=WAL`, which unlinks/recreates
+        -wal/-shm that other connections may hold open."""
+        captured = None
+        try:
+            sqlite3.connect(":memory:").execute("SELECT 1 FROM missing_table")
+            raise AssertionError("expected OperationalError")
+        except sqlite3.OperationalError as e:
+            captured = e
+        expected_name = captured.sqlite_errorname
+
+        set_attempts = [0]
+
+        class _ProbeBlocker(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                norm = sql.lower().replace(" ", "")
+                if norm == "pragmajournal_mode":  # the read-only probe
+                    raise captured
+                if "journal_mode=wal" in norm:  # the mutating set-pragma
+                    set_attempts[0] += 1
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "probe.db"), factory=_ProbeBlocker, isolation_level=None
+        )
+        with caplog.at_level("ERROR", logger="hermes_state"):
+            with pytest.raises(sqlite3.OperationalError):
+                apply_wal_with_fallback(conn, db_label="probe.db")
+        conn.close()
+
+        assert set_attempts[0] == 0, "mutating set-pragma must not run after a failed probe"
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert errors, "a failed probe must be logged"
+        assert expected_name in errors[0].getMessage()
+
+
 class TestFormatSqliteError:
     def test_extracts_name_from_real_sqlite_exception(self):
         captured = None

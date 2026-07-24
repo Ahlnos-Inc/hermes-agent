@@ -5403,10 +5403,15 @@ class TestApplyWalProbe:
 
         assert result == "delete"
 
-    def test_probe_failure_falls_through_to_set_pragma(self, tmp_path):
-        """When the read probe raises OperationalError, fall through to set-pragma."""
+    def test_probe_failure_reraises_without_set_pragma(self, tmp_path):
+        """BUILD-717: a failed read-only probe must re-raise, NOT fall through to
+        the mutating `PRAGMA journal_mode=WAL` (which unlinks/recreates -wal/-shm
+        that other connections may hold open). Turning a transient read failure
+        into a destructive write is wrong on every axis."""
         import sqlite3
         from hermes_state import apply_wal_with_fallback
+
+        set_attempts = [0]
 
         class _ProbeFails(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -5417,17 +5422,19 @@ class TestApplyWalProbe:
                 if self._first and "journal_mode" in sql and "WAL" not in sql:
                     self._first = False
                     raise sqlite3.OperationalError("simulated probe failure")
+                if "journal_mode=WAL" in sql:
+                    set_attempts[0] += 1
                 return super().execute(sql, params)
 
         db_path = tmp_path / "probe_fail.db"
         conn = _ProbeFails(str(db_path))
         try:
-            result = apply_wal_with_fallback(conn)
+            with pytest.raises(sqlite3.OperationalError, match="simulated probe failure"):
+                apply_wal_with_fallback(conn)
         finally:
             conn.close()
 
-        # Despite probe failure, set-pragma must still run and succeed.
-        assert result == "wal"
+        assert set_attempts[0] == 0, "set-pragma must not run after a failed probe"
 
     def test_no_downgrade_from_wal_to_delete_on_eio(self, tmp_path):
         """OperationalError NOT in _WAL_INCOMPAT_MARKERS must propagate, not downgrade."""
