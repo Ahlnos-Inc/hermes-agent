@@ -36,6 +36,11 @@ DEFAULT_BEDROCK_TOTAL_ATTEMPT_TIMEOUT_SECONDS = 15 * 60.0
 # intentionally cannot provide for cloud routes.
 _orphaned_route_threads: dict[tuple[str, ...], set[threading.Thread]] = {}
 _orphaned_route_threads_lock = threading.Lock()
+# When each route was first quarantined, so the fail-fast error can say how
+# long the prior request has been unwinding instead of only that it is
+# (BUILD-696: an operator saw a generic 3-retry failure with no way to tell a
+# route that frees in seconds from one wedged for ten minutes).
+_orphaned_route_since: dict[tuple[str, ...], float] = {}
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,52 @@ def _live_orphan_threads_locked(
         _orphaned_route_threads[route_key] = live
     else:
         _orphaned_route_threads.pop(route_key, None)
+        _orphaned_route_since.pop(route_key, None)
     return live
+
+
+def _route_description(route_key: tuple[str, ...]) -> str:
+    """Human-readable route identity. Endpoint is already credential-free."""
+    provider, api_mode, model = (route_key + ("", "", ""))[:3]
+    scheme, host, port, path = (tuple(route_key[3:]) + ("", "", "", ""))[:4]
+    endpoint = f"{scheme}://{host}" if host else ""
+    if endpoint and port:
+        endpoint = f"{endpoint}:{port}"
+    if endpoint and path:
+        endpoint = f"{endpoint}{path}"
+    parts = [f"provider={provider or '?'}", f"model={model or '?'}"]
+    if api_mode:
+        parts.append(f"api_mode={api_mode}")
+    if endpoint:
+        parts.append(f"endpoint={endpoint}")
+    return " ".join(parts)
+
+
+def provider_route_quarantine_status(
+    agent: Any,
+    api_payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Describe the quarantine on ``agent``'s route, or ``None`` if it is free.
+
+    The release condition is the orphaned worker thread EXITING — a condition,
+    not a timer, and deliberately so: releasing a route while its transport
+    thread is still inside a pooled TLS socket is what corrupted kanban.db in
+    BUILD-531. ``unwinding_seconds`` is therefore for reporting and for sizing
+    how long a caller should wait, never a licence to admit requests early.
+    """
+    route_key = provider_route_key(agent, api_payload or {})
+    with _orphaned_route_threads_lock:
+        live = _live_orphan_threads_locked(route_key)
+        if not live:
+            return None
+        since = _orphaned_route_since.get(route_key)
+    return {
+        "route": _route_description(route_key),
+        "orphan_threads": len(live),
+        "unwinding_seconds": (
+            None if since is None else max(0.0, time.monotonic() - since)
+        ),
+    }
 
 
 def ensure_provider_route_available(agent: Any, api_payload: dict[str, Any]) -> None:
@@ -119,10 +169,25 @@ def ensure_provider_route_available(agent: Any, api_payload: dict[str, Any]) -> 
     route_key = provider_route_key(agent, api_payload)
     with _orphaned_route_threads_lock:
         live = _live_orphan_threads_locked(route_key)
+        since = _orphaned_route_since.get(route_key)
     if live:
+        age = "" if since is None else (
+            f", unwinding for {max(0.0, time.monotonic() - since):.0f}s"
+        )
+        detail = (
+            f"{_route_description(route_key)}, "
+            f"{len(live)} orphaned request thread(s){age}"
+        )
+        logger.warning(
+            "provider route quarantined, refusing request: %s "
+            "(releases when the prior request's transport thread exits)",
+            detail,
+        )
         raise ProviderRouteQuarantined(
             "Provider route is quarantined while a prior timed-out request "
-            "is still unwinding"
+            f"is still unwinding — {detail}. It admits requests again only "
+            "when that thread exits; a local route can take as long as its "
+            "total attempt timeout to unwind."
         )
 
 
@@ -143,6 +208,13 @@ def quarantine_provider_route(
         live = _live_orphan_threads_locked(route_key)
         live.add(worker)
         _orphaned_route_threads[route_key] = live
+        _orphaned_route_since.setdefault(route_key, time.monotonic())
+    logger.warning(
+        "provider route quarantined: %s, reason=timed_out_request_still_unwinding, "
+        "orphan_threads=%d",
+        _route_description(route_key),
+        len(live),
+    )
     return True
 
 
@@ -221,6 +293,7 @@ def close_when_routes_quiet(
 def _reset_provider_route_quarantine_for_tests() -> None:
     with _orphaned_route_threads_lock:
         _orphaned_route_threads.clear()
+        _orphaned_route_since.clear()
 
 
 def resolve_attempt_budgets(agent: Any) -> AttemptBudgets:
@@ -277,6 +350,7 @@ __all__ = [
     "ProviderRouteQuarantined",
     "ensure_provider_route_available",
     "provider_route_key",
+    "provider_route_quarantine_status",
     "quarantine_provider_route",
     "resolve_attempt_budgets",
 ]

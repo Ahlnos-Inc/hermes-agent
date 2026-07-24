@@ -4941,12 +4941,26 @@ def run_conversation(
                 from agent.request_budgets import (
                     ProviderRouteQuarantined as _RouteQuarantined,
                     provider_route_is_quarantined as _route_still_quarantined,
+                    resolve_attempt_budgets as _resolve_attempt_budgets,
                 )
                 _is_route_quarantined_wait = isinstance(
                     api_error, _RouteQuarantined
                 ) and agent._fallback_index >= len(agent._fallback_chain or [])
                 if _is_route_quarantined_wait:
+                    # 90s was sized for cloud routes. A local route's own
+                    # attempt budget is 15 minutes, so its orphan can still be
+                    # prefilling long after 90s — all three retries then burn
+                    # against a route that would have freed (BUILD-696, the
+                    # 2026-07-21 omlx-local qwen3.6 failure at ~100k tokens).
+                    # Wait a fraction of the route's real budget instead, and
+                    # still break out the moment it frees.
+                    try:
+                        _route_total = _resolve_attempt_budgets(agent).total_seconds
+                    except Exception:
+                        _route_total = None
                     wait_time = 90.0
+                    if _route_total:
+                        wait_time = max(90.0, min(float(_route_total) / 3.0, 300.0))
                     _backoff_policy = "route_quarantine_release_wait"
                     agent._buffer_status(
                         "⏳ Provider is still unwinding a timed-out request — "
