@@ -21376,6 +21376,33 @@ def _default_spawn(
     # time, so admission happens immediately before a concrete local call.
     env["HERMES_KANBAN_PRIORITY"] = str(int(task.priority))
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Grant the sandbox read access to the repository this task was handed
+    # (BUILD-641 / BUILD-581). A worker on a managed worktree is confined by
+    # Seatbelt to the worktree, but both the source it must read and the
+    # worktree's git metadata (``<repo>/.git/worktrees/<id>``) live under the
+    # repo root, outside that boundary. The grant hook itself shipped with
+    # BUILD-581 and is consumed by external_runtime._sandbox_extra_read_paths;
+    # nothing populated it for a worker spawn, so it sat dormant.
+    #
+    # Derive it from the task's own recorded worktree identity rather than a
+    # per-profile path list: the hermes-infra board is BI-REPO (runtime tickets
+    # in the hermes-agent fork, config tickets in hermes-config), so a static
+    # list would have to name both repos and would still grant the wrong one.
+    # Read-only, and a task with no recorded worktree is left untouched.
+    _grant_roots = [
+        str(root).strip()
+        for root in (task.workspace_repo_root, task.workspace_repo_common_dir)
+        if str(root or "").strip()
+    ]
+    if _grant_roots:
+        _granted = [
+            part for part in env.get("HERMES_SANDBOX_EXTRA_READ_PATHS", "").split(":")
+            if part
+        ]
+        for _root in _grant_roots:
+            if _root not in _granted:
+                _granted.append(_root)
+        env["HERMES_SANDBOX_EXTRA_READ_PATHS"] = ":".join(_granted)
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
