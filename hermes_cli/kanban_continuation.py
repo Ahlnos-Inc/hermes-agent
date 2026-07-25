@@ -441,56 +441,6 @@ def _truncate_decision_statement(
     raise ContinuationContractError("decision_truncation_metadata_unstable")
 
 
-def _render_core(manifest: dict[str, Any]) -> str:
-    lines = [
-        "# Durable continuation contract",
-        "",
-        f"Task: `{manifest['task_id']}` | run: `{manifest['run_id']}`",
-        f"Objective: {manifest['objective']}",
-    ]
-    criteria = manifest["acceptance_criteria"]
-    if criteria:
-        lines.extend(["", "## Acceptance criteria"])
-        lines.extend(f"- [ ] {item}" for item in criteria)
-    decisions = manifest["decisions"]
-    if decisions:
-        lines.extend(["", "## Settled decisions"])
-        lines.extend(f"- `{item['id']}`: {item['statement']}" for item in decisions)
-    policy = manifest["provider_policy"]
-    lines.extend(
-        [
-            "",
-            "## Runtime policy",
-            f"- provider allow: {', '.join(policy['allow']) or '(any not denied)'}",
-            f"- provider deny: {', '.join(policy['deny']) or '(none)'}",
-        ]
-    )
-    repository = manifest.get("repository")
-    if repository:
-        lines.extend(
-            [
-                "",
-                "## Repository checkpoint",
-                f"- path: `{repository['path']}`",
-                f"- head: `{repository.get('head') or '(unborn)'}`",
-                f"- branch: `{repository.get('branch') or '(detached/unborn)'}`",
-                f"- dirty: `{str(bool(repository.get('dirty'))).lower()}`",
-                f"- dirty digest: `{repository.get('dirty_digest') or '(clean)'}`",
-            ]
-        )
-    refs = manifest["references"]
-    if refs:
-        lines.extend(["", "## Evidence references"])
-        for ref in refs:
-            required = "required" if ref["required"] else "on-demand"
-            digest = f" sha256:{ref['digest']}" if ref.get("digest") else ""
-            label = f" — {ref['label']}" if ref.get("label") else ""
-            lines.append(
-                f"- [{ref['kind']}/{required}] `{ref['uri']}`{digest}{label}"
-            )
-    return "\n".join(lines).rstrip() + "\n"
-
-
 def _render_core_with_decision_budget(
     manifest: dict[str, Any],
     *,
@@ -547,9 +497,6 @@ def _render_core_with_decision_budget(
             base_lines.append(
                 f"- [{ref['kind']}/{required}] `{ref['uri']}`{digest}{label}"
             )
-
-    base_core = "\n".join(base_lines).rstrip() + "\n"
-    base_bytes = len(base_core.encode("utf-8"))
 
     # Dynamic decision-section budget: min(8 KiB, max_core_bytes // 2).
     decision_budget = min(8 * 1024, max_core_bytes // 2)
