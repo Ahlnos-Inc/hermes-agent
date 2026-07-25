@@ -3661,6 +3661,24 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 
+    # Task worktrees whose card was archived or purged have no row left to
+    # sweep by, so they need the cross-board negative proof (BUILD-751).
+    orphans: list[dict] = []
+    try:
+        known_ids, known_paths = kb._all_board_task_ids_and_paths()
+        for repo_root in kb.discover_task_worktree_roots(known_paths):
+            orphans.extend(
+                kb.cleanup_orphan_task_worktrees(
+                    repo_root, owned=(known_ids, known_paths),
+                )
+            )
+    except Exception as exc:  # an incomplete board read is not proof of orphanhood
+        print(f"Orphan worktree sweep skipped: {exc}")
+    removed_worktrees = sum(1 for entry in orphans if entry["status"] == "cleaned")
+    for entry in orphans:
+        if entry["status"] != "cleaned":
+            print(f"Orphan worktree kept: {entry['path']} ({entry['reason']})")
+
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     with kb.connect_closing() as conn:
@@ -3671,6 +3689,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         older_than_seconds=log_days * 24 * 3600,
     )
     print(f"GC complete: {removed_ws} workspace(s), "
+          f"{removed_worktrees} orphan worktree(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
 

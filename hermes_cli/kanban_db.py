@@ -12024,6 +12024,142 @@ def cleanup_terminal_task_worktrees(
     return results
 
 
+# An orphan worktree -- `<repo>/.worktrees/<task-id>` whose card was archived
+# or purged -- has no row on any board, so the DB-driven sweep above has
+# nothing to key on and it sits there forever, keeping hard-linked node_modules
+# alive and tripping the workspace hardlink guard for unrelated terminals
+# (BUILD-751, the tail BUILD-749 could not reach).
+#
+# Removing one therefore rests on a NEGATIVE proof, so the proof has to be
+# complete: every board is read, and if any board cannot be read this refuses
+# to remove anything rather than reclaim a worktree whose owner lives in the
+# board it could not open. The age floor covers the other direction -- a
+# worktree materialized seconds ago for a card not yet committed to the DB.
+ORPHAN_WORKTREE_MIN_AGE_SECONDS = 6 * 3600
+
+
+def _all_board_task_ids_and_paths() -> tuple[set[str], set[str]]:
+    """Every task id and workspace path across EVERY board on disk.
+
+    Propagates any error opening or reading a board: an incomplete answer here
+    would read as "nobody owns this worktree".
+    """
+    ids: set[str] = set()
+    paths: set[str] = set()
+    for board in list_boards():
+        slug = str(board.get("slug") or "")
+        if not slug:
+            continue
+        with connect_closing(board=slug) as conn:
+            for row in conn.execute("SELECT id, workspace_path FROM tasks"):
+                ids.add(str(row["id"]))
+                if row["workspace_path"]:
+                    paths.add(str(row["workspace_path"]))
+    return ids, paths
+
+
+def cleanup_orphan_task_worktrees(
+    repo_root: Path | str,
+    *,
+    now: Optional[int] = None,
+    clock: Optional[Callable[[], float]] = None,
+    min_age_seconds: int = ORPHAN_WORKTREE_MIN_AGE_SECONDS,
+    limit: int = 50,
+    owned: Optional[tuple[set[str], set[str]]] = None,
+) -> list[dict[str, Any]]:
+    """Reap `<repo_root>/.worktrees/<task-id>` dirs owned by no board row.
+
+    Applies the same gates as the owned path: a linked worktree checkout,
+    registered with this repo, removed by ``git worktree remove`` WITHOUT
+    ``--force`` so Git itself refuses a dirty tree.
+    """
+    effective_now = _workspace_cleanup_now(now, clock)
+    root = Path(repo_root).expanduser()
+    container = root / ".worktrees"
+    if not container.is_dir():
+        return []
+    known_ids, known_paths = (
+        owned if owned is not None else _all_board_task_ids_and_paths()
+    )
+    try:
+        bounded_limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        bounded_limit = 50
+    floor = max(0, int(min_age_seconds))
+
+    results: list[dict[str, Any]] = []
+    for path in sorted(container.iterdir()):
+        if len(results) >= bounded_limit:
+            break
+        task_id = path.name
+        # Only ids this codebase mints, and only real directories: anything
+        # else under .worktrees/ was put there by someone else.
+        if not task_id.startswith("t_") or not path.is_dir():
+            continue
+        if task_id in known_ids or str(path) in known_paths:
+            continue  # owned -- cleanup_terminal_task_worktrees' business
+        try:
+            age = effective_now - int(path.stat().st_mtime)
+        except OSError:
+            continue
+        reason: Optional[str] = None
+        if age < floor:
+            reason = "worktree_too_new"
+        elif not _is_linked_worktree_checkout(path):
+            reason = "workspace_is_not_linked_worktree"
+        elif not _registered_worktree_path(root, path):
+            reason = "workspace_not_registered"
+        if reason is not None:
+            results.append({
+                "task_id": task_id, "status": "deferred",
+                "path": str(path), "reason": reason,
+            })
+            continue
+        try:
+            removed = subprocess.run(
+                ["git", "-C", str(root), "worktree", "remove", str(path)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except OSError as exc:
+            results.append({
+                "task_id": task_id, "status": "deferred", "path": str(path),
+                "reason": f"git_worktree_remove_failed:{type(exc).__name__}",
+            })
+            continue
+        if removed.returncode == 0:
+            _log.info("kanban: reclaimed orphan worktree %s", path)
+            results.append({
+                "task_id": task_id, "status": "cleaned",
+                "path": str(path), "repo_root": str(root),
+            })
+        else:
+            results.append({
+                "task_id": task_id, "status": "deferred", "path": str(path),
+                "reason": "git_worktree_remove_refused",
+                "detail": ((removed.stderr or removed.stdout or "").strip()[:400]) or None,
+            })
+    return results
+
+
+def discover_task_worktree_roots(known_paths: Iterable[str]) -> list[Path]:
+    """Repos that hold a `.worktrees/` container, per the boards themselves.
+
+    Derived from the workspace paths boards recorded plus each board's
+    ``default_workdir`` — a repo no board ever pointed at cannot have received
+    a Hermes-created task worktree.
+    """
+    roots: set[Path] = set()
+    for raw in known_paths:
+        candidate = Path(raw)
+        if candidate.parent.name == ".worktrees":
+            roots.add(candidate.parent.parent)
+    for board in list_boards():
+        workdir = board.get("default_workdir")
+        if workdir:
+            roots.add(Path(str(workdir)).expanduser())
+    return sorted(root for root in roots if (root / ".worktrees").is_dir())
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,

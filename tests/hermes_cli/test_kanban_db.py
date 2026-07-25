@@ -7155,3 +7155,87 @@ def test_workspace_cleanup_leaves_borrowed_worktree_alone(kanban_home, tmp_path)
         assert kb.cleanup_terminal_task_worktrees(conn, now=200) == []
 
     assert borrowed.exists()
+
+
+def _orphan_worktree(repo: Path, task_id: str) -> Path:
+    """Materialize `<repo>/.worktrees/<task_id>` with no board row behind it."""
+    path = repo / ".worktrees" / task_id
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", f"wt/{task_id}", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    return path
+
+
+def test_orphan_worktree_with_no_board_row_is_reclaimed(kanban_home, tmp_path):
+    """BUILD-751: the card was archived or purged, so no sweep can key on it."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    path = _orphan_worktree(repo, "t_11691437")
+
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, now=int(time.time()) + 86_400, owned=(set(), set()),
+    )
+
+    assert results == [{
+        "task_id": "t_11691437", "status": "cleaned",
+        "path": str(path), "repo_root": str(repo),
+    }]
+    assert not path.exists()
+
+
+def test_orphan_sweep_keeps_worktrees_that_are_owned_dirty_or_new(
+    kanban_home, tmp_path,
+):
+    """Owned on ANY board, dirty, or younger than the age floor: all kept."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    owned = _orphan_worktree(repo, "t_owned001")
+    dirty = _orphan_worktree(repo, "t_dirty001")
+    fresh = _orphan_worktree(repo, "t_fresh001")
+    (dirty / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # All three were just created, so a day-long floor holds every one of them.
+    fresh_results = {
+        entry["task_id"]: entry
+        for entry in kb.cleanup_orphan_task_worktrees(
+            repo, owned=(set(), set()), min_age_seconds=86_400,
+        )
+    }
+    # Now drop the floor: ownership (by id, or by a path a board recorded) and
+    # Git's own dirty-tree refusal are what have to hold on their own.
+    results = {
+        entry["task_id"]: entry
+        for entry in kb.cleanup_orphan_task_worktrees(
+            repo,
+            owned=({"t_owned001"}, {str(fresh)}),
+            min_age_seconds=0,
+        )
+    }
+
+    assert "t_owned001" not in results, "an owned worktree is 749's business"
+    assert "t_fresh001" not in results, "a board-recorded path is owned too"
+    assert results["t_dirty001"]["reason"] == "git_worktree_remove_refused"
+    assert {entry["reason"] for entry in fresh_results.values()} == {"worktree_too_new"}
+    assert owned.exists() and dirty.exists() and fresh.exists()
+
+
+def test_orphan_sweep_reads_every_board_before_claiming_orphanhood(
+    kanban_home, tmp_path,
+):
+    """A worktree owned by a NON-default board must survive the sweep."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("other")
+    with kb.connect_closing(board="other") as conn:
+        task_id = kb.create_task(conn, title="lives elsewhere", board="other")
+    path = _orphan_worktree(repo, task_id)
+
+    known_ids, known_paths = kb._all_board_task_ids_and_paths()
+    assert task_id in known_ids
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, now=int(time.time()) + 86_400, owned=(known_ids, known_paths),
+    )
+
+    assert results == []
+    assert path.exists()
