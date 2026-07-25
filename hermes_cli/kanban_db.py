@@ -4191,46 +4191,107 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         raise
 
 
+# A lock-free raw read of the DB file can legitimately observe header
+# page_count > EOF: a concurrent WAL checkpoint (this process or another) may
+# write page 1 -- which carries page_count -- before it writes the frame that
+# extends the file. Observed live 6x in two days on the hermes-infra board,
+# always 1-2 pages short, always healed on the next tick, integrity_check ok
+# (BUILD-752). A passive checkpoint can also stop at mxSafeFrame and leave that
+# state standing for far longer than a retry loop is willing to wait, so a
+# re-read narrows the false-positive window but cannot close it: the main file's
+# page_count is simply not authoritative between completed checkpoints. Hence
+# the two-stage verdict below -- re-read to absorb the common case, then let
+# SQLite itself arbitrate a mismatch that persists. Only quick_check failing is
+# corruption; that alone raises.
+_TORN_EXTEND_RECHECKS = 3
+_TORN_EXTEND_RECHECK_DELAY_S = 0.05
+
+
+def _read_page_counts(path: str, page_size: int) -> tuple:
+    """Return (header page_count, pages in the file, file bytes); zeros = unknown.
+
+    Header first, then size: the file only ever grows here, so reading size
+    first would manufacture a deficit that never existed.
+
+    Never plain-open the live DB here. On POSIX, close() cancels EVERY fcntl
+    lock this process holds on that inode -- including the locks other SQLite
+    connections in this process are actively relying on. This runs at the
+    post-commit boundary of every write_txn, so a plain open/close here revoked
+    the gateway's kanban locks on every write, letting concurrent
+    writers/checkpointers proceed without exclusion (board corruption +
+    SQLITE_IOERR on a sibling connect()). Same hazard as the fast-path header
+    guard fixed in 97a17b6c3; reuse the cached never-closed descriptor instead.
+    """
+    header_bytes = _read_db_header(Path(path), 32)[28:32]
+    if len(header_bytes) < 4:
+        return (0, 0, 0)  # can't read header
+    header_page_count = int.from_bytes(header_bytes, "big")
+    if header_page_count == 0:
+        return (0, 0, 0)  # new/empty DB
+    file_size = os.path.getsize(path)
+    return (header_page_count, file_size // page_size, file_size)
+
+
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     """Read the SQLite header page_count and compare against actual file size.
 
-    Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    A mismatch that clears on a re-read is a concurrent checkpoint, not damage.
+    One that persists is put to ``PRAGMA quick_check``: only if SQLite also says
+    the database is damaged does this raise sqlite3.DatabaseError. This runs
+    after a COMMIT that already durably succeeded, so raising cannot undo the
+    write -- it only costs the caller its tick. That price is worth paying for
+    real corruption and never for a checkpoint in flight.
     """
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
         if row is None:
             return
-        path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
+        path = row[2]  # column 2 is the file path; empty for in-memory DBs
+        if not path:
             return  # in-memory or unnamed DB; skip
-        path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        # Never plain-open the live DB here. On POSIX, close() cancels EVERY
-        # fcntl lock this process holds on that inode -- including the locks
-        # other SQLite connections in this process are actively relying on.
-        # This check runs at the post-commit boundary of every write_txn, so a
-        # plain open/close here revoked the gateway's kanban locks on every
-        # write, letting concurrent writers/checkpointers proceed without
-        # exclusion (board corruption + SQLITE_IOERR on a sibling connect()).
-        # Same hazard as the fast-path header guard fixed in 97a17b6c3; reuse
-        # the cached never-closed descriptor instead.
-        header_bytes = _read_db_header(Path(path), 32)[28:32]
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
+        header_pages, actual_pages, file_size = _read_page_counts(path, page_size)
+        if header_pages <= actual_pages:
+            return
+        for attempt in range(1, _TORN_EXTEND_RECHECKS + 1):
+            time.sleep(_TORN_EXTEND_RECHECK_DELAY_S)
+            header_pages, actual_pages, file_size = _read_page_counts(path, page_size)
+            if header_pages <= actual_pages:
+                _log.warning(
+                    "kanban: transient page-count mismatch on %s cleared after "
+                    "%d re-read(s) (%.0fms) -- concurrent WAL checkpoint, not "
+                    "corruption; commit stands",
+                    path, attempt, attempt * _TORN_EXTEND_RECHECK_DELAY_S * 1000,
+                )
+                return
+        detail = (
+            f"page count mismatch on {path}: "
+            f"header claims {header_pages} pages, "
+            f"file has {actual_pages} pages "
+            f"(missing {header_pages - actual_pages} pages, "
+            f"file_size={file_size}, page_size={page_size}); "
+            f"persisted across {_TORN_EXTEND_RECHECKS} re-reads over "
+            f"{_TORN_EXTEND_RECHECKS * _TORN_EXTEND_RECHECK_DELAY_S * 1000:.0f}ms"
+        )
+        try:
+            verdict = conn.execute("PRAGMA quick_check(1)").fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            # SQLite could not even read the file to check it -- that is the
+            # corruption verdict, delivered as an exception instead of a row.
             raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
+                f"torn-extend detected: {detail}; quick_check failed: {exc}"
+            ) from exc
+        if str(verdict).lower() == "ok":
+            _log.error(
+                "kanban: %s -- but quick_check reports ok, so the database is "
+                "intact; a stalled WAL checkpoint left the main file short. "
+                "Not failing the commit",
+                detail,
             )
+            return
+        raise sqlite3.DatabaseError(
+            f"torn-extend detected: {detail}; quick_check={verdict}"
+        )
     except sqlite3.DatabaseError:
         raise
     except Exception:

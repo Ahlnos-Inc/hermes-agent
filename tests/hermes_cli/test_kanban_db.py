@@ -6181,27 +6181,86 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_raises_on_truncated_file(tmp_path):
-    """A mocked smaller file size triggers the torn-extend check."""
+def test_write_txn_does_not_fail_commit_on_short_read_of_intact_db(tmp_path):
+    """A short file read must not abort a write_txn whose DB is actually intact.
+
+    Was: any mismatch raised. That fired six times in two days on a live board
+    whose integrity_check was ok, aborting each dispatcher tick for nothing
+    (BUILD-752).
+    """
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
-    # Get actual page size so we can fake a smaller file
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     original_getsize = os.path.getsize
 
     def fake_getsize(path):
-        # Return a size that implies at least 1 fewer page than header claims
-        real_size = original_getsize(path)
-        return max(0, real_size - page_size)
+        # Report a size that implies at least 1 fewer page than the header claims
+        return max(0, original_getsize(path) - page_size)
 
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
-            with write_txn(conn) as c:
-                c.execute(
-                    "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                    "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
-                )
+    with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+            )
+    assert conn.execute("SELECT title FROM tasks WHERE id='t_test02'").fetchone()
+    conn.close()
+
+
+def test_check_file_length_invariant_tolerates_transient_mismatch(tmp_path):
+    """A mismatch that clears on a re-read is a concurrent checkpoint, not damage.
+
+    A lock-free raw read can see header page_count > EOF while another
+    checkpointer has written page 1 but not yet the frame that extends the
+    file. Failing the tick on that first observation is a false positive
+    (BUILD-752).
+    """
+    from hermes_cli.kanban_db import connect, _check_file_length_invariant
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    real_getsize = os.path.getsize
+    seen = []
+
+    def short_once(path):
+        seen.append(path)
+        size = real_getsize(path)
+        # Only the first observation is short, as if the extending write of a
+        # concurrent checkpoint had not landed yet.
+        return size - page_size if len(seen) == 1 else size
+
+    with unittest.mock.patch(
+        "hermes_cli.kanban_db.os.path.getsize", side_effect=short_once
+    ):
+        _check_file_length_invariant(conn)  # must not raise
+    assert len(seen) > 1, "the check never re-read after the first mismatch"
+    conn.close()
+
+
+def test_check_file_length_invariant_defers_to_quick_check(tmp_path):
+    """A persistent mismatch on an intact database must not fail the commit.
+
+    A stalled WAL checkpoint can leave the main file short indefinitely, so
+    "persists" is not proof of damage — SQLite's own verdict is. The commit has
+    already durably succeeded by this point; raising only costs the caller a
+    tick (BUILD-752).
+    """
+    import hermes_cli.kanban_db as kanban_db_module
+    from hermes_cli.kanban_db import connect, _check_file_length_invariant
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
+    calls = []
+
+    def short_page_counts(path, page_size):
+        calls.append(path)
+        return (10, 9, 36864)
+
+    with unittest.mock.patch.object(
+        kanban_db_module, "_read_page_counts", short_page_counts
+    ):
+        _check_file_length_invariant(conn)  # quick_check says ok -> no raise
+    assert len(calls) == kanban_db_module._TORN_EXTEND_RECHECKS + 1
     conn.close()
 
 
