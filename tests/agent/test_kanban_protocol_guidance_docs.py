@@ -6,7 +6,9 @@ from agent.prompt_builder import KANBAN_GUIDANCE
 
 
 def test_kanban_worker_guidance_documents_block_immediate_boundary():
-    assert "GitHub push/open-PR" in KANBAN_GUIDANCE
+    # Phrased "A push/open-PR failure ..." since the BUILD-663 rewrite. The
+    # constant has a hard 5500-char budget, so pin the contract, not the prose.
+    assert "push/open-PR failure" in KANBAN_GUIDANCE
     assert "auth boundary" in KANBAN_GUIDANCE
     assert "external side-effect failure" in KANBAN_GUIDANCE
     assert "kanban_comment" in KANBAN_GUIDANCE

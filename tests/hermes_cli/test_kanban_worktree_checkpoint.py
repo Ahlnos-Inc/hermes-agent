@@ -126,7 +126,9 @@ def test_dispatch_records_checkpoint_identity(tmp_path, monkeypatch):
         result = kb.dispatch_once(
             conn,
             board="checkpoint-test",
-            spawn_fn=lambda _task, _workspace: kb.SpawnReceipt(
+            # Board-scoped dispatch refuses a legacy two-argument spawn_fn: it
+            # would resolve the kanban DB as the default board's, not this one's.
+            spawn_fn=lambda _task, _workspace, board=None: kb.SpawnReceipt(
                 pid=31_005,
                 release=lambda: None,
                 abort=lambda: None,

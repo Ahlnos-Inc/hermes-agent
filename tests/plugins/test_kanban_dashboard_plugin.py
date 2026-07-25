@@ -119,6 +119,9 @@ def test_create_task_appears_on_board(client):
 def test_create_project_linked_task_uses_project_worktree(client, tmp_path):
     repo = tmp_path / "target-repo"
     repo.mkdir()
+    # A worktree anchor must be inside a git repo (guard from 35e0d020c); a
+    # dashboard project folder is a real checkout in production.
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     with pdb.connect_closing() as conn:
         project_id = pdb.create_project(conn, name="Target Repo", folders=[str(repo)])
         project = pdb.get_project(conn, project_id)
