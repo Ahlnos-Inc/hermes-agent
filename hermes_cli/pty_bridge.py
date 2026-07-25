@@ -181,8 +181,18 @@ class PtyBridge:
         """
         if self._closed:
             return None
+        # poll(), not select(): select() is capped by FD_SETSIZE (1024) no
+        # matter how high RLIMIT_NOFILE is, and raises ValueError for any fd at
+        # or above it. That ValueError landed in the except below and returned
+        # None — indistinguishable from EOF — so a dashboard process holding
+        # ~1000 descriptors silently tore down every healthy PTY the moment the
+        # master landed above the ceiling (BUILD-769). poll() has no such
+        # ceiling. POSIX-only, like the rest of this module.
         try:
-            readable, _, _ = select.select([self._fd], [], [], timeout)
+            poller = select.poll()
+            poller.register(self._fd, select.POLLIN | select.POLLPRI)
+            # poll() takes milliseconds; a negative timeout would block forever.
+            readable = poller.poll(max(0.0, timeout) * 1000)
         except (OSError, ValueError):
             return None
         if not readable:

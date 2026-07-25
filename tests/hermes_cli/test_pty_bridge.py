@@ -65,6 +65,42 @@ class TestPtyBridgeIO:
         finally:
             bridge.close()
 
+    @skip_on_windows
+    def test_reads_child_stdout_when_master_fd_exceeds_fd_setsize(self):
+        """A PTY master above FD_SETSIZE must still stream (BUILD-769).
+
+        ``select()`` is capped by ``FD_SETSIZE`` (1024 on macOS/Linux) no
+        matter how high ``RLIMIT_NOFILE`` is, and raises ``ValueError:
+        filedescriptor out of range`` for any fd at or above it. ``read()``
+        catches ``(OSError, ValueError)`` and returns ``None``, which every
+        caller reads as "child exited" — so a long-lived dashboard process
+        holding ~1000 descriptors silently tears down healthy chat sessions,
+        and the whole ``/api/pty`` WebSocket closes without a single byte.
+        ``poll()`` has no such ceiling.
+        """
+        target_fd = 1100
+        try:
+            os.fstat(target_fd)
+        except OSError:
+            pass
+        else:  # pragma: no cover - only if the runner already holds this fd
+            pytest.skip(f"fd {target_fd} is already in use")
+
+        bridge = PtyBridge.spawn(["/bin/sh", "-c", "printf hermes-high-fd"])
+        try:
+            # Relocate the master above the select() ceiling. dup2 keeps the
+            # original open; close() still reaps via self._proc.
+            bridge._fd = os.dup2(bridge._fd, target_fd)
+            assert bridge._fd >= 1024
+            output = _read_until(bridge, b"hermes-high-fd")
+            assert b"hermes-high-fd" in output
+        finally:
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
+            bridge.close()
+
     def test_write_sends_to_child_stdin(self):
         # `cat` with no args echoes stdin back to stdout.  We write a line,
         # read it back, then signal EOF to let cat exit cleanly.

@@ -816,10 +816,19 @@ class BaseEnvironment(ABC):
                         pass
                 return
             idle_after_exit = 0
+            # poll(), not select(): select() is capped by FD_SETSIZE (1024) no
+            # matter how high RLIMIT_NOFILE is, and raises ValueError for any fd
+            # at or above it. This loop read that ValueError as "fd already
+            # closed" and stopped draining, silently truncating a command's
+            # output in any long-lived process holding ~1000 descriptors
+            # (BUILD-769; same root cause as hermes_cli/pty_bridge.py). poll()
+            # has no such ceiling. POSIX-only: Windows returned above.
             try:
                 while True:
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
+                        poller = select.poll()
+                        poller.register(fd, select.POLLIN | select.POLLPRI)
+                        ready = poller.poll(100)
                     except (ValueError, OSError):
                         break  # fd already closed
                     if ready:
