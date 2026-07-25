@@ -4,6 +4,7 @@ Mirrors test_telegram_approval_buttons.py for the new ``send_clarify`` and
 ``cl:`` callback dispatch added in feat/clarify-gateway-buttons.
 """
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -67,6 +68,12 @@ def _clear_clarify_state():
         cm._notify_cbs.clear()
 
 
+class _RetryAfter(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"Retry after {seconds}")
+        self.retry_after = seconds
+
+
 # ===========================================================================
 # send_clarify — render
 # ===========================================================================
@@ -76,6 +83,12 @@ class TestTelegramSendClarify:
 
     def setup_method(self):
         _clear_clarify_state()
+
+    def test_gateway_wait_budget_covers_retry_after_regression(self):
+        """The sync bridge must wait longer than the observed 17s flood delay."""
+        from gateway.platforms.base import CLARIFY_SEND_WAIT_TIMEOUT_SECONDS
+
+        assert CLARIFY_SEND_WAIT_TIMEOUT_SECONDS > 17
 
     @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
@@ -131,6 +144,272 @@ class TestTelegramSendClarify:
         assert "reply_markup" not in kwargs
         assert "What is your name?" in kwargs["text"]
         assert adapter._clarify_state["cid2"] == "sk2"
+
+    @pytest.mark.asyncio
+    async def test_retry_after_over_15_seconds_retries_button_prompt(self):
+        """Flood control longer than the old gateway wait still delivers clarify."""
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 102
+
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[_RetryAfter(17), mock_msg]
+        )
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            result = await adapter.send_clarify(
+                chat_id="12345",
+                question="Which option?",
+                choices=["alpha", "beta"],
+                clarify_id="cid-flood",
+                session_key="sk-flood",
+            )
+
+        assert result.success is True
+        assert result.message_id == "102"
+        sleep.assert_awaited_once_with(17.0)
+        assert adapter._bot.send_message.await_count == 2
+        assert adapter._clarify_state["cid-flood"] == "sk-flood"
+
+    @pytest.mark.asyncio
+    async def test_failed_button_retry_delivers_text_fallback_without_orphaning_state(self):
+        """Clarify stays pending and text-routable after visible fallback delivery."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register(
+            "cid-fallback",
+            "sk-fallback",
+            "Which option?",
+            ["alpha", "beta"],
+        )
+        fallback_msg = MagicMock()
+        fallback_msg.message_id = 103
+
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[
+                _RetryAfter(17),
+                RuntimeError("button retry failed"),
+                fallback_msg,
+            ]
+        )
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await adapter.send_clarify(
+                chat_id="-100123",
+                question="Which option?",
+                choices=["alpha", "beta"],
+                clarify_id="cid-fallback",
+                session_key="sk-fallback",
+                metadata={"thread_id": "77"},
+            )
+
+        assert result.success is True
+        assert result.message_id == "103"
+        assert adapter._bot.send_message.await_count == 3
+        fallback_kwargs = adapter._bot.send_message.await_args_list[-1].kwargs
+        assert "reply_markup" not in fallback_kwargs
+        assert fallback_kwargs["message_thread_id"] == 77
+        assert "Reply with the option number" in fallback_kwargs["text"]
+        pending = cm.get_pending_for_session("sk-fallback")
+        assert pending is not None
+        assert pending.clarify_id == "cid-fallback"
+        assert pending.awaiting_text is True
+        assert adapter._clarify_state["cid-fallback"] == "sk-fallback"
+
+    @pytest.mark.asyncio
+    async def test_gateway_runner_long_retry_after_delivers_routable_fallback_without_orphan(self):
+        """The real sync bridge must not outlive pending state on a long flood wait."""
+        import gateway.run as gateway_run
+        from gateway.platforms.base import CLARIFY_SEND_WAIT_TIMEOUT_SECONDS
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        fallback_msg = MagicMock()
+        fallback_msg.message_id = 104
+        attempts = []
+        routable_before_delivery = []
+
+        async def send_message(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise _RetryAfter(CLARIFY_SEND_WAIT_TIMEOUT_SECONDS + 1)
+            pending = cm.get_pending_for_session("sk-timeout")
+            routable_before_delivery.append(
+                pending is not None and pending.awaiting_text
+            )
+            assert cm.resolve_text_response_for_session("sk-timeout", "1") is True
+            return fallback_msg
+
+        adapter._bot.send_message = AsyncMock(side_effect=send_message)
+        runner = object.__new__(gateway_run.GatewayRunner)
+
+        result = await asyncio.to_thread(
+            runner._run_clarify_callback_sync,
+            adapter=adapter,
+            chat_id="-100123",
+            session_key="sk-timeout",
+            thread_metadata={"thread_id": "77"},
+            loop=asyncio.get_running_loop(),
+            question="Which option?",
+            choices=["alpha", "beta"],
+        )
+        await asyncio.sleep(0)
+
+        assert result == "alpha"
+        assert len(attempts) == 2
+        assert "reply_markup" in attempts[0]
+        assert "reply_markup" not in attempts[1]
+        assert attempts[1]["message_thread_id"] == 77
+        assert routable_before_delivery == [True]
+        assert cm.has_pending("sk-timeout") is False
+
+    @pytest.mark.asyncio
+    async def test_gateway_runner_unscheduled_send_clears_resolver(self, monkeypatch):
+        """A send cancelled before scheduling is definitively absent."""
+        import gateway.run as gateway_run
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+
+        def reject_schedule(coro, *args, **kwargs):
+            coro.close()
+            return None
+
+        monkeypatch.setattr(gateway_run, "safe_schedule_threadsafe", reject_schedule)
+        runner = object.__new__(gateway_run.GatewayRunner)
+
+        result = await asyncio.to_thread(
+            runner._run_clarify_callback_sync,
+            adapter=adapter,
+            chat_id="-100123",
+            session_key="sk-cancel",
+            thread_metadata={"thread_id": "77"},
+            loop=asyncio.get_running_loop(),
+            question="Which option?",
+            choices=["alpha", "beta"],
+        )
+
+        assert result == "[clarify prompt could not be delivered]"
+        assert adapter._bot.send_message.await_count == 0
+        assert adapter._clarify_state == {}
+        assert cm.has_pending("sk-cancel") is False
+
+    @pytest.mark.asyncio
+    async def test_gateway_runner_timeout_keeps_resolver_for_unknown_delivery(self, monkeypatch):
+        """A prompt accepted across bridge timeout must keep one live resolver."""
+        import gateway.run as gateway_run
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        delivered = asyncio.Event()
+        release_send_result = asyncio.Event()
+        send_completed = asyncio.Event()
+        delayed_msg = MagicMock()
+        delayed_msg.message_id = 106
+
+        async def send_message(**kwargs):
+            delivered.set()  # Telegram accepted the visible side effect.
+            await release_send_result.wait()  # Its response races the bridge timeout.
+            send_completed.set()
+            return delayed_msg
+
+        adapter._bot.send_message = AsyncMock(side_effect=send_message)
+        monkeypatch.setattr(
+            gateway_run,
+            "CLARIFY_SEND_WAIT_TIMEOUT_SECONDS",
+            0.01,
+        )
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner_task = asyncio.create_task(
+            asyncio.to_thread(
+                runner._run_clarify_callback_sync,
+                adapter=adapter,
+                chat_id="-100123",
+                session_key="sk-delivery-race",
+                thread_metadata={"thread_id": "77"},
+                loop=asyncio.get_running_loop(),
+                question="Which option?",
+                choices=["alpha", "beta"],
+            )
+        )
+
+        try:
+            await asyncio.wait_for(delivered.wait(), timeout=0.2)
+            await asyncio.sleep(0.05)
+
+            pending = cm.get_pending_for_session(
+                "sk-delivery-race",
+                include_choice_prompts=True,
+            )
+            assert pending is not None
+            assert runner_task.done() is False
+            assert adapter._clarify_state[pending.clarify_id] == "sk-delivery-race"
+
+            # Force successful completion after the bridge timeout, then verify
+            # the delivered prompt still has both callback routing and its waiter.
+            release_send_result.set()
+            await asyncio.wait_for(send_completed.wait(), timeout=0.2)
+            await asyncio.sleep(0)
+            assert cm.has_pending("sk-delivery-race") is True
+            assert adapter._clarify_state[pending.clarify_id] == "sk-delivery-race"
+
+            # Mirror the callback's pop-before-resolve order and verify the
+            # completed delivery can resolve only once.
+            adapter._clarify_state.pop(pending.clarify_id, None)
+            assert cm.resolve_gateway_clarify(pending.clarify_id, "alpha") is True
+            assert await asyncio.wait_for(runner_task, timeout=0.2) == "alpha"
+            assert pending.clarify_id not in adapter._clarify_state
+            assert cm.resolve_gateway_clarify(pending.clarify_id, "beta") is False
+        finally:
+            release_send_result.set()
+            cm.clear_session("sk-delivery-race")
+            if not runner_task.done():
+                await asyncio.wait_for(runner_task, timeout=0.2)
+
+    @pytest.mark.asyncio
+    async def test_gateway_runner_late_failed_delivery_clears_resolver(self, monkeypatch):
+        """A definitive failed result after bridge timeout releases the waiter."""
+        import gateway.run as gateway_run
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+
+        async def fail_after_timeout(**kwargs):
+            await asyncio.sleep(0.03)
+            raise RuntimeError("definitive send failure")
+
+        adapter._bot.send_message = AsyncMock(side_effect=fail_after_timeout)
+        monkeypatch.setattr(
+            gateway_run,
+            "CLARIFY_SEND_WAIT_TIMEOUT_SECONDS",
+            0.01,
+        )
+        runner = object.__new__(gateway_run.GatewayRunner)
+
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                runner._run_clarify_callback_sync,
+                adapter=adapter,
+                chat_id="-100123",
+                session_key="sk-late-failure",
+                thread_metadata={"thread_id": "77"},
+                loop=asyncio.get_running_loop(),
+                question="Which option?",
+                choices=["alpha", "beta"],
+            ),
+            timeout=0.2,
+        )
+
+        assert result == "[clarify prompt could not be delivered]"
+        assert cm.has_pending("sk-late-failure") is False
+        assert adapter._clarify_state == {}
 
     @pytest.mark.asyncio
     async def test_not_connected(self):

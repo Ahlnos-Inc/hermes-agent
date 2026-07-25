@@ -1893,6 +1893,15 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
     except Exception:
         return
 
+# Synchronous gateway callbacks wait on asynchronous adapter prompt sends.  This
+# budget must cover Telegram's inline RetryAfter handling (observed at 16-17s)
+# plus the retry/fallback request itself; keeping it platform-neutral lets the
+# callback and adapter delivery contract share one explicit upper bound.
+CLARIFY_SEND_WAIT_TIMEOUT_SECONDS = 45.0
+# Preserve enough of that bridge budget for Telegram's retry request (whose
+# default read/write timeout is 20s) or a plain-text fallback request.
+CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS = 20.0
+
 
 @dataclass
 class SendResult:

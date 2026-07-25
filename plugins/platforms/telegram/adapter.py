@@ -252,6 +252,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -5129,6 +5130,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # Register callback routing before the external send. If Telegram
+        # accepts the visible prompt but its response races the gateway bridge
+        # timeout, the buttons still retain a resolver while delivery is unknown.
+        self._clarify_state[clarify_id] = session_key
+
         try:
             text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
@@ -5181,10 +5187,61 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            msg = await self._send_message_with_thread_fallback(**kwargs)
-            self._clarify_state[clarify_id] = session_key
+            try:
+                msg = await self._send_message_with_thread_fallback(**kwargs)
+            except Exception as send_err:
+                retry_after = getattr(send_err, "retry_after", None)
+                if retry_after is None:
+                    raise
+                if hasattr(retry_after, "total_seconds"):
+                    retry_after = retry_after.total_seconds()
+                wait = float(retry_after)
+                if wait <= CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS:
+                    logger.warning(
+                        "[%s] Telegram flood control on clarify prompt, retrying in %.1fs: %s",
+                        self.name,
+                        wait,
+                        _redact_telegram_error_text(send_err),
+                    )
+                    await asyncio.sleep(wait)
+                    try:
+                        msg = await self._send_message_with_thread_fallback(**kwargs)
+                    except Exception as retry_err:
+                        logger.warning(
+                            "[%s] Clarify button retry failed; sending plain-text fallback: %s",
+                            self.name,
+                            _redact_telegram_error_text(retry_err),
+                        )
+                    else:
+                        return SendResult(success=True, message_id=str(msg.message_id))
+                else:
+                    logger.warning(
+                        "[%s] Telegram clarify RetryAfter %.1fs exceeds %.1fs retry budget; "
+                        "sending plain-text fallback",
+                        self.name,
+                        wait,
+                        CLARIFY_SEND_RETRY_AFTER_MAX_SECONDS,
+                    )
+
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("reply_markup", None)
+                reply_hint = (
+                    "Reply with the option number or your answer."
+                    if choices
+                    else "Reply with your answer."
+                )
+                fallback_kwargs["text"] = f"{text}\n\n{reply_hint}"
+                from tools.clarify_gateway import mark_awaiting_text
+                if not mark_awaiting_text(clarify_id):
+                    self._clarify_state.pop(clarify_id, None)
+                    return SendResult(
+                        success=False,
+                        error="Clarify request expired before fallback delivery",
+                    )
+                msg = await self._send_message_with_thread_fallback(**fallback_kwargs)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._clarify_state.pop(clarify_id, None)
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
