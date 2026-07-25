@@ -767,11 +767,20 @@ class AuthError(RuntimeError):
         provider: str = "",
         code: Optional[str] = None,
         relogin_required: bool = False,
+        category: Optional[str] = None,
+        retryable: Optional[bool] = None,
+        public_message: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.code = code
         self.relogin_required = relogin_required
+        # BUILD-591: optional typed classification hints. ``public_message`` is
+        # the operator-safe rendering; the raw message may carry endpoint or
+        # request detail that must not reach a user-facing surface.
+        self.category = category
+        self.retryable = retryable
+        self.public_message = public_message
 
 
 def is_rate_limited_auth_error(error: Exception) -> bool:

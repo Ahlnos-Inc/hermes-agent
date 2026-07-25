@@ -26,6 +26,59 @@ CLAUDE_ROUTE_POLICY_ERROR = (
 )
 
 
+class RuntimeTargetError(ValueError):
+    """A deterministic, non-retryable provider/model route configuration error.
+
+    Distinct from :class:`ClaudeRoutePolicyError`: that one rejects an
+    otherwise coherent route on policy grounds and deliberately degrades to
+    the configured fallback chain (BUILD-573), while this one names a route
+    that cannot work as asked, so no fallback is attempted (BUILD-591).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "model_provider_mismatch",
+        category: str = "configuration",
+        retryable: bool = False,
+        fallback_eligible: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.fallback_eligible = fallback_eligible
+
+
+def validate_provider_model_target(
+    provider: str,
+    model: str,
+    *,
+    first_party_direct: bool,
+) -> None:
+    """Reject only known foreign models on the canonical Anthropic route.
+
+    Unknown IDs and noncanonical Anthropic-compatible endpoints intentionally
+    remain open-world; the remote provider stays authoritative for those.
+    """
+
+    if not first_party_direct or provider.strip().lower() != "anthropic":
+        return
+
+    from hermes_cli.model_normalize import detect_vendor, normalize_model_for_provider
+
+    normalized_model = normalize_model_for_provider(model, "anthropic")
+    vendor = detect_vendor(normalized_model)
+    if vendor and vendor != "anthropic":
+        safe_model = normalized_model.replace("\n", " ").replace("\r", " ")[:96]
+        raise RuntimeTargetError(
+            "model "
+            f"'{safe_model}' is not compatible with the canonical Anthropic route; "
+            "choose a Claude model or another explicit provider"
+        )
+
+
 class ClaudeRoutePolicyError(ValueError):
     """A governed Claude route was rejected by the ``max_only`` auth policy.
 
@@ -146,9 +199,11 @@ __all__ = [
     "CLAUDE_AGENT_SDK_RUNTIME",
     "CODEX_APP_SERVER_RUNTIME",
     "HERMES_RUNTIME",
+    "RuntimeTargetError",
     "VALID_AGENT_RUNTIMES",
     "attach_runtime_identity",
     "claude_auth_policy",
     "resolve_runtime_identity",
     "validate_claude_runtime_target",
+    "validate_provider_model_target",
 ]

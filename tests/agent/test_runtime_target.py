@@ -4,9 +4,11 @@ from agent.runtime_target import (
     CLAUDE_AGENT_SDK_RUNTIME,
     CODEX_APP_SERVER_RUNTIME,
     HERMES_RUNTIME,
+    RuntimeTargetError,
     attach_runtime_identity,
     resolve_runtime_identity,
     validate_claude_runtime_target,
+    validate_provider_model_target,
 )
 
 
@@ -221,3 +223,24 @@ def test_provider_resolution_rejects_alternate_claude_under_max_only_policy(
             explicit_api_key="never-used",
             target_model=model,
         )
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "openai/gpt-5"])
+def test_direct_anthropic_rejects_confidently_foreign_models(model):
+    with pytest.raises(RuntimeTargetError) as exc_info:
+        validate_provider_model_target("anthropic", model, first_party_direct=True)
+
+    error = exc_info.value
+    assert error.code == "model_provider_mismatch"
+    assert error.category == "configuration"
+    assert error.retryable is False
+    assert error.fallback_eligible is False
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "private-next-model"])
+def test_direct_anthropic_keeps_compatible_and_unknown_models_open(model):
+    validate_provider_model_target("anthropic", model, first_party_direct=True)
+
+
+def test_proxy_anthropic_route_keeps_foreign_model_open():
+    validate_provider_model_target("anthropic", "gpt-5", first_party_direct=False)

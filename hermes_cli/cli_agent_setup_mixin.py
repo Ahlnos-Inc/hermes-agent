@@ -43,9 +43,69 @@ class CLIAgentSetupMixin:
             format_runtime_provider_error,
         )
 
+        from hermes_cli.fallback_config import resolve_entry_api_key
+        from hermes_cli.resolution_failure import (
+            classify_resolution_failure,
+            format_resolution_failure,
+        )
+
+        def _resolve_entry(entry: dict):
+            """Resolve one fallback entry atomically from its OWN route.
+
+            BUILD-591: the primary route's explicit api key / base URL must
+            never cross the fallback boundary — neither on first selection nor
+            on any later re-resolution of an already-selected fallback.
+            """
+            kwargs = {
+                "requested": str(entry.get("provider") or "").strip().lower(),
+                "target_model": str(entry.get("model") or "").strip(),
+                "route_config": entry,
+            }
+            if entry.get("base_url"):
+                kwargs["explicit_base_url"] = entry["base_url"]
+            entry_api_key = resolve_entry_api_key(entry)
+            if entry_api_key:
+                kwargs["explicit_api_key"] = entry_api_key
+            return resolve_runtime_provider(**kwargs)
+
         _primary_exc = None
         runtime = None
         _fallback_excs: list = []  # collected per-fallback resolution errors (BUILD-573)
+        # BUILD-591: a fallback selected by an earlier call stays pinned, so a
+        # per-turn re-resolution re-resolves THAT route rather than re-sending
+        # the primary's credentials to the fallback provider. The pin is
+        # dropped as soon as the live route no longer matches it (a user or
+        # preset route change always wins) or if re-resolving it fails, in
+        # which case we fall through to the ordinary primary + full-chain path.
+        _pin = getattr(self, "_active_fallback_entry", None)
+        if isinstance(_pin, dict) and not (
+            str(_pin.get("provider") or "").strip().lower()
+            == (self.requested_provider or "").strip().lower()
+            and str(_pin.get("model") or "").strip() == (self.model or "").strip()
+        ):
+            _pin = None
+            self._active_fallback_entry = None
+        if isinstance(_pin, dict):
+            try:
+                runtime = _resolve_entry(_pin)
+            except Exception as exc:
+                self._active_fallback_entry = None
+                logger.warning(
+                    "Pinned fallback re-resolution failed, retrying the full route: %s",
+                    format_resolution_failure(
+                        classify_resolution_failure(exc),
+                        surface="cli",
+                        phase="pinned_fallback",
+                        provider=self.requested_provider,
+                        model=self.model,
+                    ),
+                )
+        # Credentials passed explicitly on the command line belong to the
+        # primary provider only; once we are running on a fallback provider
+        # they must not be re-sent (BUILD-591).
+        _primary_credentials_apply = (self.requested_provider or "").strip().lower() == (
+            getattr(self, "_primary_provider", None) or self.requested_provider or ""
+        ).strip().lower()
         # BUILD-589: re-resolution for a moa route must use the preset
         # identity, not the aggregator wire-model a prior resolution wrote
         # onto self.model (see the write-back below).
@@ -57,19 +117,33 @@ class CLIAgentSetupMixin:
             # override an intentional route change (Sol review 2a/2b/2c).
             if self.model and self.model == getattr(self, "_moa_wire_model", None):
                 _target_model = getattr(self, "_moa_route_model", None) or _target_model
-        try:
-            runtime = resolve_runtime_provider(
-                requested=self.requested_provider,
-                explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url,
-                target_model=_target_model,
-            )
-        except Exception as exc:
-            _primary_exc = exc
+        if runtime is None:
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=self.requested_provider,
+                    explicit_api_key=(
+                        self._explicit_api_key if _primary_credentials_apply else None
+                    ),
+                    explicit_base_url=(
+                        self._explicit_base_url if _primary_credentials_apply else None
+                    ),
+                    target_model=_target_model,
+                )
+            except Exception as exc:
+                _primary_exc = exc
+                logger.error(
+                    "Provider resolution failed: %s",
+                    format_resolution_failure(
+                        classify_resolution_failure(exc),
+                        surface="cli",
+                        phase="primary",
+                        provider=self.requested_provider,
+                        model=self.model,
+                    ),
+                )
 
         # Primary provider auth failed — try fallback providers before giving up.
         if runtime is None and _primary_exc is not None:
-            from hermes_cli.auth import AuthError
             from agent.runtime_target import ClaudeRoutePolicyError
 
             # A ``max_only`` Claude route-policy rejection is a PERMANENT
@@ -88,7 +162,12 @@ class CLIAgentSetupMixin:
                     "model=%r; activating configured fallback chain: %s",
                     self.requested_provider, self.model, _primary_exc,
                 )
-            if isinstance(_primary_exc, (AuthError, ClaudeRoutePolicyError)):
+            # BUILD-591: eligibility is decided by typed classification, not by
+            # an isinstance ladder or exception-message text. It is behavior-
+            # identical for AuthError and ClaudeRoutePolicyError, and adds the
+            # model/provider-mismatch case, which is a permanent misconfiguration
+            # and must NOT burn the fallback chain.
+            if classify_resolution_failure(_primary_exc).fallback_eligible:
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -96,30 +175,23 @@ class CLIAgentSetupMixin:
                     if not _fb_provider or not _fb_model:
                         continue
                     try:
-                        from hermes_cli.fallback_config import resolve_entry_api_key
-
-                        # route_config carries the fallback route's runtime
-                        # identity (Claude Max closed-world / runtime-target
-                        # validation); explicit key_env/base_url resolution
-                        # honors the fallback entry's own credentials (#... 998e35313).
-                        _fb_kwargs = {
-                            "requested": _fb_provider,
-                            "target_model": _fb_model,
-                            "route_config": _fb,
-                        }
-                        if _fb.get("base_url"):
-                            _fb_kwargs["explicit_base_url"] = _fb["base_url"]
-                        _fb_api_key = resolve_entry_api_key(_fb)
-                        if _fb_api_key:
-                            _fb_kwargs["explicit_api_key"] = _fb_api_key
-                        runtime = resolve_runtime_provider(**_fb_kwargs)
+                        # ``_resolve_entry`` carries the fallback route's own
+                        # runtime identity (Claude Max closed-world / runtime-
+                        # target validation) and its own key_env/base_url
+                        # (#... 998e35313); the primary's explicit credentials
+                        # never cross this boundary (BUILD-591).
+                        runtime = _resolve_entry(_fb)
                         logger.warning(
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
                         )
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        self._primary_provider = self.requested_provider
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
+                        # Pin the selected entry so a later re-resolution
+                        # re-resolves THIS route atomically (BUILD-591).
+                        self._active_fallback_entry = dict(_fb)
                         _primary_exc = None
                         break
                     except Exception as _fb_exc:
@@ -131,6 +203,16 @@ class CLIAgentSetupMixin:
                         logger.warning(
                             "Fallback entry %s/%s failed to resolve, trying next: %s",
                             _fb_provider, _fb_model, _fb_exc,
+                        )
+                        logger.warning(
+                            "Provider fallback attempt failed: %s",
+                            format_resolution_failure(
+                                classify_resolution_failure(_fb_exc),
+                                surface="cli",
+                                phase="fallback",
+                                provider=_fb_provider,
+                                model=_fb_model,
+                            ),
                         )
                         _fallback_excs.append(_fb_exc)
                         continue

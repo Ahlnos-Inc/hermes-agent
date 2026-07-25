@@ -147,7 +147,7 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     def _runtime_resolve(**kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            raise RuntimeError("temporary auth failure")
+            raise AuthError("synthetic failure", category="availability")
         return {
             "provider": "openrouter",
             "api_mode": "chat_completions",
@@ -165,11 +165,100 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
 
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.requested_provider = "openrouter"
 
     assert shell._init_agent() is False
     assert shell._init_agent() is True
     assert calls["count"] == 2
     assert shell.agent is not None
+
+
+def test_typed_temporary_auth_failure_selects_atomic_fallback(monkeypatch):
+    cli = _import_cli()
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise AuthError("synthetic primary failure", category="availability")
+        return {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://fallback.example.test/v1",
+            "api_key": "fallback-key",
+            "source": "fallback",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.requested_provider = "anthropic"
+    shell._explicit_api_key = "primary-secret"
+    shell._explicit_base_url = "https://primary.example.test/v1"
+    shell._fallback_model = [{"provider": "openrouter", "model": "openai/gpt-5", "base_url": "https://fallback.example.test/v1"}]
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.requested_provider == "openrouter"
+    assert shell.model == "openai/gpt-5"
+    assert calls[1]["route_config"]["provider"] == "openrouter"
+    assert "explicit_api_key" not in calls[1] or calls[1]["explicit_api_key"] != "primary-secret"
+    assert calls[1]["explicit_base_url"] == "https://fallback.example.test/v1"
+
+
+def test_active_fallback_reresolves_its_own_route_and_clears_on_route_change(monkeypatch):
+    cli = _import_cli()
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise AuthError("synthetic primary failure", category="availability")
+        return {
+            "provider": kwargs["requested"],
+            "api_mode": "chat_completions",
+            "base_url": kwargs.get("explicit_base_url") or "https://primary.example.test/v1",
+            "api_key": "test-key",
+            "source": "test",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.requested_provider = "anthropic"
+    shell._explicit_api_key = "primary-secret"
+    shell._explicit_base_url = "https://primary.example.test/v1"
+    shell._fallback_model = [{"provider": "openrouter", "model": "openai/gpt-5", "base_url": "https://fallback.example.test/v1"}]
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell._ensure_runtime_credentials() is True
+    assert calls[2]["requested"] == "openrouter"
+    assert calls[2].get("explicit_api_key") != "primary-secret"
+    assert calls[2]["explicit_base_url"] == "https://fallback.example.test/v1"
+
+    # A route change under the pin drops it — and the primary's explicit
+    # credentials still must not reach the (still non-primary) provider.
+    shell.model = "manual-route-change"
+    assert shell._ensure_runtime_credentials() is True
+    assert calls[3]["requested"] == "openrouter"
+    assert calls[3].get("explicit_api_key") != "primary-secret"
+    assert calls[3].get("explicit_base_url") != "https://primary.example.test/v1"
+    assert shell._active_fallback_entry is None
+
+
+def test_model_provider_mismatch_does_not_start_cli_fallback(monkeypatch):
+    cli = _import_cli()
+    from agent.runtime_target import RuntimeTargetError
+
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeTargetError("model/provider mismatch", code="model_provider_mismatch")
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell._fallback_model = [{"provider": "openrouter", "model": "openai/gpt-5"}]
+
+    assert shell._ensure_runtime_credentials() is False
+    assert len(calls) == 1
 
 
 def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):

@@ -256,6 +256,22 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     return False
 
 
+def _effective_anthropic_base_url(
+    *,
+    explicit_base_url: Optional[str],
+    route_config: Mapping[str, Any],
+) -> str:
+    """Return the Anthropic base URL using resolver precedence without auth work."""
+
+    explicit = str(explicit_base_url or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    configured = str(route_config.get("base_url") or "").strip().rstrip("/")
+    if configured and _anthropic_base_url_override_ok(configured):
+        return configured
+    return "https://api.anthropic.com"
+
+
 def _auto_detect_local_model(base_url: str) -> str:
     """Query a local server for its model name when only one model is loaded."""
     if not base_url:
@@ -2247,6 +2263,11 @@ def resolve_runtime_provider(
     provider_hint = str(
         requested or effective_route.get("provider") or "anthropic"
     ).strip().lower()
+    # ``claude``/``claude-code`` are canonical aliases of ``anthropic``
+    # everywhere else (providers.py, models.py, model_normalize.py); normalize
+    # here so the route checks below see one provider name (BUILD-591).
+    if provider_hint in {"claude", "claude-code"}:
+        provider_hint = "anthropic"
     external_moa_config: dict[str, Any] | None = None
     if provider_hint == "moa":
         from agent.runtime_target import HERMES_RUNTIME
@@ -2321,6 +2342,32 @@ def resolve_runtime_provider(
         runtime=runtime_identity,
         base_url=str(explicit_base_url or effective_route.get("base_url") or ""),
     )
+    if provider_hint == "anthropic":
+        # BUILD-591: reject a confidently-foreign model family on the canonical
+        # first-party Anthropic route before any credential/pool/token/network
+        # work. Runs AFTER the max_only policy check on purpose: a governed
+        # Claude route must keep raising ClaudeRoutePolicyError so it still
+        # degrades to the configured fallback chain (BUILD-573); this error is
+        # a permanent misconfiguration and deliberately gets no fallback.
+        # Placed after the moa block so a promoted aggregator target is
+        # validated under its own provider, not the envelope's.
+        from agent.runtime_target import validate_provider_model_target
+
+        validate_provider_model_target(
+            provider_hint,
+            str(
+                target_model
+                or effective_route.get("model")
+                or effective_route.get("default")
+                or ""
+            ),
+            first_party_direct=base_url_hostname(
+                _effective_anthropic_base_url(
+                    explicit_base_url=explicit_base_url,
+                    route_config=effective_route,
+                )
+            ) == "api.anthropic.com",
+        )
     if runtime_identity == CLAUDE_AGENT_SDK_RUNTIME:
         if provider_hint != "anthropic":
             raise RuntimeError(

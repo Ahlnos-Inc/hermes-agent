@@ -385,6 +385,54 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
     assert resolved.get("credential_pool") is None
 
 
+def test_direct_anthropic_mismatch_fails_before_credential_resolution(monkeypatch):
+    from agent.runtime_target import RuntimeTargetError
+
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "anthropic", "default": "gpt-5"})
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda *_args: pytest.fail("credential pool must not load"))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: pytest.fail("Anthropic token resolver must not run"),
+    )
+
+    with pytest.raises(RuntimeTargetError, match="not compatible") as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic", target_model="gpt-5")
+
+    assert exc_info.value.code == "model_provider_mismatch"
+
+
+def test_direct_anthropic_invalid_config_base_url_still_rejects_foreign_model(monkeypatch):
+    from agent.runtime_target import RuntimeTargetError
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "anthropic", "base_url": "https://openrouter.ai/api/v1"},
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "anthropic")
+
+    with pytest.raises(RuntimeTargetError, match="not compatible"):
+        rp.resolve_runtime_provider(
+            requested="anthropic",
+            explicit_api_key="test-key",
+            target_model="gpt-5",
+        )
+
+
+def test_explicit_anthropic_proxy_keeps_foreign_model_open(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "anthropic")
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        explicit_api_key="test-key",
+        explicit_base_url="https://proxy.example.test/anthropic",
+        target_model="gpt-5",
+    )
+
+    assert resolved["base_url"] == "https://proxy.example.test/anthropic"
+
+
 def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     class _Pool:
         def has_credentials(self):
