@@ -178,6 +178,24 @@ TERMINAL_KINDS = (
 FAILURE_KINDS = frozenset(TERMINAL_KINDS) - {
     "completed", "status", "archived", "unblocked",
 }
+# What an upstream step's subscription selects. A stalled run emits no
+# terminal event -- `detect_stale_running` reclaims it back to `ready` and
+# records a `stale` event -- so a downstream subscriber watching only
+# FAILURE_KINDS sees nothing while its dependency silently loses hours of work
+# (BUILD-742, the stale-running slice split out of BUILD-544).
+#
+# `stale` deliberately stays OUT of FAILURE_KINDS itself: the home sweep for
+# UNSUBSCRIBED tasks also reads that set, and a stale reclaim is self-healing
+# (the card goes straight back to `ready`), so paging home about one is the
+# noise BUILD-748 just finished removing. Someone who subscribed to the
+# workflow asked to hear about it; nobody asked on the home channel.
+# `reclaim_deferred` stays out of both -- a wedged-but-alive worker re-emits it
+# every dispatcher tick.
+SUBSCRIBER_FAILURE_KINDS = FAILURE_KINDS | {"stale"}
+# What the notifier claims off a subscription before applying that sub's own
+# kinds_json filter. A kind absent here can never be delivered no matter what a
+# subscription selects.
+NOTIFIABLE_KINDS = tuple(TERMINAL_KINDS) + ("stale",)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -3995,7 +4013,8 @@ def _subscribe_step_to_failure_kinds(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             step_task_id, platform, chat_id, thread_id or "", user_id,
-            notifier_profile, now, cursor, json.dumps(sorted(FAILURE_KINDS)),
+            notifier_profile, now, cursor,
+            json.dumps(sorted(SUBSCRIBER_FAILURE_KINDS)),
         ),
     )
 
@@ -6112,7 +6131,7 @@ def compile_workflow_graph(
             for step in normalized_steps
             if step["initial_status"] != "done"
         ]
-        failure_kinds_json = json.dumps(sorted(FAILURE_KINDS))
+        failure_kinds_json = json.dumps(sorted(SUBSCRIBER_FAILURE_KINDS))
         for normalized_notification in normalized_notifications:
             for sub_task_id in subscribe_task_ids:
                 kinds_json = (

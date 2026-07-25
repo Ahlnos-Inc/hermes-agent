@@ -1171,6 +1171,11 @@ class GatewayKanbanWatchersMixin:
         # hermes_cli/kanban_db.py::TERMINAL_KINDS (BUILD-443) so the two
         # can't drift out of sync.
         TERMINAL_KINDS = _kb.TERMINAL_KINDS
+        # A stalled run is not a terminal transition, but it is the thing a
+        # downstream subscriber otherwise loses hours to in silence, so the
+        # notifier claims it too and each subscription's kinds_json decides
+        # whether it is delivered (BUILD-742).
+        NOTIFIABLE_KINDS = _kb.NOTIFIABLE_KINDS
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -1376,7 +1381,7 @@ class GatewayKanbanWatchersMixin:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFIABLE_KINDS,
                                 )
                                 if not events:
                                     continue

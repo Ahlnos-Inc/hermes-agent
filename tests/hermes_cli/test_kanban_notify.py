@@ -734,7 +734,7 @@ def test_ad_hoc_subscribe_fans_out_to_blocked_parent(kanban_home):
 
         psubs = _subs_for(conn, parent, "chatA")
         assert len(psubs) == 1
-        assert set(json.loads(psubs[0]["kinds_json"])) == set(kb.FAILURE_KINDS)
+        assert set(json.loads(psubs[0]["kinds_json"])) == set(kb.SUBSCRIBER_FAILURE_KINDS)
         assert psubs[0]["last_event_id"] == 0  # blocked → deliver pending event
         assert psubs[0]["platform"] == "telegram"
     finally:
@@ -827,5 +827,52 @@ def test_ad_hoc_subscribe_transitive_multilevel_walk(kanban_home):
         assert len(_subs_for(conn, mid, "chatA")) == 1   # intermediate subscribed
         gsubs = _subs_for(conn, gp, "chatA")
         assert len(gsubs) == 1 and gsubs[0]["last_event_id"] == 0
+    finally:
+        conn.close()
+
+
+def test_ancestor_sub_selects_stale_so_a_stalled_upstream_is_not_silent(kanban_home):
+    """BUILD-742: a stalled run emits `stale`, never a terminal event.
+
+    `detect_stale_running` requeues the card, so a downstream subscriber
+    filtered to FAILURE_KINDS alone watches its dependency lose a run's worth
+    of work in silence — the stale-running slice split out of BUILD-544.
+    """
+    import json
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="apply")
+        child = kb.create_task(conn, title="verify", parents=[parent])
+        kb.add_notify_sub(conn, task_id=child, platform="telegram", chat_id="chatA")
+
+        kinds = set(json.loads(_subs_for(conn, parent, "chatA")[0]["kinds_json"]))
+        assert "stale" in kinds
+        # The home sweep for UNSUBSCRIBED tasks reads FAILURE_KINDS; a stale
+        # reclaim is self-healing, so it must not page home.
+        assert "stale" not in kb.FAILURE_KINDS
+        # A wedged-but-alive worker re-emits this every dispatcher tick.
+        assert "reclaim_deferred" not in kinds
+    finally:
+        conn.close()
+
+
+def test_notifier_claims_stale_events_for_a_subscription(kanban_home):
+    """The notifier's claim set gates delivery before kinds_json is consulted."""
+    import hermes_cli.kanban_db as kb
+    assert "stale" in kb.NOTIFIABLE_KINDS
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="long runner")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chatA")
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "stale", {"elapsed_seconds": 14_400})
+
+        _old, _new, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chatA",
+            thread_id="", kinds=kb.NOTIFIABLE_KINDS,
+        )
+
+        assert [event.kind for event in events] == ["stale"]
     finally:
         conn.close()

@@ -824,3 +824,21 @@ def test_kanban_notifier_tui_sweep_idempotent_across_restarts(tmp_path, monkeypa
         )
     finally:
         conn.close()
+
+
+def test_shared_kanban_renderer_reports_a_stalled_requeue():
+    """BUILD-742: an unrendered kind is silently dropped, so `stale` needs one."""
+    from gateway.kanban_notifications import render_kanban_event
+
+    task = type("Task", (), {"title": "Long build", "assignee": "coder", "result": None})()
+    event = type("Event", (), {
+        "kind": "stale",
+        "payload": {"elapsed_seconds": 14_400, "heartbeat_age_seconds": 3_600},
+    })()
+
+    message = render_kanban_event(task_id="t_abc", task=task, event=event)
+
+    assert message is not None
+    assert "stalled after 14400s" in message
+    assert "no progress for 3600s" in message
+    assert "requeued" in message

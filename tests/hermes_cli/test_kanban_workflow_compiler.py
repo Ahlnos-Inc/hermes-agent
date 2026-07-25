@@ -77,8 +77,8 @@ def test_compile_workflow_graph_subscribes_every_step(tmp_path):
         # the terminal task's own subscription stays NULL (all kinds), the
         # only one that ever notified before BUILD-503/508.
         by_task = {sub["task_id"]: sub for sub in subscriptions}
-        assert kb.notify_sub_kinds(by_task[market.id]) == kb.FAILURE_KINDS
-        assert kb.notify_sub_kinds(by_task[customer.id]) == kb.FAILURE_KINDS
+        assert kb.notify_sub_kinds(by_task[market.id]) == kb.SUBSCRIBER_FAILURE_KINDS
+        assert kb.notify_sub_kinds(by_task[customer.id]) == kb.SUBSCRIBER_FAILURE_KINDS
         assert kb.notify_sub_kinds(by_task[terminal.id]) is None
     finally:
         conn.close()

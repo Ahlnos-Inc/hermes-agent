@@ -261,7 +261,7 @@ def test_compile_workflow_atomically_subscribes_gateway_target_on_every_step(
         assert all(row["chat_id"] == "chat-472" for row in subscriptions)
         assert by_task[first["terminal_task_id"]]["kinds_json"] is None
         step_kinds = json.loads(by_task[first["task_ids"]["implement"]]["kinds_json"])
-        assert step_kinds == sorted(kb.FAILURE_KINDS)
+        assert step_kinds == sorted(kb.SUBSCRIBER_FAILURE_KINDS)
 
 
 def test_compile_workflow_invalid_graph_rolls_back_without_partial_cards(

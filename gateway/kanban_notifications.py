@@ -62,6 +62,21 @@ def render_kanban_event(
     if kind == "timed_out":
         limit = int(payload.get("limit_seconds") or 0)
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "stale":
+        # No terminal event is ever emitted for a stalled run — the dispatcher
+        # requeues it — so this is the only notice a subscriber gets that its
+        # upstream lost a run's worth of work (BUILD-742).
+        elapsed = int(payload.get("elapsed_seconds") or 0)
+        age = payload.get("heartbeat_age_seconds")
+        detail = (
+            f"no progress for {int(age)}s"
+            if age is not None
+            else "no heartbeat ever"
+        )
+        return (
+            f"🕰 {board_tag}{tag}Kanban {task_id} stalled after {elapsed}s "
+            f"({detail}); reclaimed and requeued"
+        )
     if kind == "block_loop_detected":
         reason = _redact(payload.get("reason") or "").strip()
         recurrences = payload.get("recurrences")
