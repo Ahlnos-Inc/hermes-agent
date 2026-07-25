@@ -25,6 +25,17 @@ import sys
 import tempfile
 from pathlib import Path
 
+# The developer's real Hermes home, captured BEFORE the bootstrap below
+# overwrites HERMES_HOME and before any fixture redirects HOME. This is the
+# only moment the live location is still knowable, and the kanban guard below
+# needs it to tell "test-owned tempdir" from "the operator's live board"
+# (BUILD-660).
+# Deliberately the canonical location only, NOT whatever HERMES_HOME happens to
+# hold: the parallel runner spawns per-file pytest children that inherit their
+# parent's bootstrap tempdir in HERMES_HOME, and treating that as "live" would
+# make the guard fire on legitimate test-owned paths.
+_LIVE_HERMES_ROOTS = (os.path.realpath(Path.home() / ".hermes"),)
+
 # Pytest imports test modules during collection, before any fixture can run.
 # Give those imports an isolated home now so module-level path constants and
 # import-time logging can never resolve to the developer's live ~/.hermes.
@@ -942,3 +953,57 @@ def _no_real_browser(monkeypatch):
 
     for name in ("open", "open_new", "open_new_tab"):
         monkeypatch.setattr(webbrowser, name, lambda *a, **k: True)
+
+
+@pytest.fixture(scope="session")
+def live_hermes_roots() -> tuple[str, ...]:
+    """The operator's real Hermes home(s), captured before any redirection."""
+    return _LIVE_HERMES_ROOTS
+
+
+def _is_live_hermes_path(path) -> bool:
+    resolved = os.path.realpath(str(path))
+    return any(
+        resolved == root or resolved.startswith(root + os.sep)
+        for root in _LIVE_HERMES_ROOTS
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_kanban_board():
+    """Fail closed if a test opens the operator's live Kanban board (BUILD-660).
+
+    Env isolation (the HERMES_KANBAN_* purge above, the per-test HERMES_HOME)
+    is a blocklist: it stops the paths we thought of. This is the tripwire for
+    the ones we didn't. A fixture that re-pins ``HERMES_KANBAN_DB``, a callsite
+    that builds ``Path.home() / ".hermes"`` by hand, or a helper that takes an
+    explicit path argument all bypass the env purge and land here instead —
+    which is how ``t_a5f0b327`` and ``t_10a9986f`` were created in the real
+    board, spawning a fixture PID against an already-deleted pytest tempdir.
+
+    Wraps the single fd-opening funnel, so it covers every board on every path
+    (``~/.hermes/kanban.db`` and ``~/.hermes/kanban/boards/<slug>/kanban.db``)
+    without knowing how the caller resolved it. Subprocess workers don't
+    inherit this monkeypatch — the HERMES_KANBAN_* env purge is what covers
+    them, and ``tests/hermes_cli/test_kanban_live_board_isolation.py`` asserts
+    that a child process resolves a test-owned path.
+    """
+    import hermes_cli.kanban_db as kdb
+
+    real_sqlite_connect = kdb._sqlite_connect
+
+    def _guarded_sqlite_connect(path, *args, **kwargs):
+        if _is_live_hermes_path(path):
+            raise AssertionError(
+                "BUILD-660: this test tried to open the LIVE Hermes Kanban board at "
+                f"{os.path.realpath(str(path))}. Tests must stay inside the per-test "
+                "HERMES_HOME tempdir. Point the board at tmp_path (or set "
+                "HERMES_KANBAN_DB to a tempdir) instead of the canonical home."
+            )
+        return real_sqlite_connect(path, *args, **kwargs)
+
+    kdb._sqlite_connect = _guarded_sqlite_connect
+    try:
+        yield
+    finally:
+        kdb._sqlite_connect = real_sqlite_connect
