@@ -1918,6 +1918,38 @@ def test_build_worker_context_flags_archived_parent_without_handoff(kanban_home)
         conn.close()
 
 
+def test_build_worker_context_withholds_a_retracted_parent_handoff(kanban_home):
+    """A quarantined parent's result is retracted, so it must not be shipped.
+
+    The architecture gate marks an offending done card
+    ``policy_quarantined``/``policy_invalidated``; ``_parent_is_satisfied``
+    then refuses to let it authorize downstream work. The worker context has
+    to honour the same invariant or the retraction is cosmetic (BUILD-593).
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="design", assignee="architect")
+        child = kb.create_task(
+            conn, title="build", assignee="coder", parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(
+            conn, parent, result="premature", summary="ship it without a gate",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET policy_quarantined = 1, policy_invalidated = 1 "
+                "WHERE id = ?",
+                (parent,),
+            )
+
+        ctx = kb.build_worker_context(conn, child)
+        assert "ship it without a gate" not in ctx
+        assert "premature" not in ctx
+    finally:
+        conn.close()
+
+
 def test_relative_age_renders_coarse_buckets():
     """Freshness helper turns epoch seconds into coarse human ages, and
     degrades safely on missing / future timestamps."""

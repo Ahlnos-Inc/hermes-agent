@@ -21801,9 +21801,12 @@ def build_worker_context(
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      5. Structured handoff results of every done parent task. Prefers
-         ``run.summary`` / ``run.metadata`` when the parent was executed
-         via a run; falls back to ``task.result`` for older data. Same
+      5. Structured handoff results of every parent that satisfies this
+         task's dependency (``_parent_is_satisfied``: done or archived,
+         and neither quarantined nor invalidated), subject to the section
+         budget. Prefers ``run.summary`` / ``run.metadata`` when the parent
+         was executed via a run; falls back to ``task.result`` for older
+         data; states the absence explicitly when neither exists. Same
          per-field cap.
       6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
@@ -22109,13 +22112,14 @@ def build_worker_context(
         parent_groups: list[tuple[str, list[str]]] = []
         for pid in parent_ids:
             pt = get_task(conn, pid)
-            # ``archived`` satisfies a dependency exactly like ``done``
-            # (``_parent_is_satisfied``; ``archive_task`` promotes dependents
-            # on the spot), so it must be rendered here too. Dropping it lost
-            # the handoff of a completed-then-archived parent, and left a
-            # parent archived as moot completely invisible to the child that
-            # its archival just released (BUILD-593).
-            if not pt or pt.status not in ("done", "archived"):
+            # Render exactly the parents that authorized this task to run.
+            # ``archived`` satisfies a dependency like ``done`` (``archive_task``
+            # promotes dependents on the spot), so dropping it lost the handoff
+            # of a completed-then-archived parent and left a parent archived as
+            # moot invisible to the child its archival just released. Deferring
+            # to ``_parent_is_satisfied`` also stops a quarantined parent's
+            # deliberately retracted result from reaching a worker (BUILD-593).
+            if not pt or not _parent_is_satisfied(pt):
                 continue
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
             runs.sort(key=lambda r: r.started_at, reverse=True)
@@ -22129,24 +22133,33 @@ def build_worker_context(
             elif pt.completed_at:
                 done_ts = pt.completed_at
             age = _relative_age(done_ts, _now)
-            state = "archived" if pt.status == "archived" else "completed"
-            group = [f"### {pid}" + (f" ({state} {age})" if age else f" ({state})")]
+            # ``age`` measures when the RESULT was produced, never when the
+            # archival happened, so the two facts are stated separately.
+            marks = ["archived"] if pt.status == "archived" else []
+            if age:
+                marks.append(f"completed {age}")
+            elif not marks:
+                marks.append("completed")
+            group = [f"### {pid} ({', '.join(marks)})"]
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
                 body_lines.append(_cap(run.summary))
             elif pt.result:
                 body_lines.append(_cap(pt.result))
-            elif pt.status == "archived":
+            elif pt.status == "archived" and run is None:
                 # The moot-parent case: this parent authorized the current
-                # task by being archived, but produced nothing. Say so, and
-                # name the escape hatch — a worker that has to guess the
-                # missing design blocks later with an unactionable reason.
+                # task by being archived, but no completed run and no result
+                # exist. Say so, and name the escape hatch — a worker that has
+                # to guess the missing design blocks later with an
+                # unactionable reason. A parent WITH a completed run whose
+                # summary happens to be empty is not this case; it falls
+                # through so its metadata below still speaks for it.
                 body_lines.append(
-                    "**Archived without a recorded handoff** — no design, spec "
-                    "or result was produced by this parent. Do not reconstruct "
-                    "it from guesswork: if this task depends on that handoff, "
-                    f"run `hermes kanban block {task_id} --reason \"parent {pid} "
+                    "**Archived without a recorded handoff** — no completed run "
+                    "recorded a design, spec or result. Do not reconstruct it "
+                    "from guesswork: if this task depends on that handoff, run "
+                    f"`hermes kanban block {task_id} --reason \"parent {pid} "
                     "archived without a handoff\"` so a human can re-scope it or "
                     "re-run the upstream step."
                 )
