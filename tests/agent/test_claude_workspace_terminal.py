@@ -1156,3 +1156,64 @@ def test_introspection_allowlist_does_not_widen_anything_else(command):
 
     with pytest.raises(RuntimeError):
         _validate_read_only_terminal_command(command)
+
+
+# ---------------------------------------------------------------------------
+# BUILD-652: the runtime's own scratch directory must never be able to create a
+# block loop. The coder terminal redirects TMPDIR into
+# <workspace>/.hermes-claude-runtime/tmp, so a test that hard-links a fixture
+# writes that link inside the scanned tree. Three sentinel incidents were filed
+# claiming the guard then re-triggers on its own artifact and locks the task out
+# of every terminal command. It does not, and these pin that it stays that way:
+# a link whose aliases are all inside the writable scope is counted, wherever in
+# the scope it lives.
+# ---------------------------------------------------------------------------
+
+
+def test_hardlink_inside_runtime_scratch_does_not_trigger_the_guard(tmp_path):
+    """Both aliases under .hermes-claude-runtime — the exact reported shape."""
+    workspace = tmp_path / "work"
+    scratch = workspace / ".hermes-claude-runtime" / "tmp" / "pytest-of-nicholas"
+    scratch.mkdir(parents=True)
+    victim = scratch / "victim.yaml"
+    victim.write_text("victim: untouched\n", encoding="utf-8")
+    os.link(victim, scratch / "config.yaml")
+
+    boundary = prepare_workspace_terminal_boundary(workspace)
+
+    assert boundary.root == workspace.resolve()
+    # The victim is intact: the census inspects metadata, it never writes.
+    assert victim.read_text(encoding="utf-8") == "victim: untouched\n"
+
+
+def test_hardlink_from_workspace_root_into_runtime_scratch_is_accepted(tmp_path):
+    """A fixture in the repo linked into TMPDIR is still wholly inside scope."""
+    workspace = tmp_path / "work"
+    scratch = workspace / ".hermes-claude-runtime" / "tmp" / "pytest-0"
+    scratch.mkdir(parents=True)
+    victim = workspace / "victim.yaml"
+    victim.write_text("victim: untouched\n", encoding="utf-8")
+    os.link(victim, scratch / "config.yaml")
+
+    prepare_workspace_terminal_boundary(workspace)
+
+    assert victim.read_text(encoding="utf-8") == "victim: untouched\n"
+
+
+def test_runtime_scratch_link_reaching_outside_the_workspace_still_blocks(tmp_path):
+    """The negative control: excluding scratch from suspicion is not a blind zone.
+
+    An alias under .hermes-claude-runtime whose partner lives outside the
+    workspace is the tamper vector the census exists for, and must keep failing
+    closed even though the writable-scope alias sits in the runtime's own
+    scratch tree.
+    """
+    workspace = tmp_path / "work"
+    scratch = workspace / ".hermes-claude-runtime" / "tmp"
+    scratch.mkdir(parents=True)
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("outside", encoding="utf-8")
+    os.link(outside, scratch / "config.yaml")
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(workspace)
