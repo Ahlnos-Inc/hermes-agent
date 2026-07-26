@@ -949,3 +949,34 @@ def test_decision_truncation_helper_includes_marker_when_over_limit():
     assert omitted > 0
     assert len(truncated.encode("utf-8")) <= MAX_DECISION_PREVIEW_BYTES
     assert "truncated" in truncated
+
+
+# --- BUILD-781: only real issue keys may become required Jira references -----
+
+
+class TestJiraKeyExtraction:
+    def test_model_names_and_encodings_are_not_issue_keys(self):
+        from hermes_cli.kanban_continuation import extract_jira_keys
+
+        body = (
+            "Perform a fresh independent GPT-5.6 Sol adversarial review of ADR "
+            "BUILD-700 v10. Bytes are UTF-8, digest SHA-256, timestamps RFC-3339, "
+            "blockers B78-B82, severity P1-3."
+        )
+        assert extract_jira_keys(body) == ["BUILD-700"]
+
+    def test_both_ahlnos_projects_are_extracted(self):
+        from hermes_cli.kanban_continuation import extract_jira_keys
+
+        assert extract_jira_keys("fixes BUILD-12 and OPS-345") == ["BUILD-12", "OPS-345"]
+
+    def test_extraction_spans_title_body_and_branch(self):
+        from hermes_cli.kanban_continuation import extract_jira_keys
+
+        keys = extract_jira_keys("BUILD-1 title", "body OPS-2", "build/BUILD-3-slug")
+        assert keys == ["BUILD-1", "BUILD-3", "OPS-2"]
+
+    def test_a_foreign_project_key_is_not_promoted_to_required_evidence(self):
+        from hermes_cli.kanban_continuation import extract_jira_keys
+
+        assert extract_jira_keys("see JIRA-42 upstream") == []

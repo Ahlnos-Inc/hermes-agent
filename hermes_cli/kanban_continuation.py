@@ -44,7 +44,15 @@ _DECISION_OMISSION_SENTINEL_TEMPLATE = (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_JIRA_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+# Ahlnos runs exactly two Jira projects, and the extracted keys become
+# *required* references on the continuation manifest — an unresolvable one
+# makes a reviewer proceed with what looks like missing authority context.
+# A generic `[A-Z][A-Z0-9]+-\d+` matched far more than issue keys: `GPT-5.6`
+# (→ GPT-5, which filed BUILD-781), `UTF-8`, `SHA-256`, `RFC-3339`, `P1-3`.
+JIRA_PROJECT_KEYS = ("BUILD", "OPS")
+_JIRA_KEY_RE = re.compile(
+    r"\b(?:" + "|".join(JIRA_PROJECT_KEYS) + r")-\d+\b"
+)
 _CHECKBOX_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s*(.+?)\s*$")
 _REFERENCE_KINDS = frozenset({"jira", "kanban", "git", "artifact", "vault"})
 
