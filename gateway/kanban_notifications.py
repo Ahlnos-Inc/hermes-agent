@@ -14,6 +14,61 @@ def _redact(text: Any) -> str:
     return redact_sensitive_text(str(text), force=True)
 
 
+# ``gave_up`` is the one alert whose ONLY exit is a person: the dispatcher has
+# stopped retrying and nothing else will move the task. It used to render as
+# "gave up after repeated spawn failures" regardless of what actually happened,
+# which misnames the dominant case (a worker that crashes) and leaves the
+# operator with no attempt count, no pid, and no next action even though the
+# event payload already carries all three (BUILD-674).
+_GAVE_UP_CAUSE = {
+    "crashed": "repeated worker crashes",
+    "timed_out": "repeated timeouts",
+    "spawn_failed": "repeated spawn failures",
+}
+_GAVE_UP_REMEDIATION_DEFAULT = (
+    "read `hermes kanban{board} show {task_id}`, fix the cause, then "
+    "`hermes kanban{board} unblock {task_id}`"
+)
+_GAVE_UP_REMEDIATION = {
+    "crashed": (
+        "read `hermes kanban{board} log {task_id}` for the worker's own output, "
+        "fix the cause, then `hermes kanban{board} unblock {task_id}`"
+    ),
+    "timed_out": (
+        "raise the task's max_runtime or split it, then "
+        "`hermes kanban{board} unblock {task_id}`"
+    ),
+    "spawn_failed": (
+        "check the gateway log for the dispatcher/credential failure, then "
+        "`hermes kanban{board} unblock {task_id}`"
+    ),
+}
+
+
+def _gave_up_evidence(payload: dict) -> str:
+    """Render the identifying evidence a give-up post-mortem starts from.
+
+    ``branch`` is load-bearing: for a worktree task it is the only pointer to
+    work the crashed worker committed but never merged (BUILD-584).
+    """
+    facts = []
+    pid = payload.get("pid")
+    if pid is not None:
+        facts.append(f"pid {pid}")
+    exit_kind = payload.get("exit_kind")
+    exit_code = payload.get("exit_code")
+    if exit_kind == "signaled" and exit_code is not None:
+        facts.append(f"killed by signal {exit_code}")
+    elif exit_kind == "nonzero_exit" and exit_code is not None:
+        facts.append(f"exited {exit_code}")
+    elif exit_kind:
+        facts.append(f"exit {exit_kind}")
+    branch = payload.get("branch")
+    if branch:
+        facts.append(f"branch {branch}")
+    return f" [{', '.join(facts)}]" if facts else ""
+
+
 def render_kanban_event(
     *,
     task_id: str,
@@ -48,7 +103,22 @@ def render_kanban_event(
     if kind == "gave_up":
         error = _redact(payload.get("error") or "").strip()
         suffix = f"\n{error}" if error else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{suffix}"
+        trigger = str(payload.get("trigger_outcome") or "").strip()
+        cause = _GAVE_UP_CAUSE.get(trigger, "repeated failures")
+        attempts, limit = payload.get("failures"), payload.get("effective_limit")
+        counted = (
+            f" ({attempts}/{limit} attempts)"
+            if attempts is not None and limit is not None
+            else ""
+        )
+        detail = _gave_up_evidence(payload)
+        board_arg = f" --board {board_slug}" if board_slug else ""
+        remedy = _GAVE_UP_REMEDIATION.get(trigger, _GAVE_UP_REMEDIATION_DEFAULT)
+        return (
+            f"✖ {board_tag}{tag}Kanban {task_id} gave up after {cause}"
+            f"{counted}{detail}{suffix}\n"
+            f"Next: {remedy.format(task_id=task_id, board=board_arg)}"
+        )
     if kind == "crashed":
         exit_kind = payload.get("exit_kind")
         exit_code = payload.get("exit_code")
