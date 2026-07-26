@@ -15460,6 +15460,59 @@ CAPACITY_ONLY_CAUSES = frozenset({"concurrency_cap", "concurrency_cap(per_profil
 ROUTING_STEADY_STATE_CAUSES = frozenset({"nonspawnable", "unassigned"})
 BENIGN_CAUSES = CAPACITY_ONLY_CAUSES | ROUTING_STEADY_STATE_CAUSES
 
+# BUILD-728: a ready task with NO assignee at all can never spawn, and since
+# the benign-classification fix (fb8a7a675) it no longer pages either — so it
+# sits silently forever. That is a routing slip worth one low-severity, aged
+# alert. ``nonspawnable`` (a human / control-plane assignee) is deliberately
+# excluded: that IS the intended steady state.
+UNASSIGNED_READY_SLA_SECONDS = 900
+
+
+def unassigned_ready_over_sla(
+    conn: sqlite3.Connection,
+    task_ids: "Iterable[str]",
+    *,
+    threshold_seconds: Optional[float] = None,
+    now: Optional[float] = None,
+) -> "list[tuple[str, str, int]]":
+    """Ready+unassigned tasks idle past the SLA window.
+
+    Returns ``(task_id, title, idle_seconds)`` oldest-first. Age is measured
+    from the task's most recent event — the moment it last entered this
+    state — falling back to ``created_at`` for an event-less task. Deliberately
+    NOT ``created_at`` alone: a card unblocked an hour ago is one hour idle,
+    not one week. The caller passes the ids the dispatcher already skipped, so
+    this re-reads only those rows; status/assignee are re-checked here because
+    the tick's snapshot may be stale by the time it is consulted.
+    """
+    ids = [str(t) for t in task_ids if t]
+    if not ids:
+        return []
+    threshold = (
+        float(threshold_seconds)
+        if threshold_seconds is not None
+        else float(UNASSIGNED_READY_SLA_SECONDS)
+    )
+    cutoff = (time.time() if now is None else float(now)) - threshold
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT t.id, t.title, "
+        "COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+        "          WHERE e.task_id = t.id), t.created_at) AS idle_since "
+        f"FROM tasks t WHERE t.id IN ({placeholders}) "
+        "  AND t.status = 'ready' "
+        "  AND (t.assignee IS NULL OR TRIM(t.assignee) = '')",
+        ids,
+    ).fetchall()
+    reference = time.time() if now is None else float(now)
+    over = [
+        (r["id"], r["title"], int(reference - r["idle_since"]))
+        for r in rows
+        if r["idle_since"] is not None and r["idle_since"] <= cutoff
+    ]
+    over.sort(key=lambda item: item[2], reverse=True)
+    return over
+
 
 @dataclass
 class DispatchHealthLogCooldowns:
@@ -18979,15 +19032,16 @@ def detect_crashed_workers(
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, str, Optional[int], Optional[str]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text,
+    #  exit_kind, exit_code, branch_name)
     # Durable per-pid exit sidecar dir for the session-detached path (BUILD-735).
     # Resolved from the same board-pinned log dir the workers were spawned under.
     sidecar_dir = worker_exit_sidecar_dir(board=board)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, current_run_id, worker_pid, worker_started_at, worker_pgid, worker_sid, "
-            "claim_lock, started_at, workspace_path "
+            "claim_lock, started_at, workspace_path, branch_name "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -19101,9 +19155,16 @@ def detect_crashed_workers(
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
+                # BUILD-584: always stamp the classification, including
+                # ``unknown``. An absent exit_kind is indistinguishable from an
+                # older event that never carried one, so "we could not read this
+                # worker's disposition" has to be recorded explicitly — that is
+                # the diagnostic that made the 2026-07-19 reviewer crashes
+                # unreadable ("pid N not alive" and nothing else).
+                event_payload = {
+                    "pid": pid, "claimer": row["claim_lock"], "exit_kind": kind,
+                }
+                if code is not None:
                     event_payload["exit_code"] = code
 
             # Capture safe workspace diagnostics for crash/timeout
@@ -19166,7 +19227,8 @@ def detect_crashed_workers(
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text,
+                         kind, code, row["branch_name"])
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -19188,10 +19250,18 @@ def detect_crashed_workers(
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _, _, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (tid, pid, claimer, protocol_violation, error_text,
+             exit_kind, exit_code, branch_name) in crash_details:
+            # BUILD-584: carry the worker's exit classification and the
+            # worktree branch into the ``gave_up`` evidence. Retry exhaustion
+            # on a worktree-backed task is only actionable if the terminal
+            # event names WHICH branch still holds the unmerged work.
+            _exit_evidence = {"exit_kind": exit_kind, "branch": branch_name}
+            if exit_code is not None:
+                _exit_evidence["exit_code"] = exit_code
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -19233,6 +19303,7 @@ def detect_crashed_workers(
                         "claimer": claimer,
                         "protocol_violations": streak,
                         "protocol_violation_limit": violation_limit,
+                        **_exit_evidence,
                     },
                 )
                 if tripped:
@@ -19247,7 +19318,9 @@ def detect_crashed_workers(
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
+                event_payload_extra={
+                    "pid": pid, "claimer": claimer, **_exit_evidence,
+                },
             )
             if tripped:
                 auto_blocked.append(tid)
