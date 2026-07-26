@@ -11,14 +11,10 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from enum import Enum
 import json
 import logging
 import os
-import shutil
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -470,426 +466,6 @@ def _human_block_event_is_current(kb, item: dict) -> bool:
             exc_info=True,
         )
         return False
-
-
-def _snapshot_process_fds(db_path: Path, out_path: Path) -> "Optional[str]":
-    """Dump this process's open-fd table next to a corruption backup.
-
-    BUILD-531: the recurring board corruption is stray in-process writes
-    through recycled file descriptors (PR #29 found TLS record bytes in
-    page one; the three archived corruption images show three unrelated
-    random-offset structural signatures, and every legitimate writer path
-    audits clean). The missing evidence at each event is WHICH fd aliased
-    the DB file — capture the whole table at detection time so the next
-    occurrence identifies the offender instead of just the victim.
-
-    Returns a one-line summary (or None on failure). Any fd whose inode
-    matches the corrupt DB is flagged ``**DB-ALIAS**``.
-    """
-    try:
-        db_stat = os.stat(db_path)
-    except OSError:
-        db_stat = None
-    lines = [f"# fd map at corruption detection for {db_path}"]
-    aliases = 0
-    try:
-        fd_names = sorted(int(n) for n in os.listdir("/dev/fd") if n.isdigit())
-    except OSError as exc:
-        return f"fd snapshot unavailable: {exc}"
-    for fd in fd_names:
-        try:
-            st = os.fstat(fd)
-        except OSError:
-            continue
-        try:
-            target = os.readlink(f"/dev/fd/{fd}")
-        except OSError:
-            target = "?"
-        flag = ""
-        if (
-            db_stat is not None
-            and st.st_dev == db_stat.st_dev
-            and st.st_ino == db_stat.st_ino
-        ):
-            flag = " **DB-ALIAS**"
-            aliases += 1
-        lines.append(
-            f"fd={fd} mode={oct(st.st_mode)} ino={st.st_ino} "
-            f"size={st.st_size} -> {target}{flag}"
-        )
-    try:
-        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError as exc:
-        return f"fd snapshot write failed: {exc}"
-    return f"{len(lines) - 1} fds captured, {aliases} aliasing the DB, at {out_path}"
-
-
-class RecoveryStatus(str, Enum):
-    """Outcome of one guarded corrupt-board recovery attempt."""
-
-    RECOVERED = "RECOVERED"
-    UNAVAILABLE = "UNAVAILABLE"
-    RETRY = "RETRY"
-    FAILED = "FAILED"
-
-
-RECOVERED = RecoveryStatus.RECOVERED
-UNAVAILABLE = RecoveryStatus.UNAVAILABLE
-RETRY = RecoveryStatus.RETRY
-FAILED = RecoveryStatus.FAILED
-
-
-@dataclass(frozen=True)
-class RecoveryResult:
-    """Structured recovery outcome; callers must not parse ``detail``."""
-
-    status: RecoveryStatus
-    detail: str
-
-
-def _resolve_sqlite_cli() -> "Optional[str]":
-    """Resolve the sqlite3 executable once for both probing and recovery."""
-    sqlite3_cli = shutil.which("sqlite3")
-    if not sqlite3_cli:
-        return None
-    try:
-        return str(Path(sqlite3_cli).expanduser().resolve())
-    except OSError:
-        return os.path.abspath(sqlite3_cli)
-
-
-def _probe_sqlite_recover_capability(sqlite3_cli: str) -> "tuple[bool, str]":
-    """Probe ``.recover`` behavior without opening or touching a board DB."""
-    try:
-        probe = subprocess.run(
-            [sqlite3_cli, "-batch", ":memory:", ".recover"],
-            capture_output=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "capability probe timed out"
-    except OSError as exc:
-        return False, f"capability probe could not run: {exc}"
-    if probe.returncode != 0:
-        stderr = probe.stderr.decode(errors="replace").strip()
-        return False, (
-            f"capability probe exited {probe.returncode}"
-            + (f": {stderr[:200]}" if stderr else "")
-        )
-    if not probe.stdout.strip():
-        return False, "capability probe emitted no recovery script"
-    return True, "sqlite3 .recover capability available"
-
-
-def _attempt_board_db_recovery(
-    kb,
-    slug: str,
-    *,
-    before_guard: "Optional[Callable[[], None]]" = None,
-) -> RecoveryResult:
-    """Try to rebuild a corrupt board DB in place via ``sqlite3 .recover``.
-
-    The 2026-07-18 vault-v2 incident: index-level corruption paused dispatch
-    for 16+ hours while the dispatcher quietly re-logged every 5 minutes —
-    yet the very first manual ``.recover`` produced a clean DB. Corruption
-    of this class is mechanically recoverable, so the dispatcher does it
-    itself instead of waiting for a human to notice log spam.
-
-    Safety: the corrupt original (and its -wal/-shm sidecars) are retained in
-    the incident's canonical forensic backup before the recovered file is
-    moved in, so nothing is ever destroyed; the swap uses ``os.replace``
-    (atomic on POSIX). The recovered DB must pass ``PRAGMA integrity_check``
-    before the swap.
-    ``before_guard`` is invoked only after the capability probe succeeds and
-    immediately before the live-board guard is opened.
-    Returns a :class:`RecoveryResult`; ``detail`` is diagnostic text only and
-    is never a caller-facing status channel.
-    """
-    sqlite3_cli = _resolve_sqlite_cli()
-    if not sqlite3_cli:
-        return RecoveryResult(
-            RecoveryStatus.UNAVAILABLE,
-            "sqlite3 .recover capability unavailable: sqlite3 CLI not on PATH",
-        )
-    capability_ok, capability_detail = _probe_sqlite_recover_capability(sqlite3_cli)
-    if not capability_ok:
-        return RecoveryResult(
-            RecoveryStatus.UNAVAILABLE,
-            "sqlite3 .recover capability unavailable: " + capability_detail,
-        )
-    path = Path(kb.kanban_db_path(slug)).expanduser().resolve()
-    if before_guard is not None:
-        before_guard()
-    if not path.exists():
-        return RecoveryResult(RecoveryStatus.RETRY, f"{path} does not exist")
-    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time()))
-    read_incident = getattr(kb, "read_corruption_incident", None)
-    incident = read_incident(path) if callable(read_incident) else None
-    incident_id = getattr(incident, "incident_id", None)
-    recovery_token = incident_id or ts
-    recovered_tmp = path.with_name(path.name + f".recovered-{recovery_token}.tmp")
-    rollback_tmp = path.with_name(f".{path.name}.rollback-{recovery_token}.tmp")
-    corrupt_bak = path.with_name(path.name + f".corrupt-{ts}.bak")
-    canonical_bak = getattr(incident, "backup_path", None)
-
-    def _dev_ino(p: Path) -> "tuple[int, int] | None":
-        try:
-            st = os.stat(p)
-            return (st.st_dev, st.st_ino)
-        except OSError:
-            return None
-
-    # BUILD-567 writer-safe swap. Hold ONE connection open from before the
-    # .recover snapshot through the swap: ``PRAGMA data_version`` read on the
-    # SAME connection changes iff another connection commits in between. It is
-    # the right signal here because it is immune to checkpoint churn (a reader
-    # moving WAL frames into the DB is not a new commit) and because
-    # data_version is only meaningful within a single connection — comparing it
-    # across the separate opens a stat-based token would need is useless. The
-    # DB's dev/ino guards against an *external* replacement of the file (another
-    # recovery) that this connection could not observe. A raw sqlite3 connection
-    # is used (not kb.connect) precisely because the health guard would refuse
-    # to open the corrupt file; the idle connection holds no lock during the
-    # slow .recover.
-    ino_before = _dev_ino(path)
-    guard = None
-    pre_swap_stages: list[tuple[Path, Path]] = []
-    moved_sidecars: list[tuple[Path, Path]] = []
-    recovered_installed = False
-    legacy_backup_published = False
-    recovery_succeeded = False
-
-    def _stage_forensic_sources() -> bool:
-        """Stage the locked pre-swap image without opening it in this process."""
-        stage_off_lock = getattr(kb, "_stage_off_lock", None)
-        if not callable(stage_off_lock) or canonical_bak is None:
-            return canonical_bak is None
-        staged_main = stage_off_lock(path)
-        if staged_main is None:
-            return False
-        pre_swap_stages.append((staged_main, canonical_bak))
-        for suffix in ("-wal", "-shm"):
-            sidecar = path.with_name(path.name + suffix)
-            if not sidecar.exists():
-                continue
-            staged_sidecar = stage_off_lock(sidecar)
-            if staged_sidecar is None:
-                return False
-            pre_swap_stages.append(
-                (staged_sidecar, canonical_bak.with_name(canonical_bak.name + suffix))
-            )
-        return True
-
-    def _restore_after_failed_swap() -> Optional[str]:
-        """Restore the corrupt inode when a swap boundary fails."""
-        errors: list[str] = []
-        failed_recovered = path.with_name(
-            f".{path.name}.failed-recovered-{recovery_token}.tmp"
-        )
-        try:
-            if recovered_installed and path.exists() and not rollback_tmp.exists():
-                os.replace(path, failed_recovered)
-        except OSError as exc:
-            errors.append(f"could not stage failed recovered DB: {exc}")
-        if not rollback_tmp.exists() and legacy_backup_published and corrupt_bak.exists():
-            try:
-                os.replace(corrupt_bak, rollback_tmp)
-            except OSError as exc:
-                errors.append(f"could not reclaim rollback DB: {exc}")
-        if rollback_tmp.exists() and not path.exists():
-            try:
-                os.replace(rollback_tmp, path)
-            except OSError as exc:
-                errors.append(f"could not restore original DB: {exc}")
-        for live_sidecar, rollback_sidecar in moved_sidecars:
-            if rollback_sidecar.exists() and not live_sidecar.exists():
-                try:
-                    os.replace(rollback_sidecar, live_sidecar)
-                except OSError as exc:
-                    errors.append(f"could not restore {live_sidecar.name}: {exc}")
-        try:
-            failed_recovered.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            errors.append(f"could not remove failed recovered DB: {exc}")
-        return "; ".join(errors) if errors else None
-
-    try:
-        guard = sqlite3.connect(str(path), timeout=5.0)
-        dv_before = guard.execute("PRAGMA data_version").fetchone()[0]
-    except sqlite3.Error as exc:
-        if guard is not None:
-            guard.close()
-        return RecoveryResult(
-            RecoveryStatus.FAILED,
-            f"could not open board to guard the swap: {exc}",
-        )
-    try:
-        # No immutable=1: it tells SQLite the file cannot change, so the
-        # .recover pass skips locks AND the live WAL — the 2026-07-18 ROOT
-        # board corruption was WAL-resident first and an immutable scan
-        # missed it, and a moving file read without locks can enshrine a
-        # torn snapshot as the "recovered" DB. A normal open takes shared
-        # locks and includes WAL content; writers just block briefly.
-        dump = subprocess.run(
-            [sqlite3_cli, str(path), ".recover"],
-            capture_output=True, timeout=300,
-        )
-        if dump.returncode != 0 or not dump.stdout.strip():
-            return RecoveryResult(
-                RecoveryStatus.FAILED,
-                f".recover failed: {dump.stderr.decode(errors='replace')[:200]}",
-            )
-        load = subprocess.run(
-            [sqlite3_cli, str(recovered_tmp)],
-            input=dump.stdout, capture_output=True, timeout=300,
-        )
-        if load.returncode != 0:
-            return RecoveryResult(
-                RecoveryStatus.FAILED,
-                f"reload failed: {load.stderr.decode(errors='replace')[:200]}",
-            )
-        check = subprocess.run(
-            [sqlite3_cli, str(recovered_tmp), "PRAGMA integrity_check"],
-            capture_output=True, timeout=120,
-        )
-        if check.stdout.decode(errors="replace").strip() != "ok":
-            return RecoveryResult(
-                RecoveryStatus.FAILED,
-                "recovered DB failed integrity_check: "
-                + check.stdout.decode(errors="replace")[:200],
-            )
-        # Take the write lock (BEGIN IMMEDIATE only acquires the RESERVED lock —
-        # it does not read user btrees, so it still succeeds on an index-corrupt
-        # DB) and re-verify nothing committed since the .recover snapshot.
-        # Holding the lock across the os.replace sequence also stops a fresh
-        # connect() from landing mid-swap and binding a stale -wal to the
-        # recovered inode.
-        try:
-            guard.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error as exc:
-            return RecoveryResult(
-                RecoveryStatus.FAILED,
-                f"could not acquire write lock for swap: {exc}",
-            )
-        if _dev_ino(path) != ino_before:
-            return RecoveryResult(
-                RecoveryStatus.RETRY,
-                "board file was replaced during recovery; aborting swap (retry next tick)",
-            )
-        dv_after = guard.execute("PRAGMA data_version").fetchone()[0]
-        if dv_after != dv_before:
-            return RecoveryResult(
-                RecoveryStatus.RETRY,
-                "board changed during recovery; aborting swap "
-                "(a writer committed since the .recover snapshot; retry next tick)",
-            )
-        if not _stage_forensic_sources():
-            return RecoveryResult(
-                RecoveryStatus.FAILED,
-                "could not stage the guarded pre-swap original for the canonical forensic backup",
-            )
-        if rollback_tmp.exists():
-            return RecoveryResult(
-                RecoveryStatus.RETRY,
-                "a prior recovery left rollback material beside the board; refusing to overwrite it",
-            )
-        os.replace(path, rollback_tmp)
-        for suffix in ("-wal", "-shm"):
-            sidecar = path.with_name(path.name + suffix)
-            if sidecar.exists():
-                rollback_sidecar = rollback_tmp.with_name(rollback_tmp.name + suffix)
-                os.replace(sidecar, rollback_sidecar)
-                moved_sidecars.append((sidecar, rollback_sidecar))
-        os.replace(recovered_tmp, path)
-        recovered_installed = True
-        if canonical_bak is None:
-            # Direct callers from older integrations may invoke recovery before
-            # an incident marker exists. Keep that compatibility path, but all
-            # gateway-detected incidents use the durable canonical backup.
-            os.replace(rollback_tmp, corrupt_bak)
-            legacy_backup_published = True
-            for _live_sidecar, rollback_sidecar in moved_sidecars:
-                sidecar_suffix = _live_sidecar.name[len(path.name):]
-                os.replace(
-                    rollback_sidecar,
-                    corrupt_bak.with_name(corrupt_bak.name + sidecar_suffix),
-                )
-        else:
-            atomic_copy = getattr(kb, "_atomic_copy2", None)
-            if not callable(atomic_copy):
-                raise OSError("kanban DB backup publisher unavailable")
-            for staged_source, backup_destination in pre_swap_stages:
-                if not atomic_copy(staged_source, backup_destination):
-                    raise OSError(
-                        f"could not refresh canonical forensic backup at {backup_destination}"
-                    )
-            # The marker is cleared only after the recovered DB and its
-            # canonical pre-swap backup are both complete.
-            clear_incident = getattr(kb, "clear_corruption_incident", None)
-            if callable(clear_incident):
-                cleared = clear_incident(path, incident_id=incident_id)
-                if incident is not None and not cleared:
-                    raise OSError("canonical incident marker could not be cleared")
-        recovery_succeeded = True
-        return RecoveryResult(
-            RecoveryStatus.RECOVERED,
-            f"{capability_detail}; corrupt original preserved at "
-            f"{canonical_bak or corrupt_bak}",
-        )
-    except subprocess.TimeoutExpired:
-        restore_detail = _restore_after_failed_swap()
-        detail = "recovery subprocess timed out"
-        if restore_detail:
-            detail += f"; {restore_detail}"
-        return RecoveryResult(RecoveryStatus.FAILED, detail)
-    except OSError as exc:
-        restore_detail = _restore_after_failed_swap()
-        detail = f"recovery swap failed: {exc}"
-        if restore_detail:
-            detail += f"; {restore_detail}"
-        return RecoveryResult(RecoveryStatus.FAILED, detail)
-    finally:
-        # guard's fd references the pre-swap inode; closing it drops locks only
-        # on the retained pre-swap/rollback image, never on a freshly-installed
-        # recovered DB.
-        try:
-            guard.rollback()
-        except sqlite3.Error:
-            pass
-        try:
-            guard.close()
-        except sqlite3.Error:
-            pass
-        try:
-            if (
-                recovered_tmp.exists()
-                and path.exists()
-                and not recovered_tmp.samefile(path)
-            ):
-                recovered_tmp.unlink()
-        except OSError:
-            pass
-        if recovery_succeeded:
-            try:
-                rollback_tmp.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-            for _live_sidecar, rollback_sidecar in moved_sidecars:
-                try:
-                    rollback_sidecar.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
-        for staged_source, _destination in pre_swap_stages:
-            try:
-                staged_source.unlink()
-            except OSError:
-                pass
 
 
 def _resolve_auto_decompose_settings(
@@ -2623,14 +2199,11 @@ class GatewayKanbanWatchersMixin:
         # surface as "database disk image is malformed" for one tick.
         CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
         disabled_corrupt_boards: dict[str, tuple[str, float]] = {}
-        # FAILED is one recovery attempt per durable incident;
-        # UNAVAILABLE and RETRY remain eligible on the existing quarantine
-        # cadence. Re-detections of the same state log at INFO so a
-        # still-corrupt board doesn't ERROR-spam every quarantine expiry
+        # First detection of an incident logs ERROR; re-detections log INFO so
+        # a still-corrupt board doesn't ERROR-spam every quarantine expiry
         # (the 2026-07-18 vault-v2 incident logged the identical ERROR every
         # 5 minutes for 16 hours and never told the operator).
-        corrupt_recovery_attempted: set[str] = set()
-        corrupt_recovery_states: dict[str, RecoveryStatus] = {}
+        corrupt_incidents_reported: set[str] = set()
         corrupt_alert_pending: dict[tuple, str] = {}
         corrupt_alert_delivered: set[tuple] = set()
         corrupt_alert_last_attempt: dict[tuple, float] = {}
@@ -2655,14 +2228,11 @@ class GatewayKanbanWatchersMixin:
             incident_id: str,
             event_kind: str,
             message: str,
-            *,
-            replace_pending: bool = False,
         ) -> None:
             key = (incident_id, event_kind)
             if key in corrupt_alert_delivered:
                 return
-            if replace_pending or key not in corrupt_alert_pending:
-                corrupt_alert_pending[key] = message
+            corrupt_alert_pending.setdefault(key, message)
 
         def _clear_corrupt_incident_state(
             incident_id: str,
@@ -2670,8 +2240,7 @@ class GatewayKanbanWatchersMixin:
             clear_alerts: bool = True,
         ) -> None:
             """Forget runtime quarantine/retry state after an epoch heals."""
-            corrupt_recovery_attempted.discard(incident_id)
-            corrupt_recovery_states.pop(incident_id, None)
+            corrupt_incidents_reported.discard(incident_id)
             for board_slug, disabled_entry in list(disabled_corrupt_boards.items()):
                 if disabled_entry[0] == incident_id:
                     disabled_corrupt_boards.pop(board_slug, None)
@@ -2700,20 +2269,7 @@ class GatewayKanbanWatchersMixin:
             slug: str,
             incident: Any,
             exc: Exception,
-            result: RecoveryResult,
         ) -> str:
-            status = result.status.value
-            if result.status == RecoveryStatus.UNAVAILABLE:
-                recovery_label = (
-                    "UNAVAILABLE (the behavioral sqlite3 `.recover` capability "
-                    "probe failed)"
-                )
-            elif result.status == RecoveryStatus.FAILED:
-                recovery_label = "FAILED (recovery ran but could not produce a safe swap)"
-            elif result.status == RecoveryStatus.RETRY:
-                recovery_label = "RETRY (the board changed during recovery; no swap was applied)"
-            else:
-                recovery_label = status
             incident_backup = getattr(incident, "backup_path", None)
             if getattr(incident, "preservation_status", "published") != "published":
                 incident_backup = None
@@ -2724,26 +2280,13 @@ class GatewayKanbanWatchersMixin:
                 f"🚨 Kanban board `{slug}` database is corrupt. "
                 f"Incident: `{getattr(incident, 'incident_id', 'unknown')}`. "
                 f"Resolved path: `{db_path}`. "
-                f"Automatic recovery `{status}`: {recovery_label}. "
-                f"Detail: `{_bounded_alert_detail(result.detail)}`. "
                 f"Detection: `{_bounded_alert_detail(exc, 240)}`. "
                 f"Forensic backup: `{backup_detail}`. "
-                "Dispatch is PAUSED; this recovery attempt left the board "
-                "UNCHANGED. Safe operator choices: supply a recover-capable "
-                "sqlite3 binary, or restore a known-good backup."
-            )
-
-        def _corrupt_recovered_alert(
-            slug: str,
-            incident: Any,
-            result: RecoveryResult,
-        ) -> str:
-            return (
-                f"🛠 Kanban board `{slug}` database was corrupt and has been "
-                f"auto-recovered; dispatch resumes next tick. "
-                f"Incident: `{getattr(incident, 'incident_id', 'unknown')}`. "
-                f"Resolved path: `{getattr(incident, 'db_path', '')}`. "
-                f"{_bounded_alert_detail(result.detail)}."
+                "Dispatch is PAUSED and the board file is left UNCHANGED; "
+                "recovery is an operator action (BUILD-716). Run "
+                "`sqlite3 <path> .recover` into a NEW file, verify "
+                "`PRAGMA integrity_check`, then swap it in with the gateway "
+                "stopped — or restore a known-good backup."
             )
 
         def _board_corruption_incident(slug: str) -> Any:
@@ -2763,8 +2306,17 @@ class GatewayKanbanWatchersMixin:
             slug: str,
             exc: Exception,
         ) -> None:
-            """Corrupt board DB: attempt safe recovery, alert once per
-            delivered event key, and quarantine without ERROR-spamming.
+            """Corrupt board DB: fail loud, alert once per delivered event
+            key, and quarantine without ERROR-spamming.
+
+            BUILD-716: the dispatcher no longer tries to rebuild the board in
+            place. That swap renamed the live DB and its ``-wal``/``-shm`` out
+            from under every open connection — itself a documented corruption
+            source, and a second independent one layered on top of the
+            BUILD-531 defect (fixed in ``5eec2d4e2``) it was built to survive.
+            Nothing on this path now moves or rewrites the board file, so the
+            untouched original IS the forensic artifact and recovery is an
+            operator action against it.
 
             Runs in the dispatcher tick thread. Alerts are queued on
             the pending alert map and flushed to the Telegram home channel by
@@ -2801,79 +2353,20 @@ class GatewayKanbanWatchersMixin:
                         "backup_path": getattr(exc, "backup_path", None),
                     },
                 )()
-            previous_status = corrupt_recovery_states.get(incident_id)
-            if incident_id not in corrupt_recovery_attempted:
-                def _snapshot_before_recovery() -> None:
-                    # BUILD-531 forensics: capture the fd table BEFORE recovery
-                    # swaps files around, while the stray-writing fd (if any)
-                    # may still alias the corrupt image. The recovery helper
-                    # invokes this only after the capability probe succeeds.
-                    try:
-                        db_path = Path(_kb.kanban_db_path(slug))
-                        fd_timestamp = time.strftime(
-                            "%Y%m%d-%H%M%S",
-                            time.localtime(corrupt_wall_clock()),
-                        )
-                        fd_note = _snapshot_process_fds(
-                            db_path,
-                            db_path.with_name(
-                                db_path.name
-                                + f".fdmap-{fd_timestamp}.txt"
-                            ),
-                        )
-                        if fd_note:
-                            logger.warning(
-                                "kanban dispatcher: board %s corruption fd "
-                                "snapshot: %s", slug, fd_note,
-                            )
-                    except Exception:
-                        logger.debug("fd snapshot failed", exc_info=True)
-
-                result = _attempt_board_db_recovery(
-                    _kb, slug, before_guard=_snapshot_before_recovery,
-                )
-                corrupt_recovery_states[incident_id] = result.status
-                if result.status == RecoveryStatus.FAILED:
-                    corrupt_recovery_attempted.add(incident_id)
-                else:
-                    # UNAVAILABLE must be re-probed after the existing
-                    # quarantine cadence; RETRY likewise remains retryable.
-                    corrupt_recovery_attempted.discard(incident_id)
-                if result.status == RecoveryStatus.RECOVERED:
-                    logger.warning(
-                        "kanban dispatcher: board %s database was corrupt (%s); "
-                        "auto-recovered in place. %s",
-                        slug, exc, result.detail,
-                    )
-                    _clear_corrupt_incident_state(incident_id)
-                    _queue_corrupt_alert(
-                        incident_id,
-                        "recovered",
-                        _corrupt_recovered_alert(slug, incident, result),
-                    )
-                    # The recovery helper clears the marker only after the
-                    # recovered DB and canonical backup are both published.
-                    return
-                log_method = (
-                    logger.error
-                    if previous_status != result.status
-                    else logger.info
-                )
-                log_method(
+            if incident_id not in corrupt_incidents_reported:
+                corrupt_incidents_reported.add(incident_id)
+                logger.error(
                     "kanban dispatcher: board %s database %s is corrupt "
-                    "(not a valid SQLite database) and "
-                    "automatic recovery is %s (%s); dispatch remains paused "
-                    "until the file changes or the quarantine timer expires.",
+                    "(not a valid SQLite database); the file is left UNCHANGED "
+                    "and dispatch remains paused until it changes or the "
+                    "quarantine timer expires. Recovery is an operator action. "
+                    "incident=%s detection=%s",
                     slug,
                     getattr(incident, "db_path", path),
-                    result.status.value,
-                    result.detail,
+                    incident_id,
+                    exc,
                 )
             else:
-                result = RecoveryResult(
-                    previous_status or RecoveryStatus.FAILED,
-                    "automatic recovery already attempted for this unchanged incident",
-                )
                 logger.info(
                     "kanban dispatcher: board %s still corrupt (not a valid "
                     "SQLite database; incident unchanged); dispatch remains "
@@ -2882,11 +2375,7 @@ class GatewayKanbanWatchersMixin:
             _queue_corrupt_alert(
                 incident_id,
                 "failure",
-                _corrupt_failure_alert(slug, incident, exc, result),
-                replace_pending=(
-                    previous_status is not None
-                    and previous_status != result.status
-                ),
+                _corrupt_failure_alert(slug, incident, exc),
             )
             disabled_corrupt_boards[slug] = (incident_id, corrupt_monotonic_clock())
 

@@ -98,17 +98,12 @@ def test_notifier_detection_publishes_incident_dispatcher_consumes_it(
     assert incident.backup_path is not None and incident.backup_path.exists()
     assert incident.preservation_status == kb.CORRUPTION_PRESERVATION_PUBLISHED
 
-    attempts = []
-
-    def fake_recovery(_kb, slug, **_kwargs):
-        attempts.append((slug, incident.incident_id))
-        return kw.RecoveryResult(
-            kw.RecoveryStatus.UNAVAILABLE,
-            "injected capability unavailable",
-        )
+    # BUILD-716: the dispatcher must consume the incident WITHOUT touching the
+    # board file. Capture the exact inode + bytes it must leave alone.
+    db_stat_before = db.stat()
+    db_bytes_before = db.read_bytes()
 
     monkeypatch.setattr(kb, "list_notify_subs", real_list_notify_subs)
-    monkeypatch.setattr(kw, "_attempt_board_db_recovery", fake_recovery)
     monkeypatch.setattr(kb, "reap_worker_zombies", lambda: [])
     runner._running = True
 
@@ -129,7 +124,15 @@ def test_notifier_detection_publishes_incident_dispatcher_consumes_it(
     )
     asyncio.run(runner._kanban_dispatcher_watcher())
 
-    assert attempts == [("default", incident.incident_id)]
+    db_stat_after = db.stat()
+    assert (db_stat_after.st_dev, db_stat_after.st_ino) == (
+        db_stat_before.st_dev,
+        db_stat_before.st_ino,
+    )
+    assert db.read_bytes() == db_bytes_before
+    assert kb.read_corruption_incident(db).incident_id == incident.incident_id
+    assert not list(tmp_path.glob("**/*.recovered-*"))
+    assert not list(tmp_path.glob("**/*.fdmap-*.txt"))
     assert len(list(tmp_path.glob("**/kanban.db.corrupt.*.bak"))) == 1
 
 
@@ -219,13 +222,6 @@ def test_dispatcher_reenables_same_runner_after_same_size_atomic_replacement(
         lambda include_archived=False: [{"slug": "default"}],
     )
     monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"slug": slug})
-    monkeypatch.setattr(
-        kw,
-        "_attempt_board_db_recovery",
-        lambda *_args, **_kwargs: kw.RecoveryResult(
-            kw.RecoveryStatus.UNAVAILABLE, "test capability unavailable"
-        ),
-    )
     dispatches = []
     monkeypatch.setattr(
         kb,
