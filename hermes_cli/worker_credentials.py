@@ -1262,8 +1262,35 @@ def render_worker_credential_audit(root: Path | str | None = None) -> str:
         "this boundary does not cover — enumerated below (BUILD-789).",
         "",
     ]
+    lines += render_skipped_secret_audit()
+    lines.append("")
     lines += render_profile_local_env_audit(root=root)
     return "\n".join(lines)
+
+
+def render_skipped_secret_audit() -> list[str]:
+    """List vault secrets a source declined to apply, with the reason.
+
+    A secret that never became an environment variable is invisible in every
+    other view: it is present in the vault, the startup banner reports a
+    healthy "applied N", and a capability that resolves by env-var name keeps
+    using whatever it used before (BUILD-793).
+    """
+    try:
+        from hermes_cli.env_loader import skipped_secret_names
+
+        skips = skipped_secret_names()
+    except Exception:  # noqa: BLE001
+        skips = {}
+    if not skips:
+        return ["Vault secrets not applied to the environment: none"]
+    out = [f"Vault secrets NOT applied to the environment ({len(skips)}):"]
+    by_reason: dict[str, list[str]] = {}
+    for name, reason in skips.items():
+        by_reason.setdefault(reason, []).append(name)
+    for reason, names in sorted(by_reason.items()):
+        out.append(f"  {reason}: " + ", ".join(sorted(names)))
+    return out
 
 
 def render_profile_local_env_audit(root: Path | str | None = None) -> list[str]:

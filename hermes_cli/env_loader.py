@@ -96,6 +96,7 @@ def reset_secret_source_cache() -> None:
     that want to refresh after a config change.
     """
     _APPLIED_HOMES.clear()
+    _SECRET_SKIPS.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -433,12 +434,56 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                 f"({', '.join(sorted(src.applied))})",
                 file=sys.stderr,
             )
+        for line in _render_skipped(src):
+            print(line, file=sys.stderr)
         if src.result.error:
             print(f"  {src.label}: {src.result.error}", file=sys.stderr)
         for warn in src.result.warnings:
             print(f"  {src.label}: {warn}", file=sys.stderr)
     for conflict in report.conflicts:
         print(f"  Secret sources: {conflict}", file=sys.stderr)
+
+
+# Why each skip bucket is worth a line, in the order they matter to an
+# operator.  ``invalid`` is the only one that is always a DEFECT: the secret
+# exists in the vault, the startup banner reports a healthy "applied N", and
+# the value silently never arrives, because the name is not a legal
+# environment variable name (hyphens are the usual cause).  A capability that
+# resolves by env-var name then keeps using whatever it used before, with no
+# signal anywhere connecting the two — BUILD-793, found the hard way while
+# wiring BUILD-603's GitHub tokens.  The other three are ordinary precedence
+# outcomes, reported so "my secret isn't here" is answerable without a diff.
+_SKIP_BUCKETS = (
+    ("skipped_invalid", "NOT APPLIED — name is not a valid environment variable name"),
+    ("skipped_protected", "not applied — protected bootstrap-auth name"),
+    ("skipped_claimed", "not applied — an earlier source already supplied it"),
+    ("skipped_existing", "not applied — an existing .env/shell value won"),
+)
+
+# name → reason, for every secret a source declined to apply this process.
+# Read by the credential audit so the state is inspectable after startup and
+# not only in whatever scrollback the gateway happened to write it to.
+_SECRET_SKIPS: dict[str, str] = {}
+
+
+def skipped_secret_names() -> dict[str, str]:
+    """Return ``{secret name: reason}`` for secrets a source did not apply."""
+    return dict(_SECRET_SKIPS)
+
+
+def _render_skipped(src) -> list[str]:
+    """Render one line per non-empty skip bucket. Names only, never values."""
+    lines = []
+    for attr, reason in _SKIP_BUCKETS:
+        names = sorted(getattr(src, attr, ()) or ())
+        if not names:
+            continue
+        for name in names:
+            _SECRET_SKIPS[name] = reason
+        lines.append(
+            f"  {src.label}: {len(names)} {reason}: {', '.join(names)}"
+        )
+    return lines
 
 
 def _load_secrets_config(home_path: Path) -> dict:
