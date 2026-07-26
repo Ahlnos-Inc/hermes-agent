@@ -5616,3 +5616,132 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
             deadline=gateway_cli.time.monotonic() - 1,
         )
         assert ok is False
+
+
+class TestLaunchdDomainSurvivesADrain:
+    """A restore must land in the domain the service was drained from.
+
+    ``hermes-sync.sh activate`` stops the gateway before restarting it, so both
+    ``launchctl print`` probes miss and the old code fell through to
+    ``user/<uid>`` — the domain with no login keychain, which is the documented
+    root of the architect attestation crash class (BUILD-775, BUILD-720).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_domain_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        previous = gateway_cli._resolved_launchd_domain
+        gateway_cli._resolved_launchd_domain = None
+        yield
+        gateway_cli._resolved_launchd_domain = previous
+
+    @staticmethod
+    def _unloaded_launchctl(*, gui_session: bool, managername: str = "Background"):
+        """launchctl with the gateway label absent from both domains."""
+
+        def fake_run(cmd, check=False, **kwargs):
+            joined = " ".join(cmd)
+            if cmd[:2] == ["launchctl", "print"] and "ai.hermes" in joined:
+                raise subprocess.CalledProcessError(113, cmd, stderr="Could not find service")
+            if cmd[:2] == ["launchctl", "print"] and cmd[2].startswith("gui/"):
+                if not gui_session:
+                    return SimpleNamespace(returncode=113, stdout="", stderr="")
+                return SimpleNamespace(
+                    returncode=0, stdout="gui/501 = {\n\tsession = Aqua\n}\n", stderr=""
+                )
+            if cmd[:2] == ["launchctl", "managername"]:
+                return SimpleNamespace(returncode=0, stdout=managername, stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return fake_run
+
+    def test_captured_gui_domain_wins_when_the_service_is_unloaded(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".gateway-launchd-domain").write_text("gui/501\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", self._unloaded_launchctl(gui_session=False)
+        )
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+
+    def test_captured_user_domain_is_honoured_too(self, tmp_path, monkeypatch):
+        (tmp_path / ".gateway-launchd-domain").write_text("user/501\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", self._unloaded_launchctl(gui_session=True)
+        )
+
+        assert gateway_cli._launchd_domain() == "user/501"
+
+    def test_garbage_capture_is_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / ".gateway-launchd-domain").write_text("gui/99999\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", self._unloaded_launchctl(gui_session=False)
+        )
+
+        assert gateway_cli._launchd_domain() == "user/501"
+
+    def test_without_a_capture_an_aqua_login_session_still_means_gui(
+        self, monkeypatch
+    ):
+        # managername describes this *shell* (Background), not whether the user
+        # is logged in graphically — asking for the gui/<uid> domain does.
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", self._unloaded_launchctl(gui_session=True)
+        )
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+
+    def test_headless_host_still_resolves_to_the_user_domain(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", self._unloaded_launchctl(gui_session=False)
+        )
+
+        assert gateway_cli._launchd_domain() == "user/501"
+
+    def test_stop_records_the_registered_domain_before_bootout(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=False, **kwargs: SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda: tmp_path / "ai.hermes.gateway.plist",
+        )
+        _mock_single_launchd_target(monkeypatch, pid=4242, domain="gui/501")
+
+        gateway_cli.launchd_stop()
+
+        assert (tmp_path / ".gateway-launchd-domain").read_text(
+            encoding="utf-8"
+        ).strip() == "gui/501"
+
+    def test_bootstrap_ambiguity_names_the_manual_recovery_command(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway-orchestrator.plist"
+        label = "ai.hermes.gateway-orchestrator"
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                raise subprocess.CalledProcessError(5, cmd, stderr="Input/output error")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_launchd_label_domains",
+            lambda _label: _label_probe(absent=("gui/501", "user/501")),
+        )
+
+        with pytest.raises(gateway_cli.LaunchdAllOperationError) as excinfo:
+            gateway_cli._launchctl_bootstrap("user/501", plist_path, label)
+
+        message = str(excinfo.value)
+        assert f"launchctl bootstrap user/501 {plist_path}" in message
+        assert f"launchctl print user/501/{label}" in message

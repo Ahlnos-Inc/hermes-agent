@@ -4289,17 +4289,70 @@ def get_launchd_label() -> str:
 _resolved_launchd_domain: str | None = None
 
 
+def _launchd_domain_capture_path() -> Path:
+    """Where the last positively-observed managing domain is remembered."""
+    return get_hermes_home() / ".gateway-launchd-domain"
+
+
+def _record_launchd_domain(domain: str) -> None:
+    """Remember a domain observed while the service was actually loaded.
+
+    A stop boots the service out, which erases the only evidence
+    :func:`_launchd_domain` can probe.  Any restore after that drain — most
+    importantly the one ``hermes-sync.sh activate`` performs — would otherwise
+    have to guess, and guessing ``user/<uid>`` on a GUI host costs the login
+    keychain and breaks Claude Max attestation for workers (BUILD-775/720).
+    """
+    try:
+        _launchd_domain_capture_path().write_text(f"{domain}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _captured_launchd_domain() -> str | None:
+    """Read back a recorded domain, ignoring anything not currently valid."""
+    try:
+        recorded = _launchd_domain_capture_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return recorded if recorded in _launchd_candidate_domains() else None
+
+
+def _launchd_gui_session_exists(gui_domain: str) -> bool:
+    """True when this uid owns a live Aqua login session.
+
+    ``launchctl managername`` describes the *calling* process, so a background
+    shell reports ``Background`` even while the user is logged in graphically.
+    Asking launchd whether the ``gui/<uid>`` domain itself exists answers the
+    question that actually matters: is there a login keychain session to
+    bootstrap into?
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", gui_domain],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return False
+    return result.returncode == 0 and "session = Aqua" in (result.stdout or "")
+
+
 def _launchd_domain() -> str:
     """Return the launchd domain that actually manages the gateway service.
 
     Probes ``gui/<uid>`` first (Aqua sessions), then ``user/<uid>``
-    (Background/SSH sessions).  When neither domain contains a loaded
-    service, falls back to ``launchctl managername`` as a heuristic.
+    (Background/SSH sessions).  When neither domain contains a loaded service —
+    the state every restore-after-drain starts from — falls back to the domain
+    last recorded while it *was* loaded, then to whether this uid has an Aqua
+    login session at all, and only then to ``launchctl managername``.
 
     The result is cached for the lifetime of the process so that repeated
     calls (``start``, ``stop``, ``restart``) use a consistent domain.
 
-    See #40831, #23387.
+    See #40831, #23387, BUILD-775.
     """
     global _resolved_launchd_domain
     if _resolved_launchd_domain is not None:
@@ -4319,6 +4372,7 @@ def _launchd_domain() -> str:
             capture_output=True,
         )
         _resolved_launchd_domain = gui_domain
+        _record_launchd_domain(gui_domain)
         return gui_domain
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -4332,11 +4386,24 @@ def _launchd_domain() -> str:
             capture_output=True,
         )
         _resolved_launchd_domain = user_domain
+        _record_launchd_domain(user_domain)
         return user_domain
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 3. Neither domain has the service loaded — use managername as heuristic.
+    # 3. Unloaded: restore into the domain it was last drained from.
+    captured = _captured_launchd_domain()
+    if captured is not None:
+        _resolved_launchd_domain = captured
+        return captured
+
+    # 4. No capture — a live Aqua login session for this uid means gui/<uid>
+    #    regardless of what kind of session this shell runs in.
+    if _launchd_gui_session_exists(gui_domain):
+        _resolved_launchd_domain = gui_domain
+        return gui_domain
+
+    # 5. Neither domain has the service loaded — use managername as heuristic.
     #    Aqua → gui/<uid>, anything else (Background, loginwindow) → user/<uid>.
     try:
         result = subprocess.run(
@@ -4351,7 +4418,7 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 4. Default to user/<uid> (matches the pre-probing behavior for
+    # 6. Default to user/<uid> (matches the pre-probing behavior for
     #    Background/SSH sessions and is the recommended domain on macOS 26+).
     _resolved_launchd_domain = user_domain
     return user_domain
@@ -6186,9 +6253,18 @@ def _launchctl_bootstrap(
         if probe.registered != (domain,):
             raise LaunchdAllOperationError(
                 f"{domain}/{label}: bootstrap exit 5 left registration "
-                f"ambiguous or absent ({probe.registered or 'none'})"
+                f"ambiguous or absent ({probe.registered or 'none'}); "
+                + _launchd_manual_recovery_hint(domain, plist_path, label)
             ) from exc
         return True
+
+
+def _launchd_manual_recovery_hint(domain: str, plist_path, label: str) -> str:
+    """Spell out the hand recovery for a gateway left registered nowhere."""
+    return (
+        f"recover with: launchctl bootstrap {domain} {plist_path} "
+        f"(then verify: launchctl print {domain}/{label})"
+    )
 
 
 def _launchd_reload_log_path() -> Path:
@@ -6816,6 +6892,9 @@ def _launchd_stop_target(
         get_launchd_plist_path(),
     )
     domain = lifecycle_target.domain
+    if lifecycle_target.probe.registered:
+        # Last chance to record this: the bootout below erases the evidence.
+        _record_launchd_domain(domain)
     expected_identity = lifecycle_target.runtime_identity
     if record_planned_stop and expected_identity is not None:
         try:
