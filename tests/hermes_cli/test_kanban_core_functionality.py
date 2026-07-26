@@ -1865,6 +1865,59 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
         conn.close()
 
 
+def test_build_worker_context_keeps_archived_parent_handoff(kanban_home):
+    """Archiving a completed parent must not erase its handoff (BUILD-593).
+
+    ``_parent_is_satisfied`` treats ``archived`` exactly like ``done`` and
+    ``archive_task`` promotes dependents immediately, so a child dispatched
+    after a board cleanup archived its parent would otherwise run with no
+    design at all.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="design", assignee="architect")
+        child = kb.create_task(
+            conn, title="build", assignee="coder", parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(
+            conn, parent,
+            result="spec written",
+            summary="slice A then slice B; verify with test_x",
+        )
+        assert kb.archive_task(conn, parent) is True
+
+        ctx = kb.build_worker_context(conn, child)
+        assert "Parent task results" in ctx
+        assert "slice A then slice B; verify with test_x" in ctx
+    finally:
+        conn.close()
+
+
+def test_build_worker_context_flags_archived_parent_without_handoff(kanban_home):
+    """A parent archived as moot leaves an actionable diagnostic (BUILD-593).
+
+    The child is promoted regardless, so silence here is what strands the
+    coder: it sees no parent section and blocks with an unactionable reason.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="design", assignee="architect")
+        child = kb.create_task(
+            conn, title="build", assignee="coder", parents=[parent],
+        )
+        assert kb.archive_task(conn, parent) is True
+
+        ctx = kb.build_worker_context(conn, child)
+        assert "Parent task results" in ctx
+        assert parent in ctx
+        assert "archived without a recorded handoff" in ctx.lower()
+        # Actionable: names the escape hatch instead of inviting a guess.
+        assert "kanban block" in ctx
+    finally:
+        conn.close()
+
+
 def test_relative_age_renders_coarse_buckets():
     """Freshness helper turns epoch seconds into coarse human ages, and
     degrades safely on missing / future timestamps."""

@@ -22109,7 +22109,13 @@ def build_worker_context(
         parent_groups: list[tuple[str, list[str]]] = []
         for pid in parent_ids:
             pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
+            # ``archived`` satisfies a dependency exactly like ``done``
+            # (``_parent_is_satisfied``; ``archive_task`` promotes dependents
+            # on the spot), so it must be rendered here too. Dropping it lost
+            # the handoff of a completed-then-archived parent, and left a
+            # parent archived as moot completely invisible to the child that
+            # its archival just released (BUILD-593).
+            if not pt or pt.status not in ("done", "archived"):
                 continue
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
             runs.sort(key=lambda r: r.started_at, reverse=True)
@@ -22123,13 +22129,27 @@ def build_worker_context(
             elif pt.completed_at:
                 done_ts = pt.completed_at
             age = _relative_age(done_ts, _now)
-            group = [f"### {pid}" + (f" (completed {age})" if age else "")]
+            state = "archived" if pt.status == "archived" else "completed"
+            group = [f"### {pid}" + (f" ({state} {age})" if age else f" ({state})")]
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
                 body_lines.append(_cap(run.summary))
             elif pt.result:
                 body_lines.append(_cap(pt.result))
+            elif pt.status == "archived":
+                # The moot-parent case: this parent authorized the current
+                # task by being archived, but produced nothing. Say so, and
+                # name the escape hatch — a worker that has to guess the
+                # missing design blocks later with an unactionable reason.
+                body_lines.append(
+                    "**Archived without a recorded handoff** — no design, spec "
+                    "or result was produced by this parent. Do not reconstruct "
+                    "it from guesswork: if this task depends on that handoff, "
+                    f"run `hermes kanban block {task_id} --reason \"parent {pid} "
+                    "archived without a handoff\"` so a human can re-scope it or "
+                    "re-run the upstream step."
+                )
             else:
                 body_lines.append("(no result recorded)")
 
