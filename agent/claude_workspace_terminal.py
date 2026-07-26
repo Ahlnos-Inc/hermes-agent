@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -811,13 +812,22 @@ def _discover_attested_nested_worktrees(
     return tuple(candidates)
 
 
-def _census_writable_workspace(boundary: WorkspaceTerminalBoundary) -> None:
-    """Verify all multiply-linked regular files in the writable scope.
+def _collect_multilink_groups(
+    boundary: WorkspaceTerminalBoundary,
+) -> "dict[tuple[int, int], list[Any]]":
+    """Group every multiply-linked regular file in the writable scope by inode.
 
-    A directory entry is counted only when it is visible in the effective
+    Returns ``{(dev, ino): [observed_count, link_count, [paths...]]}``. A
+    directory entry is counted only when it is visible in the effective
     writable scope. This is intentional: an alias in a read-only subtree
     remains an external alias from the included path's point of view and must
     therefore fail the census.
+
+    Shared by :func:`_census_writable_workspace`, which turns a mismatch into a
+    refusal, and :func:`diagnose_workspace_boundary`, which turns the same
+    mismatch into operator evidence. One walk, one definition of "offending" —
+    a recovery path that disagreed with the guard about which file is at fault
+    would be worse than no recovery path (BUILD-653).
     """
 
     pending = [boundary.root]
@@ -850,26 +860,186 @@ def _census_writable_workspace(boundary: WorkspaceTerminalBoundary) -> None:
                 key = (int(info.st_dev), int(info.st_ino))
                 previous = groups.get(key)
                 if previous is None:
-                    groups[key] = [1, int(info.st_nlink), path]
+                    groups[key] = [1, int(info.st_nlink), [path]]
                     continue
                 previous[0] += 1
+                previous[2].append(path)
                 if previous[1] != int(info.st_nlink):
                     raise WorkspaceBoundaryProvisioningError(
                         "Workspace terminal observed inconsistent hard-link metadata: "
-                        f"{previous[2]}"
+                        f"{previous[2][0]}"
                     )
         finally:
             entries.close()
+    return groups
 
-    for observed_count, link_count, path in groups.values():
+
+def _census_writable_workspace(boundary: WorkspaceTerminalBoundary) -> None:
+    """Refuse a workspace holding a hard link that reaches outside it."""
+
+    for observed_count, link_count, paths in _collect_multilink_groups(
+        boundary
+    ).values():
         if observed_count != link_count:
             raise WorkspaceBoundaryProvisioningError(
                 "Workspace terminal rejects hard-linked regular file with an alias "
-                f"outside the writable boundary: {path} "
+                f"outside the writable boundary: {paths[0]} "
                 f"(observed {observed_count} of {link_count} directory entries). "
                 "Recreate dependency files in copy mode (for uv, set "
-                "UV_LINK_MODE=copy)."
+                "UV_LINK_MODE=copy). To recover a stranded task, run "
+                "`hermes workspace-guard diagnose <workspace>` from the "
+                "controller (BUILD-653)."
             )
+
+
+@dataclass(frozen=True)
+class OffendingAlias:
+    """One writable-scope directory entry the census refuses, with evidence."""
+
+    path: Path
+    dev: int
+    ino: int
+    link_count: int
+    observed_count: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.path} (dev={self.dev} ino={self.ino} "
+            f"nlink={self.link_count}, observed {self.observed_count} "
+            "directory entries inside the writable boundary)"
+        )
+
+
+def diagnose_workspace_boundary(
+    workspace: str | Path,
+    *,
+    git: Path | None = None,
+) -> "tuple[OffendingAlias, ...]":
+    """Report, without acting, every alias that fails the census.
+
+    BUILD-653 AC2: evidence before any recovery action. This is read-only —
+    it stats and walks, it never writes, moves or deletes. Safe to run on a
+    live blocked workspace, and safe to run when nothing is wrong (it returns
+    an empty tuple).
+    """
+
+    boundary = _attest_workspace_boundary(Path(workspace), git)
+    offending: list[OffendingAlias] = []
+    for (dev, ino), (observed, link_count, paths) in sorted(
+        _collect_multilink_groups(boundary).items()
+    ):
+        if observed == link_count:
+            continue
+        offending.extend(
+            OffendingAlias(
+                path=path,
+                dev=dev,
+                ino=ino,
+                link_count=link_count,
+                observed_count=observed,
+            )
+            for path in sorted(paths)
+        )
+    return tuple(offending)
+
+
+def quarantine_workspace_boundary_alias(
+    workspace: str | Path,
+    alias: str | Path,
+    *,
+    authorized_by: str,
+    quarantine_root: str | Path,
+    git: Path | None = None,
+) -> Path:
+    """Move ONE offending in-workspace alias out, and record that we did.
+
+    BUILD-653: a correct fail-closed census can strand a task, because the only
+    channel that could remove the offending file is the terminal the census
+    just blocked. This is the controller-side way out.
+
+    Deliberately a *move*, not a delete. A hard link's inode is shared, so
+    relocating the workspace-side directory entry restores the boundary while
+    leaving the partner alias — the victim, or the read-only worktree copy —
+    byte-for-byte untouched and still reachable for forensics. Deleting would
+    destroy the only evidence that a tamper attempt happened.
+
+    The alias must be named explicitly AND must still be in the offending set
+    at the moment of the call, re-derived from the same walk the guard uses.
+    That is what keeps this from becoming a general-purpose workspace deleter:
+    a path that is merely inconvenient is refused, and a race that heals the
+    workspace between diagnosis and recovery is refused too.
+
+    Returns the quarantined path. Appends an immutable record to
+    ``<quarantine_root>/actions.jsonl``.
+    """
+
+    if not str(authorized_by or "").strip():
+        raise WorkspaceBoundaryProvisioningError(
+            "Workspace guard recovery requires an explicit authorized_by"
+        )
+    target = Path(alias).expanduser().resolve(strict=False)
+    offending = diagnose_workspace_boundary(workspace, git=git)
+    match = next((entry for entry in offending if entry.path == target), None)
+    if match is None:
+        raise WorkspaceBoundaryProvisioningError(
+            "Workspace guard recovery refuses a path that is not currently an "
+            f"offending alias: {target}. Re-run diagnose; the offending set is "
+            + (
+                ", ".join(str(entry.path) for entry in offending)
+                if offending
+                else "empty"
+            )
+        )
+
+    destination_root = Path(quarantine_root).expanduser().resolve(strict=False)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = destination_root / target.name
+    suffix = 1
+    while destination.exists():
+        destination = destination_root / f"{target.name}.{suffix}"
+        suffix += 1
+    os.replace(target, destination)
+
+    record = {
+        "action": "quarantine_workspace_boundary_alias",
+        "authorized_by": str(authorized_by),
+        "workspace": str(Path(workspace).expanduser().resolve(strict=False)),
+        "alias": str(target),
+        "quarantined_to": str(destination),
+        "dev": match.dev,
+        "ino": match.ino,
+        "link_count": match.link_count,
+        "observed_count": match.observed_count,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+    }
+    journal = destination_root / "actions.jsonl"
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return destination
+
+
+def _attest_workspace_boundary(
+    root: Path, git: Path | None
+) -> WorkspaceTerminalBoundary:
+    """Resolve and attest a boundary WITHOUT running the census."""
+
+    root = root.expanduser().resolve(strict=False)
+    if not root.is_dir():
+        raise WorkspaceBoundaryProvisioningError(
+            f"Worker workspace does not exist: {root}"
+        )
+    selected_git = git if git is not None else _selected_git(os.defpath)
+    try:
+        readonly_subtrees = _discover_attested_nested_worktrees(root, selected_git)
+        return WorkspaceTerminalBoundary(root, readonly_subtrees)
+    except WorkspaceBoundaryProvisioningError:
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise WorkspaceBoundaryProvisioningError(
+            str(exc) or f"Could not attest worker workspace boundary: {root}"
+        ) from exc
 
 
 def prepare_workspace_terminal_boundary(
@@ -879,21 +1049,7 @@ def prepare_workspace_terminal_boundary(
 ) -> WorkspaceTerminalBoundary:
     """Prepare and attest one immutable terminal write boundary."""
 
-    root = Path(workspace).expanduser().resolve(strict=False)
-    if not root.is_dir():
-        raise WorkspaceBoundaryProvisioningError(
-            f"Worker workspace does not exist: {root}"
-        )
-    selected_git = git if git is not None else _selected_git(os.defpath)
-    try:
-        readonly_subtrees = _discover_attested_nested_worktrees(root, selected_git)
-        boundary = WorkspaceTerminalBoundary(root, readonly_subtrees)
-    except WorkspaceBoundaryProvisioningError:
-        raise
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        raise WorkspaceBoundaryProvisioningError(
-            str(exc) or f"Could not attest worker workspace boundary: {root}"
-        ) from exc
+    boundary = _attest_workspace_boundary(Path(workspace), git)
     _census_writable_workspace(boundary)
     return boundary
 

@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import subprocess
@@ -1217,3 +1218,153 @@ def test_runtime_scratch_link_reaching_outside_the_workspace_still_blocks(tmp_pa
 
     with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
         prepare_workspace_terminal_boundary(workspace)
+
+
+# ---------------------------------------------------------------------------
+# BUILD-653: controller-side recovery for a correctly-blocked workspace.
+# The census failing closed is right; the problem is that the only channel that
+# could remove the offending file is the terminal it just blocked, so the task
+# strands until a human runs rm -rf. These cover the way out.
+# ---------------------------------------------------------------------------
+
+
+def _blocked_workspace(tmp_path, name="work"):
+    """A workspace holding one alias whose partner lives outside it."""
+    workspace = tmp_path / name
+    workspace.mkdir()
+    victim = tmp_path / "victim.yaml"
+    victim.write_text("victim: untouched\n", encoding="utf-8")
+    alias = workspace / "config.yaml"
+    os.link(victim, alias)
+    return workspace, victim, alias
+
+
+def test_diagnose_reports_inode_evidence_and_changes_nothing(tmp_path):
+    """AC2 — evidence before action, and the diagnosis itself must be inert."""
+    workspace, victim, alias = _blocked_workspace(tmp_path)
+    before = _tree_bytes(tmp_path)
+
+    offending = workspace_terminal.diagnose_workspace_boundary(workspace)
+
+    assert [entry.path for entry in offending] == [alias]
+    entry = offending[0]
+    assert entry.ino == alias.stat().st_ino
+    assert entry.link_count == 2
+    assert entry.observed_count == 1
+    assert "nlink=2" in entry.describe()
+    assert _tree_bytes(tmp_path) == before
+
+
+def test_diagnose_is_empty_for_a_healthy_workspace(tmp_path):
+    """Normal case: nothing wrong, nothing reported, no exception."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("a", encoding="utf-8")
+    os.link(workspace / "a.txt", workspace / "b.txt")
+
+    assert workspace_terminal.diagnose_workspace_boundary(workspace) == ()
+
+
+def test_quarantine_unblocks_the_workspace_and_leaves_the_victim_intact(tmp_path):
+    """AC3/AC4 — the recovery path, end to end."""
+    workspace, victim, alias = _blocked_workspace(tmp_path)
+    quarantine = tmp_path / "quarantine"
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(workspace)
+
+    moved = workspace_terminal.quarantine_workspace_boundary_alias(
+        workspace, alias, authorized_by="nicholas", quarantine_root=quarantine
+    )
+
+    # The workspace is usable again.
+    prepare_workspace_terminal_boundary(workspace)
+    assert not alias.exists()
+    # A move, not a delete: evidence survives and so does the victim.
+    assert moved.read_text(encoding="utf-8") == "victim: untouched\n"
+    assert victim.read_text(encoding="utf-8") == "victim: untouched\n"
+    assert victim.stat().st_ino == moved.stat().st_ino
+
+    record = json.loads((quarantine / "actions.jsonl").read_text(encoding="utf-8"))
+    assert record["authorized_by"] == "nicholas"
+    assert record["alias"] == str(alias)
+    assert record["quarantined_to"] == str(moved)
+    assert record["ino"] == victim.stat().st_ino
+    assert record["link_count"] == 2
+    assert record["recorded_at"]
+
+
+def test_quarantine_refuses_a_path_that_is_not_offending(tmp_path):
+    """Security negative — this must not become a general workspace deleter."""
+    workspace, _victim, _alias = _blocked_workspace(tmp_path)
+    innocent = workspace / "source.py"
+    innocent.write_text("print('keep me')\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="not currently an"):
+        workspace_terminal.quarantine_workspace_boundary_alias(
+            workspace,
+            innocent,
+            authorized_by="nicholas",
+            quarantine_root=tmp_path / "quarantine",
+        )
+
+    assert innocent.read_text(encoding="utf-8") == "print('keep me')\n"
+
+
+def test_quarantine_requires_explicit_authorization(tmp_path):
+    """AC4 — recovery is an authorized act, not an automatic one."""
+    workspace, _victim, alias = _blocked_workspace(tmp_path)
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="authorized_by"):
+        workspace_terminal.quarantine_workspace_boundary_alias(
+            workspace,
+            alias,
+            authorized_by="   ",
+            quarantine_root=tmp_path / "quarantine",
+        )
+
+    assert alias.exists()
+
+
+def test_quarantine_of_an_orphan_path_is_refused(tmp_path):
+    """Orphan case: the artifact was already cleared by hand before recovery ran."""
+    workspace, _victim, alias = _blocked_workspace(tmp_path)
+    stale = str(alias)
+    alias.unlink()
+
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="offending set is empty"):
+        workspace_terminal.quarantine_workspace_boundary_alias(
+            workspace,
+            stale,
+            authorized_by="nicholas",
+            quarantine_root=tmp_path / "quarantine",
+        )
+
+
+def test_a_second_external_alias_keeps_the_boundary_closed_after_recovery(tmp_path):
+    """AC5 — fail-closed before, during AND after. Recovery is not an amnesty."""
+    workspace, _victim, alias = _blocked_workspace(tmp_path)
+    other_victim = tmp_path / "other.yaml"
+    other_victim.write_text("other", encoding="utf-8")
+    second = workspace / "second.yaml"
+    os.link(other_victim, second)
+    quarantine = tmp_path / "quarantine"
+
+    workspace_terminal.quarantine_workspace_boundary_alias(
+        workspace, alias, authorized_by="nicholas", quarantine_root=quarantine
+    )
+
+    # One recovery does not clear the other violation.
+    with pytest.raises(WorkspaceBoundaryProvisioningError, match="outside"):
+        prepare_workspace_terminal_boundary(workspace)
+    assert [e.path for e in workspace_terminal.diagnose_workspace_boundary(workspace)] == [
+        second
+    ]
+
+    workspace_terminal.quarantine_workspace_boundary_alias(
+        workspace, second, authorized_by="nicholas", quarantine_root=quarantine
+    )
+    prepare_workspace_terminal_boundary(workspace)
+
+    # The journal is append-only: both acts are recorded, in order.
+    lines = (quarantine / "actions.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["alias"] for line in lines] == [str(alias), str(second)]

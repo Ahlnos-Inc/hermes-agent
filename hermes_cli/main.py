@@ -12811,6 +12811,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "workspace-guard",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -13487,6 +13488,81 @@ def _run_cli():
         return 0
 
     secrets_parser.set_defaults(func=_dispatch_secrets)
+
+    # =========================================================================
+    # workspace-guard command (BUILD-653)
+    # =========================================================================
+    # The workspace census runs on every non-read-only worker terminal call, so
+    # when it fails closed the task loses the only channel that could remove the
+    # offending file. This is the controller-side way out: it runs as the
+    # operator, outside the blocked terminal.
+    guard_parser = subparsers.add_parser(
+        "workspace-guard",
+        help="Diagnose and recover a workspace blocked by the hard-link census",
+    )
+    guard_sub = guard_parser.add_subparsers(dest="workspace_guard_command")
+    guard_diagnose = guard_sub.add_parser(
+        "diagnose", help="Report offending aliases with inode evidence (read-only)"
+    )
+    guard_diagnose.add_argument("workspace")
+    guard_quarantine = guard_sub.add_parser(
+        "quarantine", help="Move ONE named offending alias out of the workspace"
+    )
+    guard_quarantine.add_argument("workspace")
+    guard_quarantine.add_argument("alias")
+    guard_quarantine.add_argument(
+        "--authorized-by", required=True, help="Who authorized this recovery"
+    )
+    guard_quarantine.add_argument(
+        "--quarantine-root",
+        required=True,
+        help="Directory outside the workspace to hold the alias and the record",
+    )
+
+    def _dispatch_workspace_guard(args):  # noqa: ANN001
+        from agent.claude_workspace_terminal import (
+            WorkspaceBoundaryProvisioningError,
+            diagnose_workspace_boundary,
+            quarantine_workspace_boundary_alias,
+        )
+
+        sub = getattr(args, "workspace_guard_command", None)
+        try:
+            if sub == "diagnose":
+                offending = diagnose_workspace_boundary(args.workspace)
+                if not offending:
+                    print("No offending aliases: the workspace passes the census.")
+                    return 0
+                print(
+                    f"{len(offending)} offending alias(es) in {args.workspace}:"
+                )
+                for entry in offending:
+                    print(f"  {entry.describe()}")
+                print(
+                    "\nRecover one at a time with:\n"
+                    "  hermes workspace-guard quarantine <workspace> <alias> "
+                    "--authorized-by <you> --quarantine-root <dir outside it>"
+                )
+                # main() discards every command's return value (line ~15390),
+                # so exit explicitly: a diagnose that found a tamper condition
+                # must not look like success to a script or a cron.
+                sys.exit(1)
+            if sub == "quarantine":
+                moved = quarantine_workspace_boundary_alias(
+                    args.workspace,
+                    args.alias,
+                    authorized_by=args.authorized_by,
+                    quarantine_root=args.quarantine_root,
+                )
+                print(f"Quarantined to {moved}")
+                return 0
+        except WorkspaceBoundaryProvisioningError as exc:
+            print(f"workspace-guard: {exc}", file=sys.stderr)
+            sys.exit(1)
+        guard_parser.print_help()
+        return 0
+
+    guard_parser.set_defaults(func=_dispatch_workspace_guard)
 
     # =========================================================================
     # migrate command
