@@ -183,6 +183,10 @@ ORPHAN_FAILURE_LOOKBACK_SECONDS = 72 * 3600
 ORPHAN_FAILURE_BATCH_PER_TICK = 5
 ORPHAN_FAILURE_RETRY_SECONDS = 900
 CORRUPT_ALERT_RETRY_SECONDS = 15 * 60
+# BUILD-716: a corrupt board no longer self-heals, so a single delivered page
+# is the ONLY thing standing between a paused board and the 16-hour silence of
+# the 2026-07-18 vault-v2 incident. Re-page while the incident is still open.
+CORRUPT_ALERT_REALERT_SECONDS = 6 * 60 * 60
 # BUILD-728: re-alert cadence for a ready card that still has no assignee.
 UNASSIGNED_READY_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
@@ -846,7 +850,9 @@ class GatewayKanbanWatchersMixin:
                 if previous_id != incident.incident_id:
                     logger.warning(
                         "kanban notifier: board %s corruption incident %s "
-                        "published; dispatcher owns recovery (backup=%s)",
+                        "published; the dispatcher will quarantine the board "
+                        "and page an operator — nothing repairs it "
+                        "automatically (BUILD-716). backup=%s",
                         slug,
                         incident.incident_id,
                         incident.backup_path,
@@ -2205,7 +2211,7 @@ class GatewayKanbanWatchersMixin:
         # 5 minutes for 16 hours and never told the operator).
         corrupt_incidents_reported: set[str] = set()
         corrupt_alert_pending: dict[tuple, str] = {}
-        corrupt_alert_delivered: set[tuple] = set()
+        corrupt_alert_delivered_at: dict[tuple, float] = {}
         corrupt_alert_last_attempt: dict[tuple, float] = {}
         # BUILD-728: last SLA alert per (board, task) for ready+unassigned
         # cards, so one routing slip pages at most once per cooldown. Held in
@@ -2230,34 +2236,29 @@ class GatewayKanbanWatchersMixin:
             message: str,
         ) -> None:
             key = (incident_id, event_kind)
-            if key in corrupt_alert_delivered:
+            delivered_at = corrupt_alert_delivered_at.get(key)
+            if (
+                delivered_at is not None
+                and corrupt_monotonic_clock() - delivered_at
+                < CORRUPT_ALERT_REALERT_SECONDS
+            ):
                 return
             corrupt_alert_pending.setdefault(key, message)
 
-        def _clear_corrupt_incident_state(
-            incident_id: str,
-            *,
-            clear_alerts: bool = True,
-        ) -> None:
+        def _clear_corrupt_incident_state(incident_id: str) -> None:
             """Forget runtime quarantine/retry state after an epoch heals."""
             corrupt_incidents_reported.discard(incident_id)
             for board_slug, disabled_entry in list(disabled_corrupt_boards.items()):
                 if disabled_entry[0] == incident_id:
                     disabled_corrupt_boards.pop(board_slug, None)
-            if clear_alerts:
-                for alert_key in list(corrupt_alert_pending):
+            for state in (
+                corrupt_alert_pending,
+                corrupt_alert_last_attempt,
+                corrupt_alert_delivered_at,
+            ):
+                for alert_key in list(state):
                     if alert_key[0] == incident_id:
-                        corrupt_alert_pending.pop(alert_key, None)
-                for alert_key in list(corrupt_alert_last_attempt):
-                    if alert_key[0] == incident_id:
-                        corrupt_alert_last_attempt.pop(alert_key, None)
-                corrupt_alert_delivered.difference_update(
-                    {
-                        key
-                        for key in corrupt_alert_delivered
-                        if key[0] == incident_id
-                    }
-                )
+                        state.pop(alert_key, None)
 
         def _bounded_alert_detail(value: object, limit: int = 400) -> str:
             detail = str(value).strip()
@@ -2436,7 +2437,7 @@ class GatewayKanbanWatchersMixin:
                                 return None
                         if healed:
                             # A forced healthy probe is an explicit epoch
-                            # transition. Clear recovery state before opening
+                            # transition. Clear quarantine state before opening
                             # the repaired board on this same dispatcher.
                             _clear_corrupt_incident_state(disabled_incident_id)
                             incident = _board_corruption_incident(slug)
@@ -2446,10 +2447,25 @@ class GatewayKanbanWatchersMixin:
                                 "passed; corruption incident healed",
                                 slug,
                             )
+                            # BUILD-716: recovery is now an operator action, so
+                            # the operator who was paged "dispatch is PAUSED"
+                            # is the one who must be told it resumed. Queued
+                            # AFTER the clear, which wipes this incident's
+                            # alert keys.
+                            _queue_corrupt_alert(
+                                disabled_incident_id,
+                                "resolved",
+                                f"✅ Kanban board `{slug}` passed "
+                                "`PRAGMA integrity_check` again; the "
+                                "corruption incident "
+                                f"`{disabled_incident_id}` is cleared and "
+                                "dispatch resumes this tick.",
+                            )
                             # Fall through to the normal dispatch connect.
                         else:
-                            # Still corrupt: let connect() route the same
-                            # incident through the recovery handler again.
+                            # Still corrupt: let connect() re-raise the same
+                            # incident into _handle_corrupt_board, which
+                            # re-quarantines it.
                             disabled_corrupt_boards.pop(slug, None)
                     else:
                         disabled_corrupt_boards.pop(slug, None)
@@ -2719,7 +2735,7 @@ class GatewayKanbanWatchersMixin:
                     if delivered is True:
                         corrupt_alert_pending.pop(alert_key, None)
                         corrupt_alert_last_attempt.pop(alert_key, None)
-                        corrupt_alert_delivered.add(alert_key)
+                        corrupt_alert_delivered_at[alert_key] = alert_now
                 any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):

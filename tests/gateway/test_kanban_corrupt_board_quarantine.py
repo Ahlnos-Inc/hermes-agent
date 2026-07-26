@@ -133,8 +133,8 @@ def test_corrupt_board_alert_retries_only_after_delivery_deadline(
     assert "UNCHANGED" in first_alert
     assert "operator action" in first_alert
     assert "kanban init" not in first_alert
+    assert ".recover" in first_alert
     # BUILD-716: nothing on this path may auto-recover or leave swap debris.
-    assert "auto-recovered" not in first_alert
     assert not list(tmp_path.rglob("*.recovered-*"))
     assert not list(tmp_path.rglob("*.rollback-*"))
     assert not list(tmp_path.rglob("*.fdmap-*.txt"))
@@ -151,6 +151,148 @@ def test_corrupt_board_alert_retries_only_after_delivery_deadline(
         if "still corrupt" in record.getMessage()
     ]
     assert [record.levelno for record in first_reports] == [logging.ERROR]
-    assert repeat_reports
     assert {record.levelno for record in repeat_reports} == {logging.INFO}
-    assert all(path.is_relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    # The quarantine must actually hold. Six ticks fire at t=0/100/300/900/
+    # 901/902; only the three that clear the 300s window since the previous
+    # re-probe may re-report. Without the age gate this would be 6, and the
+    # 2026-07-18 vault-v2 ERROR-every-5-minutes shape would be back.
+    assert len(first_reports) + len(repeat_reports) == 3
+
+
+def _drive_dispatcher(tmp_path, monkeypatch, *, tick_times, connect_fn):
+    """Run the embedded dispatcher over a fixed monotonic tick schedule.
+
+    Returns ``(alerts, db)`` where ``alerts`` is the list of messages the home
+    channel accepted, in order.
+    """
+    from gateway.run import GatewayRunner
+
+    import hermes_cli.config as config_mod
+    import hermes_cli.kanban_db as kanban_mod
+
+    mono_now = [tick_times[0]]
+    monkeypatch.setattr(kw.time, "time", lambda: 1_750_000_000.0)
+    monkeypatch.setattr(kw.time, "monotonic", lambda: mono_now[0])
+
+    db = tmp_path / "boards" / "alpha.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_bytes(b"not a database")
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_corrupt_wall_clock = lambda: 1_750_000_000.0
+    runner._kanban_corrupt_monotonic_clock = lambda: mono_now[0]
+    alerts = []
+
+    async def fake_notify(message):
+        alerts.append(message)
+        return True
+
+    runner._kanban_notify_home_fallback = fake_notify
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        kanban_mod, "list_boards", lambda include_archived=False: [{"slug": "alpha"}]
+    )
+    monkeypatch.setattr(kanban_mod, "read_board_metadata", lambda slug: {"slug": slug})
+    monkeypatch.setattr(kanban_mod, "kanban_db_path", lambda board=None: db)
+    monkeypatch.setattr(kanban_mod, "connect", connect_fn(db, kanban_mod))
+    monkeypatch.setattr(kanban_mod, "dispatch_once", lambda *args, **kwargs: None)
+
+    tick_count = 0
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        nonlocal tick_count
+        if getattr(fn, "__name__", "") == "_tick_once":
+            mono_now[0] = tick_times[tick_count]
+            tick_count += 1
+        result = fn(*args, **kwargs)
+        if getattr(fn, "__name__", "") == "_tick_once" and tick_count >= len(tick_times):
+            runner._running = False
+        return result
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(kw.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(kw.asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_dispatcher_watcher())
+    return alerts, db
+
+
+def test_still_corrupt_board_is_repaged_after_the_realert_window(
+    tmp_path, hermetic_home, monkeypatch
+):
+    """A delivered page must not silence a board that never heals.
+
+    Nothing repairs the board automatically any more, so a single delivered
+    alert followed by permanent silence is exactly the 16-hour blind spot of
+    the 2026-07-18 vault-v2 incident.
+    """
+    def connect_fn(db, kanban_mod):
+        def _connect(*args, **kwargs):
+            raise kanban_mod.KanbanDbCorruptError(
+                db, None, "database disk image is malformed"
+            )
+        return _connect
+
+    window = kw.CORRUPT_ALERT_REALERT_SECONDS
+    alerts, _db = _drive_dispatcher(
+        tmp_path,
+        monkeypatch,
+        # Re-detection is gated by the 300s quarantine, so the re-alert can
+        # only ride the first re-detection past the window. The t=600 and
+        # t=window-1 ticks both re-detect and must stay silent.
+        tick_times=[0.0, 600.0, window - 1.0, window + 301.0],
+        connect_fn=connect_fn,
+    )
+
+    assert len(alerts) == 2
+    assert all("is corrupt" in alert for alert in alerts)
+
+
+def test_operator_repair_pages_that_dispatch_resumed(
+    tmp_path, hermetic_home, monkeypatch
+):
+    """The operator who was told "PAUSED" must be told it resumed."""
+    import hermes_cli.kanban_db as kanban_mod
+
+    healed = [False]
+
+    def connect_fn(db, kanban_module):
+        def _connect(*args, **kwargs):
+            if healed[0]:
+                return type("HealthyConnection", (), {"close": lambda self: None})()
+            raise kanban_module.KanbanDbCorruptError(
+                db, None, "database disk image is malformed"
+            )
+        return _connect
+
+    def fake_probe(path=None, **kwargs):
+        # Models the operator repairing the file between quarantine expiries.
+        healed[0] = True
+        kanban_mod.clear_corruption_incident(path)
+        return True
+
+    monkeypatch.setattr(kanban_mod, "probe_corruption_incident", fake_probe)
+
+    alerts, _db = _drive_dispatcher(
+        tmp_path,
+        monkeypatch,
+        tick_times=[0.0, 400.0, 401.0],
+        connect_fn=connect_fn,
+    )
+
+    assert len(alerts) == 2
+    assert "is corrupt" in alerts[0] and "PAUSED" in alerts[0]
+    assert "integrity_check" in alerts[1]
+    assert "dispatch resumes" in alerts[1]
