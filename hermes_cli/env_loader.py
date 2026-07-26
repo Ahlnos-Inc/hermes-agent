@@ -66,6 +66,25 @@ def get_secret_source(env_var: str) -> str | None:
     return _SECRET_SOURCES.get(env_var)
 
 
+def externally_sourced_env_names() -> frozenset[str]:
+    """Return every env var this process pulled from an external secret vault.
+
+    The provenance map is already maintained for display purposes; BUILD-681
+    reads it as a *control*: it is the only place in the process that knows
+    which of the several hundred names in ``os.environ`` arrived from
+    Bitwarden (or another configured backend) rather than from the shell,
+    ``.env``, or the OS. A dispatcher worker inherits the gateway's
+    environment, so this set is exactly what must not cross that boundary
+    unless a manifest capability grants it.
+
+    Empty when this process never loaded a vault — in which case the values
+    are not in ``os.environ`` either, so there is nothing to strip. Profile
+    ``.env`` and ``auth.json`` are deliberately NOT included: they are a
+    separate, profile-owned control plane.
+    """
+    return frozenset(_SECRET_SOURCES)
+
+
 def reset_secret_source_cache() -> None:
     """Forget which HERMES_HOME paths have already had external secrets applied.
 

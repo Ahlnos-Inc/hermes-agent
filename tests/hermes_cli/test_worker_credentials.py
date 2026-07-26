@@ -713,3 +713,197 @@ def test_private_handoff_is_consumed_and_removed_from_os_environ(monkeypatch):
     assert consumed.capabilities == ("github_write",)
     assert SENTINEL not in repr(consumed)
     assert wc.get_consumed_worker_credential("github_write") == SENTINEL
+
+
+# ---------------------------------------------------------------------------
+# BUILD-681: vault-sourced variables must not cross the worker boundary
+# ambiently. The gateway's os.environ carries every secret the vault applied
+# at startup (142 on the live install); keeping everything except a 13-name
+# blocklist meant ~129 controller secrets reached every worker regardless of
+# its manifest, which made the manifest a description rather than a control.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def vault_env(monkeypatch):
+    """Simulate a controller whose vault applied a realistic secret set."""
+    applied = {
+        # Action-plane secrets no worker profile is granted.
+        "AWS_SECRET_ACCESS_KEY": "aws-" + SENTINEL,
+        "DATABASE_URL": "postgres://user:" + SENTINEL + "@db/app",
+        "SRV_JIRA_TOKEN": "jira-" + SENTINEL,
+        "POSTHOG_PERSONAL_KEY": "posthog-" + SENTINEL,
+        "R2_SECRET_ACCESS_KEY": "r2-" + SENTINEL,
+        "VPS_SSH_KEY": "ssh-" + SENTINEL,
+        # Model-provider control plane: the one class a worker still needs.
+        "ANTHROPIC_TOKEN": "anthropic-provider-key",
+        "OPENROUTER_API_KEY": "openrouter-provider-key",
+    }
+    for key, value in applied.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.externally_sourced_env_names",
+        lambda: frozenset(applied),
+    )
+    return applied
+
+
+ACTION_PLANE_VAULT_VARS = (
+    "AWS_SECRET_ACCESS_KEY",
+    "DATABASE_URL",
+    "SRV_JIRA_TOKEN",
+    "POSTHOG_PERSONAL_KEY",
+    "R2_SECRET_ACCESS_KEY",
+    "VPS_SSH_KEY",
+)
+
+
+@pytest.mark.parametrize(
+    "profile", ["verifier", "coder", "releaser", "marketing-operator", "not-listed"]
+)
+def test_no_worker_inherits_an_ungranted_vault_secret(
+    tmp_path, monkeypatch, vault_env, profile
+):
+    """AC1/AC2/AC3 — including a `verifier`, whose contract is `actions: []`."""
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+
+    plan = wc.resolve_worker_credentials(profile, root=tmp_path)
+    worker_env = wc.build_worker_environment(dict(os.environ), plan)
+
+    for name in ACTION_PLANE_VAULT_VARS:
+        assert name not in worker_env, f"{profile} still inherits {name}"
+    # Not just absent by name — the value is nowhere in the environment.
+    serialized = "\n".join(f"{k}={v}" for k, v in worker_env.items())
+    assert SENTINEL not in serialized
+
+
+def test_model_provider_credentials_still_reach_the_worker(
+    tmp_path, monkeypatch, vault_env
+):
+    """AC4 — a worker that cannot authenticate to its own model is useless."""
+    _github_manifest(tmp_path)
+    plan = wc.resolve_worker_credentials("verifier", root=tmp_path)
+    worker_env = wc.build_worker_environment(dict(os.environ), plan)
+
+    assert worker_env["ANTHROPIC_TOKEN"] == "anthropic-provider-key"
+    assert worker_env["OPENROUTER_API_KEY"] == "openrouter-provider-key"
+
+
+def test_provider_allowlist_is_derived_from_the_code_owned_catalogs():
+    """The allowlist must not drift into a hand-maintained list."""
+    allowed = wc.model_provider_control_plane_env()
+    for name in ("ANTHROPIC_TOKEN", "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+        assert name in allowed
+    # Deliberate exclusions, both verified against the live config:
+    # omlx-local runs `api_key: no-key-required`, and GROQ_API_KEY is
+    # speech-to-text rather than a dispatcher model provider.
+    assert "oMLX_API_KEY" not in allowed
+    assert "GROQ_API_KEY" not in allowed
+    # Action-plane secrets must never be reachable through this door.
+    for name in ACTION_PLANE_VAULT_VARS:
+        assert name not in allowed
+
+
+def test_a_granted_capability_still_receives_its_own_vault_source(
+    tmp_path, monkeypatch
+):
+    """AC6 — the strip must not fight an explicit grant.
+
+    `bws_bootstrap` resolves from a vault-sourced variable, so a naive
+    "drop everything the vault applied" would delete the very value the
+    manifest grants and break github_write's sibling capability.
+    """
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.externally_sourced_env_names",
+        lambda: frozenset({"BWS_ACCESS_TOKEN"}),
+    )
+
+    marketing = wc.resolve_worker_credentials("marketing-operator", root=tmp_path)
+    marketing_env = wc.build_worker_environment(dict(os.environ), marketing)
+    assert marketing_env[wc.BWS_BOOTSTRAP_ENV] == "controller-bootstrap"
+
+    verifier = wc.resolve_worker_credentials("verifier", root=tmp_path)
+    verifier_env = wc.build_worker_environment(dict(os.environ), verifier)
+    assert wc.BWS_BOOTSTRAP_ENV not in verifier_env
+
+
+def test_withheld_variables_are_logged_by_name_and_never_by_value(
+    tmp_path, monkeypatch, vault_env, caplog
+):
+    """AC7 — a silently missing variable is undiagnosable.
+
+    Projection cannot prove a worker read a variable, so the honest
+    substitute is an attributable record at the boundary: which profile,
+    which manifest, which names.
+    """
+    _github_manifest(tmp_path)
+    plan = wc.resolve_worker_credentials("verifier", root=tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="hermes_cli.worker_credentials"):
+        wc.build_worker_environment(dict(os.environ), plan)
+
+    withheld = [r for r in caplog.records if "withheld" in r.getMessage()]
+    assert len(withheld) == 1
+    message = withheld[0].getMessage()
+    for name in ACTION_PLANE_VAULT_VARS:
+        assert name in message
+    assert plan.manifest_digest in message
+    assert SENTINEL not in message
+
+
+def test_nothing_is_stripped_when_no_vault_was_loaded(tmp_path, monkeypatch):
+    """Back-compat: no provenance means the values are not present either."""
+    _github_manifest(tmp_path)
+    monkeypatch.setenv("SOME_SHELL_VAR", "from-the-shell")
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.externally_sourced_env_names", lambda: frozenset()
+    )
+
+    plan = wc.resolve_worker_credentials("verifier", root=tmp_path)
+    worker_env = wc.build_worker_environment(dict(os.environ), plan)
+    assert worker_env["SOME_SHELL_VAR"] == "from-the-shell"
+
+
+def test_audit_renderer_matches_the_manifest_and_prints_no_values(
+    tmp_path, monkeypatch, vault_env
+):
+    """AC5 — the audit must be a join of the two authorities, names only."""
+    _github_manifest(tmp_path)
+    manifest = wc.load_manifest(root=tmp_path)
+
+    report = wc.render_worker_credential_audit(root=tmp_path)
+
+    # Every profile in the manifest appears, with its granted capability.
+    for profile in manifest.profiles:
+        assert profile in report
+        for capability in manifest.actions_for(profile):
+            assert capability in report
+    # A profile with no action plane is rendered, not omitted — "verifier is
+    # absent" and "verifier has no grants" must not look the same.
+    assert "no action plane" in report
+    assert manifest.digest in report
+    # The vault partition is exhaustive and adds up.
+    assert "AWS_SECRET_ACCESS_KEY" in report
+    assert "ANTHROPIC_TOKEN" in report
+    # Names only. Never values.
+    assert SENTINEL not in report
+    assert "anthropic-provider-key" not in report
+
+
+def test_a_grant_the_code_registry_does_not_define_is_rejected_at_load(tmp_path):
+    """Why the audit renderer needs no unknown-capability branch.
+
+    A YAML edit can only widen or narrow grants among names the code already
+    knows — it can never inject one. That is what makes the rendered join
+    trustworthy rather than a second, drifting authority.
+    """
+    _write_manifest(
+        tmp_path,
+        "version: 1\nprofiles:\n  releaser:\n    actions:\n"
+        "      - not_a_real_capability\n",
+    )
+    with pytest.raises(wc.WorkerCredentialError, match="capability is unsupported"):
+        wc.load_manifest(root=tmp_path)

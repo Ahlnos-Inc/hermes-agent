@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -1013,15 +1014,115 @@ def prepare_worker_credentials(
     ).require_ok()
 
 
+@lru_cache(maxsize=1)
+def model_provider_control_plane_env() -> frozenset[str]:
+    """Env names carrying a model provider's OWN API credential.
+
+    BUILD-681 strips vault-sourced variables from workers, but a worker still
+    has to authenticate to the model it runs on, so this is the one class that
+    survives. It is derived from two code-owned catalogs rather than a
+    hand-maintained list, so adding a provider does not silently create a
+    fourth place to update:
+
+    * ``hermes_cli.auth.PROVIDER_REGISTRY`` — ``api_key_env_vars`` and
+      ``base_url_env_var`` for every provider with an auth flow.
+    * ``hermes_cli.config.OPTIONAL_ENV_VARS`` entries whose ``category`` is
+      ``"provider"``.
+
+    Plus the three Anthropic aliases that ``credential_pool`` special-cases
+    (the registry entry lists only one of them).
+
+    Names absent from both catalogs are deliberately NOT rescued. Two that
+    look like they should be, and are not: ``oMLX_API_KEY`` (omlx-local is
+    configured ``api_key: no-key-required`` and never reads it) and
+    ``GROQ_API_KEY`` (speech-to-text, not a dispatcher model provider).
+    """
+    names = {"ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        for definition in PROVIDER_REGISTRY.values():
+            names.update(getattr(definition, "api_key_env_vars", ()) or ())
+            base_url_env = getattr(definition, "base_url_env_var", None)
+            if base_url_env:
+                names.add(base_url_env)
+    except Exception:  # noqa: BLE001 — a catalog import must never block a spawn
+        pass
+    try:
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+
+        names.update(
+            name
+            for name, meta in OPTIONAL_ENV_VARS.items()
+            if isinstance(meta, Mapping) and meta.get("category") == "provider"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return frozenset(names)
+
+
+def ambient_vault_strip_env(plan: WorkerCredentialPlan) -> frozenset[str]:
+    """Vault-sourced names this worker must not inherit ambiently.
+
+    Everything the process pulled from the secret vault, minus the model
+    provider control plane, minus whatever this plan's capabilities grant.
+    Capability grants are projected explicitly elsewhere in this module; they
+    are excluded here only so a grant and this strip cannot contradict.
+    """
+    try:
+        from hermes_cli.env_loader import externally_sourced_env_names
+
+        vault = externally_sourced_env_names()
+    except Exception:  # noqa: BLE001 — never block a spawn on provenance
+        return frozenset()
+    if not vault:
+        return frozenset()
+    granted: set[str] = set()
+    for capability in plan.capabilities:
+        definition = CAPABILITIES.get(capability)
+        if definition is None:
+            continue
+        if definition.source_key:
+            granted.add(definition.source_key)
+        granted.update(definition.source_keys)
+        granted.update(definition.projection_env)
+    return frozenset(vault - model_provider_control_plane_env() - granted)
+
+
 def build_worker_environment(
     base_env: Mapping[str, str], plan: WorkerCredentialPlan
 ) -> dict[str, str]:
-    """Sanitize a worker environment, then add only authorized handoffs."""
+    """Sanitize a worker environment, then add only authorized handoffs.
+
+    BUILD-681: the base environment is the *gateway's* ``os.environ``, which
+    carries every secret the vault applied at startup (142 on this install).
+    Keeping everything except a 13-name blocklist meant ~129 controller
+    secrets — AWS keys, database URLs, Jira tokens, R2 keys, VPS SSH keys —
+    reached every worker regardless of its manifest, which made the manifest
+    a description rather than a control. Vault-sourced names are now dropped
+    by default and re-added only by capability or provider class.
+    """
+    stripped_vault = ambient_vault_strip_env(plan)
     env = {
         key: value
         for key, value in base_env.items()
-        if key not in plan._strip_env and not key.startswith(PRIVATE_HANDOFF_PREFIX)
+        if key not in plan._strip_env
+        and key not in stripped_vault
+        and not key.startswith(PRIVATE_HANDOFF_PREFIX)
     }
+    if stripped_vault:
+        # Names only, never values. A worker that silently loses a variable it
+        # was relying on is undiagnosable; this line is what makes the
+        # resulting failure attributable to the tightening rather than to the
+        # worker's own code.
+        _log.info(
+            "worker credentials: profile=%s manifest=%s withheld %d "
+            "vault-sourced variable(s) not granted by the manifest: %s",
+            plan.profile,
+            plan.manifest_digest,
+            len(stripped_vault),
+            ", ".join(sorted(stripped_vault)),
+        )
     for key, value in plan._handoff:
         env[key] = value
     env[MANIFEST_DIGEST_ENV] = plan.manifest_digest
@@ -1069,6 +1170,98 @@ def get_consumed_worker_credential(capability: str) -> str | None:
     """Return a consumed value for an internal authorized boundary."""
     with _WORKER_CREDENTIAL_LOCK:
         return _TRUSTED_WORKER_CREDENTIALS.get(capability)
+
+
+def render_worker_credential_audit(root: Path | str | None = None) -> str:
+    """Render the read-only credential audit. Names only, never values.
+
+    BUILD-681 AC5. Joins the code-owned capability registry with the live
+    manifest so "which profile can reach which secret" is answerable from one
+    view instead of inferred from two files that can disagree. Deliberately
+    an operator command, not a model tool.
+    """
+    manifest = load_manifest(root=root)
+    header = (
+        "profile", "capability", "source", "source key", "projection",
+        "scope", "manifest digest",
+    )
+    rows: list[tuple[str, ...]] = []
+    for profile in sorted(manifest.profiles):
+        capabilities = manifest.actions_for(profile)
+        if not capabilities:
+            rows.append(
+                (profile, "(none)", "-", "-", "-", "no action plane", manifest.digest)
+            )
+            continue
+        for capability in capabilities:
+            # No unknown-capability branch: load_manifest already rejects a
+            # grant naming a capability the code registry does not define, in
+            # both v1 and v2, so a loaded manifest cannot carry one.
+            definition = CAPABILITIES[capability]
+            source_keys = tuple(
+                key for key in (definition.source_key, *definition.source_keys) if key
+            )
+            projection = tuple(
+                name
+                for name in (definition.projection_env or (definition.handoff_env,))
+                if name
+            )
+            scope = definition.operation or definition.projection_kind
+            if definition.api_major:
+                scope = f"{scope} ({definition.api_major})"
+            rows.append(
+                (
+                    profile,
+                    capability,
+                    "controller-resolved",
+                    ", ".join(source_keys) or "-",
+                    ", ".join(projection) or "-",
+                    scope,
+                    manifest.digest,
+                )
+            )
+
+    widths = [
+        max(len(str(row[index])) for row in (header, *rows))
+        for index in range(len(header))
+    ]
+
+    def _row(cells: tuple[str, ...]) -> str:
+        return " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(cells))
+
+    lines = [_row(header), "-+-".join("-" * width for width in widths)]
+    lines.extend(_row(row) for row in rows)
+
+    try:
+        from hermes_cli.env_loader import externally_sourced_env_names
+
+        vault = externally_sourced_env_names()
+    except Exception:  # noqa: BLE001
+        vault = frozenset()
+    # UNCONDITIONAL_STRIP_ENV outranks the provider allowlist: GH_TOKEN and
+    # GITHUB_TOKEN are provider credentials for `copilot` AND the GitHub write
+    # path, and the capability projection is the only way they may reach a
+    # worker. Reporting them as ambient would be a false clean bill.
+    provider = sorted(
+        vault & model_provider_control_plane_env() - UNCONDITIONAL_STRIP_ENV
+    )
+    withheld = sorted(
+        vault - model_provider_control_plane_env() - UNCONDITIONAL_STRIP_ENV
+    )
+    capability_only = sorted(vault & UNCONDITIONAL_STRIP_ENV)
+    lines += [
+        "",
+        f"Vault-sourced variables visible to this controller: {len(vault)}",
+        f"  reaching every worker (model provider control plane, {len(provider)}): "
+        + (", ".join(provider) or "(none)"),
+        f"  stripped always, reachable only by capability projection "
+        f"({len(capability_only)}): " + (", ".join(capability_only) or "(none)"),
+        f"  withheld from workers ({len(withheld)}): "
+        + (", ".join(withheld) or "(none)"),
+        "  Profile-local .env and auth.json are a separate, profile-owned "
+        "control plane and are NOT covered by this boundary (BUILD-789).",
+    ]
+    return "\n".join(lines)
 
 
 # Descriptive aliases keep call sites readable while preserving one contract.

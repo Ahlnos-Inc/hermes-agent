@@ -13453,6 +13453,14 @@ def _run_cli():
         help="1Password (op:// references) integration",
     )
 
+    # BUILD-681: read-only audit of which profile may reach which secret.
+    # Names only, never values.
+    secrets_subparsers.add_parser(
+        "worker-audit",
+        aliases=["audit"],
+        help="Show the worker credential manifest joined with the code registry",
+    )
+
     # Lazy import — only pays for itself when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
     from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
@@ -13468,6 +13476,13 @@ def _run_cli():
             return args.func(args)
         if sub in ("onepassword", "op", "1password") and op_sub is not None:
             return args.func(args)
+        if sub in ("worker-audit", "audit"):
+            from hermes_cli.worker_credentials import (
+                render_worker_credential_audit,
+            )
+
+            print(render_worker_credential_audit())
+            return 0
         secrets_parser.print_help()
         return 0
 
