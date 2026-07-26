@@ -296,3 +296,41 @@ def test_operator_repair_pages_that_dispatch_resumed(
     assert "is corrupt" in alerts[0] and "PAUSED" in alerts[0]
     assert "integrity_check" in alerts[1]
     assert "dispatch resumes" in alerts[1]
+
+
+def test_invalid_sqlite_header_quarantines_through_the_real_connect(
+    tmp_path, hermetic_home, monkeypatch, caplog
+):
+    """BUILD-633 AC1/AC4: the `file is not a database` form, end to end.
+
+    Every other test here hands `_handle_corrupt_board` a pre-built
+    KanbanDbCorruptError. This one writes a genuinely invalid header and lets
+    the real `kanban_db.connect` classify it, so the whole chain — header
+    validation, incident publication, dispatcher routing — is under test and
+    the failure is deterministic rather than an uncaught tick exception.
+    """
+    import hermes_cli.kanban_db as kanban_mod
+
+    alerts, db = _drive_dispatcher(
+        tmp_path,
+        monkeypatch,
+        tick_times=[0.0, 1.0],
+        # The real connect(), captured before monkeypatch replaces the name.
+        connect_fn=lambda _db, module: module.connect,
+    )
+
+    assert len(alerts) == 1
+    assert "is corrupt" in alerts[0] and "PAUSED" in alerts[0]
+
+    incident = kanban_mod.read_corruption_incident(db)
+    assert incident is not None
+    assert "invalid SQLite header" in incident.reason
+    assert db.read_bytes() == b"not a database"
+
+    classified = [
+        r for r in caplog.records
+        if "the file is left UNCHANGED" in r.getMessage()
+    ]
+    assert [r.levelno for r in classified] == [logging.ERROR]
+    # Deterministic classification, not an escaped exception.
+    assert not [r for r in caplog.records if "tick failed on board" in r.getMessage()]
