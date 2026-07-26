@@ -1725,10 +1725,27 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
         _external_runtime_switch = False
+        # Route this call block's api_messages were built and sized for.
+        _block_route = (agent.provider, agent.model)
 
         while retry_count < max_retries:
             if getattr(agent, "runtime", HERMES_RUNTIME) != HERMES_RUNTIME:
                 _external_runtime_switch = True
+                break
+            # BUILD-533: a mid-block fallback activation swaps to a provider
+            # with its own context window, but every activation site below
+            # ``continue``s THIS loop — which re-dispatches the same
+            # api_messages and never re-reaches the outer pre-API compression
+            # preflight (it sits above this loop). Shipping a 176k request to
+            # a 131k-window fallback is a guaranteed 400, and recovery then
+            # crawls through the context-overflow error path (2026-07-18
+            # cascade). Restart the call block instead: the outer iteration
+            # rebuilds api_messages from ``messages`` and re-runs the
+            # preflight against the NEW window, compressing first when it no
+            # longer fits. Fires at most once per swap — the rebuilt block
+            # recomputes _block_route from the now-active route.
+            if (agent.provider, agent.model) != _block_route:
+                _retry.restart_with_compressed_messages = True
                 break
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
