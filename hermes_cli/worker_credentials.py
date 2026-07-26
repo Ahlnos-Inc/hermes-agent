@@ -1258,10 +1258,60 @@ def render_worker_credential_audit(root: Path | str | None = None) -> str:
         f"({len(capability_only)}): " + (", ".join(capability_only) or "(none)"),
         f"  withheld from workers ({len(withheld)}): "
         + (", ".join(withheld) or "(none)"),
-        "  Profile-local .env and auth.json are a separate, profile-owned "
-        "control plane and are NOT covered by this boundary (BUILD-789).",
+        "  Profile-local .env is a separate, profile-owned control plane that "
+        "this boundary does not cover — enumerated below (BUILD-789).",
+        "",
     ]
+    lines += render_profile_local_env_audit(root=root)
     return "\n".join(lines)
+
+
+def render_profile_local_env_audit(root: Path | str | None = None) -> list[str]:
+    """List credential NAMES each profile's own ``.env`` carries. Never values.
+
+    The strip boundary only governs what a worker INHERITS. A profile whose own
+    ``.env`` holds a credential hands it to every worker spawned for that
+    profile regardless, and if that credential is a vault access token the
+    worker can re-pull the entire vault (BUILD-789 — five profiles did, four of
+    them because their ``.env`` was a symlink to the machine-global secrets
+    file, which no audit surface showed).
+    """
+    from hermes_cli.env_loader import _CREDENTIAL_SUFFIXES
+
+    profiles_dir = (
+        Path(root) if root is not None else get_default_hermes_root()
+    ) / "profiles"
+    out = ["Profile-local .env credential names (profile-owned, names only):"]
+    if not profiles_dir.is_dir():
+        return out + ["  (no profiles directory)"]
+
+    for profile_dir in sorted(p for p in profiles_dir.iterdir() if p.is_dir()):
+        env_file = profile_dir / ".env"
+        if not env_file.exists():
+            continue
+        names = []
+        try:
+            for line in env_file.read_text(errors="replace").splitlines():
+                name = line.split("=", 1)[0].strip()
+                if not name or line.lstrip().startswith("#") or "=" not in line:
+                    continue
+                if name.endswith(_CREDENTIAL_SUFFIXES):
+                    names.append(name)
+        except OSError:
+            out.append(f"  {profile_dir.name:26s} (unreadable)")
+            continue
+        # A symlinked .env is the finding that hid for months: the profile is
+        # not holding its own small credential set, it is reading the
+        # controller's entire secrets file.
+        shared = ""
+        if env_file.is_symlink():
+            shared = f" [symlink -> {os.readlink(env_file)}]"
+        vault = " ** HOLDS A VAULT ACCESS TOKEN **" if BWS_BOOTSTRAP_ENV in names else ""
+        out.append(
+            f"  {profile_dir.name:26s} {len(names):2d}{shared}{vault}"
+            + (": " + ", ".join(sorted(dict.fromkeys(names))) if names else "")
+        )
+    return out
 
 
 # Descriptive aliases keep call sites readable while preserving one contract.

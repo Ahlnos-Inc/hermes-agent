@@ -333,6 +333,38 @@ def _apply_managed_env() -> None:
     _load_dotenv_with_fallback(managed_env, override=True)
 
 
+def _worker_vault_pull_is_ungranted() -> bool:
+    """True when this process is a dispatcher worker with no vault grant.
+
+    BUILD-681 stopped a worker INHERITING the controller's vault-sourced
+    environment, but a worker whose profile home can reach a vault access token
+    just re-pulls the whole project itself at import time — same secrets, a
+    different door, and one the credential manifest neither records nor can
+    revoke (BUILD-789).
+
+    A dispatcher worker is identified by ``HERMES_KANBAN_TASK``, which the
+    dispatcher sets before the process starts. Nothing else is affected: the
+    controller, cron agents, and interactive CLI runs have no task id and pull
+    exactly as before. ``bws_bootstrap`` is the existing manifest capability
+    for a full-process vault grant, so a worker that legitimately needs one
+    already has an enumerable, revocable way to say so.
+
+    Fails closed: a worker that cannot name its profile, or whose manifest
+    cannot be read, gets nothing.
+    """
+    if not str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile:
+        return True
+    try:
+        from hermes_cli.worker_credentials import load_manifest
+
+        return "bws_bootstrap" not in load_manifest().actions_for(profile)
+    except Exception:  # noqa: BLE001 — an unreadable manifest grants nothing
+        return True
+
+
 def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from every enabled external source into env.
 
@@ -360,6 +392,9 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     if home_key in _APPLIED_HOMES:
         return
     _APPLIED_HOMES.add(home_key)
+
+    if _worker_vault_pull_is_ungranted():
+        return
 
     try:
         cfg = _load_secrets_config(home_path)
