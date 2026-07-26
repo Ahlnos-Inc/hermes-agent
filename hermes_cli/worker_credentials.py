@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -48,13 +49,23 @@ GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV = "HERMES_GOOGLE_ADS_CONTROLLER_BWS_TOKEN"
 # Ambient name that must always be STRIPPED from workers (kept in
 # UNCONDITIONAL_STRIP_ENV below). It is NOT the resolve source anymore.
 GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
-# The BWS secret github_write actually RESOLVES from. The fine-grained
-# GH_TOKEN_SECRET_WRITE PAT is not authorized for the release-target repos
-# (contents + pull_requests both 403 on Ahlnos-Inc/aldnoah), so github_write
-# is sourced from the classic GITHUB_TOKEN (repo scope) per Nicholas's call
-# 2026-07-20. Tradeoff: classic token is broad-scoped; migrate back to a
-# properly-scoped fine-grained PAT under BUILD-603 to restore least-privilege.
-GITHUB_WRITE_RESOLVE_KEY = "GITHUB_TOKEN"
+# The BWS secrets github_write RESOLVES from, keyed by the GitHub owner of the
+# repository the worker will publish to (BUILD-603).
+#
+# A fine-grained PAT has exactly one resource owner, and the release targets
+# span two (``rules/pr-target-repo-allowlist.json`` allows ``Ahlnos-Inc`` and
+# ``nlachica``), so one token cannot cover both and there is no single resolve
+# key to point at. The dispatcher selects per task from the owner of the
+# worker's own workspace remote; an owner with no entry here gets no
+# ``github_write`` handoff at all.
+#
+# This replaces the classic broad-scoped ``GITHUB_TOKEN`` (all repos, workflow
+# scope, no expiry) that was the accepted interim from 2026-07-20 until both
+# fine-grained PATs were minted on 2026-07-26. Keys are casefolded owners.
+GITHUB_WRITE_RESOLVE_KEYS: Mapping[str, str] = {
+    "ahlnos-inc": "HERMES_RELEASER_AHLNOS_INC",
+    "nlachica": "HERMES_RELEASER_NLACHICA",
+}
 
 # These names are intentionally explicit.  The list is also used when a
 # caller provides an environment mapping rather than os.environ, so a worker
@@ -122,6 +133,11 @@ class CapabilityDefinition:
     ambient_strip_env: tuple[str, ...] = ()
     operation: str | None = None
     api_major: str | None = None
+    # What picks ONE of several ``source_keys`` per task, when the keys are
+    # alternatives rather than a bundle. Display-only, but load-bearing for the
+    # operator: without it the audit lists every candidate key on one row and
+    # reads as "this profile receives all of them".
+    selected_by: str | None = None
 
 
 # ``bws_bootstrap`` is transitional.  It exists only for the current
@@ -130,9 +146,14 @@ class CapabilityDefinition:
 CAPABILITIES: Mapping[str, CapabilityDefinition] = {
     "github_write": CapabilityDefinition(
         name="github_write",
-        source_key=GITHUB_WRITE_RESOLVE_KEY,
+        # Owner-selected: exactly one of these is resolved per task, never
+        # both. Listing both here is what keeps the unselected one in
+        # CAPABILITY_SENSITIVE_ENV, so a releaser worker cannot inherit the
+        # other owner's token ambiently.
+        source_keys=tuple(sorted(set(GITHUB_WRITE_RESOLVE_KEYS.values()))),
         handoff_env=GITHUB_WRITE_HANDOFF_ENV,
         projection_env=("GH_TOKEN",),
+        selected_by="repository owner",
     ),
     "bws_bootstrap": CapabilityDefinition(
         name="bws_bootstrap",
@@ -881,6 +902,82 @@ def _safe_source_result(result: Any, required_key: str) -> tuple[str | None, str
     return value, None
 
 
+# Owner and repository of a GitHub remote, in the URL shapes git accepts:
+# ``scheme://[user[:pass]@]github.com[:port]/owner/repo[.git]`` and the
+# scp-style ``[user@]github.com:owner/repo[.git]``.
+#
+# Anchored at BOTH ends, and ``github.com`` must be the whole host -- matching
+# it anywhere in the string would accept ``https://evil.example/github.com/o/r``
+# and ``https://notgithub.com/o/r`` and hand a real GitHub credential to a
+# worker whose remote points somewhere else entirely. The path must be exactly
+# ``owner/repo``; a deeper path is not a repository URL and yields no owner.
+_GITHUB_REMOTE_OWNER_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://)?"      # optional scheme
+    r"(?:[^/@\s]*@)?"                       # optional user[:password]@
+    r"github\.com"                          # the host, and only this host
+    r"(?::\d+)?"                            # optional port
+    r"[:/]"                                 # scp-style ':' or a path '/'
+    r"(?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+    r"(?P<repo>[^/\s]+?)(?:\.git)?/?"
+)
+
+
+def github_write_resolve_key(owner: str | None) -> str | None:
+    """Return the BWS secret backing ``github_write`` for ``owner``."""
+    if not owner:
+        return None
+    return GITHUB_WRITE_RESOLVE_KEYS.get(owner.strip().casefold())
+
+
+def github_owner_for_workspace(
+    workspace: Path | str | None, *, remote: str = "origin"
+) -> str | None:
+    """GitHub owner the worker in ``workspace`` would publish to, or ``None``.
+
+    BUILD-603: ``github_write`` is owner-scoped, so the dispatcher has to know
+    which repository a task publishes to before it can pick a token. The
+    workspace's own remote URL is the only per-task repo context available at
+    spawn time -- ``tasks.publication_remote`` is a git *remote name*
+    (``origin`` is its only live value), not an owner.
+
+    Never raises: a workspace that is not a git repository, has no such remote,
+    or points at a non-GitHub host simply has no owner, and the caller fails
+    closed. Never logs the URL either -- a remote can carry an embedded
+    credential (``https://x-access-token:<token>@github.com/...``).
+
+    Reads the PUSH url. A remote may carry a ``pushurl`` distinct from its
+    fetch url (the fetch-upstream / push-fork setup), and it is where the
+    worker's push actually lands that decides which token is the right one.
+    ``--push`` falls back to the fetch url when no ``pushurl`` is configured.
+    """
+    if not workspace:
+        return None
+    remote_name = (remote or "origin").strip() or "origin"
+    if remote_name.startswith("-"):
+        # A remote name is task-controlled; never let one become a git flag.
+        return None
+    # An ambient GIT_DIR / GIT_WORK_TREE / GIT_CONFIG_* in the dispatcher's own
+    # environment would silently point this probe at a different repository or
+    # inject config into it, so the probe answers about a repo the worker will
+    # never touch. Scrub the whole namespace rather than enumerate it.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace), "remote", "get-url", "--push", remote_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _GITHUB_REMOTE_OWNER_RE.fullmatch((completed.stdout or "").strip())
+    return match.group("owner") if match else None
+
+
 def resolve_worker_credentials(
     profile: str,
     *,
@@ -888,12 +985,14 @@ def resolve_worker_credentials(
     base_env: Mapping[str, str] | None = None,
     run_id: int | str | None = None,
     manifest: WorkerCredentialManifest | None = None,
+    github_owner: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve the closed grants for one worker without leaking secrets.
 
     Ambient ``GH_TOKEN``, ``GITHUB_TOKEN``, and ``GH_TOKEN_SECRET_WRITE`` are
     never considered valid action sources.  ``github_write`` is satisfied only
-    by the selected value returned by the Bitwarden source adapter.
+    by the selected value returned by the Bitwarden source adapter, and only
+    for a ``github_owner`` that has a registered release-target token.
     """
     cleanup_stale_worker_credential_artifacts()
     normalized_profile = _normalize_profile(profile)
@@ -911,6 +1010,43 @@ def resolve_worker_credentials(
     strip_env = set(UNCONDITIONAL_STRIP_ENV)
     strip_env.update(CAPABILITY_SENSITIVE_ENV)
     strip_env.add(access_token_env)
+
+    github_resolve_key: str | None = None
+    if needs_bitwarden:
+        # Owner selection is pure policy and needs no vault, so it runs before
+        # the bootstrap and source checks: an unresolvable owner is reported as
+        # itself rather than as a missing secret.
+        github_resolve_key = github_write_resolve_key(github_owner)
+        statuses.append(f"github_write_owner={github_owner or 'unresolved'}")
+        if github_resolve_key is None:
+            plan = WorkerCredentialPlan(
+                profile=normalized_profile,
+                manifest_digest=loaded_manifest.digest,
+                capabilities=capabilities,
+                diagnostics=tuple([*statuses, "github_write=missing"]),
+                error=(
+                    "worker credential preflight cannot select a GitHub write "
+                    "token: "
+                    + (
+                        f"no release-target token is registered for owner "
+                        f"{github_owner!r}"
+                        if github_owner
+                        # Deliberately enumerated: owner=None collapses four
+                        # distinct causes, and naming only one of them sends
+                        # the operator to check the wrong thing.
+                        else "the task workspace yielded no GitHub release "
+                        "target -- it is not a git repository, has no such "
+                        "remote, its push url is not a github.com repository, "
+                        "or the git probe failed (give the task a "
+                        "worktree/dir workspace on the repository it "
+                        "publishes to)"
+                    )
+                ),
+                source="bitwarden",
+                _strip_env=frozenset(strip_env),
+            )
+            _log_preflight(plan, run_id)
+            return plan
 
     if needs_bootstrap:
         statuses.append(f"bws_bootstrap={'present' if bootstrap else 'missing'}")
@@ -949,7 +1085,8 @@ def resolve_worker_credentials(
             access_token=bootstrap,
             source_config=source_config,
         )
-        github_value, failure = _safe_source_result(result, GITHUB_WRITE_RESOLVE_KEY)
+        assert github_resolve_key is not None  # set whenever needs_bitwarden
+        github_value, failure = _safe_source_result(result, github_resolve_key)
         if github_value is None:
             statuses.append("github_write=missing")
             plan = WorkerCredentialPlan(
@@ -1003,6 +1140,7 @@ def prepare_worker_credentials(
     base_env: Mapping[str, str] | None = None,
     run_id: int | str | None = None,
     manifest: WorkerCredentialManifest | None = None,
+    github_owner: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve grants and raise a safe error when the worker cannot start."""
     return resolve_worker_credentials(
@@ -1011,6 +1149,7 @@ def prepare_worker_credentials(
         base_env=base_env,
         run_id=run_id,
         manifest=manifest,
+        github_owner=github_owner,
     ).require_ok()
 
 
@@ -1209,6 +1348,10 @@ def render_worker_credential_audit(root: Path | str | None = None) -> str:
             scope = definition.operation or definition.projection_kind
             if definition.api_major:
                 scope = f"{scope} ({definition.api_major})"
+            if definition.selected_by:
+                # Otherwise the row lists every candidate key and reads as
+                # though the worker receives all of them at once.
+                scope = f"{scope}, 1 of {len(source_keys)} by {definition.selected_by}"
             rows.append(
                 (
                     profile,

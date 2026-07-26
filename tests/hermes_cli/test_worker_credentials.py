@@ -13,6 +13,10 @@ from hermes_cli import worker_credentials as wc
 
 
 SENTINEL = "sentinel-worker-token-do-not-log"
+# BUILD-603: github_write is owner-scoped, so every releaser resolution
+# needs the owner of the repository the task publishes to.
+RELEASE_OWNER = "Ahlnos-Inc"
+RESOLVE_KEY = wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]
 
 
 @pytest.fixture(autouse=True)
@@ -165,12 +169,12 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     monkeypatch.setenv("GH_TOKEN_SECRET_WRITE", "ambient-action-token")
 
     def fetch(**_kwargs):
-        return FetchResult(secrets={wc.GITHUB_WRITE_RESOLVE_KEY: SENTINEL})
+        return FetchResult(secrets={RESOLVE_KEY: SENTINEL})
 
     monkeypatch.setattr(wc, "_fetch_bitwarden_result", fetch)
     with caplog.at_level(logging.INFO, logger=wc._log.name):
         plan = wc.resolve_worker_credentials(
-            "Releaser", root=tmp_path, base_env=os.environ
+            "Releaser", root=tmp_path, base_env=os.environ, github_owner=RELEASE_OWNER
         )
 
     # Use the real process environment for this assertion without allowing
@@ -230,7 +234,7 @@ def test_unauthenticated_publication_fails_closed_without_leaking_secrets(
     monkeypatch.setattr(wc, "_fetch_bitwarden_result", lambda **_kw: fetch_result)
     with caplog.at_level(logging.INFO, logger=wc._log.name):
         plan = wc.resolve_worker_credentials(
-            "Releaser", root=tmp_path, base_env=os.environ
+            "Releaser", root=tmp_path, base_env=os.environ, github_owner=RELEASE_OWNER
         )
 
     # Fail closed with an actionable, non-secret diagnostic.
@@ -594,7 +598,9 @@ def test_missing_bootstrap_and_secret_are_safe_failures(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     _enable_bitwarden(tmp_path)
     monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
-    missing_bootstrap = wc.resolve_worker_credentials("releaser", root=tmp_path)
+    missing_bootstrap = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
     assert not missing_bootstrap.ok
     assert "missing BWS bootstrap" in (missing_bootstrap.error or "")
     assert SENTINEL not in repr(missing_bootstrap)
@@ -605,7 +611,9 @@ def test_missing_bootstrap_and_secret_are_safe_failures(tmp_path, monkeypatch):
         "_fetch_bitwarden_result",
         lambda **_kwargs: FetchResult(secrets={}),
     )
-    missing_secret = wc.resolve_worker_credentials("releaser", root=tmp_path)
+    missing_secret = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
     assert not missing_secret.ok
     assert "GitHub write secret is missing" in (missing_secret.error or "")
     assert SENTINEL not in repr(missing_secret)
@@ -615,17 +623,19 @@ def test_action_value_present_only_in_dotenv_is_not_used(tmp_path, monkeypatch):
     _github_manifest(tmp_path)
     _enable_bitwarden(tmp_path)
     (tmp_path / ".env").write_text(
-        f"{wc.GITHUB_WRITE_RESOLVE_KEY}={SENTINEL}\n", encoding="utf-8"
+        f"{RESOLVE_KEY}={SENTINEL}\n", encoding="utf-8"
     )
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
-    monkeypatch.setenv(wc.GITHUB_WRITE_RESOLVE_KEY, SENTINEL)
+    monkeypatch.setenv(RESOLVE_KEY, SENTINEL)
     monkeypatch.setattr(
         wc,
         "_fetch_bitwarden_result",
         lambda **_kwargs: FetchResult(secrets={}),
     )
 
-    plan = wc.resolve_worker_credentials("releaser", root=tmp_path)
+    plan = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
     assert not plan.ok
     assert "GitHub write secret is missing" in (plan.error or "")
     assert SENTINEL not in repr(plan)
@@ -649,7 +659,9 @@ def test_adapter_exception_is_redacted_from_result_exception_and_log(
 
     monkeypatch.setattr(registry, "get_source", lambda _name: FailingSource())
     with caplog.at_level(logging.INFO, logger=wc._log.name):
-        plan = wc.resolve_worker_credentials("releaser", root=tmp_path)
+        plan = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
 
     assert not plan.ok
     assert SENTINEL not in repr(plan)
@@ -672,13 +684,17 @@ def test_existing_bitwarden_cache_is_used_and_failures_do_not_become_credentials
 
     def run_bws(*_args):
         calls.append(True)
-        return {wc.GITHUB_WRITE_RESOLVE_KEY: SENTINEL}, []
+        return {RESOLVE_KEY: SENTINEL}, []
 
     monkeypatch.setattr(bw, "_run_bws_list", run_bws)
     bw._reset_cache_for_tests(tmp_path)
     try:
-        first = wc.resolve_worker_credentials("releaser", root=tmp_path)
-        second = wc.resolve_worker_credentials("releaser", root=tmp_path)
+        first = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
+        second = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
         assert first.ok and second.ok
         assert len(calls) == 1
 
@@ -694,7 +710,9 @@ def test_existing_bitwarden_cache_is_used_and_failures_do_not_become_credentials
             encoding="utf-8",
         )
         monkeypatch.setattr(bw, "_run_bws_list", fail_bws)
-        failed = wc.resolve_worker_credentials("releaser", root=tmp_path)
+        failed = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
         assert not failed.ok
         assert "Bitwarden source failed" in (failed.error or "")
         assert len(calls) == 2
@@ -891,6 +909,12 @@ def test_audit_renderer_matches_the_manifest_and_prints_no_values(
     # Names only. Never values.
     assert SENTINEL not in report
     assert "anthropic-provider-key" not in report
+    # BUILD-603: github_write lists two candidate source keys but delivers
+    # exactly one. Both names on one row would otherwise read as "the releaser
+    # holds both tokens" — the property this capability exists to deny.
+    for name in wc.GITHUB_WRITE_RESOLVE_KEYS.values():
+        assert name in report
+    assert "1 of 2 by repository owner" in report
 
 
 def test_a_grant_the_code_registry_does_not_define_is_rejected_at_load(tmp_path):
@@ -907,3 +931,243 @@ def test_a_grant_the_code_registry_does_not_define_is_rejected_at_load(tmp_path)
     )
     with pytest.raises(wc.WorkerCredentialError, match="capability is unsupported"):
         wc.load_manifest(root=tmp_path)
+
+
+# --- BUILD-603: owner-scoped github_write -----------------------------------
+#
+# A fine-grained PAT has exactly one resource owner and the release targets
+# span two, so github_write cannot resolve from a single key. These cover the
+# selection itself, the owner source, and the fail-closed edges.
+
+
+def _git_repo(root: Path, remote_url: str | None, *, remote: str = "origin") -> Path:
+    import subprocess
+
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    if remote_url is not None:
+        subprocess.run(
+            ["git", "-C", str(root), "remote", "add", remote, remote_url],
+            check=True,
+        )
+    return root
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://github.com/Ahlnos-Inc/hermes-agent.git", "Ahlnos-Inc"),
+        ("https://github.com/nlachica/hermes-config", "nlachica"),
+        ("git@github.com:Ahlnos-Inc/aldnoah.git", "Ahlnos-Inc"),
+        ("ssh://git@github.com/nlachica/arivity.git", "nlachica"),
+        # A remote may carry an embedded credential; the owner still parses and
+        # the URL is never returned to the caller.
+        ("https://x-access-token:secret@github.com/nlachica/arivity.git", "nlachica"),
+        ("https://github.com:443/nlachica/arivity.git", "nlachica"),
+        # Not GitHub: these tokens are GitHub credentials and must not be
+        # selected for a remote pointing anywhere else. The last three are
+        # host SPOOFS -- a substring match on "github.com" accepts all of
+        # them and hands a real token to a worker publishing elsewhere.
+        ("https://gitlab.com/Ahlnos-Inc/hermes-agent.git", None),
+        ("git@example.invalid:Ahlnos-Inc/hermes-agent.git", None),
+        ("https://notgithub.com/nlachica/arivity.git", None),
+        ("https://evil.example/github.com/nlachica/arivity.git", None),
+        ("git@example.invalid:x/github.com/Ahlnos-Inc/aldnoah.git", None),
+        # A deeper path is not a repository URL.
+        ("https://github.com/nlachica/arivity/extra.git", None),
+    ],
+)
+def test_github_owner_is_read_from_the_workspace_remote(tmp_path, url, expected):
+    workspace = _git_repo(tmp_path / "repo", url)
+    assert wc.github_owner_for_workspace(workspace) == expected
+
+
+def test_github_owner_is_none_when_the_workspace_cannot_name_a_remote(tmp_path):
+    # A scratch workspace is not a repository at all.
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    assert wc.github_owner_for_workspace(scratch) is None
+    assert wc.github_owner_for_workspace(None) is None
+
+    # A repository with no such remote.
+    repo = _git_repo(tmp_path / "no-remote", None)
+    assert wc.github_owner_for_workspace(repo) is None
+
+    # A named remote that exists is honoured; one that does not is not silently
+    # replaced by origin.
+    named = _git_repo(
+        tmp_path / "named",
+        "https://github.com/nlachica/hermes-config.git",
+        remote="publish",
+    )
+    assert wc.github_owner_for_workspace(named, remote="publish") == "nlachica"
+    assert wc.github_owner_for_workspace(named, remote="origin") is None
+
+    # A remote name is task-controlled and must never become a git flag.
+    assert wc.github_owner_for_workspace(named, remote="--upload-pack=touch") is None
+
+
+def test_github_write_resolves_only_the_token_for_the_workspace_owner(
+    tmp_path, monkeypatch, caplog
+):
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    ahlnos = "ahlnos-inc-fine-grained-token"
+    nlachica = "nlachica-fine-grained-token"
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={
+                wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]: ahlnos,
+                wc.GITHUB_WRITE_RESOLVE_KEYS["nlachica"]: nlachica,
+                # The classic broad-scoped token this ticket retires. It is
+                # still in the vault and must never be selected again.
+                "GITHUB_TOKEN": "classic-broad-scoped-token",
+            }
+        ),
+    )
+
+    for owner, expected, other in (
+        ("Ahlnos-Inc", ahlnos, nlachica),
+        ("nlachica", nlachica, ahlnos),
+        # Owner comparison is case-insensitive: GitHub owners are.
+        ("AHLNOS-INC", ahlnos, nlachica),
+    ):
+        base_env = {"BWS_ACCESS_TOKEN": "controller-bootstrap"}
+        with caplog.at_level(logging.INFO, logger=wc._log.name):
+            plan = wc.resolve_worker_credentials(
+                "releaser", root=tmp_path, base_env=base_env, github_owner=owner
+            )
+        assert plan.ok, plan.error
+        env = wc.build_worker_environment(base_env, plan)
+        assert env[wc.GITHUB_WRITE_HANDOFF_ENV] == expected
+        # The worker holds exactly one token: not the other owner's, and not
+        # the classic token (BUILD-603 AC2).
+        assert other not in env.values()
+        assert "classic-broad-scoped-token" not in env.values()
+        assert expected not in caplog.text
+
+
+def test_github_write_fails_closed_when_the_owner_has_no_registered_token(
+    tmp_path, monkeypatch
+):
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    fetched = []
+
+    def fetch(**_kwargs):
+        fetched.append(True)
+        return FetchResult(secrets={RESOLVE_KEY: SENTINEL})
+
+    monkeypatch.setattr(wc, "_fetch_bitwarden_result", fetch)
+
+    # Every credential a fallback could reach is present in the environment,
+    # so "no handoff" is a real assertion rather than one about an empty dict.
+    base_env = {
+        "BWS_ACCESS_TOKEN": "controller-bootstrap",
+        "GITHUB_TOKEN": "classic-broad-scoped-token",
+        "GH_TOKEN": "ambient-gh-token",
+        **{name: f"ambient-{name}" for name in wc.GITHUB_WRITE_RESOLVE_KEYS.values()},
+    }
+    for owner, fragment in (
+        (None, "yielded no GitHub release target"),
+        ("", "yielded no GitHub release target"),
+        ("some-other-org", "no release-target token is registered"),
+    ):
+        plan = wc.resolve_worker_credentials(
+            "releaser", root=tmp_path, base_env=dict(base_env), github_owner=owner
+        )
+        assert not plan.ok
+        assert fragment in (plan.error or "")
+        assert "github_write=missing" in plan.diagnostics
+        env = wc.build_worker_environment(dict(base_env), plan)
+        assert wc.GITHUB_WRITE_HANDOFF_ENV not in env
+        assert SENTINEL not in env.values()
+        # No ambient GitHub credential survives as a substitute.
+        assert not set(base_env.values()) & set(env.values())
+        with pytest.raises(wc.WorkerCredentialError):
+            plan.require_ok()
+
+    # Owner selection is policy and needs no vault: an unresolvable owner must
+    # not even reach the secret source.
+    assert fetched == []
+
+
+def test_both_release_target_tokens_are_stripped_from_every_worker(
+    tmp_path, monkeypatch
+):
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets={RESOLVE_KEY: SENTINEL}),
+    )
+    ambient = {
+        name: f"ambient-{name}" for name in wc.GITHUB_WRITE_RESOLVE_KEYS.values()
+    }
+    ambient["GITHUB_TOKEN"] = "ambient-classic"
+    base_env = {**ambient, "BWS_ACCESS_TOKEN": "controller-bootstrap"}
+
+    for profile, owner in (
+        ("releaser", RELEASE_OWNER),
+        ("verifier", None),
+        ("marketing-operator", None),
+    ):
+        plan = wc.resolve_worker_credentials(
+            profile, root=tmp_path, base_env=dict(base_env), github_owner=owner
+        )
+        assert plan.ok, (profile, plan.error)
+        env = wc.build_worker_environment(dict(base_env), plan)
+        for name in (*wc.GITHUB_WRITE_RESOLVE_KEYS.values(), "GITHUB_TOKEN"):
+            assert name not in env, (profile, name)
+        assert not set(ambient.values()) & set(env.values()), profile
+
+
+def test_owner_comes_from_the_push_url_not_the_fetch_url(tmp_path):
+    """A remote can fetch from one owner and push to another.
+
+    The fetch-upstream / push-fork setup is standard, and it is where the
+    push LANDS that decides which fine-grained PAT is the correct one.
+    Reading the fetch url hands out the wrong owner's token and the push then
+    403s while the preflight reports ``github_write=present``.
+    """
+    import subprocess
+
+    repo = _git_repo(tmp_path / "split", "https://github.com/nlachica/hermes-config.git")
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "set-url", "--push", "origin",
+            "https://github.com/Ahlnos-Inc/aldnoah.git",
+        ],
+        check=True,
+    )
+
+    assert wc.github_owner_for_workspace(repo) == "Ahlnos-Inc"
+    assert wc.github_write_resolve_key(
+        wc.github_owner_for_workspace(repo)
+    ) == wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]
+
+
+def test_ambient_git_env_cannot_redirect_the_owner_probe(tmp_path, monkeypatch):
+    """The probe must answer about the WORKSPACE, not about GIT_DIR.
+
+    The dispatcher's own environment is inherited by the probe, and GIT_DIR /
+    GIT_WORK_TREE take precedence over ``git -C`` discovery -- so an ambient
+    value would silently select a token for a repository the worker never
+    touches.
+    """
+    workspace = _git_repo(
+        tmp_path / "workspace", "https://github.com/nlachica/hermes-config.git"
+    )
+    elsewhere = _git_repo(
+        tmp_path / "elsewhere", "https://github.com/Ahlnos-Inc/aldnoah.git"
+    )
+    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(elsewhere))
+
+    assert wc.github_owner_for_workspace(workspace) == "nlachica"

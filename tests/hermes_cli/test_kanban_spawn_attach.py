@@ -386,8 +386,14 @@ def test_default_spawn_preflights_and_handoffs_only_authorized_action(
     monkeypatch.setattr(
         wc,
         "_fetch_bitwarden_result",
-        lambda **_kwargs: FetchResult(secrets={wc.GITHUB_WRITE_RESOLVE_KEY: sentinel}),
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]: sentinel}
+        ),
     )
+    # BUILD-603: the owner normally comes from the workspace git remote.
+    # Pinned here so this test stays about the handoff, not about git;
+    # the resolver itself is covered in test_worker_credentials.py.
+    monkeypatch.setattr(wc, "github_owner_for_workspace", lambda *_a, **_kw: "Ahlnos-Inc")
     captured = {}
 
     class FakeProc:
@@ -416,8 +422,11 @@ def test_default_spawn_preflights_and_handoffs_only_authorized_action(
 def test_default_spawn_does_not_call_popen_when_credential_preflight_fails(
     kanban_home, monkeypatch
 ):
+    from hermes_cli import worker_credentials as wc
+
     _write_worker_contract(kanban_home)
     monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(wc, "github_owner_for_workspace", lambda *_a, **_kw: "Ahlnos-Inc")
     called = []
 
     def fake_popen(*_args, **_kwargs):
@@ -897,3 +906,76 @@ def test_spawn_contract_reports_queried_board_and_path_not_no_longer_current(
     assert str(task.current_run_id) in message
     assert "hermes-infra" in message
     assert str(expected_path) in message
+
+
+def test_default_spawn_selects_the_token_for_the_workspace_owner(
+    kanban_home, monkeypatch, tmp_path
+):
+    """BUILD-603: the dispatcher derives the owner from the real workspace.
+
+    Covers the wiring the unit tests stub out: a releaser spawn resolves the
+    fine-grained token matching its workspace's git remote, and a workspace
+    that names no GitHub remote gets no handoff at all instead of falling back
+    to a broad-scoped one.
+    """
+    from agent.secret_sources.base import FetchResult
+    from hermes_cli import worker_credentials as wc
+
+    _write_worker_contract(kanban_home)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    tokens = {
+        key: f"token-for-{owner}"
+        for owner, key in wc.GITHUB_WRITE_RESOLVE_KEYS.items()
+    }
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets=dict(tokens)),
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "remote", "add", "origin",
+            "https://github.com/nlachica/hermes-config.git",
+        ],
+        check=True,
+    )
+
+    class FakeProc:
+        pid = 55_777
+
+    captured = {}
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, *args, **kwargs):
+        # The owner probe is a read-only `git remote get-url`, not a worker
+        # launch; let it through so this test exercises the real resolution.
+        if list(cmd)[:1] == ["git"]:
+            return real_popen(cmd, *args, **kwargs)
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    kb._default_spawn(_spawn_test_task(), str(repo))
+
+    handoff = captured["env"][wc.GITHUB_WRITE_HANDOFF_ENV]
+    assert handoff == tokens[wc.GITHUB_WRITE_RESOLVE_KEYS["nlachica"]]
+    assert tokens[wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]] not in (
+        captured["env"].values()
+    )
+
+    # A scratch workspace names no remote: fail closed, never spawn.
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    def refuse_popen(cmd, *args, **kwargs):
+        if list(cmd)[:1] == ["git"]:
+            return real_popen(cmd, *args, **kwargs)
+        raise AssertionError("Popen must not run without a resolvable owner")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse_popen)
+    with pytest.raises(RuntimeError, match="yielded no GitHub release target"):
+        kb._default_spawn(_spawn_test_task(), str(scratch))

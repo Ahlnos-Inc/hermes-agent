@@ -21386,13 +21386,33 @@ def _default_spawn(
     # paths remain deliberately outside this default-spawn authority path.
     from hermes_cli.worker_credentials import (
         build_worker_environment,
+        github_owner_for_workspace,
+        load_manifest,
         prepare_worker_credentials,
+    )
+
+    # BUILD-603: github_write is backed by per-owner fine-grained PATs, so the
+    # token has to be chosen from the repository this task publishes to. The
+    # workspace remote is the only per-task repo context available here --
+    # publication_remote is a git remote NAME, not an owner. The manifest is
+    # loaded once and reused so the "does this profile need an owner" question
+    # and the resolution below cannot read two different contracts, and so a
+    # spawn that grants no github_write never shells out to git at all.
+    credential_manifest = load_manifest()
+    github_owner = (
+        github_owner_for_workspace(
+            workspace, remote=task.publication_remote or "origin"
+        )
+        if "github_write" in credential_manifest.actions_for(profile_arg)
+        else None
     )
 
     worker_credential_plan = prepare_worker_credentials(
         profile_arg,
         base_env=os.environ,
         run_id=task.current_run_id,
+        manifest=credential_manifest,
+        github_owner=github_owner,
     )
 
     prompt = f"work kanban task {task.id}"
