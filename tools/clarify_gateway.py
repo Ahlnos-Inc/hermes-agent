@@ -234,6 +234,31 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in ids)
 
 
+def cancel(clarify_id: str) -> bool:
+    """Resolve and drop exactly ONE pending clarify, leaving its siblings alone.
+
+    Session-wide cleanup is the wrong tool for a late delivery outcome: by the
+    time a timed-out send resolves, the session may already have registered a
+    newer clarify, and :func:`clear_session` would cancel that one too — the
+    caller would see its prompt answered with the empty sentinel it never
+    earned (BUILD-679). Returns False when the entry is already gone, which is
+    the normal race with a user who answered first.
+    """
+    with _lock:
+        entry = _entries.pop(clarify_id, None)
+        if entry is not None:
+            ids = _session_index.get(entry.session_key)
+            if ids and clarify_id in ids:
+                ids.remove(clarify_id)
+                if not ids:
+                    _session_index.pop(entry.session_key, None)
+    if entry is None:
+        return False
+    entry.response = ""
+    entry.event.set()
+    return True
+
+
 def clear_session(session_key: str) -> int:
     """Resolve and drop every pending clarify for a session.
 

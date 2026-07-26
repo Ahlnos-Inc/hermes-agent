@@ -250,3 +250,78 @@ class TestGatewayTextIntercept:
         
         # Clean up
         cm.clear_session("sk-tf")
+
+
+class TestIdentityScopedCancel:
+    """BUILD-679: a late delivery outcome must not cancel a newer clarify."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_cancel_drops_only_the_named_entry(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("old", "sk", "first question", ["A"])
+        cm.register("new", "sk", "second question", ["B"])
+
+        waiter = ThreadPoolExecutor(max_workers=1).submit(
+            cm.wait_for_response, "old", 5.0
+        )
+        time.sleep(0.05)
+        assert cm.cancel("old") is True
+        # The blocked agent thread gets the empty sentinel, not a hang.
+        assert waiter.result(timeout=2) == ""
+        # The survivor is still pending and still resolvable by the user.
+        assert cm.resolve_gateway_clarify("new", "B") is True
+        assert cm.wait_for_response("new", timeout=0.05) == "B"
+
+    def test_cancel_leaves_the_session_index_usable_for_the_survivor(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("old", "sk", "first question", None)
+        cm.register("new", "sk", "second question", None)
+
+        cm.cancel("old")
+
+        pending = cm.get_pending_for_session("sk")
+        assert pending is not None
+        assert pending.clarify_id == "new"
+
+    def test_cancel_of_an_already_resolved_entry_is_false(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id", "sk", "q", ["A"])
+        cm.resolve_gateway_clarify("id", "A")
+        assert cm.wait_for_response("id", timeout=0.05) == "A"
+
+        assert cm.cancel("id") is False
+
+    def test_cancel_removes_an_emptied_session_from_the_index(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("only", "sk", "q", ["A"])
+        cm.cancel("only")
+
+        assert cm.has_pending("sk") is False
+        assert "sk" not in cm._session_index
+
+    def test_clear_session_still_cancels_every_entry(self):
+        # Control: session-boundary cleanup (/new, shutdown) is unchanged.
+        from tools import clarify_gateway as cm
+
+        cm.register("a", "sk", "q1", ["A"])
+        cm.register("b", "sk", "q2", ["B"])
+        assert cm.clear_session("sk") == 2
+
+    def test_late_delivery_callback_cancels_by_identity_not_by_session(self):
+        # The defect BUILD-679 names lives at the call site, not in this module:
+        # a timed-out send that later resolves "definitively absent" used to call
+        # clear_session(session_key), taking any newer clarify down with it.
+        from pathlib import Path
+
+        run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+        block = run_py.read_text(encoding="utf-8").split(
+            "def _capture_late_outcome", 1
+        )[1].split("fut.add_done_callback", 1)[0]
+        assert "clarify_mod.cancel(clarify_id)" in block
+        assert "clear_session" not in block

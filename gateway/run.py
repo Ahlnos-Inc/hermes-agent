@@ -18092,7 +18092,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         late_outcome = _ClarifyDeliveryOutcome.UNKNOWN
                     _record_outcome(late_outcome)
                     if late_outcome in _CLARIFY_DEFINITIVELY_ABSENT:
-                        clarify_mod.clear_session(session_key)
+                        # Identity-scoped: this callback can fire long after the
+                        # session moved on to a newer clarify, and clearing the
+                        # whole session would cancel that one too (BUILD-679).
+                        clarify_mod.cancel(clarify_id)
 
                 fut.add_done_callback(_capture_late_outcome)
                 logger.warning(
@@ -18112,7 +18115,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Clarify send failed: %s", exc)
 
         if _current_outcome() in _CLARIFY_DEFINITIVELY_ABSENT:
-            clarify_mod.clear_session(session_key)
+            clarify_mod.cancel(clarify_id)
             return "[clarify prompt could not be delivered]"
 
         timeout = clarify_mod.get_clarify_timeout()
