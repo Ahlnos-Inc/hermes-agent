@@ -7239,3 +7239,49 @@ def test_orphan_sweep_reads_every_board_before_claiming_orphanhood(
 
     assert results == []
     assert path.exists()
+
+
+class TestScratchHeaderDescriptorEviction:
+    """BUILD-771: the never-closed header fd cache must not grow per test.
+
+    ``_HEADER_FD_CACHE`` holds one deliberately never-closed read-only
+    descriptor per database path (BUILD-575 — closing any descriptor to a file
+    drops every fcntl lock the process holds on it). Production has a handful of
+    paths; this suite creates one per test, which is 1002 of the ~1030
+    descriptors still open at the end of a full ``tests/hermes_cli`` run. The
+    autouse fixture in ``conftest.py`` evicts the scratch entries at teardown.
+    """
+
+    scratch_key: str | None = None
+
+    def test_a_reading_a_scratch_header_caches_a_descriptor(self, tmp_path):
+        db = tmp_path / "scratch.db"
+        kb.init_db(db)
+        kb._read_db_header(db)
+
+        key = os.path.realpath(str(db))
+        assert key in kb._HEADER_FD_CACHE
+        type(self).scratch_key = key
+
+    def test_b_teardown_evicted_and_closed_that_descriptor(self):
+        key = type(self).scratch_key
+        assert key is not None, "ordering: the previous test must run first"
+        assert key not in kb._HEADER_FD_CACHE
+
+    def test_live_hermes_paths_are_never_evicted(self, monkeypatch, tmp_path):
+        # A path under the real ~/.hermes must keep its descriptor: another
+        # process may hold fcntl locks on it, and closing ours would drop them.
+        import tests.hermes_cli.conftest as ct
+
+        db = tmp_path / "pretend-live.db"
+        kb.init_db(db)
+        kb._read_db_header(db)
+        key = os.path.realpath(str(db))
+        monkeypatch.setattr(ct, "_LIVE_HERMES_ROOT", str(tmp_path))
+
+        ct._close_scratch_header_descriptors()
+
+        assert key in kb._HEADER_FD_CACHE
+        # Clean up ourselves so the fixture's own eviction has nothing to do.
+        fd = kb._HEADER_FD_CACHE.pop(key)[0]
+        os.close(fd)

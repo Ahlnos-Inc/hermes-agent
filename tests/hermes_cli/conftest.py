@@ -23,6 +23,16 @@ def _close_kanban_db_connections():
     teardown. Idempotent with ``connect_closing`` (double-close is a no-op) and
     safe because the kernel keeps no connection pool — every ``connect()`` opens
     an independent handle.
+
+    Connections are not the whole story (BUILD-771): measured across a full
+    ``tests/hermes_cli`` run, 1002 of the ~1030 descriptors open at exit were
+    ``.db`` files held **read-only**, which no sqlite connection is — they are
+    ``kanban_db._HEADER_FD_CACHE``, one never-closed header descriptor per DB
+    path. That cache is deliberate and must stay (BUILD-575: closing any
+    descriptor to a file releases every fcntl lock the process holds on it), but
+    production has a handful of DB paths and this suite has one per test. So the
+    fixture also evicts the cache entries this test created — see
+    :func:`_close_scratch_header_descriptors`.
     """
     import hermes_cli.kanban_db as kdb
 
@@ -45,6 +55,71 @@ def _close_kanban_db_connections():
             except Exception:
                 pass
         opened.clear()
+        _close_scratch_header_descriptors()
+        _fail_if_descriptors_near_the_select_ceiling()
+
+
+def _close_scratch_header_descriptors() -> None:
+    """Drop header-fd cache entries for databases outside the real ~/.hermes.
+
+    Closing one of these is safe here and only here: a per-test scratch database
+    has no other process holding fcntl locks on it, and the test that created it
+    is over. The real ``~/.hermes`` paths are left alone so the BUILD-575
+    invariant is untouched for anything a test might share with the live host.
+    """
+    try:
+        import hermes_cli.kanban_db as kdb
+
+        cache = kdb._HEADER_FD_CACHE
+        lock = kdb._HEADER_FD_LOCK
+    except Exception:  # pragma: no cover - module shape changed
+        return
+    with lock:
+        for key in [k for k in cache if not k.startswith(_LIVE_HERMES_ROOT)]:
+            fd = cache.pop(key)[0]
+            try:
+                _REAL_CLOSE(fd)
+            except OSError:
+                pass
+
+
+# Bound at import, before any test can monkeypatch ``os.close`` (several do, to
+# exercise close-failure paths) — a probe that goes through the patched function
+# would raise out of teardown and error the very test it is measuring.
+import os as _os
+
+_REAL_OPEN = _os.open
+_REAL_CLOSE = _os.close
+# Resolved at import, before any test can fake ``pathlib`` into Windows mode or
+# redirect HOME: the real home is only knowable now (same reason as BUILD-660).
+_LIVE_HERMES_ROOT = _os.path.join(_os.path.expanduser("~"), ".hermes")
+
+
+# select() is capped at FD_SETSIZE=1024 no matter how high RLIMIT_NOFILE is, and
+# it fails silently above that (BUILD-769 lost two sessions to it). Fail the test
+# that crosses the line instead of whichever unlucky test allocates fd 1024 —
+# once per run, because a descriptor leak is monotonic and would otherwise error
+# every remaining test and bury its own first report.
+_FD_CEILING = 1000
+_fd_ceiling_reported = False
+
+
+def _fail_if_descriptors_near_the_select_ceiling() -> None:
+    global _fd_ceiling_reported
+    if _fd_ceiling_reported:
+        return
+    try:
+        probe = _REAL_OPEN(_os.devnull, _os.O_RDONLY)
+    except OSError:  # pragma: no cover - only under real exhaustion
+        pytest.fail("could not open a probe descriptor: the process is out of fds")
+    _REAL_CLOSE(probe)
+    if probe >= _FD_CEILING:
+        _fd_ceiling_reported = True
+        pytest.fail(
+            f"open descriptors reached fd {probe} (ceiling {_FD_CEILING}, "
+            f"select() breaks at 1024). This test left descriptors open — see "
+            f"BUILD-771."
+        )
 
 
 HERMES_MODULE_PREFIXES = ("hermes_cli", "hermes_state", "hermes_constants")
@@ -183,3 +258,4 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
