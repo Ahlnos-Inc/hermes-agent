@@ -187,6 +187,8 @@ ORPHAN_FAILURE_LOOKBACK_SECONDS = 72 * 3600
 ORPHAN_FAILURE_BATCH_PER_TICK = 5
 ORPHAN_FAILURE_RETRY_SECONDS = 900
 CORRUPT_ALERT_RETRY_SECONDS = 15 * 60
+# BUILD-728: re-alert cadence for a ready card that still has no assignee.
+UNASSIGNED_READY_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
 
 def _is_corruption_db_error(kb: Any, exc: BaseException) -> bool:
@@ -2632,6 +2634,12 @@ class GatewayKanbanWatchersMixin:
         corrupt_alert_pending: dict[tuple, str] = {}
         corrupt_alert_delivered: set[tuple] = set()
         corrupt_alert_last_attempt: dict[tuple, float] = {}
+        # BUILD-728: last SLA alert per (board, task) for ready+unassigned
+        # cards, so one routing slip pages at most once per cooldown. Held in
+        # memory like every other alert cadence in this watcher — a gateway
+        # restart re-alerting a still-unassigned card is the correct outcome
+        # for a low-severity nudge, and it costs no schema change.
+        unassigned_sla_last_alert: dict[tuple[str, str], float] = {}
         corrupt_wall_clock = getattr(
             self,
             "_kanban_wall_clock",
@@ -3046,6 +3054,38 @@ class GatewayKanbanWatchersMixin:
                             pass
             return False
 
+        def _unassigned_sla_scan(
+            tick_results: "Optional[list[tuple[str, Optional[object]]]]",
+        ) -> "list[tuple[str, str, str, int]]":
+            """Ready+unassigned cards past the SLA window (BUILD-728).
+
+            Reads only the ids this tick already skipped as ``unassigned``, so
+            an idle fleet does no work at all. Returns
+            ``(board, task_id, title, idle_seconds)``.
+            """
+            out: list[tuple[str, str, str, int]] = []
+            for slug, res in (tick_results or []):
+                ids = list(getattr(res, "skipped_unassigned", None) or ())
+                if not ids:
+                    continue
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    for tid, title, idle in _kb.unassigned_ready_over_sla(conn, ids):
+                        out.append((slug, tid, title, idle))
+                except Exception:
+                    logger.debug(
+                        "kanban dispatcher: unassigned-SLA scan failed for %s",
+                        slug, exc_info=True,
+                    )
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            return out
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -3208,6 +3248,36 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                # BUILD-728: age/SLA nudge for ready cards with NO assignee.
+                # They are benign for dispatcher health (nothing is stuck) but
+                # can never spawn, so without this they sit silent forever.
+                # Detection rides the tick's own skip list — no extra scan.
+                for _slug, _tid, _title, _idle in await asyncio.to_thread(
+                    _unassigned_sla_scan, results,
+                ):
+                    _key = (_slug, _tid)
+                    _last = unassigned_sla_last_alert.get(_key)
+                    _now = corrupt_monotonic_clock()
+                    if (
+                        _last is not None
+                        and _now - _last < UNASSIGNED_READY_ALERT_COOLDOWN_SECONDS
+                    ):
+                        continue
+                    _hours = _idle / 3600.0
+                    _msg = (
+                        f"📋 kanban [{_slug}]: task {_tid} has been ready and "
+                        f"UNASSIGNED for {_hours:.1f}h — it can never spawn a "
+                        f"worker. Assign a profile or archive it.\n{_title}"
+                    )
+                    try:
+                        _sent = await self._kanban_notify_home_fallback(_msg)
+                    except Exception:
+                        logger.exception(
+                            "kanban dispatcher: unassigned-SLA alert send failed",
+                        )
+                        _sent = False
+                    if _sent:
+                        unassigned_sla_last_alert[_key] = _now
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
