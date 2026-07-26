@@ -1171,3 +1171,186 @@ def test_ambient_git_env_cannot_redirect_the_owner_probe(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_WORK_TREE", str(elsewhere))
 
     assert wc.github_owner_for_workspace(workspace) == "nlachica"
+
+
+# --- BUILD-601: the credentials that replace marketing-operator's vault token -
+
+
+MARKETING_READ_CAPABILITIES = (
+    "meta_marketing_read",
+    "instagram_graph_read",
+    "posthog_read",
+)
+
+
+def _marketing_manifest(root: Path) -> None:
+    actions = ", ".join(MARKETING_READ_CAPABILITIES)
+    _write_manifest(
+        root,
+        "version: 1\n"
+        "profiles:\n"
+        "  marketing-operator:\n"
+        f"    actions: [{actions}]\n"
+        "  verifier:\n"
+        "    actions: []\n",
+    )
+
+
+def test_vault_sourced_capabilities_is_derived_not_a_literal(tmp_path):
+    """The set that needs a vault fetch comes from the registry.
+
+    Before BUILD-601 this was the literal ``"github_write" in capabilities``,
+    so a new capability silently resolved to nothing.
+    """
+    assert wc.vault_sourced_capabilities(("github_write",)) == ("github_write",)
+    assert wc.vault_sourced_capabilities(MARKETING_READ_CAPABILITIES) == (
+        MARKETING_READ_CAPABILITIES
+    )
+    # bws_bootstrap's source IS the controller bootstrap variable: no fetch.
+    assert wc.vault_sourced_capabilities(("bws_bootstrap",)) == ()
+    # A controller-action capability never projects into a worker at all.
+    assert wc.vault_sourced_capabilities(("google_ads_campaign_status_read",)) == ()
+    assert wc.vault_sourced_capabilities(()) == ()
+
+
+def test_marketing_read_capabilities_resolve_each_from_its_own_record(
+    tmp_path, monkeypatch, caplog
+):
+    """Each grant resolves its own Bitwarden RECORD name, hyphens included."""
+    _marketing_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    values = {
+        "meta-system-user-token": "meta-value",
+        "INSTAGRAM_GRAPH_TOKEN": "instagram-value",
+        "POSTHOG_PERSONAL_KEY": "posthog-value",
+        # Present in the same vault and granted to nobody here.
+        "WAVE_FULL_ACCESS_TOKEN": "unrelated-value",
+    }
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets=dict(values)),
+    )
+    # The controller's OWN environment already carries these vault names, so
+    # they must be in base_env or the "not in the worker env" assertions below
+    # are about an absence that was never there to begin with.
+    base_env = {
+        "BWS_ACCESS_TOKEN": "controller-bootstrap",
+        "INSTAGRAM_GRAPH_TOKEN": "ambient-instagram",
+        "POSTHOG_PERSONAL_KEY": "ambient-posthog",
+        "META_SYSTEM_USER_TOKEN": "ambient-meta",
+        "SAFE": "yes",
+    }
+
+    with caplog.at_level(logging.INFO, logger=wc._log.name):
+        plan = wc.resolve_worker_credentials(
+            "marketing-operator", root=tmp_path, base_env=base_env
+        )
+
+    assert plan.ok, plan.error
+    assert plan.capabilities == tuple(sorted(MARKETING_READ_CAPABILITIES))
+    for capability in MARKETING_READ_CAPABILITIES:
+        assert f"{capability}=present" in plan.diagnostics
+    # Values never appear in the plan or its log line.
+    for value in values.values():
+        assert value not in repr(plan)
+        assert value not in caplog.text
+
+    env = wc.build_worker_environment(base_env, plan)
+    handoffs = {
+        wc.META_MARKETING_HANDOFF_ENV: "meta-value",
+        wc.INSTAGRAM_GRAPH_HANDOFF_ENV: "instagram-value",
+        wc.POSTHOG_READ_HANDOFF_ENV: "posthog-value",
+    }
+    assert {k: env[k] for k in handoffs} == handoffs
+    # Terminal-only, like github_write: the projected names are NOT in the
+    # worker's own environment, and no ungranted secret rides along.
+    for projected in ("META_SYSTEM_USER_TOKEN", "INSTAGRAM_GRAPH_TOKEN",
+                      "POSTHOG_PERSONAL_KEY"):
+        assert projected not in env, projected
+    # ...and the ambient controller copies are gone too, not merely the
+    # resolved ones. A grant must not become a second, unaudited delivery path.
+    for ambient in ("ambient-instagram", "ambient-posthog", "ambient-meta"):
+        assert ambient not in env.values(), ambient
+    assert env["SAFE"] == "yes"
+    assert "unrelated-value" not in env.values()
+    # The vault token itself is not granted here and must not be projected.
+    assert wc.BWS_BOOTSTRAP_ENV not in env
+
+
+def test_one_missing_marketing_secret_fails_the_whole_preflight(tmp_path, monkeypatch):
+    """A partially-credentialed worker fails later and further from the cause."""
+    _marketing_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={
+                "meta-system-user-token": "meta-value",
+                "INSTAGRAM_GRAPH_TOKEN": "instagram-value",
+                # POSTHOG_PERSONAL_KEY absent.
+            }
+        ),
+    )
+    base_env = {"BWS_ACCESS_TOKEN": "controller-bootstrap"}
+
+    plan = wc.resolve_worker_credentials(
+        "marketing-operator", root=tmp_path, base_env=base_env
+    )
+
+    assert not plan.ok
+    assert "posthog_read" in (plan.error or "")
+    assert "posthog_read=missing" in plan.diagnostics
+    env = wc.build_worker_environment(base_env, plan)
+    # No partial handoff survives the failure.
+    for name in (wc.META_MARKETING_HANDOFF_ENV, wc.INSTAGRAM_GRAPH_HANDOFF_ENV,
+                 wc.POSTHOG_READ_HANDOFF_ENV):
+        assert name not in env
+    assert "meta-value" not in env.values()
+    with pytest.raises(wc.WorkerCredentialError):
+        plan.require_ok()
+
+
+def test_every_capability_handoff_name_has_a_consumer():
+    """A handoff name with no consumer leaks to a later shell hook.
+
+    The consume map is derived from the registry so this cannot regress by
+    forgetting to extend a literal.
+    """
+    declared = {
+        definition.handoff_env
+        for definition in wc.CAPABILITIES.values()
+        if definition.handoff_env
+    }
+    assert declared == set(wc._HANDOFF_ENV_TO_CAPABILITY)
+    for handoff_env, capability in wc._HANDOFF_ENV_TO_CAPABILITY.items():
+        assert handoff_env.startswith(wc.PRIVATE_HANDOFF_PREFIX)
+        assert wc.CAPABILITIES[capability].handoff_env == handoff_env
+
+    consumed = wc.consume_worker_credential_handoff(
+        {name: f"value-for-{name}" for name in declared}
+    )
+    assert set(consumed.capabilities) == set(wc._HANDOFF_ENV_TO_CAPABILITY.values())
+
+
+def test_every_capability_source_and_projection_name_is_strip_listed():
+    """The strip list is a property of the registry, not a parallel list.
+
+    Asserted directly because the overlap between record names and projected
+    names hides gaps: today two of the marketing record names happen to equal
+    their projected names, so omitting singular ``source_key`` breaks no
+    behaviour -- until a capability sources from a legal env name that differs
+    from what it projects, at which point a granted worker silently inherits
+    the controller's ambient copy.
+    """
+    for definition in wc.CAPABILITIES.values():
+        names = (
+            *((definition.source_key,) if definition.source_key else ()),
+            *definition.source_keys,
+            *definition.projection_env,
+            *definition.ambient_strip_env,
+        )
+        assert names, definition.name
+        for name in names:
+            assert name in wc.CAPABILITY_SENSITIVE_ENV, (definition.name, name)

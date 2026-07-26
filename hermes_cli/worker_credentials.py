@@ -73,6 +73,9 @@ GITHUB_WRITE_RESOLVE_KEYS: Mapping[str, str] = {
 PRIVATE_HANDOFF_PREFIX = "HERMES_WORKER_CREDENTIAL_"
 GITHUB_WRITE_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}GITHUB_WRITE"
 BWS_BOOTSTRAP_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}BWS_BOOTSTRAP"
+META_MARKETING_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}META_MARKETING_READ"
+INSTAGRAM_GRAPH_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}INSTAGRAM_GRAPH_READ"
+POSTHOG_READ_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}POSTHOG_READ"
 MANIFEST_DIGEST_ENV = f"{PRIVATE_HANDOFF_PREFIX}MANIFEST_DIGEST"
 
 # Terminal-only artifacts live below the machine-global Kanban runtime root,
@@ -161,6 +164,36 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
         handoff_env=BWS_BOOTSTRAP_HANDOFF_ENV,
         projection_env=(BWS_BOOTSTRAP_ENV,),
     ),
+    # BUILD-601: the three credentials marketing-operator actually needs, so
+    # its ``bws_bootstrap`` grant -- the last full-vault-token grant on the
+    # system -- can be retired. Deliberately three single-secret capabilities
+    # rather than one bundle: the existing CapabilityDefinition shape already
+    # fits, each grant is independently revocable, and the audit renders one
+    # row per credential instead of one row naming three.
+    #
+    # ``source_key`` is a Bitwarden RECORD name, which is why the hyphenated
+    # ``meta-system-user-token`` works here: the adapter returns raw record
+    # names, and it is only the env_loader apply step that drops names which
+    # are not legal environment variables (BUILD-793). The projected names are
+    # code-owned and always legal.
+    "meta_marketing_read": CapabilityDefinition(
+        name="meta_marketing_read",
+        source_key="meta-system-user-token",
+        handoff_env=META_MARKETING_HANDOFF_ENV,
+        projection_env=("META_SYSTEM_USER_TOKEN",),
+    ),
+    "instagram_graph_read": CapabilityDefinition(
+        name="instagram_graph_read",
+        source_key="INSTAGRAM_GRAPH_TOKEN",
+        handoff_env=INSTAGRAM_GRAPH_HANDOFF_ENV,
+        projection_env=("INSTAGRAM_GRAPH_TOKEN",),
+    ),
+    "posthog_read": CapabilityDefinition(
+        name="posthog_read",
+        source_key="POSTHOG_PERSONAL_KEY",
+        handoff_env=POSTHOG_READ_HANDOFF_ENV,
+        projection_env=("POSTHOG_PERSONAL_KEY",),
+    ),
     "google_ads_campaign_status_read": CapabilityDefinition(
         name="google_ads_campaign_status_read",
         projection_kind="controller_action_receipt",
@@ -192,11 +225,43 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
     ),
 }
 
+# Every name a capability sources from, plus the aliases those sources are
+# conventionally exported under. Stripped from EVERY worker, including one
+# granted the capability: a grant is delivered through the private handoff and
+# projected at the terminal boundary, never inherited ambiently from the
+# controller's own environment.
+#
+# ``source_key`` (singular) belongs here as much as ``source_keys``. It was
+# absent until BUILD-601, which did not matter while the only singular source
+# was ``bws_bootstrap``'s BWS_ACCESS_TOKEN (stripped separately as
+# ``access_token_env``) -- but the marketing read capabilities source from
+# INSTAGRAM_GRAPH_TOKEN and POSTHOG_PERSONAL_KEY, which are real vault names
+# already present in the controller environment, so omitting them would hand a
+# granted worker the ambient copy and quietly defeat the terminal-only
+# boundary.
 CAPABILITY_SENSITIVE_ENV = frozenset(
     name
     for definition in CAPABILITIES.values()
-    for name in (*definition.source_keys, *definition.ambient_strip_env)
+    for name in (
+        *((definition.source_key,) if definition.source_key else ()),
+        *definition.source_keys,
+        *definition.ambient_strip_env,
+        # The names a grant is PROJECTED under belong here too: an ambient
+        # copy under the same name would be indistinguishable from the
+        # projected credential to anything downstream. GH_TOKEN and
+        # BWS_ACCESS_TOKEN were already covered by name; this makes it a
+        # property of the registry instead of two hand-kept lists.
+        *definition.projection_env,
+    )
 )
+
+# Reverse index of the private handoff names, derived so that adding a
+# capability cannot leave its handoff without a consumer.
+_HANDOFF_ENV_TO_CAPABILITY: Mapping[str, str] = {
+    definition.handoff_env: name
+    for name, definition in CAPABILITIES.items()
+    if definition.handoff_env
+}
 
 
 def _canonical_manifest_payload(
@@ -739,7 +804,6 @@ def project_worker_terminal_environment(
         return False
 
     token = get_trusted_worker_credential("github_write", environ=os.environ)
-    bws_bootstrap = get_trusted_worker_credential("bws_bootstrap", environ=os.environ)
     _run_dir, gh_config_dir, git_config = _terminal_artifacts()
     # Remove ambient command-scope config knobs before installing the exact
     # two entries below.  This is configuration isolation, not a credential
@@ -763,8 +827,18 @@ def project_worker_terminal_environment(
         environ["GH_TOKEN"] = token
         environ["GIT_CONFIG_KEY_1"] = "credential.helper"
         environ["GIT_CONFIG_VALUE_1"] = GIT_ENV_TOKEN_HELPER
-    if bws_bootstrap is not None:
-        environ[BWS_BOOTSTRAP_ENV] = bws_bootstrap
+    # Every other worker_environment capability projects its resolved value
+    # into the names the registry declares. ``github_write`` is handled above
+    # instead of here because its projection is paired with the git
+    # credential-helper config written into GIT_CONFIG_KEY_1.
+    for name, definition in CAPABILITIES.items():
+        if name == "github_write" or definition.projection_kind != "worker_environment":
+            continue
+        value = get_trusted_worker_credential(name, environ=os.environ)
+        if value is None:
+            continue
+        for projected in definition.projection_env:
+            environ[projected] = value
     return True
 
 
@@ -929,6 +1003,31 @@ def github_write_resolve_key(owner: str | None) -> str | None:
     return GITHUB_WRITE_RESOLVE_KEYS.get(owner.strip().casefold())
 
 
+def vault_sourced_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]:
+    """Granted capabilities whose value must be fetched from the secret vault.
+
+    Derived from the code-owned registry rather than a hand-kept list, so
+    adding a capability does not create a second place to update (BUILD-601 --
+    before it, this was the literal ``"github_write" in capabilities``).
+
+    ``bws_bootstrap`` is excluded: its source IS the controller's bootstrap
+    environment variable, so it needs no fetch. Controller-action capabilities
+    are excluded too -- they never project into a worker at all.
+    """
+    resolved: list[str] = []
+    for capability in capabilities:
+        definition = CAPABILITIES.get(capability)
+        if definition is None or definition.projection_kind != "worker_environment":
+            continue
+        keys = tuple(
+            key for key in (definition.source_key, *definition.source_keys) if key
+        )
+        if not keys or keys == (BWS_BOOTSTRAP_ENV,):
+            continue
+        resolved.append(capability)
+    return tuple(resolved)
+
+
 def github_owner_for_workspace(
     workspace: Path | str | None, *, remote: str = "origin"
 ) -> str | None:
@@ -1002,7 +1101,8 @@ def resolve_worker_credentials(
     source_config = _bitwarden_config(Path(root) if root is not None else get_default_hermes_root())
     access_token_env = str((source_config or {}).get("access_token_env") or BWS_BOOTSTRAP_ENV)
     bootstrap = str(env.get(access_token_env) or "").strip()
-    needs_bitwarden = "github_write" in capabilities
+    vault_capabilities = vault_sourced_capabilities(capabilities)
+    needs_bitwarden = bool(vault_capabilities)
     needs_bootstrap = needs_bitwarden or "bws_bootstrap" in capabilities
     statuses: list[str] = []
     handoff: dict[str, str] = {}
@@ -1012,7 +1112,7 @@ def resolve_worker_credentials(
     strip_env.add(access_token_env)
 
     github_resolve_key: str | None = None
-    if needs_bitwarden:
+    if "github_write" in vault_capabilities:
         # Owner selection is pure policy and needs no vault, so it runs before
         # the bootstrap and source checks: an unresolvable owner is reported as
         # itself rather than as a missing secret.
@@ -1072,7 +1172,9 @@ def resolve_worker_credentials(
                 profile=normalized_profile,
                 manifest_digest=loaded_manifest.digest,
                 capabilities=capabilities,
-                diagnostics=tuple([*statuses, "github_write=missing"]),
+                diagnostics=tuple(
+                    [*statuses, *(f"{name}=missing" for name in vault_capabilities)]
+                ),
                 error="worker credential preflight Bitwarden source is unavailable",
                 source="bitwarden",
                 _strip_env=frozenset(strip_env),
@@ -1085,27 +1187,44 @@ def resolve_worker_credentials(
             access_token=bootstrap,
             source_config=source_config,
         )
-        assert github_resolve_key is not None  # set whenever needs_bitwarden
-        github_value, failure = _safe_source_result(result, github_resolve_key)
-        if github_value is None:
-            statuses.append("github_write=missing")
-            plan = WorkerCredentialPlan(
-                profile=normalized_profile,
-                manifest_digest=loaded_manifest.digest,
-                capabilities=capabilities,
-                diagnostics=tuple(statuses),
-                error=(
-                    "worker credential preflight Bitwarden source failed"
-                    if failure != "secret_missing"
-                    else "worker credential preflight GitHub write secret is missing"
-                ),
-                source="bitwarden",
-                _strip_env=frozenset(strip_env),
-            )
-            _log_preflight(plan, run_id)
-            return plan
-        statuses.append("github_write=present")
-        handoff[GITHUB_WRITE_HANDOFF_ENV] = github_value
+        # One fetch, then one selection per granted capability. Every grant
+        # must resolve or the worker does not start: a partially-credentialed
+        # worker fails later, further from the cause, and with a live task
+        # already claimed.
+        for capability in vault_capabilities:
+            definition = CAPABILITIES[capability]
+            if capability == "github_write":
+                assert github_resolve_key is not None  # set above for this grant
+                resolve_key = github_resolve_key
+            else:
+                resolve_key = definition.source_key or ""
+            value, failure = _safe_source_result(result, resolve_key)
+            if value is None:
+                statuses.append(f"{capability}=missing")
+                plan = WorkerCredentialPlan(
+                    profile=normalized_profile,
+                    manifest_digest=loaded_manifest.digest,
+                    capabilities=capabilities,
+                    diagnostics=tuple(statuses),
+                    error=(
+                        "worker credential preflight Bitwarden source failed"
+                        if failure != "secret_missing"
+                        else (
+                            "worker credential preflight GitHub write secret "
+                            "is missing"
+                            if capability == "github_write"
+                            else f"worker credential preflight secret for "
+                            f"{capability} is missing"
+                        )
+                    ),
+                    source="bitwarden",
+                    _strip_env=frozenset(strip_env),
+                )
+                _log_preflight(plan, run_id)
+                return plan
+            statuses.append(f"{capability}=present")
+            if definition.handoff_env:
+                handoff[definition.handoff_env] = value
 
     plan = WorkerCredentialPlan(
         profile=normalized_profile,
@@ -1289,10 +1408,11 @@ def consume_worker_credential_handoff(
         if not key.startswith(PRIVATE_HANDOFF_PREFIX):
             continue
         value = target.pop(key, None)
-        capability = {
-            GITHUB_WRITE_HANDOFF_ENV: "github_write",
-            BWS_BOOTSTRAP_HANDOFF_ENV: "bws_bootstrap",
-        }.get(key)
+        # Derived from the registry, so a capability can never be added with a
+        # handoff name that has no consumer -- the case this function's
+        # docstring warns about, previously prevented only by remembering to
+        # edit a literal here too.
+        capability = _HANDOFF_ENV_TO_CAPABILITY.get(key)
         if capability and isinstance(value, str) and value:
             consumed[capability] = value
 
