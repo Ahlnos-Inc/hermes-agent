@@ -1064,3 +1064,136 @@ def test_accepted_architect_edit_invalidates_within_owning_mutation(kanban_home)
         reopened = kb.get_architecture_gate(conn, gate.gate_id)
         assert reopened is not None and reopened.state == "open"
         assert kb.get_task(conn, architect).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# BUILD-800 — a dispatcher worker must not be able to forge a human approval.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatcher_worker_cannot_forge_human_gate_approval(kanban_home, monkeypatch):
+    """The BUILD-800 reproduction, verbatim.
+
+    A process marked as a dispatcher worker holds a writable board handle, so it
+    can read ``gate.design_digest`` straight off the board and hand in a
+    ``MutationContext`` claiming ``actor_type="human"`` on an authenticated
+    surface. Every field the old check consulted was therefore either
+    self-asserted or board-readable.
+    """
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+
+        # Exactly what the dispatcher sets on a worker (`_default_spawn`).
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_pretend_worker")
+        monkeypatch.setenv("HERMES_PROFILE", "coder")
+
+        # The digest is an integrity binding, not a secret: the worker reads it.
+        stolen_digest = kb.get_architecture_gate(conn, gate.gate_id).design_digest
+        assert stolen_digest == gate.design_digest
+
+        for forged in (_human_context(), _human_context(surface="dashboard")):
+            with pytest.raises(
+                kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+            ):
+                kb.approve_architecture_gate(conn, gate.gate_id, forged, stolen_digest)
+            with pytest.raises(
+                kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+            ):
+                kb.reject_architecture_gate(conn, gate.gate_id, forged, stolen_digest)
+            with pytest.raises(
+                kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+            ):
+                kb.issue_discovery_capability(
+                    conn,
+                    gate.gate_id,
+                    forged,
+                    principal="human-1",
+                    session_id="session-1",
+                    request_scope_id="turn-1",
+                    profile="researcher",
+                )
+            with pytest.raises(
+                kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+            ):
+                kb.apply_policy_quarantine(
+                    conn, gate.gate_id, context=forged, signal_fn=lambda *_: None,
+                )
+
+        # Graph issuance is authorized on a different triple, and is forgeable
+        # the same way, so it carries the same board-side check.
+        with pytest.raises(
+            kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+        ):
+            kb.issue_architecture_graph(
+                conn,
+                gate.gate_id,
+                kb.MutationContext(
+                    board_key="default",
+                    principal="orchestrator-session",
+                    actor_type="orchestrator_agent",
+                    profile="orchestrator",
+                    session_id="session-1",
+                    request_scope_id="turn-1",
+                    mode="enforce",
+                    phase="graph_issuance",
+                ),
+                [{"title": "implement", "assignee": "coder"}],
+                idempotency_key="forged",
+            )
+
+        assert kb.get_architecture_gate(conn, gate.gate_id).state == (
+            "validated_awaiting_approval"
+        )
+
+        # AC3: the genuine human path is untouched — same context, same digest,
+        # from a process with no worker provenance.
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), stolen_digest,
+        )
+        assert approved.state == "human_approved"
+        replay = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), stolen_digest,
+        )
+        assert replay.row_version == approved.row_version
+
+
+def test_gate_approval_refused_from_a_live_worker_session_without_the_env_marker(
+    kanban_home, monkeypatch,
+):
+    """Scrubbing ``HERMES_KANBAN_TASK`` is not enough to shed worker provenance.
+
+    Workers are spawned session leaders, so every process a worker starts shares
+    its session id, and the board records that id as ``tasks.worker_sid``. The
+    check is therefore derived from the board's own record of live workers
+    rather than from the environment alone.
+    """
+    import os
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        digest = gate.design_digest
+
+        # A running worker whose session id is this process's session id.
+        victim = kb.create_task(conn, title="worker work", assignee="coder")
+        claimed = kb.claim_task(conn, victim)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_sid = ? WHERE id = ?",
+            (os.getpid(), os.getsid(0), victim),
+        )
+        conn.commit()
+
+        with pytest.raises(
+            kb.ArchitectureGateError, match="approval_surface_is_dispatcher_worker"
+        ):
+            kb.approve_architecture_gate(conn, gate.gate_id, _human_context(), digest)
+
+        # The binding is to a *live* worker: once the run is no longer running,
+        # the same process is an ordinary operator shell again.
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (victim,))
+        conn.commit()
+        assert kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), digest,
+        ).state == "human_approved"

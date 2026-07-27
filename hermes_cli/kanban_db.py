@@ -5409,6 +5409,73 @@ def architecture_review_approval_subject(
     return _architecture_review_approval_subject_in_txn(conn, gate)
 
 
+def _dispatcher_worker_provenance(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the task id if this process belongs to a dispatcher worker.
+
+    Derived board-side from provenance the caller cannot put in a
+    ``MutationContext``:
+
+    * ``HERMES_KANBAN_TASK`` — the marker the dispatcher itself writes onto the
+      worker environment (``_default_spawn``).
+    * the POSIX session id. Workers are spawned with ``start_new_session=True``,
+      so a worker is a session leader and *every* process it starts inherits
+      that session id. The board persists it as ``tasks.worker_sid`` when it
+      attaches the pid, so the session id of the calling process can be matched
+      against the board's own record of live workers.
+
+    Returns ``None`` for a process with no worker provenance — the controller,
+    an operator shell, or a test.
+    """
+    marked = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if marked:
+        return marked
+    getsid = getattr(os, "getsid", None)
+    if getsid is None:  # windows-footgun: ok — no POSIX sessions to derive from
+        return None
+    try:
+        session_id = int(getsid(0))
+    except OSError:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM tasks "
+            " WHERE worker_sid = ? AND worker_pid IS NOT NULL AND status = 'running' "
+            " LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        # A board too old to have the column cannot answer; the env marker above
+        # is the only signal available and has already been consulted.
+        return None
+    return str(row["id"]) if row is not None else None
+
+
+def _require_authenticated_human_context(
+    conn: sqlite3.Connection,
+    context: MutationContext,
+    *,
+    human_error: str,
+    surface_error: str,
+) -> None:
+    """Authorize a privileged gate transition.
+
+    ``actor_type`` and ``surface`` are self-asserted by whoever builds the
+    ``MutationContext``, so on their own they authorize nothing: a dispatcher
+    worker runs as the same uid as the controller, can import this module and
+    open the board, and can therefore hand in
+    ``MutationContext(actor_type="human", surface="cli")``. The worker
+    provenance check below is derived board-side instead, so a process carrying
+    worker provenance is refused whatever it claims about itself.
+    """
+    worker_task = _dispatcher_worker_provenance(conn)
+    if worker_task is not None:
+        raise ArchitectureGateError("approval_surface_is_dispatcher_worker")
+    if context.actor_type != "human":
+        raise ArchitectureGateError(human_error)
+    if context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
+        raise ArchitectureGateError(surface_error)
+
+
 def approve_architecture_gate(
     conn: sqlite3.Connection,
     gate_id: str,
@@ -5427,10 +5494,12 @@ def approve_architecture_gate(
     scheduler status can never grant authority. Exact repeat submissions from
     the same authenticated actor/surface are idempotent; all other replays deny.
     """
-    if context.actor_type != "human":
-        raise ArchitectureGateError("approval_requires_human")
-    if context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
-        raise ArchitectureGateError("approval_surface_not_authenticated")
+    _require_authenticated_human_context(
+        conn,
+        context,
+        human_error="approval_requires_human",
+        surface_error="approval_surface_not_authenticated",
+    )
     if review_completion_event_id is not None and isinstance(
         review_completion_event_id, bool
     ):
@@ -5551,10 +5620,12 @@ def reject_architecture_gate(
     conn: sqlite3.Connection, gate_id: str, context: MutationContext, digest: str,
 ) -> ArchitectureGate:
     """Record a human rejection without treating a UI projection as authority."""
-    if context.actor_type != "human":
-        raise ArchitectureGateError("approval_requires_human")
-    if context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
-        raise ArchitectureGateError("approval_surface_not_authenticated")
+    _require_authenticated_human_context(
+        conn,
+        context,
+        human_error="approval_requires_human",
+        surface_error="approval_surface_not_authenticated",
+    )
     with write_txn(conn):
         gate = get_architecture_gate(conn, gate_id)
         if gate is None or gate.board_key != context.board_key:
@@ -5590,6 +5661,8 @@ def issue_architecture_graph(
     inserted in one transaction so a rejected duplicate cannot leave partial
     tasks or dependency edges behind.
     """
+    if _dispatcher_worker_provenance(conn) is not None:
+        raise ArchitectureGateError("approval_surface_is_dispatcher_worker")
     if (
         context.actor_type != "orchestrator_agent"
         or context.profile != "orchestrator"
@@ -6336,8 +6409,12 @@ def issue_discovery_capability(
     profile: str,
 ) -> DiscoveryCapability:
     """Issue a one-purpose current-turn capability from an authenticated UI."""
-    if issuer.actor_type != "human" or issuer.surface not in AUTHENTICATED_APPROVAL_SURFACES:
-        raise ArchitectureGateError("discovery_capability_requires_human")
+    _require_authenticated_human_context(
+        conn,
+        issuer,
+        human_error="discovery_capability_requires_human",
+        surface_error="discovery_capability_requires_human",
+    )
     if profile not in READ_ONLY_DISCOVERY_PROFILES or not all((principal, session_id, request_scope_id)):
         raise ArchitectureGateError("discovery_capability_invalid_binding")
     with write_txn(conn):
@@ -6445,8 +6522,12 @@ def apply_policy_quarantine(
     signal_fn=None,
 ) -> set[str]:
     """Human-authorized containment with worker termination outside the txn."""
-    if context.actor_type != "human" or context.surface not in AUTHENTICATED_APPROVAL_SURFACES:
-        raise ArchitectureGateError("containment_requires_authenticated_human")
+    _require_authenticated_human_context(
+        conn,
+        context,
+        human_error="containment_requires_authenticated_human",
+        surface_error="containment_requires_authenticated_human",
+    )
     terminations: list[
         tuple[
             str,
