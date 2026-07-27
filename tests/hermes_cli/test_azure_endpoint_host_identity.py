@@ -16,7 +16,8 @@ import pytest
 from agent import anthropic_adapter
 from utils import base_url_host_matches
 
-CANARY = "sk-canary-BUILD598-must-not-leak"
+AZURE_CANARY = "sk-canary-BUILD598-azure-only"
+ANTHROPIC_CANARY = "sk-canary-BUILD598-generic-anthropic"
 
 # Genuine Azure endpoints that must keep their behaviour.
 AZURE_OK = [
@@ -78,12 +79,22 @@ def test_context_1m_beta_gate_skips_lookalikes(url):
 
 @pytest.mark.parametrize("url", AZURE_LOOKALIKE)
 def test_lookalike_endpoint_receives_no_azure_credential(url, monkeypatch):
-    """Secret canary: the Azure short circuit must not hand key material to a
-    host that merely contains the string `azure.com`."""
+    """Secret canary: the Azure short circuit must not hand AZURE key material
+    to a host that merely contains the string `azure.com`.
+
+    The two canaries are deliberately distinct. A lookalike that is refused by
+    the Azure branch falls through to the ordinary explicit-anthropic path and
+    legitimately uses `ANTHROPIC_API_KEY` — that is the key the caller
+    configured for the base_url they asked for, and it is not this ticket's
+    concern. What must never happen is `AZURE_ANTHROPIC_KEY` reaching a host
+    that is not Azure. Asserting on a single shared canary conflated the two
+    and failed on a clean CI environment while passing locally, where ambient
+    config routed the fall-through elsewhere.
+    """
     from hermes_cli import runtime_provider
 
-    monkeypatch.setenv("AZURE_ANTHROPIC_KEY", CANARY)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", CANARY)
+    monkeypatch.setenv("AZURE_ANTHROPIC_KEY", AZURE_CANARY)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_CANARY)
 
     resolved = runtime_provider._resolve_runtime_provider(
         requested="anthropic",
@@ -91,14 +102,14 @@ def test_lookalike_endpoint_receives_no_azure_credential(url, monkeypatch):
         explicit_api_key=None,
     )
     assert resolved.get("source") != "azure-explicit", resolved
-    assert CANARY not in repr(resolved), resolved
+    assert AZURE_CANARY not in repr(resolved), resolved
 
 
 def test_real_azure_endpoint_still_takes_the_short_circuit(monkeypatch):
     """The negative tests above are only meaningful if the positive path works."""
     from hermes_cli import runtime_provider
 
-    monkeypatch.setenv("AZURE_ANTHROPIC_KEY", CANARY)
+    monkeypatch.setenv("AZURE_ANTHROPIC_KEY", AZURE_CANARY)
     resolved = runtime_provider._resolve_runtime_provider(
         requested="anthropic",
         explicit_base_url="https://my-resource.azure.com/v1",
@@ -106,4 +117,4 @@ def test_real_azure_endpoint_still_takes_the_short_circuit(monkeypatch):
     )
     assert resolved["source"] == "azure-explicit"
     assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == CANARY
+    assert resolved["api_key"] == AZURE_CANARY
