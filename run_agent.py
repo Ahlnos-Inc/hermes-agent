@@ -1259,7 +1259,7 @@ class AIAgent:
             url = str(base_url).lower()
         else:
             url = getattr(self, "_base_url_lower", "") or ""
-        return "openai.azure.com" in url
+        return base_url_host_matches(url, "openai.azure.com")
 
     def _is_github_copilot_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
@@ -4631,7 +4631,7 @@ class AIAgent:
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
         # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
         _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
+        if base_url_host_matches(_base, "azure.com"):
             return False
 
         try:
