@@ -1412,3 +1412,60 @@ def test_every_capability_source_and_projection_name_is_strip_listed():
         assert names, definition.name
         for name in names:
             assert name in wc.CAPABILITY_SENSITIVE_ENV, (definition.name, name)
+
+
+def test_marketing_worker_bootstrap_admits_every_granted_handoff(
+    tmp_path, monkeypatch
+):
+    """The LIVE consume path must be registry-derived, not a literal.
+
+    ``consume_worker_credential_handoff`` is derived and tested, but nothing
+    outside this module calls it: every real caller (hermes_cli.main,
+    agent.shell_hooks, tools.environments.local) goes through
+    ``bootstrap_worker_credential_context``. BUILD-601 left that function
+    collecting two hardcoded handoff names, so the controller delivered all
+    three marketing handoffs and the worker admitted none of them -- the
+    preflight logged ``meta_marketing_read=present`` while the worker's
+    terminal saw nothing. Measured live on marketing board task t_62ea8f10.
+    """
+    _marketing_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "marketing-operator")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-bootstrap-marketing-reads")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "104")
+    monkeypatch.setenv(wc.META_MARKETING_HANDOFF_ENV, "meta-value")
+    monkeypatch.setenv(wc.INSTAGRAM_GRAPH_HANDOFF_ENV, "instagram-value")
+    monkeypatch.setenv(wc.POSTHOG_READ_HANDOFF_ENV, "posthog-value")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(tmp_path).digest)
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.manifest_verified
+    assert set(runtime.capabilities) == set(MARKETING_READ_CAPABILITIES)
+    for capability in MARKETING_READ_CAPABILITIES:
+        assert wc.has_trusted_worker_action(capability), capability
+    # Consumed, so no handoff rides on into a later shell hook or subprocess.
+    for name in (wc.META_MARKETING_HANDOFF_ENV, wc.INSTAGRAM_GRAPH_HANDOFF_ENV,
+                 wc.POSTHOG_READ_HANDOFF_ENV):
+        assert name not in os.environ, name
+
+
+def test_bootstrap_collects_the_same_handoff_names_the_controller_writes():
+    """Whatever the controller can write, the worker must be able to admit.
+
+    Asserted as a registry property rather than by listing names: the two
+    sides drifted apart once already and the drift was invisible to every
+    behavioural test.
+    """
+    written = {
+        definition.handoff_env
+        for definition in wc.CAPABILITIES.values()
+        if definition.handoff_env
+    }
+    assert written == set(wc._HANDOFF_ENV_TO_CAPABILITY)
+    assert wc.GITHUB_WRITE_HANDOFF_ENV in written
+    # The retired grant is not a capability any more, but its stale marker is
+    # still scrubbed from workers.
+    assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in written
+    assert wc.BWS_BOOTSTRAP_HANDOFF_ENV in wc.worker_credential_strip_env()

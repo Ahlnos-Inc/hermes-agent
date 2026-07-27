@@ -623,9 +623,15 @@ def bootstrap_worker_credential_context(
 
         target = os.environ if environ is None else environ
         identity = _worker_identity(target)
+        # Derived from the registry, like the admission below and like
+        # consume_worker_credential_handoff. As a literal pair this collected
+        # github_write and the retired bws_bootstrap only, so BUILD-601's three
+        # marketing handoffs were written by the controller, dropped here, and
+        # then scrubbed — preflight logged them present while the worker's
+        # terminal got nothing.
         handoff = {
             name: target.get(name)
-            for name in (GITHUB_WRITE_HANDOFF_ENV, BWS_BOOTSTRAP_HANDOFF_ENV)
+            for name in _HANDOFF_ENV_TO_CAPABILITY
             if isinstance(target.get(name), str) and target.get(name)
         }
         if identity is None:
