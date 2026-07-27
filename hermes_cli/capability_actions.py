@@ -339,13 +339,22 @@ def _path_is_outside_workspace(path: Path, workspace: str) -> bool:
 
 
 def _same_uid_can_replace(metadata: os.stat_result) -> bool:
-    """Return whether this process's uid/group can mutate a path entry."""
-    if metadata.st_uid == os.geteuid():
+    """Return whether this process's uid/group can mutate a path entry.
+
+    The caller treats ``True`` as "this source is not immutable" and refuses the
+    file, so a platform where the answer cannot be computed must return ``True``.
+    Windows has no ``geteuid``/``getegid``/``getgroups`` and no equivalent of
+    this mode/owner model, so it fails closed rather than silently accepting an
+    unverified helper source.
+    """
+    if os.name != "posix":
+        return True
+    if metadata.st_uid == os.geteuid():  # windows-footgun: ok — POSIX-gated above
         # An owner can chmod a read-only inode before modifying it.
         return True
     if metadata.st_mode & stat.S_IWOTH:
         return True
-    groups = {os.getegid(), *os.getgroups()}
+    groups = {os.getegid(), *os.getgroups()}  # windows-footgun: ok — POSIX-gated above
     return bool(metadata.st_mode & stat.S_IWGRP and metadata.st_gid in groups)
 
 
@@ -927,7 +936,7 @@ def _launch_helper(
 
     bootstrap = (
         "import sys;"
-        "source=open(int(sys.argv[1]),'rb',closefd=True).read();"
+        "source=open(int(sys.argv[1]),'rb',closefd=True).read();"  # windows-footgun: ok — binary mode in a source string
         "scope={'__name__':'__main__','__file__':'<verified-google-ads-helper>',"
         "'__package__':None};"
         "exec(compile(source,'<verified-google-ads-helper>','exec'),scope,scope)"
@@ -969,7 +978,7 @@ def _launch_helper(
         except subprocess.TimeoutExpired:
             try:
                 if os.name == "posix":
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — os.name-gated, proc.kill() below
                 else:  # pragma: no cover - live backend is local Darwin
                     proc.kill()
             except (OSError, ProcessLookupError):
@@ -984,7 +993,7 @@ def _launch_helper(
         if proc is not None:
             try:
                 if os.name == "posix":
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — os.name-gated, proc.kill() below
                 else:  # pragma: no cover - live backend is local Darwin
                     proc.kill()
                 proc.communicate()
