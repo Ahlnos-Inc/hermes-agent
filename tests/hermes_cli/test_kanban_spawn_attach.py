@@ -393,7 +393,10 @@ def test_default_spawn_preflights_and_handoffs_only_authorized_action(
     # BUILD-603: the owner normally comes from the workspace git remote.
     # Pinned here so this test stays about the handoff, not about git;
     # the resolver itself is covered in test_worker_credentials.py.
-    monkeypatch.setattr(wc, "github_owner_for_workspace", lambda *_a, **_kw: "Ahlnos-Inc")
+    monkeypatch.setattr(
+        wc, "github_release_target_for_workspace",
+        lambda *_a, **_kw: ("Ahlnos-Inc", "Ahlnos-Inc/aldnoah"),
+    )
     captured = {}
 
     class FakeProc:
@@ -426,7 +429,10 @@ def test_default_spawn_does_not_call_popen_when_credential_preflight_fails(
 
     _write_worker_contract(kanban_home)
     monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
-    monkeypatch.setattr(wc, "github_owner_for_workspace", lambda *_a, **_kw: "Ahlnos-Inc")
+    monkeypatch.setattr(
+        wc, "github_release_target_for_workspace",
+        lambda *_a, **_kw: ("Ahlnos-Inc", "Ahlnos-Inc/aldnoah"),
+    )
     called = []
 
     def fake_popen(*_args, **_kwargs):

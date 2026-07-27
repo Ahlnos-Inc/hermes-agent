@@ -1012,6 +1012,46 @@ def github_write_resolve_key(owner: str | None) -> str | None:
     return GITHUB_WRITE_RESOLVE_KEYS.get(owner.strip().casefold())
 
 
+def denied_publication_repos(
+    profile: str, root: Path | str | None = None
+) -> dict[str, str]:
+    """Repositories denied as a publication target, as ``{slug: reason}``.
+
+    Reads the same `rules/pr-target-repo-allowlist.json` the `gh` hook uses, so
+    there is one list rather than two that drift. That hook guards `gh`
+    commands; a plain `git push` through the projected credential helper never
+    reaches it, which is why credential selection has to consult the list too
+    (BUILD-795).
+
+    A missing or malformed file yields no denials. Failing closed here would
+    take the whole releaser lane offline in any home that has not synced the
+    rules directory, which is a worse outcome than losing a defence-in-depth
+    check that the `gh` hook still enforces on its own path. The caller reports
+    an unreadable file in its diagnostics so the gap is visible rather than
+    silent.
+    """
+    base = Path(root) if root is not None else get_default_hermes_root()
+    # The sync installs this per publishing profile, not centrally
+    # (`hermes-sync.sh::merge_pr_target_repo_allowlist_hook` writes
+    # `profiles/<releaser|coder>/rules/`). Reading the central root finds
+    # nothing and would silently disable the check.
+    rules = base / "profiles" / _normalize_profile(profile) / "rules"
+    try:
+        payload = json.loads(
+            (rules / "pr-target-repo-allowlist.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {}
+    denied = payload.get("denied_repos") if isinstance(payload, dict) else None
+    if not isinstance(denied, dict):
+        return {}
+    return {
+        str(slug).strip().casefold(): str(reason)
+        for slug, reason in denied.items()
+        if str(slug).strip()
+    }
+
+
 def vault_sourced_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]:
     """Granted capabilities whose value must be fetched from the secret vault.
 
@@ -1036,26 +1076,13 @@ def vault_sourced_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]
     return tuple(resolved)
 
 
-def github_owner_for_workspace(
+def _github_remote_match(
     workspace: Path | str | None, *, remote: str = "origin"
-) -> str | None:
-    """GitHub owner the worker in ``workspace`` would publish to, or ``None``.
+) -> "re.Match[str] | None":
+    """Match ``remote``'s push url in ``workspace`` against the GitHub pattern.
 
-    BUILD-603: ``github_write`` is owner-scoped, so the dispatcher has to know
-    which repository a task publishes to before it can pick a token. The
-    workspace's own remote URL is the only per-task repo context available at
-    spawn time -- ``tasks.publication_remote`` is a git *remote name*
-    (``origin`` is its only live value), not an owner.
-
-    Never raises: a workspace that is not a git repository, has no such remote,
-    or points at a non-GitHub host simply has no owner, and the caller fails
-    closed. Never logs the URL either -- a remote can carry an embedded
-    credential (``https://x-access-token:<token>@github.com/...``).
-
-    Reads the PUSH url. A remote may carry a ``pushurl`` distinct from its
-    fetch url (the fetch-upstream / push-fork setup), and it is where the
-    worker's push actually lands that decides which token is the right one.
-    ``--push`` falls back to the fetch url when no ``pushurl`` is configured.
+    One probe behind both public helpers, so the owner and the repo can never
+    be read from two different urls.
     """
     if not workspace:
         return None
@@ -1081,8 +1108,65 @@ def github_owner_for_workspace(
         return None
     if completed.returncode != 0:
         return None
-    match = _GITHUB_REMOTE_OWNER_RE.fullmatch((completed.stdout or "").strip())
+    return _GITHUB_REMOTE_OWNER_RE.fullmatch((completed.stdout or "").strip())
+
+
+def github_owner_for_workspace(
+    workspace: Path | str | None, *, remote: str = "origin"
+) -> str | None:
+    """GitHub owner the worker in ``workspace`` would publish to, or ``None``.
+
+    BUILD-603: ``github_write`` is owner-scoped, so the dispatcher has to know
+    which repository a task publishes to before it can pick a token. The
+    workspace's own remote URL is the only per-task repo context available at
+    spawn time -- ``tasks.publication_remote`` is a git *remote name*
+    (``origin`` is its only live value), not an owner.
+
+    Never raises: a workspace that is not a git repository, has no such remote,
+    or points at a non-GitHub host simply has no owner, and the caller fails
+    closed. Never logs the URL either -- a remote can carry an embedded
+    credential (``https://x-access-token:<token>@github.com/...``).
+
+    Reads the PUSH url. A remote may carry a ``pushurl`` distinct from its
+    fetch url (the fetch-upstream / push-fork setup), and it is where the
+    worker's push actually lands that decides which token is the right one.
+    ``--push`` falls back to the fetch url when no ``pushurl`` is configured.
+    """
+    match = _github_remote_match(workspace, remote=remote)
     return match.group("owner") if match else None
+
+
+def github_release_target_for_workspace(
+    workspace: Path | str | None, *, remote: str = "origin"
+) -> tuple[str | None, str | None]:
+    """``(owner, "owner/repo")`` for ``workspace``'s push url, from ONE probe.
+
+    The dispatcher needs both: the owner selects the token, the full slug is
+    checked against the deny list. Reading them with two separate `git` calls
+    would leave a window in which the workspace's own `.git/config` — which the
+    previous worker in that worktree can write — changes between them, so the
+    deny check and the token selection could describe different repositories.
+    That is the exact class of steering BUILD-795 exists to close, so both come
+    off a single invocation.
+    """
+    match = _github_remote_match(workspace, remote=remote)
+    if match is None:
+        return None, None
+    return match.group("owner"), f"{match.group('owner')}/{match.group('repo')}"
+
+
+def github_repo_for_workspace(
+    workspace: Path | str | None, *, remote: str = "origin"
+) -> str | None:
+    """``owner/repo`` the worker in ``workspace`` would push to, or ``None``.
+
+    Same probe and same guarantees as :func:`github_owner_for_workspace` — it
+    just keeps the repository half, which the deny list needs and an owner
+    cannot express (BUILD-795: `Ahlnos-Inc/hermes-config` is abandoned while
+    other `Ahlnos-Inc` repositories are live).
+    """
+    match = _github_remote_match(workspace, remote=remote)
+    return f"{match.group('owner')}/{match.group('repo')}" if match else None
 
 
 def resolve_worker_credentials(
@@ -1093,6 +1177,7 @@ def resolve_worker_credentials(
     run_id: int | str | None = None,
     manifest: WorkerCredentialManifest | None = None,
     github_owner: str | None = None,
+    github_repo: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve the closed grants for one worker without leaking secrets.
 
@@ -1124,6 +1209,28 @@ def resolve_worker_credentials(
 
     github_resolve_key: str | None = None
     if "github_write" in vault_capabilities:
+        # BUILD-795: the owner-level token is coarser than the repo policy.
+        # `rules/pr-target-repo-allowlist.json` denies a repository by name,
+        # but that rule is enforced by a `gh` hook and a plain `git push`
+        # through the projected credential helper never reaches it. Check the
+        # same list here, before a token is selected, so a denied repository
+        # gets none. Denial precedes owner resolution: a denied repo must not
+        # be reportable as a mere owner problem.
+        denied = denied_publication_repos(normalized_profile, root)
+        denied_reason = denied.get((github_repo or "").strip().casefold())
+        if denied_reason:
+            statuses.append(f"github_write_repo={github_repo} denied")
+            return WorkerCredentialPlan(
+                profile=normalized_profile,
+                manifest_digest=loaded_manifest.digest,
+                capabilities=capabilities,
+                diagnostics=tuple([*statuses, "github_write=denied_repo"]),
+                error=(
+                    "worker credential preflight refuses a GitHub write token: "
+                    f"the workspace publishes to {github_repo!r}, which is "
+                    f"denied as a release target ({denied_reason})"
+                ),
+            )
         # Owner selection is pure policy and needs no vault, so it runs before
         # the bootstrap and source checks: an unresolvable owner is reported as
         # itself rather than as a missing secret.
@@ -1271,6 +1378,7 @@ def prepare_worker_credentials(
     run_id: int | str | None = None,
     manifest: WorkerCredentialManifest | None = None,
     github_owner: str | None = None,
+    github_repo: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve grants and raise a safe error when the worker cannot start."""
     return resolve_worker_credentials(
@@ -1280,6 +1388,7 @@ def prepare_worker_credentials(
         run_id=run_id,
         manifest=manifest,
         github_owner=github_owner,
+        github_repo=github_repo,
     ).require_ok()
 
 

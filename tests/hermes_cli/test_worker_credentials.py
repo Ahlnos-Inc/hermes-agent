@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import json
 from pathlib import Path
 
 import pytest
@@ -1469,3 +1470,108 @@ def test_bootstrap_collects_the_same_handoff_names_the_controller_writes():
     # still scrubbed from workers.
     assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in written
     assert wc.BWS_BOOTSTRAP_HANDOFF_ENV in wc.worker_credential_strip_env()
+
+
+# ---------------------------------------------------------------------------
+# BUILD-795 — a denied release target gets no token, whatever its owner is.
+# ---------------------------------------------------------------------------
+
+
+def _write_denied_repos(root: Path, profile: str, denied: dict) -> None:
+    """Install the deny list where the sync actually puts it."""
+    rules = root / "profiles" / profile / "rules"
+    rules.mkdir(parents=True, exist_ok=True)
+    (rules / "pr-target-repo-allowlist.json").write_text(
+        json.dumps({
+            "version": 1,
+            "allowed_owners": ["Ahlnos-Inc", "nlachica"],
+            "denied_repos": denied,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_denied_publication_repos_reads_the_profile_rules_directory(tmp_path):
+    # `hermes-sync.sh::merge_pr_target_repo_allowlist_hook` installs this per
+    # publishing profile, not centrally. Reading the central root finds nothing
+    # and silently disables the check.
+    _write_denied_repos(tmp_path, "releaser", {"Ahlnos-Inc/hermes-config": "abandoned"})
+    assert wc.denied_publication_repos("releaser", tmp_path) == {
+        "ahlnos-inc/hermes-config": "abandoned"
+    }
+    # A profile without the file, and an unreadable one, deny nothing rather
+    # than taking the lane offline — the `gh` hook still guards its own path.
+    assert wc.denied_publication_repos("verifier", tmp_path) == {}
+    (tmp_path / "profiles/releaser/rules/pr-target-repo-allowlist.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert wc.denied_publication_repos("releaser", tmp_path) == {}
+
+
+def test_denied_release_target_gets_no_github_write_token(tmp_path, monkeypatch):
+    """The owner is registered and the secret is present; the repo is denied.
+
+    `github_write` is owner-scoped, so `Ahlnos-Inc` resolves a real token —
+    which is exactly why the abandoned `Ahlnos-Inc/hermes-config` copy needs a
+    check the owner cannot express.
+    """
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    _write_denied_repos(
+        tmp_path, "releaser",
+        {"Ahlnos-Inc/hermes-config": "lives at nlachica/hermes-config since 2026-07-19"},
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc, "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]: SENTINEL}
+        ),
+    )
+
+    denied = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path,
+        github_owner=RELEASE_OWNER, github_repo="Ahlnos-Inc/hermes-config",
+    )
+    assert not denied.ok
+    assert "denied as a release target" in (denied.error or "")
+    assert "github_write=denied_repo" in denied.diagnostics
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in dict(denied._handoff)
+    assert SENTINEL not in repr(denied)
+    assert SENTINEL not in (denied.error or "")
+
+    # Same owner, a repository that is not denied: unchanged behaviour.
+    allowed = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path,
+        github_owner=RELEASE_OWNER, github_repo="Ahlnos-Inc/aldnoah",
+    )
+    assert allowed.ok, allowed.error
+    assert dict(allowed._handoff)[wc.GITHUB_WRITE_HANDOFF_ENV] == SENTINEL
+
+    # A releaser card predating the recorded target still works (repo unknown).
+    legacy = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER, github_repo=None,
+    )
+    assert legacy.ok, legacy.error
+
+
+def test_release_target_owner_and_repo_come_from_one_probe(tmp_path, monkeypatch):
+    """Two `git` calls would let the workspace remote change between them.
+
+    The workspace's `.git/config` is writable by the previous worker in that
+    worktree, so reading the owner and the repo separately would let a
+    `git remote set-url` land between the deny check and the token selection.
+    """
+    repo = _git_repo(tmp_path / "ws", "https://github.com/Ahlnos-Inc/hermes-config.git")
+    calls = []
+    real_run = wc.subprocess.run
+
+    def counting_run(cmd, *args, **kwargs):
+        if "remote" in cmd:
+            calls.append(tuple(cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(wc.subprocess, "run", counting_run)
+    owner, slug = wc.github_release_target_for_workspace(repo)
+    assert (owner, slug) == ("Ahlnos-Inc", "Ahlnos-Inc/hermes-config")
+    assert len(calls) == 1, calls
