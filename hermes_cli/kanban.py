@@ -1062,6 +1062,81 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- gate (architecture-gate lifecycle) ---
+    p_gate = sub.add_parser(
+        "gate",
+        help="Inspect and resolve architecture gates",
+        description=(
+            "Operator surface for the architecture gate. Opening a gate is "
+            "automatic (an architect card opens one) and acceptance happens "
+            "atomically when the architect card completes, but approval, "
+            "rejection, invalidation, reopen and graph issuance had no caller "
+            "at all -- so an enforcing gate could be opened and never "
+            "resolved. These subcommands are that missing surface.\n\n"
+            "Approval is exact-digest and single-shot: run `gate show` first "
+            "and pass back the digest and evidence it prints. The evidence "
+            "flags are deliberately not auto-filled -- their whole purpose is "
+            "to record that a human saw the exact reviewed artifact."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    gate_sub = p_gate.add_subparsers(dest="gate_action")
+
+    g_list = gate_sub.add_parser("list", aliases=["ls"], help="List architecture gates")
+    g_list.add_argument("--state", default=None,
+                        help="Only gates in this state (e.g. validated_awaiting_approval)")
+    g_list.add_argument("--json", action="store_true")
+
+    g_show = gate_sub.add_parser(
+        "show", help="Show one gate, including the exact digest/evidence approval needs",
+    )
+    g_show.add_argument("gate_id")
+    g_show.add_argument("--json", action="store_true")
+
+    g_approve = gate_sub.add_parser(
+        "approve", help="Record an authenticated human approval (exact digest)",
+    )
+    g_approve.add_argument("gate_id")
+    g_approve.add_argument("--digest", required=True,
+                           help="Exact design digest from `gate show`")
+    g_approve.add_argument("--operator", default=None,
+                           help="Principal recorded as approver (default: cli:$USER)")
+    g_approve.add_argument("--review-task-id", default=None)
+    g_approve.add_argument("--review-completion-event-id", type=int, default=None)
+    g_approve.add_argument("--artifact-generation", type=int, default=None)
+    g_approve.add_argument("--artifact-sha256", default=None)
+    g_approve.add_argument("--json", action="store_true")
+
+    g_reject = gate_sub.add_parser("reject", help="Record a human rejection (exact digest)")
+    g_reject.add_argument("gate_id")
+    g_reject.add_argument("--digest", required=True)
+    g_reject.add_argument("--operator", default=None)
+    g_reject.add_argument("--json", action="store_true")
+
+    g_inval = gate_sub.add_parser(
+        "invalidate", help="Invalidate a gate so its architect can correct and retry",
+    )
+    g_inval.add_argument("gate_id")
+    g_inval.add_argument("--reason", required=True)
+    g_inval.add_argument("--json", action="store_true")
+
+    g_reopen = gate_sub.add_parser(
+        "reopen",
+        help="Reopen an invalidated gate (rebuilds the original owner context)",
+    )
+    g_reopen.add_argument("gate_id")
+    g_reopen.add_argument("--json", action="store_true")
+
+    g_issue = gate_sub.add_parser(
+        "issue-graph",
+        help="Issue the one authorized implementation graph for an approved gate",
+    )
+    g_issue.add_argument("gate_id")
+    g_issue.add_argument("--graph-file", required=True,
+                         help="JSON list of {title, assignee, parents:[idx]} objects")
+    g_issue.add_argument("--idempotency-key", required=True)
+    g_issue.add_argument("--json", action="store_true")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1096,6 +1171,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+
+    # `gate` is NOT handled here: unlike `boards` it operates on the
+    # per-board DB, so it belongs under the --board scope with the rest
+    # (see the `gate` entry in the handlers table below).
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1183,6 +1262,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "context":  _cmd_context,
+            "gate":     _dispatch_gate,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
@@ -1218,6 +1298,307 @@ def _profile_author() -> str:
 # ---------------------------------------------------------------------------
 # Boards management (hermes kanban boards …)
 # ---------------------------------------------------------------------------
+
+_GATE_FIELDS = (
+    "gate_id", "board_key", "state", "enforcement_mode", "architect_task_id",
+    "creator_principal", "creator_actor_type", "creator_profile",
+    "session_id", "workflow_key", "request_scope_id",
+    "design_digest", "approval_actor_id", "approval_surface", "row_version",
+)
+
+
+def _gate_to_dict(gate: Any) -> dict:
+    return {name: getattr(gate, name, None) for name in _GATE_FIELDS}
+
+
+def _gate_refuse_if_worker(op: str) -> Optional[int]:
+    """Refuse operator gate actions from a dispatcher worker process.
+
+    This is hygiene at the boundary, NOT the authorization boundary. The DB
+    entry points authorize on ``MutationContext`` fields the caller supplies,
+    and a worker holds its own board handle, so it can bypass this CLI
+    entirely -- see BUILD-800, which fixes that at the identity layer. The
+    check still belongs here: it stops the obvious path, and it keeps this
+    surface honest about who it thinks it is talking to.
+    """
+    task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return None
+    print(
+        f"kanban gate {op}: refusing -- this process is dispatcher worker "
+        f"{task_id}. Resolving an architecture gate is an operator action.",
+        file=sys.stderr,
+    )
+    return 3
+
+
+def _gate_operator_principal(args: argparse.Namespace) -> str:
+    explicit = str(getattr(args, "operator", None) or "").strip()
+    if explicit:
+        return explicit
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 -- no controlling user is not fatal here
+        user = "unknown"
+    return f"cli:{user}"
+
+
+def _gate_human_context(args: argparse.Namespace, gate: Any) -> Any:
+    """Build the human approval context bound to the gate's own board."""
+    return kb.MutationContext(
+        board_key=gate.board_key,
+        principal=_gate_operator_principal(args),
+        actor_type="human",
+        surface="cli",
+        session_id=gate.session_id,
+        request_scope_id=gate.request_scope_id,
+        workflow_key=gate.workflow_key,
+        gate_id=gate.gate_id,
+        mode=gate.enforcement_mode,
+        phase="protected",
+    )
+
+
+def _gate_emit(args: argparse.Namespace, gate: Any, message: str) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps(_gate_to_dict(gate), indent=2))
+    else:
+        print(message)
+    return 0
+
+
+def _gate_load(conn: Any, gate_id: str) -> Any:
+    gate = kb.get_architecture_gate(conn, gate_id)
+    if gate is None:
+        print(f"no such architecture gate: {gate_id}", file=sys.stderr)
+    return gate
+
+
+def _cmd_gate_list(args: argparse.Namespace) -> int:
+    state = str(getattr(args, "state", None) or "").strip()
+    with kb.connect_closing() as conn:
+        sql = "SELECT gate_id FROM architecture_gates"
+        params: list[Any] = []
+        if state:
+            sql += " WHERE state = ?"
+            params.append(state)
+        sql += " ORDER BY updated_at DESC"
+        gate_ids = [row[0] for row in conn.execute(sql, params)]
+        gates = [kb.get_architecture_gate(conn, gid) for gid in gate_ids]
+    gates = [g for g in gates if g is not None]
+    if getattr(args, "json", False):
+        print(json.dumps([_gate_to_dict(g) for g in gates], indent=2))
+        return 0
+    if not gates:
+        print("no architecture gates" + (f" in state {state!r}" if state else ""))
+        return 0
+    for gate in gates:
+        print(
+            f"{gate.gate_id}  {gate.state:30s} mode={gate.enforcement_mode:16s} "
+            f"architect={gate.architect_task_id}"
+        )
+    return 0
+
+
+def _cmd_gate_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        gate = _gate_load(conn, args.gate_id)
+        if gate is None:
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(_gate_to_dict(gate), indent=2))
+            return 0
+        for name in _GATE_FIELDS:
+            print(f"{name:24s} {getattr(gate, name, None)}")
+        if gate.state == "validated_awaiting_approval":
+            print()
+            print("To approve, pass the digest back exactly:")
+            print(
+                f"  hermes kanban gate approve {gate.gate_id} "
+                f"--digest {gate.design_digest}"
+            )
+    return 0
+
+
+def _cmd_gate_approve(args: argparse.Namespace) -> int:
+    refused = _gate_refuse_if_worker("approve")
+    if refused is not None:
+        return refused
+    with kb.connect_closing() as conn:
+        gate = _gate_load(conn, args.gate_id)
+        if gate is None:
+            return 1
+        try:
+            approved = kb.approve_architecture_gate(
+                conn,
+                gate.gate_id,
+                _gate_human_context(args, gate),
+                str(args.digest),
+                review_task_id=getattr(args, "review_task_id", None),
+                review_completion_event_id=getattr(
+                    args, "review_completion_event_id", None
+                ),
+                artifact_generation=getattr(args, "artifact_generation", None),
+                artifact_sha256=getattr(args, "artifact_sha256", None),
+            )
+        except kb.ArchitectureGateError as exc:
+            print(f"kanban gate approve: {exc}", file=sys.stderr)
+            return 1
+        return _gate_emit(
+            args, approved,
+            f"{approved.gate_id} approved by {approved.approval_actor_id} "
+            f"(state={approved.state})",
+        )
+
+
+def _cmd_gate_reject(args: argparse.Namespace) -> int:
+    refused = _gate_refuse_if_worker("reject")
+    if refused is not None:
+        return refused
+    with kb.connect_closing() as conn:
+        gate = _gate_load(conn, args.gate_id)
+        if gate is None:
+            return 1
+        try:
+            rejected = kb.reject_architecture_gate(
+                conn, gate.gate_id, _gate_human_context(args, gate), str(args.digest),
+            )
+        except kb.ArchitectureGateError as exc:
+            print(f"kanban gate reject: {exc}", file=sys.stderr)
+            return 1
+        return _gate_emit(args, rejected, f"{rejected.gate_id} rejected")
+
+
+def _cmd_gate_invalidate(args: argparse.Namespace) -> int:
+    refused = _gate_refuse_if_worker("invalidate")
+    if refused is not None:
+        return refused
+    with kb.connect_closing() as conn:
+        if _gate_load(conn, args.gate_id) is None:
+            return 1
+        try:
+            gate = kb.invalidate_architecture_gate(
+                conn, args.gate_id, reason=str(args.reason),
+            )
+        except (kb.ArchitectureGateError, ValueError) as exc:
+            print(f"kanban gate invalidate: {exc}", file=sys.stderr)
+            return 1
+        return _gate_emit(args, gate, f"{gate.gate_id} invalidated (state={gate.state})")
+
+
+def _cmd_gate_reopen(args: argparse.Namespace) -> int:
+    """Reopen an invalidated gate as its ORIGINAL architecture owner.
+
+    ``reopen_architecture_gate`` verifies every persisted owner binding, so
+    the context is rebuilt from the gate row rather than from flags -- an
+    operator cannot be expected to retype a session id and a turn id, and
+    inventing them would just be denied.
+    """
+    refused = _gate_refuse_if_worker("reopen")
+    if refused is not None:
+        return refused
+    with kb.connect_closing() as conn:
+        gate = _gate_load(conn, args.gate_id)
+        if gate is None:
+            return 1
+        owner = kb.MutationContext(
+            board_key=gate.board_key,
+            principal=gate.creator_principal,
+            actor_type=gate.creator_actor_type or "orchestrator_agent",
+            profile=gate.creator_profile,
+            session_id=gate.session_id,
+            request_scope_id=gate.request_scope_id,
+            workflow_key=gate.workflow_key,
+            mode=gate.enforcement_mode,
+            phase="architecture",
+        )
+        try:
+            reopened = kb.reopen_architecture_gate(conn, gate.gate_id, owner)
+        except (kb.ArchitectureGateError, ValueError) as exc:
+            print(f"kanban gate reopen: {exc}", file=sys.stderr)
+            return 1
+        return _gate_emit(args, reopened, f"{reopened.gate_id} reopened (state={reopened.state})")
+
+
+def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
+    """Issue the one authorized graph for an approved gate.
+
+    Issuance is an orchestrator-agent action, not a human one
+    (``issue_architecture_graph`` requires actor_type/profile/phase to be
+    orchestrator/graph_issuance), so this does not reuse the human context.
+    """
+    refused = _gate_refuse_if_worker("issue-graph")
+    if refused is not None:
+        return refused
+    try:
+        raw = Path(args.graph_file).read_text(encoding="utf-8")
+        tasks = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"kanban gate issue-graph: cannot read --graph-file: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(tasks, list) or not tasks:
+        print(
+            "kanban gate issue-graph: --graph-file must hold a non-empty JSON list",
+            file=sys.stderr,
+        )
+        return 2
+    with kb.connect_closing() as conn:
+        gate = _gate_load(conn, args.gate_id)
+        if gate is None:
+            return 1
+        issuer = kb.MutationContext(
+            board_key=gate.board_key,
+            principal=gate.creator_principal,
+            actor_type="orchestrator_agent",
+            profile="orchestrator",
+            session_id=gate.session_id,
+            request_scope_id=gate.request_scope_id,
+            workflow_key=gate.workflow_key,
+            gate_id=gate.gate_id,
+            mode=gate.enforcement_mode,
+            phase="graph_issuance",
+        )
+        try:
+            issued = kb.issue_architecture_graph(
+                conn, gate.gate_id, issuer, tasks,
+                idempotency_key=str(args.idempotency_key),
+            )
+        except (kb.ArchitectureGateError, ValueError, TypeError) as exc:
+            print(f"kanban gate issue-graph: {exc}", file=sys.stderr)
+            return 1
+    if getattr(args, "json", False):
+        print(json.dumps({"gate_id": args.gate_id, "issued": issued}, indent=2))
+    else:
+        print(f"issued {len(issued)} task(s): {', '.join(issued)}")
+    return 0
+
+
+def _dispatch_gate(args: argparse.Namespace) -> int:
+    """Handle ``hermes kanban gate <action>``.
+
+    Exit codes are raised through ``sys.exit`` rather than returned: ``main()``
+    calls ``args.func(args)`` and discards the result (``main.py:15393``), so a
+    plain return would report a refused approval as success.
+    """
+    sub = getattr(args, "gate_action", None) or "list"
+    handlers = {
+        "list": _cmd_gate_list,
+        "ls": _cmd_gate_list,
+        "show": _cmd_gate_show,
+        "approve": _cmd_gate_approve,
+        "reject": _cmd_gate_reject,
+        "invalidate": _cmd_gate_invalidate,
+        "reopen": _cmd_gate_reopen,
+        "issue-graph": _cmd_gate_issue_graph,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"kanban gate: unknown action {sub!r}", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(int(handler(args) or 0))
+
 
 def _dispatch_boards(args: argparse.Namespace) -> int:
     """Handle ``hermes kanban boards <action>``.
