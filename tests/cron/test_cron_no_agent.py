@@ -329,3 +329,139 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+# ---------------------------------------------------------------------------
+# BUILD-816: script jobs must get the per-run env reload too
+# ---------------------------------------------------------------------------
+
+
+def test_run_job_no_agent_reloads_env_before_running_script(hermes_env, monkeypatch):
+    """A value changed at the source must reach a no_agent script's child env.
+
+    The reload used to sit inside the agent path, BELOW the no_agent
+    short-circuit, so script jobs ran with whatever the gateway process
+    started with.  A Bitwarden record added mid-flight then reached a running
+    cron only after a gateway restart — measured as ~50 minutes of Interac
+    auto-reconciliation downtime on 2026-07-27 while four consecutive cycles
+    kept POSTing to the old origin.
+
+    ``reset_secret_source_cache()`` must run BEFORE the dotenv load: without
+    it ``_APPLIED_HOMES`` short-circuits the vault re-resolve and only the
+    .env placeholder is re-applied (#33465), which reads as a working reload
+    while every vault-backed value stays frozen.
+    """
+    import os
+
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    # The value the long-running process started with. monkeypatch owns the
+    # cleanup, including the mutation the fake reload makes below.
+    monkeypatch.setenv("BUILD816_PROBE", "stale-value")
+
+    calls: list[str] = []
+
+    def fake_reset() -> None:
+        calls.append("reset")
+
+    def fake_load(**kwargs):
+        calls.append("load")
+        os.environ["BUILD816_PROBE"] = "fresh-value"
+        return []
+
+    monkeypatch.setattr(env_loader, "reset_secret_source_cache", fake_reset)
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", fake_load)
+
+    script_path = hermes_env / "scripts" / "probe.sh"
+    script_path.write_text(
+        '#!/bin/bash\necho "PROBE=${BUILD816_PROBE:-MISSING}"\n'
+    )
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="probe.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    success, _doc, final_response, error = run_job(job)
+
+    assert success is True, error
+    assert calls == ["reset", "load"], calls
+    assert "PROBE=fresh-value" in final_response
+
+
+def test_run_job_no_agent_survives_a_broken_env_reload(hermes_env, monkeypatch):
+    """A failing reload must not take the job down with it.
+
+    A malformed .env or an unreachable vault would otherwise turn a config
+    typo into a total cron outage — strictly worse than the stale value the
+    reload exists to replace.
+    """
+    import hermes_cli.env_loader as env_loader
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    def boom(**kwargs):
+        raise RuntimeError("config.yaml is malformed")
+
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", boom)
+
+    script_path = hermes_env / "scripts" / "still_runs.sh"
+    script_path.write_text("#!/bin/bash\necho 'ran anyway'\n")
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="still_runs.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    success, _doc, final_response, error = run_job(job)
+
+    assert success is True, error
+    assert "ran anyway" in final_response
+
+
+def test_reload_job_env_serializes_concurrent_jobs(hermes_env, monkeypatch):
+    """Two jobs firing on the same tick must not interleave their reloads.
+
+    Due jobs run on a ThreadPoolExecutor with no worker cap by default, and
+    ``_apply_external_secret_sources`` marks the HERMES_HOME as applied BEFORE
+    it applies anything.  Unserialized, the second job sees "already applied",
+    returns early, and runs its script against a half-written environment.
+    """
+    import threading
+
+    import cron.scheduler as scheduler
+    import hermes_cli.env_loader as env_loader
+
+    inside = threading.Event()
+    overlapped: list[bool] = []
+    active = 0
+    active_guard = threading.Lock()
+
+    def slow_load(**kwargs):
+        nonlocal active
+        with active_guard:
+            active += 1
+            overlapped.append(active > 1)
+        inside.set()
+        # Long enough that an unlocked second caller would land here too.
+        threading.Event().wait(0.05)
+        with active_guard:
+            active -= 1
+        return []
+
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", slow_load)
+
+    threads = [threading.Thread(target=scheduler._reload_job_env) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert inside.is_set(), "the reload never ran"
+    assert not any(overlapped), "two jobs were inside the env reload at once"
