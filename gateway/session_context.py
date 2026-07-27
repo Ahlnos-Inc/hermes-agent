@@ -93,6 +93,39 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Whether this turn arrived through the interactive front door — a human
+# message the gateway bound to a session — as opposed to cron, a dispatcher
+# worker, a one-shot CLI call, or any other automation running in the same
+# process.
+#
+# This exists because the architecture gate needs an identity a caller cannot
+# acquire by accident, and an environment variable is the wrong shape for that:
+# env is inherited by every child by default, so the trust claim spreads
+# silently. Before BUILD-814 the gate asked for HERMES_PROFILE == "orchestrator"
+# and no production path ever set it, so the gate could not open in ANY mode —
+# a guard that was unreachable rather than permissive, which is worse, because
+# the policy file reads as enforcing.
+#
+# Deliberately OUTSIDE ``_VAR_MAP``: that map is the HERMES_SESSION_* env mirror
+# the subprocess bridge exports, and this flag must never cross a process
+# boundary. Same shape as ``_SESSION_ASYNC_DELIVERY``, which is a capability
+# flag rather than an env var for the same reason.
+#
+# Fails CLOSED: the default is False, and both the handler-exit clear and the
+# pre-bind reset put it back to False rather than to _UNSET. A context that
+# never declared itself a front door is not one.
+_SESSION_FRONT_DOOR: ContextVar = ContextVar("HERMES_SESSION_FRONT_DOOR", default=False)
+
+
+def front_door_turn() -> bool:
+    """True when the current context is an interactive gateway front-door turn.
+
+    Only the gateway's own per-message handler declares this (via
+    ``set_session_vars(front_door=True)``). Cron, workers, the API server and
+    CLI one-shots all leave it False.
+    """
+    return bool(_SESSION_FRONT_DOOR.get())
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -169,6 +202,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    front_door: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -204,6 +238,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_FRONT_DOOR.set(bool(front_door)),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -245,6 +280,9 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Front-door authority is dropped, not defaulted: a finished handler must
+    # not leave the flag standing for whatever runs next in this context.
+    _SESSION_FRONT_DOOR.set(False)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -293,6 +331,11 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Front-door authority is the one flag that must NOT inherit through the
+    # pre-bind window: a task spawned from a context that had already bound a
+    # front-door turn would otherwise carry that authority before binding its
+    # own session. False, never _UNSET — unbound is not a front door.
+    _SESSION_FRONT_DOOR.set(False)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

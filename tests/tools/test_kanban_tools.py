@@ -1933,6 +1933,33 @@ def _write_model_routing_table(home: str | os.PathLike[str], *, weak_flash: bool
     return path
 
 
+@pytest.fixture
+def front_door():
+    """Bind the context exactly the way the gateway's message handler does.
+
+    BUILD-814: front-door authority is a ContextVar the gateway sets on the
+    turn it is serving, NOT an environment variable. A test that instead
+    exports ``HERMES_PROFILE=orchestrator`` is asserting against a state
+    production never reaches — the sole production assignment of that variable
+    is the dispatcher's worker-spawn env, and every such process also carries
+    ``HERMES_KANBAN_TASK`` and is refused one guard earlier. Those two guards
+    were mutually exclusive, which is why the gate opened on 0 tasks.
+
+    ``profile`` is stamped explicitly here because the gateway stamps it for
+    multiplexed profiles; the primary profile leaves it blank and the resolver
+    falls back to the HERMES_HOME profile name (covered separately).
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        session_id="trusted-session", profile="orchestrator", front_door=True
+    )
+    try:
+        yield "trusted-session"
+    finally:
+        clear_session_vars(tokens)
+
+
 def _write_architecture_gate_policy(
     home: str | os.PathLike[str], *, version: str = "v1", mode: str = "off",
 ) -> Path:
@@ -2413,20 +2440,13 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
 @pytest.mark.parametrize("mode", ["shadow", "orchestrator_only"])
 @pytest.mark.parametrize("model_routing", [None, "verification_leaf"])
 def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_routing(
-    monkeypatch, worker_env, mode, model_routing,
+    monkeypatch, worker_env, front_door, mode, model_routing,
 ):
     """Trusted front-door identity, not model routing, activates staged gates."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
-    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
-    # Earlier tests may bind a process-local session ContextVar.  This case
-    # models an unattached front-door invocation whose authority comes from
-    # its environment, so restore the unbound resolution state explicitly.
-    from gateway.session_context import reset_session_vars
-    reset_session_vars()
     args = {
         "title": "Design the workflow", "assignee": "architect",
         "session_id": "forged-model-session",
@@ -2449,17 +2469,13 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_rou
 
 
 def test_front_door_open_gate_denies_unparented_coder_in_same_turn(
-    monkeypatch, worker_env,
+    monkeypatch, worker_env, front_door,
 ):
     """Every managed front-door mutation receives trusted gate context."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
-    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
-    from gateway.session_context import reset_session_vars
-    reset_session_vars()
     _write_architecture_gate_policy(
         os.environ["HERMES_HOME"], mode="orchestrator_only"
     )
@@ -2508,7 +2524,9 @@ def test_front_door_architecture_gate_does_not_expand_to_ordinary_creates(
         assert kb.get_architecture_gate_for_task(conn, created["task_id"]) is None
 
 
-def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(monkeypatch, worker_env):
+def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(
+    monkeypatch, worker_env, front_door,
+):
     """The trusted boundary reads managed policy and never scopes to model data."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.config import DEFAULT_CONFIG
@@ -2516,8 +2534,6 @@ def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(monkeyp
 
     assert "architecture_gate" not in DEFAULT_CONFIG["kanban"]
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
-    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
     (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
         "kanban:\n  architecture_gate:\n    version: v1\n    mode: orchestrator_only\n"
     )
@@ -4613,3 +4629,193 @@ def test_compile_workflow_signature_retry_is_idempotent(
     second = json.loads(kt._handle_compile_workflow(args))
     assert first["ok"] is True
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# BUILD-814: the gate must be reachable from the real front door, and from
+# nothing else. Every case below was silently identical before the fix — the
+# resolver returned None unconditionally, so "gate opens" and "gate refuses"
+# were the same observation and neither was being tested.
+# ---------------------------------------------------------------------------
+
+
+def _create_architect(kt, *, turn_id="trusted-turn"):
+    return json.loads(
+        kt._handle_create(
+            {"title": "Design the workflow", "assignee": "architect"},
+            turn_id=turn_id,
+        )
+    )
+
+
+def _gate_rows(kb):
+    with kb.connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM architecture_gates").fetchone()[0]
+
+
+def test_primary_front_door_opens_the_gate_without_a_stamped_profile(
+    monkeypatch, worker_env,
+):
+    """The PRIMARY profile leaves ``source.profile`` blank — the real shape.
+
+    Only multiplexed secondaries get a stamped profile
+    (``_make_profile_message_handler``), so the primary's turns must resolve
+    their profile from HERMES_HOME instead. A test that always stamps
+    "orchestrator" would never exercise this and would pass with the fallback
+    deleted.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles as _profiles
+    from tools import kanban_tools as kt
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
+    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
+
+    tokens = set_session_vars(session_id="primary-session", profile="", front_door=True)
+    try:
+        created = _create_architect(kt)
+    finally:
+        clear_session_vars(tokens)
+
+    assert created["ok"]
+    with kb.connect() as conn:
+        gate = kb.get_architecture_gate_for_task(conn, created["task_id"])
+    assert gate is not None and gate.state == "open"
+    assert gate.session_id == "primary-session"
+
+
+def test_hermes_profile_env_alone_does_not_open_the_gate(monkeypatch, worker_env):
+    """The pre-814 premise, now explicitly refused.
+
+    ``HERMES_PROFILE=orchestrator`` was the entire second guard, and nothing in
+    production set it. Keeping it as the identity would have meant a trust
+    decision resting on an inheritable environment variable that every child
+    process also sees — in the one subsystem whose purpose is authority a
+    caller cannot fabricate.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles as _profiles
+    from tools import kanban_tools as kt
+    from gateway.session_context import reset_session_vars
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-only-session")
+    reset_session_vars()
+    # Everything ELSE the resolver wants is satisfied, so the front-door
+    # declaration is the only thing that can refuse this. Without pinning the
+    # profile the test would pass because HERMES_HOME resolves to "custom",
+    # and deleting the front-door check outright would still leave it green.
+    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
+    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
+
+    created = _create_architect(kt)
+
+    assert created["ok"]
+    assert _gate_rows(kb) == 0
+
+
+def test_cron_turn_does_not_open_the_gate(monkeypatch, worker_env):
+    """Cron binds a session too — it just never claims the front door.
+
+    ``cron/scheduler.py`` calls ``set_session_vars`` on every agent job. If
+    front-door authority were inferred from "a session is bound" rather than
+    declared, every cron tick would carry it.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles as _profiles
+    from tools import kanban_tools as kt
+    from gateway.session_context import (
+        clear_session_vars,
+        set_current_session_id,
+        set_session_vars,
+    )
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
+    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
+
+    tokens = set_session_vars(platform="", chat_id="", chat_name="")
+    # A cron agent job really does end up with a session id: agent_init calls
+    # set_current_session_id() once the agent is built. Leaving it empty would
+    # make this test pass on the "no session id" branch and prove nothing about
+    # the front-door check.
+    set_current_session_id("cron-session")
+    try:
+        created = _create_architect(kt)
+    finally:
+        clear_session_vars(tokens)
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    assert created["ok"]
+    assert _gate_rows(kb) == 0
+
+
+def test_multiplexed_secondary_front_door_does_not_open_an_orchestrator_gate(
+    monkeypatch, worker_env,
+):
+    """``multiplex_profiles`` is live (marketing-operator on its own topic).
+
+    Its messages are a real front door, but an ``orchestrator_only`` policy is
+    not about them, and an "orchestrator:" principal would misattribute them.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
+
+    tokens = set_session_vars(
+        session_id="marketing-session", profile="marketing-operator", front_door=True
+    )
+    try:
+        created = _create_architect(kt)
+    finally:
+        clear_session_vars(tokens)
+
+    assert created["ok"]
+    assert _gate_rows(kb) == 0
+
+
+def test_worker_cannot_open_the_gate_even_holding_front_door_context(
+    monkeypatch, worker_env, front_door,
+):
+    """Order matters: the worker check runs before anything else is consulted.
+
+    A worker is a separate process and cannot inherit the ContextVar, so this
+    is belt-and-braces — but it is the guard that made the old
+    ``HERMES_PROFILE`` check unreachable, and it must keep refusing first.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_someworkertask")
+    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
+
+    created = _create_architect(kt)
+
+    assert created["ok"]
+    assert _gate_rows(kb) == 0
+
+
+def test_front_door_context_does_not_survive_the_turn(front_door):
+    """Authority is dropped at handler exit, not left standing for what runs next."""
+    from gateway.session_context import (
+        clear_session_vars,
+        front_door_turn,
+        reset_session_vars,
+        set_session_vars,
+    )
+
+    assert front_door_turn() is True
+    clear_session_vars([])
+    assert front_door_turn() is False
+
+    tokens = set_session_vars(front_door=True)
+    assert front_door_turn() is True
+    reset_session_vars()
+    assert front_door_turn() is False
+    clear_session_vars(tokens)

@@ -2724,16 +2724,64 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
 def _trusted_front_door_architecture_context(
     kb: Any, *, board: Any, assignee: Any, turn_id: Any,
 ) -> Any:
-    """Construct architecture authority from runtime identity, never tool args."""
+    """Construct architecture authority from runtime identity, never tool args.
+
+    Identity comes from two independent facts, in this order:
+
+    1. This process is not a dispatcher worker (``HERMES_KANBAN_TASK``).
+    2. This *context* was declared an interactive front-door turn by the
+       gateway's own message handler (``front_door_turn()``).
+
+    (2) used to be ``HERMES_PROFILE == "orchestrator"``, which no production
+    path ever set — the sole assignment in the runtime is the dispatcher's
+    worker-spawn env, and every such process also carries ``HERMES_KANBAN_TASK``
+    and so is already refused by (1). The live gateway carries neither. The two
+    guards were mutually exclusive, so this function returned ``None``
+    unconditionally and the gate could not open in ANY mode: 0
+    ``architecture_gates`` rows across 558 tasks on all 7 live boards, with
+    ``off``, ``shadow`` and ``orchestrator_only`` behaviourally identical
+    (BUILD-814).
+
+    The fix deliberately does NOT set ``HERMES_PROFILE`` in the gateway's
+    launchd job. That would work, and it is the wrong shape: an environment
+    variable is inherited by every child process, so a subsystem whose entire
+    purpose is authority a caller cannot fabricate would be resting on the most
+    freely-propagated state in the runtime. ``front_door_turn()`` is a
+    ContextVar the gateway sets on the turn it is serving and drops when the
+    turn ends; it cannot cross a process boundary at all, and it fails closed.
+
+    None of this makes the authority unforgeable in-process — workers are plain
+    ``Popen`` children at the same uid with no sandbox (BUILD-800/808), so
+    anything in this address space can be reached by code running in it. It
+    makes it REACHABLE and accidentally-unacquirable, which is what a speed
+    bump on the front door needs to be, and what it demonstrably was not.
+    """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return None
-    if os.environ.get("HERMES_PROFILE") != "orchestrator":
-        return None
     try:
-        from gateway.session_context import get_session_env
+        from gateway.session_context import front_door_turn, get_session_env
+        if not front_door_turn():
+            return None
         session_id = get_session_env("HERMES_SESSION_ID", "")
+    except ImportError:
+        # No gateway package importable => not a gateway front door.
+        return None
     except Exception:
-        session_id = os.environ.get("HERMES_SESSION_ID", "")
+        return None
+    # Which profile's front door this is. Under multiplex the gateway stamps
+    # the secondary profile onto the message source; the primary leaves it
+    # blank, so fall back to the profile this HERMES_HOME belongs to. An
+    # ``orchestrator_only`` policy must not gate another profile's front door.
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = (
+            str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+            or get_active_profile_name()
+        )
+    except Exception:
+        return None
+    if profile != "orchestrator":
+        return None
     session_id = str(session_id).strip()
     trusted_turn_id = str(turn_id or "").strip()
     mode = _managed_architecture_gate_mode()

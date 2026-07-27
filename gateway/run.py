@@ -15807,6 +15807,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            # THE front door: a human message the gateway bound to a session.
+            # This is the only place that declares it. Cron binds its own
+            # session (cron/scheduler.py) and leaves it False; dispatcher
+            # workers are separate processes and cannot inherit a ContextVar.
+            # BUILD-814 — the architecture gate needs an identity that is
+            # granted deliberately rather than inherited from the environment.
+            front_door=True,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
