@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -427,3 +428,119 @@ def test_dispatch_materializes_bundle_for_seatbelt_while_denies_attachment_store
     assert task_id in [task[0] for task in result.spawned]
     assert len(seatbelt_results) == 1
     assert seatbelt_results[0].returncode == 0, seatbelt_results[0].stderr
+
+
+@pytest.mark.skipif(not Path("/usr/bin/sandbox-exec").exists(), reason="macOS sandbox-exec")
+def test_worker_clones_and_verifies_the_bundle_from_task_local_inputs_only(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    """AC4: git itself must work on the handoff, not just ``cat``.
+
+    Proving the bundle is *readable* under Seatbelt is weaker than the claim
+    the ticket makes. The worker has to ``git bundle verify`` and ``git clone``
+    it — reading the bundle, writing a checkout, and giving git somewhere for
+    its own config — all from the task workspace.
+
+    "No broad sandbox relaxation" is enforced by construction: the toolchain
+    grants come from the SAME two helpers the production terminal uses
+    (``_selected_git`` + ``_homebrew_formula_roots``), so this test cannot pass
+    by widening the profile past what a real worker already gets. Everything
+    else — HOME, the git config, the clone target — is pinned into the
+    workspace; if the worker needed the host's ``~/.gitconfig`` the handoff
+    would not be task-local and this would fail rather than quietly relax.
+
+    Note the sandbox default PATH resolves ``/usr/bin/git``, which on a stock
+    macOS box is the xcode-select shim and dies reading
+    ``/private/var/select/sh``. Production does not hit that because
+    ``_selected_git`` resolves the PATH git (Homebrew here) — so the test pins
+    the resolved binary rather than trusting PATH.
+    """
+    from agent.claude_workspace_terminal import (
+        _homebrew_formula_roots,
+        _mach_o_dependencies,
+        _selected_git,
+        build_workspace_seatbelt_profile,
+    )
+
+    git_bin = _selected_git(os.environ.get("PATH", ""))
+    if git_bin is None:
+        pytest.skip("no git on PATH")
+    git_bin = Path(git_bin)
+    # Production resolves the binary's own shared-library closure the same way
+    # (build_workspace_terminal_args). A Homebrew git aborts under the profile
+    # without it — dyld cannot load libpcre2 — so omitting this would make the
+    # test fail for a reason that has nothing to do with the handoff.
+    git_paths = [git_bin, *_mach_o_dependencies([git_bin])]
+
+    payload, commit, git_ref = _git_bundle(tmp_path)
+    digest = hashlib.sha256(payload).hexdigest()
+    outcomes = []
+
+    def fake_spawn(task, workspace):
+        workspace = Path(workspace)
+        source_path = workspace / ".hermes-sources" / "approved-adr" / "source.bundle"
+        profile = build_workspace_seatbelt_profile(
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            allow_network=False,
+            readable_roots=_homebrew_formula_roots(git_paths),
+            readable_paths=git_paths,
+        )
+        checkout = workspace / "checkout"
+        branch = git_ref.removeprefix("refs/heads/")
+        script = "; ".join([
+            "set -e",
+            f"export HOME={workspace!s}",
+            "export GIT_CONFIG_GLOBAL=$HOME/.gitconfig-task",
+            "export GIT_CONFIG_SYSTEM=/dev/null",
+            # `bundle verify` needs to run from inside SOME repository; a
+            # task-local scratch one keeps the verify-before-use order without
+            # reaching outside the workspace for it.
+            f"{git_bin!s} init -q $HOME/verify-repo",
+            f"{git_bin!s} -C $HOME/verify-repo bundle verify {source_path!s}",
+            # The bundle carries the pinned ref and no HEAD, so name the ref
+            # on the clone — the same thing a worker holding git_ref must do.
+            f"{git_bin!s} clone -q --branch {branch} {source_path!s} {checkout!s}",
+            f"{git_bin!s} -C {checkout!s} rev-parse HEAD",
+        ])
+        outcomes.append(subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", script],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ))
+        return kb.SpawnReceipt(
+            pid=65_503,
+            release=lambda: None,
+            abort=lambda: None,
+            process_started_at=1234.5,
+            process_group_id=65_503,
+            session_id=65_503,
+        )
+
+    with kb.connect() as conn:
+        source_task_id = kb.create_task(conn, title="approved source")
+        attachment_id = kb.store_attachment_bytes(
+            conn, source_task_id, "source.bundle", payload
+        )
+        _approve_source_task(conn, source_task_id)
+        task_id = kb.create_task(
+            conn,
+            title="bundle consumer",
+            assignee="alice",
+            parents=[source_task_id],
+            source_refs=[{
+                **_source_ref(source_task_id, attachment_id, digest)[0],
+                "git_commit": commit,
+                "git_ref": git_ref,
+            }],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert task_id in [task[0] for task in result.spawned]
+    assert len(outcomes) == 1
+    done = outcomes[0]
+    assert done.returncode == 0, f"stdout={done.stdout!r} stderr={done.stderr!r}"
+    # The clone must land on the exact pinned commit, not merely succeed.
+    assert commit in done.stdout, done.stdout
