@@ -15391,7 +15391,15 @@ def _run_cli():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Handlers that report an exit status return an int — `kanban_command`,
+        # `projects_command` and friends are annotated `-> int` and already
+        # compute the right code; discarding it made every failure exit 0.
+        # Anything else (None, an object, a string) is not a status. `bool` is
+        # an int subclass and a handler returning True means success, so it is
+        # excluded rather than turned into exit 1.
+        if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+            sys.exit(result)
     else:
         parser.print_help()
 
