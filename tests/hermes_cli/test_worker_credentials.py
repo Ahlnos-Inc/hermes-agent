@@ -51,7 +51,7 @@ def _github_manifest(root: Path) -> None:
         "  verifier:\n"
         "    actions: []\n"
         "  marketing-operator:\n"
-        "    actions: [bws_bootstrap]\n",
+        "    actions: [meta_marketing_read, instagram_graph_read, posthog_read]\n",
     )
 
 
@@ -365,7 +365,15 @@ def test_controller_bootstrap_keeps_custom_bitwarden_bootstrap_name(monkeypatch)
     assert os.environ["CUSTOM_BWS_TOKEN"] == "controller-bootstrap"
 
 
-def test_marketing_bootstrap_reprojects_only_granted_bws_value(tmp_path, monkeypatch):
+def test_marketing_worker_bootstrap_never_restores_the_vault_token(
+    tmp_path, monkeypatch
+):
+    """BUILD-601: the ex-holder of the vault grant gets no vault token back.
+
+    Both doors are held open on purpose -- an ambient copy in the environment
+    AND a stale private handoff of the kind the retired ``bws_bootstrap`` grant
+    used to deliver. Neither may survive into the worker.
+    """
     _github_manifest(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_PROFILE", "marketing-operator")
@@ -380,8 +388,9 @@ def test_marketing_bootstrap_reprojects_only_granted_bws_value(tmp_path, monkeyp
     runtime = wc.bootstrap_worker_credential_context()
 
     assert runtime is not None
-    assert runtime.capabilities == ("bws_bootstrap",)
-    assert os.environ[wc.BWS_BOOTSTRAP_ENV] == "handoff-value"
+    assert "bws_bootstrap" not in runtime.capabilities
+    assert wc.BWS_BOOTSTRAP_ENV not in os.environ
+    assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in os.environ
 
 
 def test_non_worker_bootstrap_keeps_ambient_credentials(monkeypatch):
@@ -511,24 +520,35 @@ def test_empty_or_unknown_profile_receives_no_capability_or_secret(tmp_path, mon
         assert "GITHUB_TOKEN" not in child_env
 
 
-def test_bws_bootstrap_is_projected_only_for_granted_profile(tmp_path, monkeypatch):
+def test_no_worker_receives_the_vault_access_token(tmp_path, monkeypatch):
+    """AC2/AC3 of BUILD-601: the full-vault-token grant is gone system-wide.
+
+    ``marketing-operator`` is the interesting case -- it is the profile that
+    used to hold ``bws_bootstrap``, and it still has three granted vault-sourced
+    capabilities, so its plan genuinely resolves against the vault. The value it
+    receives must be the resolved secrets, never the key used to fetch them.
+    """
     _github_manifest(tmp_path)
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
 
-    marketing = wc.resolve_worker_credentials("marketing-operator", root=tmp_path)
-    marketing_env = wc.build_worker_environment(dict(os.environ), marketing)
-    assert marketing.ok
-    assert marketing_env[wc.BWS_BOOTSTRAP_ENV] == "controller-bootstrap"
-    assert marketing_env[wc.BWS_BOOTSTRAP_HANDOFF_ENV] == "controller-bootstrap"
+    for profile in ("marketing-operator", "releaser", "verifier", "not-listed"):
+        plan = wc.resolve_worker_credentials(profile, root=tmp_path)
+        worker_env = wc.build_worker_environment(dict(os.environ), plan)
+        assert wc.BWS_BOOTSTRAP_ENV not in worker_env, profile
+        assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in worker_env, profile
+        assert "controller-bootstrap" not in worker_env.values(), profile
 
-    verifier = wc.resolve_worker_credentials("verifier", root=tmp_path)
-    verifier_env = wc.build_worker_environment(dict(os.environ), verifier)
-    assert wc.BWS_BOOTSTRAP_ENV not in verifier_env
-    assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in verifier_env
 
-    unknown = wc.resolve_worker_credentials("not-listed", root=tmp_path)
-    unknown_env = wc.build_worker_environment(dict(os.environ), unknown)
-    assert wc.BWS_BOOTSTRAP_ENV not in unknown_env
+def test_bws_bootstrap_is_no_longer_a_grantable_capability(tmp_path):
+    """A manifest naming the retired grant must fail closed, not be ignored."""
+    assert "bws_bootstrap" not in wc.CAPABILITIES
+    _write_manifest(
+        tmp_path,
+        "version: 1\nprofiles:\n  marketing-operator:\n"
+        "    actions: [bws_bootstrap]\n",
+    )
+    with pytest.raises(wc.WorkerCredentialError):
+        wc.load_manifest(tmp_path)
 
 
 def test_google_ads_controller_source_token_is_never_projected_to_any_worker(
@@ -552,22 +572,28 @@ def test_google_ads_controller_source_token_is_never_projected_to_any_worker(
 def test_real_v2_co_grant_keeps_google_source_token_controller_only(
     tmp_path, monkeypatch
 ):
+    _enable_bitwarden(tmp_path)
     _write_manifest(
         tmp_path,
         """version: 2
 profiles:
   marketing-operator:
     actions:
-      bws_bootstrap: {}
+      posthog_read: {}
       google_ads_campaign_status_read:
         activation_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 """,
     )
-    bootstrap = "unrelated-worker-bootstrap-token"
+    posthog = "resolved-posthog-value"
     google_source = "dedicated-google-source-token"
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets={"POSTHOG_PERSONAL_KEY": posthog}),
+    )
     base_env = {
         "SAFE": "yes",
-        wc.BWS_BOOTSTRAP_ENV: bootstrap,
+        wc.BWS_BOOTSTRAP_ENV: "controller-bootstrap",
         wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV: google_source,
     }
 
@@ -578,16 +604,19 @@ profiles:
 
     assert plan.ok
     assert plan.capabilities == (
-        "bws_bootstrap",
         "google_ads_campaign_status_read",
+        "posthog_read",
     )
     assert worker_env["SAFE"] == "yes"
-    assert worker_env[wc.BWS_BOOTSTRAP_ENV] == bootstrap
+    # The worker-environment grant is delivered; the controller-action
+    # capability's source token is not, and neither is the vault key itself.
+    assert wc.BWS_BOOTSTRAP_ENV not in worker_env
+    assert "controller-bootstrap" not in worker_env.values()
     assert wc.GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV not in worker_env
     assert google_source not in worker_env.values()
 
     wc.consume_worker_credential_handoff(worker_env)
-    assert wc.get_consumed_worker_credential("bws_bootstrap") == bootstrap
+    assert wc.get_consumed_worker_credential("posthog_read") == posthog
     assert (
         wc.get_consumed_worker_credential("google_ads_campaign_status_read")
         is None
@@ -828,24 +857,37 @@ def test_a_granted_capability_still_receives_its_own_vault_source(
 ):
     """AC6 — the strip must not fight an explicit grant.
 
-    `bws_bootstrap` resolves from a vault-sourced variable, so a naive
-    "drop everything the vault applied" would delete the very value the
-    manifest grants and break github_write's sibling capability.
+    The granted value is vault-sourced, so a naive "drop everything the vault
+    applied" would delete the very thing the manifest grants. It must survive,
+    but only through the private handoff — never as the ambient source name,
+    and never for a profile without the grant.
     """
     _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setenv(RESOLVE_KEY, "ambient-copy-must-not-survive")
     monkeypatch.setattr(
         "hermes_cli.env_loader.externally_sourced_env_names",
-        lambda: frozenset({"BWS_ACCESS_TOKEN"}),
+        lambda: frozenset({"BWS_ACCESS_TOKEN", RESOLVE_KEY}),
+    )
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets={RESOLVE_KEY: SENTINEL}),
     )
 
-    marketing = wc.resolve_worker_credentials("marketing-operator", root=tmp_path)
-    marketing_env = wc.build_worker_environment(dict(os.environ), marketing)
-    assert marketing_env[wc.BWS_BOOTSTRAP_ENV] == "controller-bootstrap"
+    releaser = wc.resolve_worker_credentials(
+        "Releaser", root=tmp_path, github_owner=RELEASE_OWNER
+    )
+    releaser_env = wc.build_worker_environment(dict(os.environ), releaser)
+    assert releaser.ok, releaser.error
+    assert releaser_env[wc.GITHUB_WRITE_HANDOFF_ENV] == SENTINEL
+    assert RESOLVE_KEY not in releaser_env
 
     verifier = wc.resolve_worker_credentials("verifier", root=tmp_path)
     verifier_env = wc.build_worker_environment(dict(os.environ), verifier)
-    assert wc.BWS_BOOTSTRAP_ENV not in verifier_env
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in verifier_env
+    assert SENTINEL not in verifier_env.values()
 
 
 def test_withheld_variables_are_logged_by_name_and_never_by_value(
@@ -1105,7 +1147,16 @@ def test_both_release_target_tokens_are_stripped_from_every_worker(
     monkeypatch.setattr(
         wc,
         "_fetch_bitwarden_result",
-        lambda **_kwargs: FetchResult(secrets={RESOLVE_KEY: SENTINEL}),
+        # marketing-operator holds the three scoped reads since BUILD-601, so
+        # its plan genuinely resolves against the vault and needs them present.
+        lambda **_kwargs: FetchResult(
+            secrets={
+                RESOLVE_KEY: SENTINEL,
+                "META_SYSTEM_USER_TOKEN": "meta-value",
+                "INSTAGRAM_GRAPH_TOKEN": "instagram-value",
+                "POSTHOG_PERSONAL_KEY": "posthog-value",
+            }
+        ),
     )
     ambient = {
         name: f"ambient-{name}" for name in wc.GITHUB_WRITE_RESOLVE_KEYS.values()
@@ -1206,7 +1257,7 @@ def test_vault_sourced_capabilities_is_derived_not_a_literal(tmp_path):
     assert wc.vault_sourced_capabilities(MARKETING_READ_CAPABILITIES) == (
         MARKETING_READ_CAPABILITIES
     )
-    # bws_bootstrap's source IS the controller bootstrap variable: no fetch.
+    # A retired or unknown capability contributes nothing.
     assert wc.vault_sourced_capabilities(("bws_bootstrap",)) == ()
     # A controller-action capability never projects into a worker at all.
     assert wc.vault_sourced_capabilities(("google_ads_campaign_status_read",)) == ()
@@ -1216,11 +1267,18 @@ def test_vault_sourced_capabilities_is_derived_not_a_literal(tmp_path):
 def test_marketing_read_capabilities_resolve_each_from_its_own_record(
     tmp_path, monkeypatch, caplog
 ):
-    """Each grant resolves its own Bitwarden RECORD name, hyphens included."""
+    """Each grant resolves its own Bitwarden RECORD name.
+
+    Every record name must ALSO be a legal environment-variable name: the
+    controller fetches through ``_run_bws_list``, which drops keys failing
+    ``is_valid_env_name`` before they ever reach the capability lookup. The
+    hyphenated ``meta-system-user-token`` therefore resolved to nothing and was
+    recreated as ``META_SYSTEM_USER_TOKEN`` (BUILD-601).
+    """
     _marketing_manifest(tmp_path)
     _enable_bitwarden(tmp_path)
     values = {
-        "meta-system-user-token": "meta-value",
+        "META_SYSTEM_USER_TOKEN": "meta-value",
         "INSTAGRAM_GRAPH_TOKEN": "instagram-value",
         "POSTHOG_PERSONAL_KEY": "posthog-value",
         # Present in the same vault and granted to nobody here.
@@ -1287,7 +1345,7 @@ def test_one_missing_marketing_secret_fails_the_whole_preflight(tmp_path, monkey
         "_fetch_bitwarden_result",
         lambda **_kwargs: FetchResult(
             secrets={
-                "meta-system-user-token": "meta-value",
+                "META_SYSTEM_USER_TOKEN": "meta-value",
                 "INSTAGRAM_GRAPH_TOKEN": "instagram-value",
                 # POSTHOG_PERSONAL_KEY absent.
             }

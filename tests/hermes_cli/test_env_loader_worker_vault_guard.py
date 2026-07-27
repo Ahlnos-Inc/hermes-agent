@@ -67,12 +67,19 @@ def test_worker_without_grant_does_not_pull(monkeypatch, applied):
     assert applied() is False
 
 
-def test_worker_with_bws_bootstrap_grant_pulls(monkeypatch, applied):
-    """The grant is the whole point: marketing-operator holds one today."""
+def test_no_grant_can_make_a_worker_pull_the_vault(monkeypatch, applied):
+    """BUILD-601 removed the exemption, so this asserts the inverse.
+
+    ``bws_bootstrap`` was the one capability that let a worker pull the whole
+    vault; retiring it left no legitimate reason, so the guard is unconditional
+    for workers. A manifest naming the retired grant -- or any other grant --
+    must not reopen the door.
+    """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
     monkeypatch.setenv("HERMES_PROFILE", "coder")
-    _grant(monkeypatch, ["bws_bootstrap"])
-    assert applied() is True
+    for grants in (["bws_bootstrap"], ["github_write"], ["posthog_read"], []):
+        _grant(monkeypatch, grants)
+        assert applied() is False, grants
 
 
 def test_an_unrelated_grant_is_not_a_vault_grant(monkeypatch, applied):

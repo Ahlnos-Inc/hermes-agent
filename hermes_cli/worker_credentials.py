@@ -143,9 +143,10 @@ class CapabilityDefinition:
     selected_by: str | None = None
 
 
-# ``bws_bootstrap`` is transitional.  It exists only for the current
-# marketing-operator migration and is intentionally not a general vault
-# capability.
+# No capability here hands a worker the vault access token itself. The last one
+# that did (``bws_bootstrap``, marketing-operator) was retired by BUILD-601 in
+# favour of the three scoped marketing reads below; a worker now receives only
+# resolved values, projected at the terminal boundary.
 CAPABILITIES: Mapping[str, CapabilityDefinition] = {
     "github_write": CapabilityDefinition(
         name="github_write",
@@ -158,27 +159,27 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
         projection_env=("GH_TOKEN",),
         selected_by="repository owner",
     ),
-    "bws_bootstrap": CapabilityDefinition(
-        name="bws_bootstrap",
-        source_key=BWS_BOOTSTRAP_ENV,
-        handoff_env=BWS_BOOTSTRAP_HANDOFF_ENV,
-        projection_env=(BWS_BOOTSTRAP_ENV,),
-    ),
-    # BUILD-601: the three credentials marketing-operator actually needs, so
-    # its ``bws_bootstrap`` grant -- the last full-vault-token grant on the
-    # system -- can be retired. Deliberately three single-secret capabilities
+    # BUILD-601: the three credentials marketing-operator actually needs, which
+    # replaced its ``bws_bootstrap`` grant -- the last full-vault-token grant on
+    # the system. Deliberately three single-secret capabilities
     # rather than one bundle: the existing CapabilityDefinition shape already
     # fits, each grant is independently revocable, and the audit renders one
     # row per credential instead of one row naming three.
     #
-    # ``source_key`` is a Bitwarden RECORD name, which is why the hyphenated
-    # ``meta-system-user-token`` works here: the adapter returns raw record
-    # names, and it is only the env_loader apply step that drops names which
-    # are not legal environment variables (BUILD-793). The projected names are
-    # code-owned and always legal.
+    # ``source_key`` is a Bitwarden RECORD name, but it must ALSO be a legal
+    # environment-variable name: the controller fetches through
+    # ``_run_bws_list``, which drops any record whose key fails
+    # ``is_valid_env_name`` (agent/secret_sources/bitwarden.py:481) BEFORE the
+    # ``secrets[key]`` assignment five lines later. The hyphenated
+    # ``meta-system-user-token`` therefore resolved to nothing; the record was
+    # recreated as ``META_SYSTEM_USER_TOKEN`` in the controller's own project
+    # (BUILD-601). Every capability here must also live in the project named by
+    # ``secrets.bitwarden.project_id`` -- the adapter fetches exactly one
+    # project, so a record in a sibling project is invisible to the controller
+    # even though an unscoped ``bws`` CLI can see it.
     "meta_marketing_read": CapabilityDefinition(
         name="meta_marketing_read",
-        source_key="meta-system-user-token",
+        source_key="META_SYSTEM_USER_TOKEN",
         handoff_env=META_MARKETING_HANDOFF_ENV,
         projection_env=("META_SYSTEM_USER_TOKEN",),
     ),
@@ -674,8 +675,6 @@ def bootstrap_worker_credential_context(
 
         for key in strip_env:
             target.pop(key, None)
-        if "bws_bootstrap" in admitted:
-            target[BWS_BOOTSTRAP_ENV] = admitted["bws_bootstrap"]
 
         runtime = TrustedWorkerCredentialRuntime(
             profile=profile,
@@ -793,11 +792,15 @@ def project_worker_terminal_environment(
     """Isolate worker terminals and project trusted action credentials.
 
     ``github_write`` is projected as ``GH_TOKEN`` plus a token-free git helper.
-    ``bws_bootstrap`` is the transitional FULL-PROCESS grant (marketing-operator):
-    its ``BWS_ACCESS_TOKEN`` must also reach the worker's subprocesses — e.g. the
-    ``bws`` CLI the marketing skill shells out to for its Instagram secrets — so
-    it is re-projected here after the sanitizer stripped every ambient copy. Only
-    a trusted worker with the grant receives either value.
+    Every other worker_environment capability is projected into the names its
+    registry entry declares, after the sanitizer has stripped every ambient
+    copy — so a granted worker uses the terminal projection and never the
+    controller's own environment. Only a trusted worker receives any value.
+
+    Nothing here projects the vault access token itself: BUILD-601 retired the
+    transitional ``bws_bootstrap`` grant in favour of the three resolved
+    marketing reads, so a worker can no longer re-derive secrets the manifest
+    did not grant it.
     """
     runtime = bootstrap_worker_credential_context()
     if runtime is None:
@@ -1010,9 +1013,8 @@ def vault_sourced_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]
     adding a capability does not create a second place to update (BUILD-601 --
     before it, this was the literal ``"github_write" in capabilities``).
 
-    ``bws_bootstrap`` is excluded: its source IS the controller's bootstrap
-    environment variable, so it needs no fetch. Controller-action capabilities
-    are excluded too -- they never project into a worker at all.
+    Controller-action capabilities are excluded -- they never project into a
+    worker at all.
     """
     resolved: list[str] = []
     for capability in capabilities:
@@ -1103,7 +1105,10 @@ def resolve_worker_credentials(
     bootstrap = str(env.get(access_token_env) or "").strip()
     vault_capabilities = vault_sourced_capabilities(capabilities)
     needs_bitwarden = bool(vault_capabilities)
-    needs_bootstrap = needs_bitwarden or "bws_bootstrap" in capabilities
+    # The bootstrap token is the CONTROLLER's key to the vault, needed only to
+    # perform the fetch. No worker receives it (BUILD-601 retired the last
+    # grant that did), so needing it is now exactly needing a fetch.
+    needs_bootstrap = needs_bitwarden
     statuses: list[str] = []
     handoff: dict[str, str] = {}
     source = "bitwarden" if needs_bitwarden else None
@@ -1149,7 +1154,10 @@ def resolve_worker_credentials(
             return plan
 
     if needs_bootstrap:
-        statuses.append(f"bws_bootstrap={'present' if bootstrap else 'missing'}")
+        # The CONTROLLER's key to the vault, not a worker grant -- naming it
+        # after the retired capability made a controller-side fetch failure
+        # read as a worker holding a vault token.
+        statuses.append(f"vault_bootstrap={'present' if bootstrap else 'missing'}")
         if not bootstrap:
             plan = WorkerCredentialPlan(
                 profile=normalized_profile,
@@ -1162,9 +1170,6 @@ def resolve_worker_credentials(
             )
             _log_preflight(plan, run_id)
             return plan
-
-    if "bws_bootstrap" in capabilities:
-        handoff[BWS_BOOTSTRAP_HANDOFF_ENV] = bootstrap
 
     if needs_bitwarden:
         if not isinstance(source_config, dict) or not source_config.get("enabled"):
@@ -1384,11 +1389,6 @@ def build_worker_environment(
     for key, value in plan._handoff:
         env[key] = value
     env[MANIFEST_DIGEST_ENV] = plan.manifest_digest
-    if "bws_bootstrap" in plan.capabilities:
-        for key, value in plan._handoff:
-            if key == BWS_BOOTSTRAP_HANDOFF_ENV:
-                env[BWS_BOOTSTRAP_ENV] = value
-                break
     return env
 
 

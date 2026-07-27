@@ -246,12 +246,16 @@ def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     assert TOKEN not in caplog.text
 
 
-def test_bws_bootstrap_worker_terminal_gets_bws_access_token(tmp_path, monkeypatch):
-    """The transitional bws_bootstrap grant reaches worker subprocesses.
+def test_marketing_worker_terminal_never_gets_the_vault_access_token(
+    tmp_path, monkeypatch
+):
+    """BUILD-601 inverted this test: the vault token must NOT reach the terminal.
 
-    Regression for the marketing-operator break: its skill shells out to the
-    ``bws`` CLI, which needs BWS_ACCESS_TOKEN in the terminal env. The value
-    must be the contract-delivered handoff, not any ambient copy.
+    It used to assert the opposite -- ``bws_bootstrap`` deliberately projected
+    BWS_ACCESS_TOKEN so the marketing skill could shell out to the ``bws`` CLI.
+    That grant is retired and the skill reads projected values instead, so the
+    terminal must now be free of the vault key by every route: an ambient copy,
+    and a stale private handoff of the shape the old grant delivered.
     """
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -259,25 +263,26 @@ def test_bws_bootstrap_worker_terminal_gets_bws_access_token(tmp_path, monkeypat
         "version: 1\n"
         "profiles:\n"
         "  marketing-operator:\n"
-        "    actions: [bws_bootstrap]\n"
+        "    actions: [meta_marketing_read, instagram_graph_read, posthog_read]\n"
         "  releaser:\n"
         "    actions: [github_write]\n",
         encoding="utf-8",
     )
-    delivered = "worker-bws-token-never-log"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("HERMES_PROFILE", "marketing-operator")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-bws-terminal")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
     monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(hermes_home).digest)
-    monkeypatch.setenv(wc.BWS_BOOTSTRAP_HANDOFF_ENV, delivered)
-    # An ambient BWS token must be stripped and replaced by the delivered one.
+    monkeypatch.setenv(wc.BWS_BOOTSTRAP_HANDOFF_ENV, "stale-handoff-must-not-survive")
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "ambient-bws-must-not-survive")
     wc.reset_worker_credential_context_for_tests()
     try:
         run_env = local._make_run_env({"PATH": "/usr/bin:/bin"})
-        assert run_env.get("BWS_ACCESS_TOKEN") == delivered
-        # bws_bootstrap does NOT carry github_write: no GH_TOKEN.
+        assert "BWS_ACCESS_TOKEN" not in run_env
+        assert wc.BWS_BOOTSTRAP_HANDOFF_ENV not in run_env
+        assert "ambient-bws-must-not-survive" not in run_env.values()
+        assert "stale-handoff-must-not-survive" not in run_env.values()
+        # These grants do NOT carry github_write: no GH_TOKEN.
         assert "GH_TOKEN" not in run_env
     finally:
         wc.cleanup_worker_terminal_artifacts()

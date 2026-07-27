@@ -346,24 +346,20 @@ def _worker_vault_pull_is_ungranted() -> bool:
     A dispatcher worker is identified by ``HERMES_KANBAN_TASK``, which the
     dispatcher sets before the process starts. Nothing else is affected: the
     controller, cron agents, and interactive CLI runs have no task id and pull
-    exactly as before. ``bws_bootstrap`` is the existing manifest capability
-    for a full-process vault grant, so a worker that legitimately needs one
-    already has an enumerable, revocable way to say so.
+    exactly as before.
 
-    Fails closed: a worker that cannot name its profile, or whose manifest
-    cannot be read, gets nothing.
+    Since BUILD-601 this is unconditional for workers. It used to exempt a
+    profile granted ``bws_bootstrap``, the one manifest capability that handed
+    a worker the whole vault token; retiring that grant removed the only
+    legitimate reason for a worker to pull, so there is no exemption left to
+    check. A worker now receives resolved values through its private handoff
+    and the terminal projection, never a vault key it could re-pull with.
+
+    Deliberately does NOT consult the manifest: an exemption that no capability
+    can produce would be dead code that reads like a live escape hatch, and
+    re-adding one must be a deliberate edit here rather than a YAML grant.
     """
-    if not str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
-        return False
-    profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
-    if not profile:
-        return True
-    try:
-        from hermes_cli.worker_credentials import load_manifest
-
-        return "bws_bootstrap" not in load_manifest().actions_for(profile)
-    except Exception:  # noqa: BLE001 — an unreadable manifest grants nothing
-        return True
+    return bool(str(os.environ.get("HERMES_KANBAN_TASK") or "").strip())
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
