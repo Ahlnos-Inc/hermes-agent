@@ -387,6 +387,23 @@ def fetch_bitwarden_secrets(
 
     cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
     if use_cache:
+        # Deleting the disk cache is the ONLY channel an operator has for
+        # "re-pull now" against a long-running process (the gateway), so treat
+        # its absence as an explicit invalidation and drop the in-process entry
+        # too. Otherwise L1 keeps serving the old value for up to
+        # cache_ttl_seconds and the deletion looks like it did nothing — which
+        # is exactly what happened during the 2026-07-27 BUILD-357 cutover
+        # (BUILD-816): the file was moved aside, a fresh process resolved the
+        # new value, and the running gateway kept using the old one.
+        #
+        # Cost when the file genuinely can't be written: one `bws secret list`
+        # (~380ms) per fetch instead of a cached read. Correct-but-slower is
+        # the right side to fail on for a value someone just changed.
+        try:
+            if not _DISK_CACHE.path(home_path).exists():
+                _CACHE.pop(cache_key, None)
+        except Exception:  # noqa: BLE001 — cache probing must never raise
+            pass
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, []
