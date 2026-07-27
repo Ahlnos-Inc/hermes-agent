@@ -2680,6 +2680,51 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _reload_job_env() -> None:
+    """Re-read .env / config.yaml and re-resolve vault-backed secrets.
+
+    Called once at the top of every ``run_job``, before the no_agent
+    short-circuit.  It used to live inside the agent path only, below that
+    short-circuit — which meant script jobs (58 of the 63 jobs on the
+    reference box, including both money-path crons) never reloaded anything,
+    and a changed Bitwarden value reached a running cron ONLY after a gateway
+    restart.  That cost ~50 minutes of Interac auto-reconciliation downtime on
+    2026-07-27 (BUILD-816): the record was created, a fresh process resolved it
+    correctly, and four consecutive no_agent cycles kept using the value the
+    gateway had started with.
+
+    Route through ``load_hermes_dotenv`` (not a bare ``load_dotenv``) and reset
+    the secret-source cache first: startup already applied external secrets and
+    recorded this HERMES_HOME in ``_APPLIED_HOMES``, so a naive reload would
+    re-apply only the .env placeholder and never re-resolve a Bitwarden/BSM-
+    backed secret — leaving cron jobs 401'ing on the placeholder (#33465).  The
+    resolved secret overrides an existing value only when
+    ``secrets.<source>.override_existing`` is set (mirrors startup).
+    ``load_hermes_dotenv`` also handles the utf-8/latin-1 fallback internally.
+
+    Latency is NOT zero, and the old comment here claiming changes "take effect
+    without a gateway restart" was wrong as written.  ``reset_secret_source_cache()``
+    clears only the applied-homes bookkeeping, not the vault VALUE cache, which
+    is governed by ``secrets.<source>.cache_ttl_seconds`` (300s by default).  So
+    a value changed at the source becomes visible to jobs within one TTL plus
+    one tick.  Restart the gateway when it must be immediate.
+
+    Best-effort: a broken .env or an unreachable vault must not stop the job
+    from running — that would turn a config typo into a total cron outage.
+    ``load_hermes_dotenv`` already swallows secret-source failures internally;
+    this guard covers the rest.
+    """
+    try:
+        from hermes_cli.env_loader import (
+            load_hermes_dotenv,
+            reset_secret_source_cache,
+        )
+        reset_secret_source_cache()
+        load_hermes_dotenv(hermes_home=_get_hermes_home())
+    except Exception as exc:  # noqa: BLE001 — never block a job on env reload
+        logger.warning("Cron env reload failed (using current env): %s", exc)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2701,6 +2746,10 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    # Refresh .env / config.yaml / vault secrets BEFORE any branch below, so
+    # a config change reaches every job kind and not just agent jobs.
+    _reload_job_env()
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3029,24 +3078,8 @@ def run_job(
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
-        # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart. Route through
-        # load_hermes_dotenv (not a bare load_dotenv) and reset the secret-
-        # source cache first: startup already applied external secrets and
-        # recorded this HERMES_HOME in _APPLIED_HOMES, so a naive reload would
-        # re-apply only the .env placeholder and never re-resolve a Bitwarden/
-        # BSM-backed secret — leaving cron jobs 401'ing on the placeholder
-        # (#33465). Clearing the cache forces the re-pull; the resolved secret
-        # overrides the placeholder only when secrets.bitwarden.override_existing
-        # is set (mirrors startup), and the Bitwarden value-cache keeps the
-        # forced re-pull off the network. load_hermes_dotenv also handles the
-        # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        # The env reload used to live here; it now runs at the top of run_job
+        # so no_agent script jobs get it too (BUILD-816).
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
