@@ -2680,6 +2680,18 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+# Serializes the per-job env reload. Due jobs run on a ThreadPoolExecutor with
+# no worker cap by default (``cron.max_parallel_jobs`` / HERMES_CRON_MAX_PARALLEL
+# are both unset on the reference box), so several ``run_job`` calls can be in
+# ``_reload_job_env`` at the same tick.  Without this lock the reload is not
+# merely redundant, it is WRONG: ``_apply_external_secret_sources`` records the
+# HERMES_HOME in ``_APPLIED_HOMES`` BEFORE it applies anything, so a second job
+# entering while the first is mid-apply sees the home as already-applied,
+# returns immediately, and runs its script against a half-written environment.
+# Holding this across reset+load means a waiter always observes a settled env.
+_env_reload_lock = threading.Lock()
+
+
 def _reload_job_env() -> None:
     """Re-read .env / config.yaml and re-resolve vault-backed secrets.
 
@@ -2709,6 +2721,12 @@ def _reload_job_env() -> None:
     a value changed at the source becomes visible to jobs within one TTL plus
     one tick.  Restart the gateway when it must be immediate.
 
+    That same value cache is what keeps this affordable now that every job
+    reloads rather than the handful of agent jobs: the cache is process-global
+    and keyed by (token, project, server), so vault traffic is bounded by one
+    ``bws secret list`` per TTL — ~12/hour at the 300s default — no matter how
+    many jobs fire.  Reload frequency and pull frequency are not the same knob.
+
     Best-effort: a broken .env or an unreachable vault must not stop the job
     from running — that would turn a config typo into a total cron outage.
     ``load_hermes_dotenv`` already swallows secret-source failures internally;
@@ -2719,8 +2737,9 @@ def _reload_job_env() -> None:
             load_hermes_dotenv,
             reset_secret_source_cache,
         )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        with _env_reload_lock:
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
     except Exception as exc:  # noqa: BLE001 — never block a job on env reload
         logger.warning("Cron env reload failed (using current env): %s", exc)
 

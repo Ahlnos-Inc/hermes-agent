@@ -423,3 +423,45 @@ def test_run_job_no_agent_survives_a_broken_env_reload(hermes_env, monkeypatch):
 
     assert success is True, error
     assert "ran anyway" in final_response
+
+
+def test_reload_job_env_serializes_concurrent_jobs(hermes_env, monkeypatch):
+    """Two jobs firing on the same tick must not interleave their reloads.
+
+    Due jobs run on a ThreadPoolExecutor with no worker cap by default, and
+    ``_apply_external_secret_sources`` marks the HERMES_HOME as applied BEFORE
+    it applies anything.  Unserialized, the second job sees "already applied",
+    returns early, and runs its script against a half-written environment.
+    """
+    import threading
+
+    import cron.scheduler as scheduler
+    import hermes_cli.env_loader as env_loader
+
+    inside = threading.Event()
+    overlapped: list[bool] = []
+    active = 0
+    active_guard = threading.Lock()
+
+    def slow_load(**kwargs):
+        nonlocal active
+        with active_guard:
+            active += 1
+            overlapped.append(active > 1)
+        inside.set()
+        # Long enough that an unlocked second caller would land here too.
+        threading.Event().wait(0.05)
+        with active_guard:
+            active -= 1
+        return []
+
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", slow_load)
+
+    threads = [threading.Thread(target=scheduler._reload_job_env) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert inside.is_set(), "the reload never ran"
+    assert not any(overlapped), "two jobs were inside the env reload at once"
