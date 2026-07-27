@@ -24,14 +24,14 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _architect_context() -> "kb.MutationContext":
+def _architect_context(mode: str = "enforce") -> "kb.MutationContext":
     return kb.MutationContext(
         board_key="default",
         principal="orchestrator-session",
         actor_type="orchestrator_agent",
         session_id="session-1",
         request_scope_id="turn-1",
-        mode="enforce",
+        mode=mode,
         phase="architecture",
     )
 
@@ -284,12 +284,12 @@ def _human_context(*, surface: str = "cli") -> "kb.MutationContext":
     )
 
 
-def _awaiting_human_approval(conn) -> "kb.ArchitectureGate":
+def _awaiting_human_approval(conn, mode: str = "enforce") -> "kb.ArchitectureGate":
     architect = kb.create_task(
         conn,
         title="Design workflow",
         assignee="architect",
-        mutation_context=_architect_context(),
+        mutation_context=_architect_context(mode),
     )
     claimed = kb.claim_task(conn, architect)
     assert claimed is not None and claimed.current_run_id is not None
@@ -1197,3 +1197,287 @@ def test_gate_approval_refused_from_a_live_worker_session_without_the_env_marker
         assert kb.approve_architecture_gate(
             conn, gate.gate_id, _human_context(), digest,
         ).state == "human_approved"
+
+
+# ---------------------------------------------------------------------------
+# BUILD-818 — the two paths a shadow soak cannot exercise
+#
+# `_link_tasks_in_txn` is the one deliberate exception to "no MutationContext
+# => no gate evaluation": a context-less caller is *refused* on a gated
+# subtree.  It cannot fire in `shadow`, because `enforcement_mode` is stamped
+# on the gate row when the gate opens and shadow rows are not in
+# ARCHITECTURE_GATE_ENFORCING_MODES.  So the BUILD-382 flip is the first
+# production execution of every assertion below.
+# ---------------------------------------------------------------------------
+
+
+def _gated_subtree(conn, mode: str = "orchestrator_only", scope: str = "turn-1"):
+    """An architect card with a live gate plus one card below it.
+
+    The descendant is wired with raw SQL on purpose: `create_task(parents=…)`
+    is itself gate-checked, so building the fixture through it would test the
+    create path rather than the link path.
+
+    `scope` must differ between two gates in one test: an architecture-phase
+    create inside an existing (board_key, principal, request_scope_id) scope
+    returns that gate's architect card rather than opening a second gate.
+    """
+    context = kb.MutationContext(
+        **{**_architect_context(mode).__dict__, "request_scope_id": scope}
+    )
+    architect = kb.create_task(
+        conn,
+        title="Design workflow",
+        assignee="architect",
+        mutation_context=context,
+    )
+    gate = kb.get_architecture_gate_for_task(conn, architect)
+    assert gate is not None and gate.enforcement_mode == mode
+    descendant = kb.create_task(conn, title="already under the gate", assignee="coder")
+    conn.execute(
+        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (architect, descendant),
+    )
+    return architect, descendant, gate
+
+
+def _counts(conn) -> tuple[int, int]:
+    return (
+        conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+    )
+
+
+def test_context_less_link_into_a_gated_subtree_is_refused_under_orchestrator_only(
+    kanban_home,
+):
+    """The decision is: refuse, in both directions, through the ancestry walk.
+
+    A caller that cannot present a `MutationContext` cannot prove it is the
+    front door, and a link is the one mutation that attaches arbitrary
+    existing work to a gated subtree without creating anything.  Fail closed.
+    """
+    with kb.connect() as conn:
+        architect, descendant, _gate = _gated_subtree(conn)
+        outsider = kb.create_task(conn, title="unrelated work", assignee="coder")
+        links_before, events_before = _counts(conn)
+
+        # gated task as parent
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.link_tasks(conn, architect, outsider)
+        # gated task as child — the lookup checks both endpoints
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.link_tasks(conn, outsider, architect)
+        # a descendant of the gated card resolves the same gate by ancestry
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.link_tasks(conn, descendant, outsider)
+
+        # Nothing was written, and — measured, not assumed — the refusal
+        # leaves no audit trail: the caller owns the write_txn, so an audit
+        # row appended before the raise would roll back with it.  During the
+        # flip window a denial is visible at the calling surface only.
+        assert _counts(conn) == (links_before, events_before)
+
+        # An ungated pair is untouched.
+        kb.link_tasks(conn, outsider, kb.create_task(conn, title="sibling", assignee="coder"))
+
+
+def test_a_shadow_gate_cannot_exercise_the_context_less_link_refusal(kanban_home):
+    """Why a clean shadow soak says nothing about the path above.
+
+    `enforcement_mode` is written once, at gate creation, from the mode in
+    force at that moment, and no code path updates it.  A gate opened while
+    the policy said `shadow` therefore never enforces — not after the flip,
+    not ever — and a shadow soak cannot produce the denial.
+    """
+    with kb.connect() as conn:
+        architect, descendant, gate = _gated_subtree(conn, mode="shadow")
+        outsider = kb.create_task(conn, title="unrelated work", assignee="coder")
+        _links_before, events_before = _counts(conn)
+
+        kb.link_tasks(conn, architect, outsider)
+        kb.link_tasks(conn, descendant, outsider)
+
+        # set(): parent_ids orders by the random task id, not insertion order.
+        assert set(kb.parent_ids(conn, outsider)) == {architect, descendant}
+        # The shadow *audit* is also silent here: `create_allowed` is only
+        # written on the context-carrying branch.
+        assert _counts(conn)[1] == events_before + 2  # two `linked` events, no audit
+        assert not [
+            event
+            for event in kb.list_events(conn, architect)
+            if event.kind == "create_allowed"
+        ]
+
+        # The sibling fail-closed rule on the create path is mode-gated the
+        # same way: a context-less create with a gated parent is permitted
+        # under shadow and refused under `orchestrator_only`.
+        child = kb.create_task(
+            conn, title="context-less child", assignee="coder", parents=[architect],
+        )
+        assert kb.parent_ids(conn, child) == [architect]
+
+        # Opening an enforcing gate elsewhere on the same board does not
+        # retroactively arm the shadow row.
+        _gated_subtree(conn, mode="orchestrator_only", scope="turn-2")
+        assert kb.get_architecture_gate(conn, gate.gate_id).enforcement_mode == "shadow"
+        kb.link_tasks(conn, architect, kb.create_task(conn, title="still fine", assignee="coder"))
+
+
+def test_a_shadow_gate_allows_a_context_less_link_even_after_graph_issuance(kanban_home):
+    """The second half of "shadow proves nothing here".
+
+    Both refusals on the context-less branch are mode-gated, not just the
+    open-gate one: a shadow gate whose graph has already been issued still
+    permits the link that `orchestrator_only` refuses as
+    `architecture_graph_issued`.
+    """
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn, title="Design workflow", assignee="architect",
+            mutation_context=_architect_context("shadow"),
+        )
+        claimed = kb.claim_task(conn, architect)
+        assert kb.complete_task(
+            conn, architect,
+            metadata={**_formal_handoff(), "human_approval_required": True},
+            expected_run_id=claimed.current_run_id,
+        )
+        # Under `shadow` completion leaves the gate `open`; acceptance is what
+        # moves it on. Under `enforce` completion moves it directly.
+        gate = kb.accept_architecture_handoff(
+            conn, kb.get_architecture_gate_for_task(conn, architect).gate_id,
+        )
+        assert gate.state == "validated_awaiting_approval"
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        issued = kb.issue_architecture_graph(
+            conn,
+            approved.gate_id,
+            kb.MutationContext(
+                board_key="default", principal="orchestrator-session",
+                actor_type="orchestrator_agent", session_id="session-1",
+                request_scope_id="turn-1", gate_id=approved.gate_id,
+                profile="orchestrator", mode="shadow", phase="graph_issuance",
+            ),
+            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            idempotency_key="issued-shadow-graph",
+        )
+        outsider = kb.create_task(conn, title="late addition", assignee="coder")
+
+        kb.link_tasks(conn, issued[0], outsider)
+
+        assert kb.parent_ids(conn, outsider) == [issued[0]]
+
+        # And the general contract behind it: `shadow` never denies. The same
+        # protected, context-carrying create that `orchestrator_only` refuses
+        # is permitted here — only the audit row records the would-deny.
+        permitted = kb.create_task(
+            conn,
+            title="protected work",
+            assignee="coder",
+            mutation_context=kb.MutationContext(
+                **{**_architect_context("shadow").__dict__, "phase": "implementation"}
+            ),
+        )
+        assert kb.get_task(conn, permitted) is not None
+
+
+def test_dispatcher_worker_kanban_link_is_refused_under_orchestrator_only(
+    kanban_home, monkeypatch,
+):
+    """BUILD-818 AC2, at the real surface.
+
+    `kanban_link` builds no `MutationContext` for anyone — not for a worker
+    and not for the front door — so every call it makes lands on the
+    context-less branch.  A dispatcher worker attaching its own follow-up work
+    to a gated subtree is therefore refused.
+    """
+    with kb.connect() as conn:
+        architect, descendant, _gate = _gated_subtree(conn)
+        follow_up = kb.create_task(conn, title="worker follow-up", assignee="coder")
+        links_before, _events_before = _counts(conn)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", descendant)
+    monkeypatch.setenv("HERMES_PROFILE", "coder")
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_link({"parent_id": descendant, "child_id": follow_up})
+    )
+    assert result["error"].endswith("architecture_gate_open")
+
+    with kb.connect() as conn:
+        assert _counts(conn)[0] == links_before
+        assert kb.parent_ids(conn, follow_up) == []
+
+
+def test_context_less_link_after_graph_issuance_is_refused_as_issued(kanban_home):
+    """The second context-less refusal: an issued graph is closed to edits."""
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn, mode="orchestrator_only")
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        issued = kb.issue_architecture_graph(
+            conn,
+            approved.gate_id,
+            kb.MutationContext(
+                board_key="default", principal="orchestrator-session",
+                actor_type="orchestrator_agent", session_id="session-1",
+                request_scope_id="turn-1", gate_id=approved.gate_id,
+                profile="orchestrator", mode="orchestrator_only",
+                phase="graph_issuance",
+            ),
+            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            idempotency_key="issued-link-graph",
+        )
+        outsider = kb.create_task(conn, title="late addition", assignee="coder")
+        links_before, _events_before = _counts(conn)
+
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_graph_issued"):
+            kb.link_tasks(conn, issued[0], outsider)
+
+        assert _counts(conn)[0] == links_before
+
+
+def test_vault_doc_impact_rewire_survives_a_gate_refusal_without_orphaning(kanban_home):
+    """The rewire adds before it removes, so a refused link changes nothing.
+
+    `_rewire_parents_to_gate` used to delete every parent edge of the
+    finalizer first.  A refusal on the following link — which an enforcing
+    architecture gate produces for this context-less caller — left the
+    finalizer with no parents at all.  Nothing would have reported it:
+    `ArchitectureGateError` subclasses `ValueError`, so the rewire's own
+    `except ValueError` swallows it, and `kanban_create` swallows whatever
+    escapes at debug level.
+    """
+    from hermes_cli import kanban_vault_doc_impact as vdi
+
+    with kb.connect() as conn:
+        upstream = kb.create_task(conn, title="upstream", assignee="coder")
+        finalizer = kb.create_task(
+            conn, title="finalizer", assignee="reviewer", parents=[upstream],
+        )
+        curator = kb.create_task(conn, title="doc impact", assignee="vault-v2-curator")
+
+        calls: list[tuple[str, str]] = []
+        real_link = kb.link_tasks
+
+        def refusing_link(conn_, parent_id, child_id, **kw):
+            calls.append((parent_id, child_id))
+            if child_id == finalizer:
+                raise kb.ArchitectureGateError("architecture_gate_open")
+            return real_link(conn_, parent_id, child_id, **kw)
+
+        vdi.kb.link_tasks = refusing_link
+        try:
+            vdi._rewire_parents_to_gate(conn, kb.get_task(conn, finalizer), curator)
+        finally:
+            vdi.kb.link_tasks = real_link
+
+        # The finalizer keeps its original parent: the refusal happened before
+        # anything was removed.  With the old unlink-first order this is [].
+        assert kb.parent_ids(conn, finalizer) == [upstream]
+        assert (curator, finalizer) in calls

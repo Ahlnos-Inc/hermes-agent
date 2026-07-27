@@ -392,11 +392,16 @@ def _rewire_parents_to_gate(
     if current_parents == [gate_id]:
         return
 
-    # 1. Remove all current parents from the finalizer.
-    for pid in list(current_parents):
-        kb.unlink_tasks(conn, pid, finalizer.id)
+    # Link before unlink. Each call commits its own transaction, so an
+    # unlink-first order destroys the finalizer's whole parent set before the
+    # new wiring is attempted, and any refusal in between leaves it orphaned
+    # with no error the caller sees (kanban_create swallows this at debug).
+    # An enforcing architecture gate refuses context-less links on a gated
+    # subtree (BUILD-818), which makes that a live failure mode rather than a
+    # theoretical one. Doing the additions first means a refusal changes
+    # nothing.
 
-    # 2. Move original parents to the gate (if not already there).
+    # 1. Move original parents to the gate (if not already there).
     for pid in current_parents:
         if pid != gate_id and pid not in gate_current:
             try:
@@ -404,11 +409,22 @@ def _rewire_parents_to_gate(
             except ValueError:
                 pass  # already linked or self-link
 
-    # 3. Link gate → finalizer.
+    # 2. Link gate → finalizer.
     try:
         kb.link_tasks(conn, gate_id, finalizer.id)
     except ValueError:
-        pass  # already linked
+        pass  # already linked, or refused by an architecture gate
+
+    # 3. Remove the superseded direct parents from the finalizer — but only
+    #    once the gate edge actually exists. `ArchitectureGateError` subclasses
+    #    `ValueError`, so a gate refusal above is swallowed silently; unlinking
+    #    regardless would leave the finalizer with no parents at all. Skip
+    #    gate_id itself: that is the edge step 2 established.
+    if gate_id not in kb.parent_ids(conn, finalizer.id):
+        return
+    for pid in list(current_parents):
+        if pid != gate_id:
+            kb.unlink_tasks(conn, pid, finalizer.id)
 
 
 def _record_event(

@@ -8733,6 +8733,26 @@ def _link_tasks_in_txn(
         if gate is not None and mutation_context.mode.strip().lower() == "shadow":
             _append_gate_audit(conn, gate, "create_allowed", ARCHITECTURE_GATE_REASON_OPEN)
     elif gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
+        # Deliberate exception to "no MutationContext => no gate evaluation"
+        # (BUILD-818). Everywhere else a context-less caller is simply not
+        # evaluated; here it is refused, because a link is the one mutation
+        # that can attach arbitrary existing work to a gated subtree without
+        # creating anything, and a caller that cannot present a context cannot
+        # prove it is the front door. Fail closed.
+        #
+        # The context-less production callers are the ``kanban_link`` tool
+        # (which plumbs no context for anyone, front door included), the
+        # ``kanban link`` CLI, the dashboard link endpoint, and the vault
+        # doc-impact rewire. After the flip all four are refused inside a
+        # gated subtree; that is the intended blast radius, and it is bounded
+        # because ``enforcement_mode`` is stamped on the gate row at creation
+        # and never updated, so gates opened while the policy said ``shadow``
+        # stay non-enforcing forever.
+        #
+        # NOTE: this refusal writes no audit row. The caller owns the
+        # ``write_txn``, so anything appended here is rolled back with the
+        # raise. Denials are observable at the calling surface (the tool/CLI
+        # error carries the reason), never in ``task_events``.
         if _gate_requires_enforcement(gate):
             raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
         if conn.execute(
