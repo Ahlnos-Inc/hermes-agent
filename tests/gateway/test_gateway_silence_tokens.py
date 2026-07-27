@@ -61,6 +61,11 @@ def _runner(monkeypatch, tmp_path):
         platform=Platform.TELEGRAM,
         chat_type="group",
     )
+    # `async_session_store` rebinds its facade to whatever `session_store`
+    # currently is, so a bare MagicMock makes the redelivery guard's
+    # `has_platform_message_id` return a truthy Mock and every *new* message is
+    # dropped as "already persisted". These events are first deliveries.
+    runner.session_store.has_platform_message_id.return_value = False
     runner.session_store.load_transcript.return_value = []
     runner.session_store.append_to_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()

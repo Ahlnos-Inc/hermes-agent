@@ -67,10 +67,15 @@ def _session_id_assignments_followed_by_save(source: str) -> list[tuple[int, boo
             for i, stmt in enumerate(body):
                 if self._is_session_id_assign(stmt):
                     results.append((stmt.lineno, self._block_has_save_after(body, i)))
-                for child in ast.iter_child_nodes(stmt):
-                    if isinstance(child, (ast.If, ast.For, ast.While, ast.With,
-                                          ast.Try, ast.AsyncWith, ast.AsyncFor)):
-                        self._walk_node(child)
+                # Recurse into the compound statement ITSELF, not into its
+                # compound grandchildren. Descending only to grandchildren
+                # skipped every assignment sitting directly in an `if`/`try`
+                # body, so the walker silently found nothing once the two real
+                # sites moved one level in — and a guard that finds nothing
+                # passes vacuously (BUILD-666).
+                if isinstance(stmt, (ast.If, ast.For, ast.While, ast.With,
+                                     ast.Try, ast.AsyncWith, ast.AsyncFor)):
+                    self._walk_node(stmt)
 
         def _walk_node(self, node: ast.AST) -> None:
             for attr in ("body", "orelse", "finalbody"):

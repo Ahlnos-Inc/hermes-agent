@@ -94,6 +94,10 @@ def _make_runner(session_db=None):
         chat_type="dm",
         origin=source,
     )
+    # A bare MagicMock session_store makes the redelivery guard's
+    # `has_platform_message_id` return a truthy Mock, so every *new*
+    # message is dropped as "already persisted" (BUILD-666).
+    runner.session_store.has_platform_message_id.return_value = False
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.append_to_transcript = MagicMock()
