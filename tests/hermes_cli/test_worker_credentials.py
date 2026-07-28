@@ -1575,3 +1575,80 @@ def test_release_target_owner_and_repo_come_from_one_probe(tmp_path, monkeypatch
     owner, slug = wc.github_release_target_for_workspace(repo)
     assert (owner, slug) == ("Ahlnos-Inc", "Ahlnos-Inc/hermes-config")
     assert len(calls) == 1, calls
+
+
+def test_recorded_release_target_must_agree_with_the_workspace_remote(tmp_path, monkeypatch):
+    """BUILD-795 AC2: the row's target and the workspace's push url must agree.
+
+    The workspace's `.git/config` is writable by every worker that ran in that
+    worktree; the task row is not. When they disagree the preflight refuses
+    before a token is selected, and it fails CLOSED — a recorded target with
+    no resolvable workspace repository is a mismatch, not a pass.
+    """
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc, "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]: SENTINEL}
+        ),
+    )
+
+    def resolve(**over):
+        kwargs = {
+            "root": tmp_path,
+            "github_owner": RELEASE_OWNER,
+            "github_repo": "Ahlnos-Inc/aldnoah",
+            "expected_github_repo": "Ahlnos-Inc/aldnoah",
+        }
+        kwargs.update(over)
+        return wc.resolve_worker_credentials("releaser", **kwargs)
+
+    agreed = resolve()
+    assert agreed.ok, agreed.error
+    assert dict(agreed._handoff)[wc.GITHUB_WRITE_HANDOFF_ENV] == SENTINEL
+
+    # A remote rewritten to another repository of the SAME owner — the case an
+    # owner-scoped token cannot catch on its own.
+    steered = resolve(github_repo="Ahlnos-Inc/hermes-agent")
+    assert not steered.ok
+    assert "records release target" in (steered.error or "")
+    assert "github_write=target_mismatch" in steered.diagnostics
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in dict(steered._handoff)
+    assert SENTINEL not in repr(steered)
+    assert SENTINEL not in (steered.error or "")
+
+    # Fail closed: the workspace yielded no github.com repository at all.
+    blanked = resolve(github_repo=None, github_owner=None)
+    assert not blanked.ok
+    assert "github_write=target_mismatch" in blanked.diagnostics
+
+    # Slug comparison is case-insensitive, as GitHub owners/repos are.
+    assert resolve(github_repo="ahlnos-inc/AlDnOaH").ok
+
+    # A card with no recorded target keeps working exactly as before (AC4).
+    legacy = resolve(expected_github_repo=None, github_repo="Ahlnos-Inc/hermes-agent")
+    assert legacy.ok, legacy.error
+
+
+def test_a_denied_repository_is_refused_before_the_target_check(tmp_path, monkeypatch):
+    """Denial must not be reportable as a mere target disagreement."""
+    _github_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    _write_denied_repos(tmp_path, "releaser", {"Ahlnos-Inc/hermes-config": "abandoned"})
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc, "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_WRITE_RESOLVE_KEYS["ahlnos-inc"]: SENTINEL}
+        ),
+    )
+    plan = wc.resolve_worker_credentials(
+        "releaser", root=tmp_path, github_owner=RELEASE_OWNER,
+        github_repo="Ahlnos-Inc/hermes-config",
+        expected_github_repo="Ahlnos-Inc/aldnoah",
+    )
+    assert not plan.ok
+    assert "github_write=denied_repo" in plan.diagnostics
+    assert "github_write=target_mismatch" not in plan.diagnostics

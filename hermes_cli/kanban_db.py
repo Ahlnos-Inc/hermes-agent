@@ -1096,6 +1096,7 @@ class _PreparedTaskCreate:
     publication_expected_sha: Optional[str]
     publication_remote: Optional[str]
     publication_ref: Optional[str]
+    publication_repo: Optional[str] = None
     project_obj: Any = None
     project_repo: Optional[str] = None
     # BUILD-655: normalised source-ref declaration, JSON-encoded. Validation
@@ -1269,6 +1270,7 @@ class Task:
     publication_expected_sha: Optional[str] = None
     publication_remote: Optional[str] = None
     publication_ref: Optional[str] = None
+    publication_repo: Optional[str] = None
     # Worktree lifecycle ownership. ``True`` means Hermes created the linked
     # worktree for this task; a pre-existing checkout is borrowed and is never
     # removed automatically.
@@ -1407,6 +1409,9 @@ class Task:
             ),
             publication_remote=(
                 row["publication_remote"] if "publication_remote" in keys else None
+            ),
+            publication_repo=(
+                row["publication_repo"] if "publication_repo" in keys else None
             ),
             publication_ref=(
                 row["publication_ref"] if "publication_ref" in keys else None
@@ -1972,6 +1977,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     publication_expected_sha TEXT,
     publication_remote    TEXT,
     publication_ref       TEXT,
+    -- BUILD-795: the ``owner/repo`` this task is allowed to publish to,
+    -- recorded at create time and never updated. The credential preflight
+    -- refuses a github_write token when the workspace's own push url
+    -- disagrees with it -- the workspace's .git/config is writable by every
+    -- worker that ran in that worktree, this column is not.
+    publication_repo      TEXT,
     -- BUILD-655: JSON array of source-ref declarations. Each entry is a dict:
     -- {ref, task_id, filename|attachment_id, sha256 (optional but recommended)}.
     -- The dispatcher resolves these and materializes the attachments into the
@@ -3887,6 +3898,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "publication_remote" not in cols:
         _add_column_if_missing(
             conn, "tasks", "publication_remote", "publication_remote TEXT"
+        )
+    if "publication_repo" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "publication_repo", "publication_repo TEXT"
         )
     if "publication_ref" not in cols:
         _add_column_if_missing(
@@ -6865,6 +6880,7 @@ def _prepare_task_create(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
     publication_expected_sha: Optional[str] = None,
+    publication_repo: Optional[str] = None,
     publication_remote: Optional[str] = None,
     publication_ref: Optional[str] = None,
     board: Optional[str] = None,
@@ -6978,6 +6994,18 @@ def _prepare_task_create(
         publication_expected_sha = None
         publication_remote = None
         publication_ref = None
+
+    # BUILD-795: the release target is deliberately INDEPENDENT of the
+    # publication triple. It is recorded on the coder card at create time and
+    # inherited by the publication card the worker later requests, so the row
+    # states the intended repository before any worker has touched the
+    # workspace it will be checked against. Cards created without one keep
+    # working exactly as before — this is a binding, not a requirement.
+    publication_repo = str(publication_repo or "").strip() or None
+    if publication_repo is not None and not re.fullmatch(
+        r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", publication_repo
+    ):
+        raise ValueError("publication_repo must be an 'owner/repo' GitHub slug")
 
     parents = tuple(p for p in parents if p)
 
@@ -7117,6 +7145,7 @@ def _prepare_task_create(
         publication_expected_sha=publication_expected_sha,
         publication_remote=publication_remote,
         publication_ref=publication_ref,
+        publication_repo=publication_repo,
         project_obj=project_obj,
         project_repo=project_repo,
         source_refs_json=_source_refs_json,
@@ -7212,12 +7241,12 @@ def _insert_task_in_txn(
             model_reasoning_effort, max_retries, goal_mode, goal_max_turns,
             session_id, workflow_key, workflow_template_id, current_step_key,
             publication_expected_sha, publication_remote, publication_ref,
-            source_refs_json
+            publication_repo, source_refs_json
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?
+            ?, ?
         )
         """,
         (
@@ -7251,6 +7280,7 @@ def _insert_task_in_txn(
             prepared.publication_expected_sha,
             prepared.publication_remote,
             prepared.publication_ref,
+            prepared.publication_repo,
             prepared.source_refs_json,
         ),
     )
@@ -7319,6 +7349,7 @@ def create_task(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
     publication_expected_sha: Optional[str] = None,
+    publication_repo: Optional[str] = None,
     publication_remote: Optional[str] = None,
     publication_ref: Optional[str] = None,
     board: Optional[str] = None,
@@ -7376,6 +7407,7 @@ def create_task(
         publication_expected_sha=publication_expected_sha,
         publication_remote=publication_remote,
         publication_ref=publication_ref,
+        publication_repo=publication_repo,
         board=board,
         project_id=project_id,
     )
@@ -8480,6 +8512,14 @@ def request_publication_handoff(
                 f"Workspace: {path}\n"
                 f"Remote ref: {publication.remote or 'origin'} {ref}"
             )
+        # BUILD-795: the release target is inherited from the REQUESTER'S row,
+        # never from the requesting worker's payload. The worker names the
+        # workspace, the remote and the sha; if it could also name the
+        # repository the card is checked against, the check would be checking
+        # the worker against itself.
+        requester_row = conn_in.execute(
+            "SELECT publication_repo FROM tasks WHERE id = ?", (requester_task_id,),
+        ).fetchone()
         prepared = _prepare_task_create(
             title=title,
             body=body,
@@ -8490,6 +8530,9 @@ def request_publication_handoff(
             publication_expected_sha=expected,
             publication_remote=publication.remote or "origin",
             publication_ref=ref,
+            publication_repo=(
+                requester_row["publication_repo"] if requester_row is not None else None
+            ),
         )
         publication_id = _insert_task_in_txn(
             conn_in,
@@ -22249,6 +22292,10 @@ def _default_spawn(
         manifest=credential_manifest,
         github_owner=github_owner,
         github_repo=github_repo,
+        # BUILD-795: the row's own statement of where this card may publish.
+        # Set at create time and never updated, so unlike the workspace remote
+        # no worker in that worktree can have rewritten it.
+        expected_github_repo=task.publication_repo,
     )
 
     prompt = f"work kanban task {task.id}"

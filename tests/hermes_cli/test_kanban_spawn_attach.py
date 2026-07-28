@@ -351,8 +351,9 @@ def _write_worker_contract(home: Path, *, actions: str = "[github_write]") -> No
     )
 
 
-def _spawn_test_task(*, assignee: str = "releaser") -> kb.Task:
+def _spawn_test_task(*, assignee: str = "releaser", publication_repo: str | None = None) -> kb.Task:
     return kb.Task(
+        publication_repo=publication_repo,
         id="t_credential_spawn",
         title="credential spawn",
         body=None,
@@ -985,3 +986,34 @@ def test_default_spawn_selects_the_token_for_the_workspace_owner(
     monkeypatch.setattr(subprocess, "Popen", refuse_popen)
     with pytest.raises(RuntimeError, match="yielded no GitHub release target"):
         kb._default_spawn(_spawn_test_task(), str(scratch))
+
+
+def test_default_spawn_refuses_when_the_row_and_the_workspace_disagree(
+    kanban_home, monkeypatch
+):
+    """BUILD-795 AC2, end to end: the recorded target reaches the preflight.
+
+    The workspace remote is the steerable half — every worker that ran in that
+    worktree could rewrite `.git/config`. The row is not, so a card that
+    records `nlachica/hermes-config` gets no token from a workspace pushing to
+    `Ahlnos-Inc/aldnoah`, however plausible that owner is.
+    """
+    from hermes_cli import worker_credentials as wc
+
+    _write_worker_contract(kanban_home)
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc, "github_release_target_for_workspace",
+        lambda *_a, **_kw: ("Ahlnos-Inc", "Ahlnos-Inc/aldnoah"),
+    )
+
+    def fake_popen(*_args, **_kwargs):
+        raise AssertionError("Popen must not run after credential preflight failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="records release target"):
+        kb._default_spawn(
+            _spawn_test_task(publication_repo="nlachica/hermes-config"),
+            str(kanban_home / "workspace"),
+        )

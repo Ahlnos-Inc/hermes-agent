@@ -727,3 +727,80 @@ def test_cli_publication_handoff_supports_dry_run_and_json(
         assert publisher is not None
         assert publisher.assignee == "releaser"
         assert publisher.publication_ref == "refs/heads/main"
+
+
+def test_release_target_is_recorded_at_create_time_and_validated(board: Path) -> None:
+    """BUILD-795 AC1: the row states where the card may publish.
+
+    It is deliberately independent of the publication triple — an ordinary
+    coder card records it, and the publication card inherits it later.
+    """
+    with kb.connect_closing(board) as conn:
+        bound = kb.create_task(
+            conn, title="coder work", assignee="coder",
+            publication_repo="Ahlnos-Inc/aldnoah",
+        )
+        assert kb.get_task(conn, bound).publication_repo == "Ahlnos-Inc/aldnoah"
+
+        # Unbound cards keep working (AC4), and an empty value is not a target.
+        assert kb.get_task(conn, _create_requester(conn)).publication_repo is None
+        blank = kb.create_task(
+            conn, title="blank", assignee="coder", publication_repo="   ",
+        )
+        assert kb.get_task(conn, blank).publication_repo is None
+
+        for bad in ("not-a-slug", "owner/", "/repo", "owner/repo/extra", "own er/repo"):
+            with pytest.raises(ValueError, match="owner/repo"):
+                kb.create_task(
+                    conn, title="bad", assignee="coder", publication_repo=bad,
+                )
+
+
+def test_publication_card_inherits_the_requesters_release_target(
+    board: Path, tmp_path: Path,
+) -> None:
+    """The target comes from the REQUESTER'S row, never the worker's payload.
+
+    The requesting worker chooses the workspace, the remote and the sha. If it
+    could also choose the repository its card is checked against, the check
+    would be checking the worker against itself.
+    """
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+    with kb.connect_closing(board) as conn:
+        requester = kb.create_task(
+            conn, title="coder work", assignee="coder",
+            publication_repo="nlachica/hermes-config",
+        )
+        run_id = _claim(conn, requester)
+        result = kb.request_publication_handoff(
+            conn,
+            requester,
+            publication=kb.NewPublicationTask(
+                expected_sha=EXPECTED_SHA,
+                workspace_path=str(workspace),
+                remote_ref="refs/heads/main",
+            ),
+            request_key="publish-inherit-1",
+            actor="coder",
+            expected_run_id=run_id,
+        )
+        publisher = kb.get_task(conn, result.publication_task_id)
+        assert publisher.publication_repo == "nlachica/hermes-config"
+
+        # An unbound requester yields an unbound publication card.
+        other = _create_requester(conn)
+        other_run = _claim(conn, other)
+        other_result = kb.request_publication_handoff(
+            conn,
+            other,
+            publication=kb.NewPublicationTask(
+                expected_sha=EXPECTED_SHA,
+                workspace_path=str(workspace),
+                remote_ref="refs/heads/main",
+            ),
+            request_key="publish-inherit-2",
+            actor="coder",
+            expected_run_id=other_run,
+        )
+        assert kb.get_task(conn, other_result.publication_task_id).publication_repo is None

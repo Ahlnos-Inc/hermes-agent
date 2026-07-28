@@ -1356,6 +1356,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "publication_expected_sha": task.publication_expected_sha,
         "publication_remote": task.publication_remote,
         "publication_ref": task.publication_ref,
+        "publication_repo": task.publication_repo,
         "is_publication": task.is_publication,
         "project_id": task.project_id,
         "created_by": task.created_by,
@@ -3323,6 +3324,7 @@ def _handle_create(args: dict, **kw) -> str:
     source_refs = args.get("source_refs")
     if source_refs is not None and not isinstance(source_refs, list):
         return tool_error("source_refs must be a list of bounded source declarations")
+    publication_repo = args.get("publication_repo")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -3446,6 +3448,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
                 mutation_context=mutation_context,
                 source_refs=source_refs,
+                publication_repo=publication_repo,
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None
@@ -4379,6 +4382,17 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Optional namespace for multi-project isolation. "
                     "Defaults to HERMES_TENANT env if set."
+                ),
+            },
+            "publication_repo": {
+                "type": "string",
+                "description": (
+                    "Optional 'owner/repo' this task and the publication card "
+                    "it later requests are allowed to publish to. Recorded on "
+                    "the row at create time and never updated, so the "
+                    "credential preflight can refuse a GitHub write token when "
+                    "the workspace's own push url disagrees with it. Omit "
+                    "unless the task will push (BUILD-795)."
                 ),
             },
             "source_refs": {

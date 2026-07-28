@@ -72,6 +72,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "publication_expected_sha": t.publication_expected_sha,
         "publication_remote": t.publication_remote,
         "publication_ref": t.publication_ref,
+        "publication_repo": t.publication_repo,
         "is_publication": t.is_publication,
         "branch_name": t.branch_name,
         "project_id": t.project_id,

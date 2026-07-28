@@ -1178,6 +1178,7 @@ def resolve_worker_credentials(
     manifest: WorkerCredentialManifest | None = None,
     github_owner: str | None = None,
     github_repo: str | None = None,
+    expected_github_repo: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve the closed grants for one worker without leaking secrets.
 
@@ -1229,6 +1230,29 @@ def resolve_worker_credentials(
                     "worker credential preflight refuses a GitHub write token: "
                     f"the workspace publishes to {github_repo!r}, which is "
                     f"denied as a release target ({denied_reason})"
+                ),
+            )
+        # BUILD-795 AC2: the task row states which repository this card may
+        # publish to. The workspace's push url comes out of its own
+        # .git/config, which every worker that ran in that worktree could
+        # write, so the two must AGREE before a token is chosen. Fail closed:
+        # a recorded target with no resolvable workspace repo is a mismatch,
+        # not a pass. This can only ever REFUSE — the token is still selected
+        # from the probed owner, never from the recorded target — so recording
+        # a target can narrow a card's reach and never widen it.
+        expected_slug = str(expected_github_repo or "").strip().casefold()
+        if expected_slug and expected_slug != (github_repo or "").strip().casefold():
+            statuses.append(f"github_write_target={expected_github_repo}")
+            return WorkerCredentialPlan(
+                profile=normalized_profile,
+                manifest_digest=loaded_manifest.digest,
+                capabilities=capabilities,
+                diagnostics=tuple([*statuses, "github_write=target_mismatch"]),
+                error=(
+                    "worker credential preflight refuses a GitHub write token: "
+                    f"the task records release target {expected_github_repo!r} "
+                    "but the workspace publishes to "
+                    f"{github_repo or 'no github.com repository'!r}"
                 ),
             )
         # Owner selection is pure policy and needs no vault, so it runs before
@@ -1379,6 +1403,7 @@ def prepare_worker_credentials(
     manifest: WorkerCredentialManifest | None = None,
     github_owner: str | None = None,
     github_repo: str | None = None,
+    expected_github_repo: str | None = None,
 ) -> WorkerCredentialPlan:
     """Resolve grants and raise a safe error when the worker cannot start."""
     return resolve_worker_credentials(
@@ -1389,6 +1414,7 @@ def prepare_worker_credentials(
         manifest=manifest,
         github_owner=github_owner,
         github_repo=github_repo,
+        expected_github_repo=expected_github_repo,
     ).require_ok()
 
 
