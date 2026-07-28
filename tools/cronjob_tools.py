@@ -308,6 +308,34 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _undeployed_script_notice(job: Dict[str, Any]) -> Optional[str]:
+    """Return a notice when the job's script is not where cron will look.
+
+    Cron executes the *profile* copy under ``HERMES_HOME/scripts/``; committing
+    a script to the config repo does not put it there (that needs a hand-copy or
+    the next ``activate``). Without this, the job registers cleanly and then
+    fails on every firing instead of at authoring time — BUILD-770 alerted every
+    two hours against a script that was committed but never deployed
+    (BUILD-837). Returns ``None`` for scriptless jobs and deployed scripts.
+    """
+    script = job.get("script")
+    if not script:
+        return None
+    try:
+        from cron.scheduler import resolve_job_script
+
+        _, error = resolve_job_script(str(script))
+    except Exception:  # never fail job creation on a best-effort notice
+        return None
+    if not error:
+        return None
+    return (
+        f"WARNING: {error} — cron runs the profile copy, not the repo checkout. "
+        "Deploy the script (hand-copy into the profile's scripts/ dir, or run "
+        "`hermes-sync.sh activate`) or every run of this job will fail."
+    )
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -759,6 +787,9 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
+            _script_notice = _undeployed_script_notice(job)
+            if _script_notice:
+                _create_message = f"{_create_message} {_script_notice}"
             return json.dumps(
                 {
                     "success": True,

@@ -465,3 +465,163 @@ def test_reload_job_env_serializes_concurrent_jobs(hermes_env, monkeypatch):
 
     assert inside.is_set(), "the reload never ran"
     assert not any(overlapped), "two jobs were inside the env reload at once"
+
+
+# ---------------------------------------------------------------------------
+# BUILD-837: a job registered against an undeployed script must not fail
+# silently at authoring time and must not alert on every tick forever.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_job_script_accepts_a_deployed_script(hermes_env):
+    from cron.scheduler import resolve_job_script
+
+    (hermes_env / "scripts" / "there.py").write_text("print('hi')\n")
+
+    path, error = resolve_job_script("there.py")
+    assert error is None
+    assert path == (hermes_env / "scripts" / "there.py").resolve()
+
+
+def test_resolve_job_script_reports_the_profile_path_it_looked_in(hermes_env):
+    """The error must name the PROFILE path, not the repo copy the author edits."""
+    from cron.scheduler import resolve_job_script
+
+    path, error = resolve_job_script("never-deployed.py")
+    assert path is None
+    assert error.startswith("Script not found:")
+    assert str(hermes_env / "scripts" / "never-deployed.py") in error
+
+
+def test_resolve_job_script_keeps_the_containment_guard(hermes_env):
+    from cron.scheduler import resolve_job_script
+
+    path, error = resolve_job_script("/etc/passwd")
+    assert path is None
+    assert "Blocked" in error
+
+
+def test_a_non_executable_script_still_resolves(hermes_env):
+    """The runner uses sys.executable, so the exec bit is irrelevant."""
+    import os
+
+    from cron.scheduler import resolve_job_script
+
+    script = hermes_env / "scripts" / "noexec.py"
+    script.write_text("print('ok')\n")
+    os.chmod(script, 0o644)
+
+    path, error = resolve_job_script("noexec.py")
+    assert error is None
+    assert path is not None
+
+
+def test_creating_a_job_warns_when_the_script_is_not_deployed(hermes_env, caplog):
+    import logging
+
+    from cron.jobs import create_job
+
+    with caplog.at_level(logging.WARNING):
+        job = create_job(
+            prompt=None,
+            schedule="0 */2 * * *",
+            name="undeployed watchdog",
+            script="not-deployed-yet.py",
+            no_agent=True,
+        )
+
+    # Warned, but still created — a script deployed later must stay registrable.
+    assert job["script"] == "not-deployed-yet.py"
+    assert any(
+        "does not resolve yet" in r.getMessage() for r in caplog.records
+    ), "registration must warn that cron will not find the script"
+
+
+def test_creating_a_job_with_a_deployed_script_does_not_warn(hermes_env, caplog):
+    import logging
+
+    from cron.jobs import create_job
+
+    (hermes_env / "scripts" / "deployed.py").write_text("print('ok')\n")
+
+    with caplog.at_level(logging.WARNING):
+        create_job(
+            prompt=None,
+            schedule="0 */2 * * *",
+            name="deployed watchdog",
+            script="deployed.py",
+            no_agent=True,
+        )
+
+    assert not any("does not resolve yet" in r.getMessage() for r in caplog.records)
+
+
+def test_first_script_resolution_failure_still_alerts(hermes_env):
+    from cron.scheduler import _suppress_repeat_script_failure
+
+    job = {"id": "j1"}
+    assert _suppress_repeat_script_failure(job, "Script not found: /x/y.py") is False
+    # The alert is stamped so the next identical one can be recognised.
+    assert job["script_failure_signature"] == "Script not found: /x/y.py"
+    assert job["script_failure_alerted_at"]
+
+
+def test_repeat_identical_script_failure_is_suppressed(hermes_env):
+    from cron.scheduler import _suppress_repeat_script_failure
+
+    job = {"id": "j1"}
+    error = "Script not found: /x/y.py"
+    assert _suppress_repeat_script_failure(job, error) is False
+    assert _suppress_repeat_script_failure(job, error) is True
+    assert _suppress_repeat_script_failure(job, error) is True
+
+
+def test_a_changed_failure_message_alerts_again(hermes_env):
+    from cron.scheduler import _suppress_repeat_script_failure
+
+    job = {"id": "j1"}
+    assert _suppress_repeat_script_failure(job, "Script not found: /x/y.py") is False
+    assert _suppress_repeat_script_failure(job, "Script not found: /x/y.py") is True
+    # A different message is new information and must not be swallowed.
+    assert _suppress_repeat_script_failure(job, "Script path is not a file: /x/y.py") is False
+
+
+def test_the_alert_returns_after_the_repeat_window(hermes_env):
+    from datetime import timedelta
+
+    from cron.scheduler import _suppress_repeat_script_failure
+    from hermes_time import now as hermes_now
+
+    job = {"id": "j1"}
+    error = "Script not found: /x/y.py"
+    assert _suppress_repeat_script_failure(job, error) is False
+    assert _suppress_repeat_script_failure(job, error) is True
+
+    job["script_failure_alerted_at"] = (hermes_now() - timedelta(hours=25)).isoformat()
+    assert _suppress_repeat_script_failure(job, error) is False
+
+
+def test_a_real_script_failure_is_never_suppressed(hermes_env):
+    """Only unresolvable-script failures throttle. A script that RAN and failed
+    (the money-path case) must alert every single time."""
+    from cron.scheduler import _suppress_repeat_script_failure
+
+    job = {"id": "j1"}
+    for error in (
+        "Traceback (most recent call last): RuntimeError: boom",
+        "Script timed out after 300s",
+        "upstream returned HTTP 530",
+    ):
+        assert _suppress_repeat_script_failure(job, error) is False
+        assert _suppress_repeat_script_failure(job, error) is False
+
+
+def test_unparseable_alert_timestamp_fails_open_and_alerts(hermes_env):
+    from cron.scheduler import _suppress_repeat_script_failure
+
+    job = {
+        "id": "j1",
+        "script_failure_signature": "Script not found: /x/y.py",
+        "script_failure_alerted_at": "not-a-timestamp",
+    }
+    assert _suppress_repeat_script_failure(job, "Script not found: /x/y.py") is False

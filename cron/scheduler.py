@@ -2108,6 +2108,99 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def resolve_job_script(script_path: str) -> tuple[Path | None, str | None]:
+    """Resolve a cron job's script against the profile's ``HERMES_HOME/scripts/``.
+
+    Returns ``(path, None)`` when the script is runnable, else ``(None, error)``
+    carrying the message the runner reports. Shared by the runner, create-time
+    validation and the repeat-alert throttle so all three judge a job against
+    the one path cron actually executes — the profile copy, never the repo
+    checkout it was authored in (BUILD-837).
+    """
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    raw = Path(script_path).expanduser()
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
+
+    # Guard against path traversal, absolute path injection, and symlink
+    # escape — scripts MUST reside within HERMES_HOME/scripts/.
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        return None, (
+            f"Blocked: script path resolves outside the scripts directory "
+            f"({scripts_dir_resolved}): {script_path!r}"
+        )
+
+    if not path.exists():
+        return None, f"Script not found: {path}"
+    if not path.is_file():
+        return None, f"Script path is not a file: {path}"
+    return path, None
+
+
+# A script that cannot resolve fails identically on every tick until a human
+# deploys it, so re-alerting each firing is pure noise (BUILD-770 fired every
+# 2h). These are the three messages resolve_job_script can return.
+_SCRIPT_RESOLVE_FAILURE_PREFIXES = (
+    "Script not found:",
+    "Script path is not a file:",
+    "Blocked: script path resolves outside",
+)
+_SCRIPT_FAILURE_REALERT_HOURS = 24.0
+
+
+def is_script_resolve_failure(error: str | None) -> bool:
+    """True when a failed run never reached the interpreter at all."""
+    text = (error or "").strip()
+    return any(text.startswith(prefix) for prefix in _SCRIPT_RESOLVE_FAILURE_PREFIXES)
+
+
+def _suppress_repeat_script_failure(job: dict, error: str | None) -> bool:
+    """Should this failure's chat delivery be skipped as a known repeat?
+
+    Alerts on the first occurrence and whenever the message changes, then stays
+    quiet for ``_SCRIPT_FAILURE_REALERT_HOURS``. The job keeps running, so it
+    recovers on its own the moment the script is deployed — auto-pausing would
+    turn an alerting watchdog silent, which is the worse failure.
+    """
+    if not is_script_resolve_failure(error):
+        return False
+
+    signature = (error or "").strip()
+    now = _hermes_now()
+    last_signature = job.get("script_failure_signature")
+    last_at = job.get("script_failure_alerted_at")
+
+    if last_signature == signature and last_at:
+        from datetime import datetime as _dt
+
+        try:
+            elapsed_h = (now - _dt.fromisoformat(last_at)).total_seconds() / 3600
+        except (TypeError, ValueError):
+            elapsed_h = _SCRIPT_FAILURE_REALERT_HOURS + 1
+        if elapsed_h < _SCRIPT_FAILURE_REALERT_HOURS:
+            return True
+
+    # First sighting, a changed message, or the window elapsed: alert and stamp.
+    updates = {
+        "script_failure_signature": signature,
+        "script_failure_alerted_at": now.isoformat(),
+    }
+    job.update(updates)
+    try:
+        from cron.jobs import update_job
+
+        update_job(job.get("id"), updates)
+    except Exception as exc:  # never let bookkeeping suppress a real alert
+        logger.debug("Could not persist script-failure alert state: %s", exc)
+    return False
+
+
 def _run_job_script(script_path: str, timeout: int | None = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2142,30 +2235,11 @@ def _run_job_script(script_path: str, timeout: int | None = None) -> tuple[bool,
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
+    _get_hermes_home().joinpath("scripts").mkdir(parents=True, exist_ok=True)
 
-    raw = Path(script_path).expanduser()
-    if raw.is_absolute():
-        path = raw.resolve()
-    else:
-        path = (scripts_dir / raw).resolve()
-
-    # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
-        )
-
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+    path, resolve_error = resolve_job_script(script_path)
+    if resolve_error:
+        return False, resolve_error
 
     script_timeout = timeout if timeout is not None else _get_script_timeout()
 
@@ -3912,6 +3986,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
+            # A job whose script cannot resolve reports the identical failure
+            # every tick until someone deploys the file, so alert once and then
+            # stay quiet for a day. The job keeps firing, so it recovers by
+            # itself the moment the script lands (BUILD-837/BUILD-770).
+            if should_deliver and not success and _suppress_repeat_script_failure(job, error):
+                logger.info(
+                    "Job '%s': repeat script-resolution failure — alert already sent, skipping delivery",
+                    job["id"],
+                )
+                should_deliver = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed

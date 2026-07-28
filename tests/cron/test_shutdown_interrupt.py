@@ -276,3 +276,63 @@ class TestRunOneJobHonoursInterruptedFlag:
 
         assert result is False
         mock_mark.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# BUILD-837: the repeat-alert throttle must actually be WIRED into the
+# delivery decision. The unit tests above cannot see a call site that is
+# never reached, so drive the real run_one_job() flow.
+# ---------------------------------------------------------------------------
+class TestScriptFailureAlertThrottleWiring:
+    def _job(self, job_id="job-837"):
+        return {"id": job_id, "name": "undeployed watchdog", "prompt": "", "script": "gone.py"}
+
+    def _fire(self, job, error):
+        """Run one tick whose script failed to resolve; return the delivered text."""
+        import cron.scheduler as sched
+
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("agent.secret_scope.set_secret_scope", return_value=None), \
+             patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+             patch("agent.secret_scope.reset_secret_scope"), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(False, "doc", "alert", error),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._is_cron_silence_response", return_value=False), \
+             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler.mark_job_run"):
+            sched.run_one_job(job)
+        return mock_deliver.call_args.args[1] if mock_deliver.call_args else None
+
+    def test_first_missing_script_tick_delivers_then_repeats_stay_quiet(self):
+        job = self._job()
+        error = "Script not found: /Users/x/.hermes/profiles/orchestrator/scripts/gone.py"
+
+        first = self._fire(job, error)
+        assert first is not None, "the first missing-script failure must reach the user"
+        assert "gone.py" in first
+
+        # BUILD-770 fired this identical alert every 2 hours. It must go quiet.
+        assert self._fire(job, error) is None
+        assert self._fire(job, error) is None
+
+    def test_a_script_that_ran_and_failed_still_alerts_every_tick(self):
+        """The money-path guarantee: only unresolvable-script failures throttle."""
+        job = self._job()
+        error = "Traceback (most recent call last): RuntimeError: the probe failed"
+
+        assert self._fire(job, error) is not None
+        assert self._fire(job, error) is not None
+        assert self._fire(job, error) is not None
+
+    def test_delivery_resumes_once_the_script_is_deployed_and_fails_for_real(self):
+        """Recovery: after the throttle engages, a genuine runtime failure from
+        the now-deployed script is new information and must be delivered."""
+        job = self._job()
+        missing = "Script not found: /Users/x/.hermes/profiles/orchestrator/scripts/gone.py"
+
+        assert self._fire(job, missing) is not None
+        assert self._fire(job, missing) is None
+        assert self._fire(job, "RuntimeError: deployed but crashed") is not None

@@ -1296,6 +1296,28 @@ def create_job(
     from cron.lifecycle_guard import check_gateway_lifecycle
     check_gateway_lifecycle(prompt_text, normalized_script)
 
+    # Warn (never refuse) when the script is not deployed where cron will look.
+    # Committing a script to the config repo does not put it in the profile's
+    # scripts/ dir — that happens on the next `activate` or a hand-copy — so a
+    # job can otherwise be registered against a file that never runs and fail
+    # on every tick instead of at authoring time (BUILD-837).
+    if normalized_script:
+        try:
+            from cron.scheduler import resolve_job_script
+
+            _, _script_error = resolve_job_script(normalized_script)
+            if _script_error:
+                logger.warning(
+                    "Cron job '%s' registers script %r which does not resolve yet: %s "
+                    "— cron runs the profile copy, not the repo checkout; deploy it "
+                    "(hand-copy or `hermes-sync.sh activate`) or the job fails every tick.",
+                    name or "(unnamed)",
+                    normalized_script,
+                    _script_error,
+                )
+        except Exception as exc:  # validation must never block job creation
+            logger.debug("Could not pre-validate cron script %r: %s", normalized_script, exc)
+
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
     provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
