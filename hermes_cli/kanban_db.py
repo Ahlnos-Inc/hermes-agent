@@ -6954,6 +6954,7 @@ def _prepare_task_create(
     publication_ref: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    derive_publication_repo: bool = False,
 ) -> _PreparedTaskCreate:
     """Validate and normalize task creation without touching the board DB."""
     assignee = _canonical_assignee(assignee)
@@ -7015,6 +7016,32 @@ def _prepare_task_create(
             and project_obj.primary_path
         ):
             project_repo = str(project_obj.primary_path)
+            # BUILD-820: give BUILD-795's check something to bind to.
+            #
+            # The slug comes from the project registry's canonical checkout,
+            # probed here on the controller -- NOT from `project_repo` itself,
+            # which is a filesystem path, and not from anything the executing
+            # worker can write. The worker's worktree is cut from this exact
+            # path below (`<project_repo>/.worktrees/<task_id>`), so agreement
+            # at spawn is by construction; a disagreement means the workspace's
+            # own remote was rewritten between create and spawn, which is the
+            # steering BUILD-795 exists to refuse.
+            #
+            # Confined to this branch on purpose. A caller that names its own
+            # `workspace_path`, or a scratch/dir workspace, gives no such
+            # guarantee, and an explicit `publication_repo` always wins. An
+            # unresolvable slug leaves the column NULL -- pre-795 behaviour.
+            #
+            # Only `create_task` sets `derive_publication_repo`, because this
+            # probe shells out to `git` (up to 15s) and `_prepare_task_create`
+            # also runs *inside* a write_txn on the rework and publication
+            # paths, where that would hold the board write lock. Those two
+            # paths do not need it: a publication card inherits the requester's
+            # target and a rework fix stays on the card it reworks.
+            if derive_publication_repo and publication_repo is None:
+                from hermes_cli.worker_credentials import github_repo_for_workspace
+
+                publication_repo = github_repo_for_workspace(project_repo)
 
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
@@ -7479,6 +7506,7 @@ def create_task(
         publication_repo=publication_repo,
         board=board,
         project_id=project_id,
+        derive_publication_repo=True,
     )
     for attempt in range(2):
         try:

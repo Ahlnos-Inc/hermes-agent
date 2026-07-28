@@ -181,3 +181,116 @@ def test_project_linked_coder_worktree_is_writable_but_siblings_and_auth_are_den
     assert f'(allow file-write* (subpath "{workspace}"))' in profile
     assert str(sibling) not in profile
     assert str(host_auth.parent) not in profile
+
+
+# ---------------------------------------------------------------------------
+# BUILD-820: give BUILD-795's release-target check a producer.
+# ---------------------------------------------------------------------------
+
+
+def _add_origin(path, url):
+    subprocess.run(
+        ["git", "remote", "add", "origin", url],
+        cwd=path, check=True, capture_output=True, text=True,
+    )
+
+
+def test_project_linked_card_records_the_projects_release_target(kanban_conn, tmp_path):
+    repo = tmp_path / "webapp"
+    _init_repo(repo)
+    _add_origin(repo, "https://github.com/Ahlnos-Inc/hermes-agent.git")
+    proj = _make_project(repo=str(repo))
+
+    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
+    task = kb.get_task(kanban_conn, tid)
+
+    # The slug comes from the project registry's canonical checkout, not from
+    # the worker's workspace -- which is cut from that same path, so the
+    # BUILD-795 preflight agrees by construction.
+    assert task.publication_repo == "Ahlnos-Inc/hermes-agent"
+    assert task.workspace_path.startswith(str(repo))
+
+
+def test_a_project_without_a_github_origin_leaves_the_target_unset(kanban_conn, tmp_path):
+    """Unset is pre-795 behaviour, which is the safe default (AC3)."""
+    repo = tmp_path / "local-only"
+    _init_repo(repo)
+    proj = _make_project(name="Local Only", repo=str(repo))
+
+    task = kb.get_task(
+        kanban_conn, kb.create_task(kanban_conn, title="work", project_id=proj.slug)
+    )
+    assert task.publication_repo is None
+
+    # A non-GitHub remote is not a GitHub release target either.
+    other = tmp_path / "gitlab"
+    _init_repo(other)
+    _add_origin(other, "https://gitlab.com/owner/repo.git")
+    proj2 = _make_project(name="Gitlab", repo=str(other))
+    assert kb.get_task(
+        kanban_conn, kb.create_task(kanban_conn, title="w2", project_id=proj2.slug)
+    ).publication_repo is None
+
+
+def test_an_explicit_release_target_wins_over_the_derived_one(kanban_conn, tmp_path):
+    repo = tmp_path / "webapp2"
+    _init_repo(repo)
+    _add_origin(repo, "https://github.com/Ahlnos-Inc/hermes-agent.git")
+    proj = _make_project(name="Explicit", repo=str(repo))
+
+    task = kb.get_task(kanban_conn, kb.create_task(
+        kanban_conn, title="work", project_id=proj.slug,
+        publication_repo="nlachica/hermes-config",
+    ))
+    assert task.publication_repo == "nlachica/hermes-config"
+
+
+def test_the_release_target_probe_never_runs_inside_the_board_transaction(
+    kanban_conn, tmp_path, monkeypatch,
+):
+    """`git remote get-url` can take up to 15s; the board write lock cannot.
+
+    `_prepare_task_create` also runs *inside* a write_txn on the rework and
+    publication paths, which is why only `create_task` asks it to derive.
+    """
+    repo = tmp_path / "webapp3"
+    _init_repo(repo)
+    _add_origin(repo, "https://github.com/Ahlnos-Inc/hermes-agent.git")
+    proj = _make_project(name="Lock Free", repo=str(repo))
+
+    from hermes_cli import worker_credentials as wc
+
+    seen = []
+    real = wc.github_repo_for_workspace
+
+    def watched(workspace, **kw):
+        seen.append(kanban_conn.in_transaction)
+        return real(workspace, **kw)
+
+    monkeypatch.setattr(wc, "github_repo_for_workspace", watched)
+
+    kb.create_task(kanban_conn, title="work", project_id=proj.slug)
+    assert seen == [False]
+
+    # The rework path prepares its fix card *inside* a write_txn and binds it
+    # to the same project, so a probe there would hold the board write lock
+    # for up to 15s.  It must not run at all: a fix card stays on the card it
+    # reworks, so it has no release target of its own to derive.
+    review = kb.create_task(kanban_conn, title="review", assignee="reviewer")
+    claimed = kb.claim_task(kanban_conn, review, claimer="reviewer")
+    assert claimed is not None and claimed.current_run_id is not None
+    kb.request_rework(
+        kanban_conn,
+        review,
+        finding="assertion is inverted",
+        fix=kb.NewFixTask(
+            title="fix it",
+            body="apply the correction",
+            assignee="coder",
+            project_id=proj.slug,
+        ),
+        request_key="rework-1",
+        actor="reviewer",
+        expected_run_id=int(claimed.current_run_id),
+    )
+    assert seen == [False]
