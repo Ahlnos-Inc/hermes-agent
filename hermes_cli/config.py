@@ -1502,6 +1502,14 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Source-materialization: when true (default), the dispatcher
+        # materializes source-attachment refs into the worker's workspace
+        # at dispatch time.  Emergency rollback: set to false to restore
+        # legacy dispatch (no materialization, no source-attachment
+        # validation).
+        "source_materialization": {
+            "attachments": True,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
