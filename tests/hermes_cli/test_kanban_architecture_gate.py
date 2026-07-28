@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -1272,11 +1273,18 @@ def test_context_less_link_into_a_gated_subtree_is_refused_under_orchestrator_on
         with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
             kb.link_tasks(conn, descendant, outsider)
 
-        # Nothing was written, and — measured, not assumed — the refusal
-        # leaves no audit trail: the caller owns the write_txn, so an audit
-        # row appended before the raise would roll back with it.  During the
-        # flip window a denial is visible at the calling surface only.
-        assert _counts(conn) == (links_before, events_before)
+        # No link landed.  The only rows the three refusals added are the three
+        # denial audits, written by write_txn after each rollback (BUILD-819) —
+        # the mutations themselves still wrote nothing.
+        links_after, events_after = _counts(conn)
+        assert links_after == links_before
+        assert events_after == events_before + 3
+        denied = [
+            e for e in kb.list_events(conn, architect)
+            if e.kind == "architecture_gate_denied"
+        ]
+        assert len(denied) == 3
+        assert {e.payload["mutation"] for e in denied} == {"link"}
 
         # An ungated pair is untouched.
         kb.link_tasks(conn, outsider, kb.create_task(conn, title="sibling", assignee="coder"))
@@ -1481,3 +1489,169 @@ def test_vault_doc_impact_rewire_survives_a_gate_refusal_without_orphaning(kanba
         # anything was removed.  With the old unlink-first order this is [].
         assert kb.parent_ids(conn, finalizer) == [upstream]
         assert (curator, finalizer) in calls
+
+
+# ---------------------------------------------------------------------------
+# BUILD-819: a denial must leave a record the board can be queried for.
+#
+# The refusal is raised inside the caller's ``write_txn``, so an audit row
+# appended before the raise is rolled back with it.  These tests pin the
+# behaviour that survives that rollback.
+# ---------------------------------------------------------------------------
+
+
+def _denials(conn, task_id):
+    return [e for e in kb.list_events(conn, task_id) if e.kind == "architecture_gate_denied"]
+
+
+def test_denied_create_is_recorded_though_its_own_transaction_rolled_back(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.create_task(
+                conn,
+                title="Implement workflow",
+                assignee="coder",
+                parents=[architect],
+                mutation_context=_implementation_context(),
+            )
+
+        # The mutation itself wrote nothing: no card, and no event of its own.
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+        denials = _denials(conn, architect)
+        assert len(denials) == 1
+        assert denials[0].payload == {
+            "gate_id": gate.gate_id,
+            "state": gate.state,
+            "mode": gate.enforcement_mode,
+            "reason": "architecture_gate_open",
+            "mutation": "create",
+        }
+
+
+def test_denied_context_less_link_is_recorded_even_when_the_caller_swallows_it(kanban_home):
+    """The vault doc-impact rewire catches ``ValueError``; the record survives.
+
+    ``ArchitectureGateError`` subclasses ``ValueError``, so that caller absorbs
+    a refusal without a trace of its own.  The audit must not depend on the
+    caller re-raising or logging.
+    """
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        gate = kb.get_architecture_gate_for_task(conn, architect)
+        outsider = kb.create_task(conn, title="unrelated work", assignee="coder")
+
+        # No mutation_context at all -- the four context-less production
+        # callers (kanban_link tool, kanban link CLI, dashboard endpoint,
+        # vault doc-impact rewire) all look like this.
+        try:
+            kb.link_tasks(conn, architect, outsider)
+        except ValueError:
+            pass  # exactly what _rewire_parents_to_gate does
+
+        assert kb.parent_ids(conn, outsider) == []
+        denials = _denials(conn, architect)
+        assert len(denials) == 1
+        assert denials[0].payload["mutation"] == "link"
+        assert denials[0].payload["reason"] == "architecture_gate_open"
+        assert denials[0].payload["gate_id"] == gate.gate_id
+
+
+def test_denied_link_from_a_worker_context_is_recorded_too(kanban_home):
+    """The contexted branch of the link refusal, not the context-less one."""
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        outsider = kb.create_task(conn, title="unrelated work", assignee="coder")
+
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.link_tasks(
+                conn,
+                architect,
+                outsider,
+                mutation_context=_implementation_context(),
+            )
+
+        assert kb.parent_ids(conn, outsider) == []
+        denials = _denials(conn, architect)
+        assert len(denials) == 1
+        assert denials[0].payload["mutation"] == "link"
+
+
+def test_recording_a_denial_cannot_change_or_fail_the_mutation_path(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(),
+        )
+        real_append = kb._append_gate_audit
+
+        def exploding_audit(c, gate, kind, reason=None, **kwargs):
+            if kind == "architecture_gate_denied":
+                raise sqlite3.OperationalError("database is locked")
+            return real_append(c, gate, kind, reason, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_gate_audit", exploding_audit)
+
+        # The caller still sees the policy denial, not the audit failure.
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_gate_open"):
+            kb.create_task(
+                conn,
+                title="Implement workflow",
+                assignee="coder",
+                parents=[architect],
+                mutation_context=_implementation_context(),
+            )
+        assert _denials(conn, architect) == []
+
+        # And the connection is still usable: the failed audit left no open txn.
+        assert kb.create_task(conn, title="after the failed audit", assignee="coder")
+
+
+def test_shadow_mode_records_the_allow_and_no_denial(kanban_home):
+    with kb.connect() as conn:
+        architect = kb.create_task(
+            conn,
+            title="Design workflow",
+            assignee="architect",
+            mutation_context=_architect_context(mode="shadow"),
+        )
+        shadow_impl = kb.MutationContext(
+            board_key="default",
+            principal="orchestrator-session",
+            actor_type="orchestrator_agent",
+            session_id="session-1",
+            request_scope_id="turn-1",
+            mode="shadow",
+            phase="implementation",
+        )
+        child = kb.create_task(
+            conn,
+            title="Implement workflow",
+            assignee="coder",
+            parents=[architect],
+            mutation_context=shadow_impl,
+        )
+        assert kb.get_task(conn, child) is not None
+        assert _denials(conn, architect) == []
+        assert any(e.kind == "create_allowed" for e in kb.list_events(conn, architect))

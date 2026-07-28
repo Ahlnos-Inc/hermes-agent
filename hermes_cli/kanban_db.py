@@ -1794,10 +1794,24 @@ class ArchitectureGate:
 
 
 class ArchitectureGateError(ValueError):
-    """Stable policy denial safe to expose to callers and audit logs."""
+    """Stable policy denial safe to expose to callers and audit logs.
 
-    def __init__(self, code: str = ARCHITECTURE_GATE_REASON_OPEN):
+    ``gate`` and ``mutation`` are carried on the exception so ``write_txn``
+    can audit the refusal after the guarded transaction has rolled back
+    (BUILD-819). Raising sites that know neither leave them unset and are
+    simply not audited; the caller still gets the same stable ``code``.
+    """
+
+    def __init__(
+        self,
+        code: str = ARCHITECTURE_GATE_REASON_OPEN,
+        *,
+        gate: "Optional[ArchitectureGate]" = None,
+        mutation: Optional[str] = None,
+    ):
         self.code = code
+        self.gate = gate
+        self.mutation = mutation
         super().__init__(code)
 
 
@@ -4577,7 +4591,7 @@ def write_txn(conn: sqlite3.Connection):
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
-    except Exception:
+    except Exception as exc:
         try:
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
@@ -4585,6 +4599,7 @@ def write_txn(conn: sqlite3.Connection):
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
             pass
+        _record_gate_denial(conn, exc)
         raise
     else:
         try:
@@ -4600,6 +4615,57 @@ def write_txn(conn: sqlite3.Connection):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+
+
+ARCHITECTURE_GATE_DENIED_EVENT = "architecture_gate_denied"
+
+
+def _record_gate_denial(conn: sqlite3.Connection, exc: BaseException) -> None:
+    """Audit an architecture-gate refusal after its own txn has rolled back.
+
+    The refusal is raised *inside* the guarded ``write_txn`` (BUILD-819), so
+    an audit row appended at the raise site is rolled back with the raise --
+    which is why ``create_allowed`` exists and ``create_denied`` never did,
+    and why ``shadow`` used to record strictly more than the enforcing modes.
+
+    Writing it here instead is the only ordering that works:
+
+    * ROLLBACK has already run, so the board write lock is released and this
+      short transaction is not held across the raise;
+    * it runs before the exception reaches the caller, so a caller that
+      swallows it (``ArchitectureGateError`` subclasses ``ValueError``, and
+      ``_rewire_parents_to_gate`` catches exactly that) cannot hide it;
+    * every failure is swallowed -- auditing a denial must never turn a
+      stable policy refusal into a different, unstable error.
+    """
+    gate = getattr(exc, "gate", None)
+    if not isinstance(exc, ArchitectureGateError) or gate is None:
+        return
+    try:
+        with write_txn(conn):
+            _append_gate_audit(
+                conn,
+                gate,
+                ARCHITECTURE_GATE_DENIED_EVENT,
+                exc.code,
+                extra={"mutation": exc.mutation or "unknown"},
+            )
+    except Exception:
+        _log.warning(
+            "architecture gate denial audit failed for gate=%s reason=%s",
+            getattr(gate, "gate_id", "?"),
+            exc.code,
+            exc_info=True,
+        )
+
+
+def _gate_denied(
+    gate: "Optional[ArchitectureGate]",
+    mutation: str,
+    code: str = ARCHITECTURE_GATE_REASON_OPEN,
+) -> "ArchitectureGateError":
+    """Build a refusal that ``write_txn`` can audit once it has rolled back."""
+    return ArchitectureGateError(code, gate=gate, mutation=mutation)
 
 
 # ---------------------------------------------------------------------------
@@ -5089,6 +5155,7 @@ def _append_gate_audit(
     kind: str,
     reason: Optional[str] = None,
     *,
+    extra: Optional[dict[str, Any]] = None,
     created_at: Optional[int] = None,
 ) -> int:
     payload: dict[str, Any] = {
@@ -5098,6 +5165,8 @@ def _append_gate_audit(
     }
     if reason:
         payload["reason"] = reason
+    if extra:
+        payload.update(extra)
     return _append_event(
         conn,
         gate.architect_task_id,
@@ -6502,18 +6571,18 @@ def _consume_discovery_capability(
     conn: sqlite3.Connection, gate: ArchitectureGate, context: MutationContext, assignee: Optional[str],
 ) -> None:
     if context.phase != "discovery":
-        raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+        raise _gate_denied(gate, "create")
     if not context.discovery_capability:
-        raise ArchitectureGateError("discovery_capability_missing")
+        raise _gate_denied(gate, "create", "discovery_capability_missing")
     row = conn.execute(
         "SELECT * FROM discovery_capabilities WHERE token = ?", (context.discovery_capability,)
     ).fetchone()
     if row is None:
-        raise ArchitectureGateError("discovery_capability_forged")
+        raise _gate_denied(gate, "create", "discovery_capability_forged")
     if row["used_at"] is not None:
-        raise ArchitectureGateError("discovery_capability_used")
+        raise _gate_denied(gate, "create", "discovery_capability_used")
     if int(row["expires_at"] or 0) <= int(time.time()):
-        raise ArchitectureGateError("discovery_capability_expired")
+        raise _gate_denied(gate, "create", "discovery_capability_expired")
     if (
         row["gate_id"] != gate.gate_id or row["board_key"] != context.board_key
         or row["principal"] != context.principal or row["session_id"] != context.session_id
@@ -6521,13 +6590,13 @@ def _consume_discovery_capability(
         or row["profile"] != context.profile or assignee != context.profile
         or context.profile not in READ_ONLY_DISCOVERY_PROFILES
     ):
-        raise ArchitectureGateError("discovery_capability_binding_mismatch")
+        raise _gate_denied(gate, "create", "discovery_capability_binding_mismatch")
     cur = conn.execute(
         "UPDATE discovery_capabilities SET used_at = ? WHERE token = ? AND used_at IS NULL",
         (int(time.time()), context.discovery_capability),
     )
     if cur.rowcount != 1:
-        raise ArchitectureGateError("discovery_capability_used")
+        raise _gate_denied(gate, "create", "discovery_capability_used")
     _append_gate_audit(conn, gate, "discovery_capability_used")
 
 
@@ -6840,14 +6909,14 @@ def _authorize_mutation(
             "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
         ).fetchone()
         if issued is not None:
-            raise ArchitectureGateError("architecture_graph_issued")
+            raise _gate_denied(gate, "create", "architecture_graph_issued")
         if context.phase != "graph_issuance":
-            raise ArchitectureGateError("architecture_graph_issuance_required")
+            raise _gate_denied(gate, "create", "architecture_graph_issuance_required")
     if _gate_requires_enforcement(gate):
         if context.phase == "discovery":
             _consume_discovery_capability(conn, gate, context, assignee)
         elif context.phase != "architecture":
-            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+            raise _gate_denied(gate, "create")
     return gate
 
 
@@ -7178,7 +7247,7 @@ def _insert_task_in_txn(
         for parent_id in parents:
             parent_gate = get_architecture_gate_for_task(conn, parent_id)
             if _gate_requires_enforcement(parent_gate):
-                raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+                raise _gate_denied(parent_gate, "create")
             if (
                 parent_gate is not None
                 and parent_gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES
@@ -7187,7 +7256,7 @@ def _insert_task_in_txn(
                     (parent_gate.gate_id,),
                 ).fetchone() is not None
             ):
-                raise ArchitectureGateError("architecture_graph_issued")
+                raise _gate_denied(parent_gate, "create", "architecture_graph_issued")
 
     if prepared.initial_status == "blocked":
         task_status = "blocked"
@@ -8772,7 +8841,7 @@ def _link_tasks_in_txn(
     gate = get_architecture_gate_for_task(conn, child_id) or get_architecture_gate_for_task(conn, parent_id)
     if mutation_context is not None:
         if gate is not None and _gate_requires_enforcement(gate) and mutation_context.phase != "architecture":
-            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+            raise _gate_denied(gate, "link")
         if gate is not None and mutation_context.mode.strip().lower() == "shadow":
             _append_gate_audit(conn, gate, "create_allowed", ARCHITECTURE_GATE_REASON_OPEN)
     elif gate is not None and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES:
@@ -8792,16 +8861,19 @@ def _link_tasks_in_txn(
         # and never updated, so gates opened while the policy said ``shadow``
         # stay non-enforcing forever.
         #
-        # NOTE: this refusal writes no audit row. The caller owns the
-        # ``write_txn``, so anything appended here is rolled back with the
-        # raise. Denials are observable at the calling surface (the tool/CLI
-        # error carries the reason), never in ``task_events``.
+        # The refusal cannot audit itself here -- the caller owns the
+        # ``write_txn`` and anything appended would roll back with the raise.
+        # ``write_txn`` writes the ``architecture_gate_denied`` row instead,
+        # after ROLLBACK, from the gate carried on the exception (BUILD-819).
+        # That matters most on this branch: the vault doc-impact rewire
+        # catches ``ValueError`` and would otherwise absorb the refusal
+        # without a trace anywhere.
         if _gate_requires_enforcement(gate):
-            raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+            raise _gate_denied(gate, "link")
         if conn.execute(
             "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
         ).fetchone() is not None:
-            raise ArchitectureGateError("architecture_graph_issued")
+            raise _gate_denied(gate, "link", "architecture_graph_issued")
     missing = _find_missing_parents(conn, [parent_id, child_id])
     if missing:
         raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -14415,9 +14487,9 @@ def decompose_triage_task(
                 "SELECT 1 FROM architecture_graph_issuances WHERE gate_id = ?", (gate.gate_id,)
             ).fetchone()
             if issued is not None:
-                raise ArchitectureGateError("architecture_graph_issued")
-            raise ArchitectureGateError("architecture_graph_issuance_required")
-        raise ArchitectureGateError(ARCHITECTURE_GATE_REASON_OPEN)
+                raise _gate_denied(gate, "decompose", "architecture_graph_issued")
+            raise _gate_denied(gate, "decompose", "architecture_graph_issuance_required")
+        raise _gate_denied(gate, "decompose")
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
