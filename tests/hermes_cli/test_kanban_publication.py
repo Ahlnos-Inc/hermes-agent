@@ -39,13 +39,60 @@ def _claim(conn, task_id: str) -> int:
     return int(claimed.current_run_id)
 
 
+# Candidate git binaries in preference order — same fallback chain as
+# _find_git_binary() in kanban_db.py.
+_GIT_BINS = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git", "git")
+
+
+def _find_git() -> str:
+    """Return the first accessible non-stub git binary."""
+    import os as _os
+    for c in _GIT_BINS:
+        if _os.access(c, _os.X_OK):
+            return c
+    import shutil as _shutil
+    return _shutil.which("git") or "git"
+
+
+def _git_exec_path(git: str) -> str | None:
+    """Return the git exec-path via Cellar discovery (no subprocess.run)."""
+    import os as _os
+    try:
+        with _os.popen(
+            f'GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 "{git}" --version 2>/dev/null'
+        ) as p:
+            ver = p.read().split("git version ")[-1].strip()
+        for prefix in ("/opt/homebrew", "/usr/local"):
+            cellar = f"{prefix}/Cellar/git/{ver}/libexec/git-core"
+            try:
+                if "git-upload-pack" in _os.listdir(cellar):
+                    return cellar
+            except (PermissionError, FileNotFoundError):
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _git_env() -> dict:
+    """Build env for hermetic git calls: correct exec-path, no system config."""
+    import os as _os
+    git = _find_git()
+    env = {**_os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+    ep = _git_exec_path(git)
+    if ep:
+        env["GIT_EXEC_PATH"] = ep
+    return env
+
+
 def _git(*args: str, cwd: Path | None = None) -> str:
     result = subprocess.run(
-        ["git", *args],
+        [_find_git(), *args],
         cwd=cwd,
         check=True,
         capture_output=True,
         text=True,
+        env=_git_env(),
     )
     return result.stdout.strip()
 
@@ -381,8 +428,8 @@ def test_publication_completion_rejects_contract_changed_after_readback(
         mutation_thread.start()
         original_readback = kb._read_publication_remote_ref
 
-        def readback_then_wait(contract):
-            verification = original_readback(contract)
+        def readback_then_wait(contract, **kwargs):
+            verification = original_readback(contract, **kwargs)
             # The underlying git readback has returned. Let a second writer
             # mutate the contract before this function hands verification back
             # to complete_task, which is the stale-read window under test.
@@ -525,9 +572,7 @@ def test_publication_readback_failure_is_lock_free_and_leaves_board_open(
         payload = json.loads(blocked["payload"])
         assert payload["reason"] == "publication_ref_not_verified"
         if failure_mode == "timeout":
-            assert payload["readback_reason"] == (
-                "git readback unavailable: TimeoutExpired"
-            )
+            assert payload["readback_reason"] == "timeout"
 
 
 def test_publication_handoff_adopts_existing_publication_card(board: Path, tmp_path: Path) -> None:

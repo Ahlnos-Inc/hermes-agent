@@ -1095,6 +1095,16 @@ def _github_remote_match(
     # inject config into it, so the probe answers about a repo the worker will
     # never touch. Scrub the whole namespace rather than enumerate it.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # Re-add the two safety vars after the scrub: GIT_CONFIG_NOSYSTEM prevents
+    # the system gitconfig from being read (blocked in sandbox environments),
+    # GIT_TERMINAL_PROMPT prevents interactive credential prompts.
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    # Prevent git from walking above the workspace directory when searching
+    # for a .git entry; without this, a non-repo workspace inside a larger
+    # git checkout silently resolves the parent repo's remote instead of
+    # returning "not a git repository".
+    env["GIT_CEILING_DIRECTORIES"] = str(Path(str(workspace)).parent)
     try:
         completed = subprocess.run(
             ["git", "-C", str(workspace), "remote", "get-url", "--push", remote_name],
@@ -1743,6 +1753,395 @@ def render_profile_local_env_audit(root: Path | str | None = None) -> list[str]:
             + (": " + ", ".join(sorted(dict.fromkeys(names))) if names else "")
         )
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Trusted hermetic publication readback (BUILD-841)
+# ---------------------------------------------------------------------------
+
+# Minimal, static PATH for hermetic git subprocess: no ambient shell.
+_HERMETIC_GIT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Full 40-hex or 64-hex object ID; prefix SHAs and anything shorter fail closed.
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+# Environment names to unconditionally absent from the hermetic subprocess.
+# We start with an empty env, so this list is documentation rather than a
+# strip list, but it records the threat model for audit purposes.
+_HERMETIC_STRIP_DOCUMENTED = frozenset({
+    "HOME", "GIT_DIR", "GIT_WORK_TREE", "GIT_EXEC_PATH", "GIT_COMMON_DIR",
+    "GIT_NAMESPACE", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",
+    "GIT_CURL_VERBOSE", "GIT_TRACE", "GIT_TRACE2", "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_PACKET", "GIT_TRACE2_EVENT", "GIT_ASKPASS", "GIT_CREDENTIAL_HELPER",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS",
+    "HTTPS_PROXY", "HTTP_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy",
+    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "PYTHONSTARTUP", "PYTHONPATH",
+} | UNCONDITIONAL_STRIP_ENV | CAPABILITY_SENSITIVE_ENV)
+
+
+def _hermetic_git_env(*, fresh_home: str, token: str | None = None) -> dict[str, str]:
+    """Build the minimal environment for one hermetic git ls-remote call.
+
+    Starts from an empty dict (never inherits the process environment) and
+    adds only the variables git and its credential helper strictly need.
+    This prevents HOME, GIT_*, SSH_*, proxy, TLS, LD_PRELOAD, and every
+    ambient credential from steering the credentialed request.
+    """
+    env: dict[str, str] = {
+        "HOME": fresh_home,
+        "PATH": _HERMETIC_GIT_PATH,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+    }
+    if token is not None:
+        # GH_TOKEN is read by GIT_ENV_TOKEN_HELPER which we pass via -c.
+        env["GH_TOKEN"] = token
+    return env
+
+
+def _hermetic_ls_remote(
+    *,
+    git_bin: str,
+    remote_url: str,
+    ref: str,
+    expected_sha: str,
+    token: str | None,
+    allow_file: bool,
+) -> dict[str, Any]:
+    """One hermetic ``git ls-remote`` attempt; returns the readback result dict.
+
+    Uses a fresh 0700 temporary HOME/cwd so no ambient gitconfig, SSH agent,
+    proxy, or injected code can reach the subprocess.  External protocols and
+    HTTP redirects are disabled.  The ``file://`` transport is enabled only
+    when ``allow_file`` is True (local bare-remote path).
+    """
+    import tempfile
+
+    details: dict[str, Any] = {
+        "expected_sha": expected_sha or None,
+        "remote_ref": ref or None,
+        "observed_sha": None,
+        "verified": False,
+    }
+
+    cmd = [git_bin]
+    cmd += ["-c", "http.followRedirects=false"]
+    cmd += ["-c", "protocol.allow=never"]
+    if allow_file:
+        cmd += ["-c", "protocol.file.allow=always"]
+    else:
+        cmd += ["-c", "protocol.https.allow=always"]
+    if token is not None:
+        cmd += ["-c", f"credential.helper={GIT_ENV_TOKEN_HELPER}"]
+    cmd += ["ls-remote", "--exit-code", "--refs", remote_url, ref]
+
+    try:
+        import tempfile as _tempfile
+        tmp_dir = _tempfile.mkdtemp(prefix="hermes-pub-rdback-")
+    except OSError:
+        details["reason"] = "transport"
+        return details
+
+    try:
+        import stat as _stat
+        try:
+            os.chmod(tmp_dir, 0o700)
+        except OSError:
+            pass
+
+        env = _hermetic_git_env(fresh_home=tmp_dir, token=token)
+
+        try:
+            from hermes_cli import kanban_db as _kb
+            timeout = getattr(_kb, "PUBLICATION_READBACK_TIMEOUT_SECONDS", 30)
+        except Exception:
+            timeout = 30
+
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                cwd=tmp_dir,
+            )
+        except subprocess.TimeoutExpired:
+            details["reason"] = "timeout"
+            return details
+        except OSError:
+            details["reason"] = "git_unavailable"
+            return details
+    finally:
+        # Best-effort cleanup; never block on failure.
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if completed.returncode != 0:
+        # Without credential: failed readback means ref is absent (or needs auth).
+        # With credential: anything non-zero is a definitive remote rejection.
+        details["reason"] = "remote_rejected" if token is not None else "ref_absent"
+        return details
+
+    # Parse output: accept exactly one line for the exact ref (tab-separated).
+    # ``--refs`` excludes peeled ``^{}`` objects, but we double-check anyway.
+    matching: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        if "	" in line:
+            sha_part, ref_part = line.split("	", 1)
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            sha_part, ref_part = parts[0], parts[1]
+        sha_part = sha_part.strip().lower()
+        ref_part = ref_part.strip()
+        # Reject peeled objects and refs that are not an exact match.
+        if ref_part != ref or ref_part.endswith("^{}"):
+            continue
+        matching.append(sha_part)
+
+    if not matching:
+        details["reason"] = "ref_absent"
+        return details
+    if len(matching) > 1:
+        details["reason"] = "malformed_response"
+        return details
+
+    observed = matching[0]
+    if not _FULL_SHA_RE.fullmatch(observed):
+        details["reason"] = "malformed_response"
+        return details
+
+    details["observed_sha"] = observed
+    details["verified"] = observed == expected_sha
+    if not details["verified"]:
+        details["reason"] = "sha_mismatch"
+    return details
+
+
+def trusted_publication_readback(
+    contract: Any,
+    *,
+    task_id: str = "",
+    run_id: int | None = None,
+) -> dict[str, Any]:
+    """Hermetic publication readback with task/run-bound credential authorization.
+
+    Enforces, in order:
+
+    1. Contract completeness and full-SHA validation.
+    2. Workspace existence.
+    3. Remote URL resolution and transport classification
+       (local file / public GitHub / private GitHub / unknown).
+    4. Push-target equality: the remote's owner/repo must equal
+       ``publication_repo`` when the latter is set.
+    5. Public (no-credential) attempt first.
+    6. For private GitHub targets: task/run identity verification, then
+       the sealed ``github_write`` credential — only after all checks pass.
+
+    Only the approved finite codes from ``_APPROVED_READBACK_CODES`` are
+    returned in the ``reason`` field; raw stdout/stderr, exception text,
+    URLs, environment contents, and credential material are never persisted.
+    """
+    details: dict[str, Any] = {
+        "expected_sha": None,
+        "remote": None,
+        "remote_ref": None,
+        "workspace_path": None,
+        "observed_sha": None,
+        "verified": False,
+    }
+
+    # --- 1. Validate contract fields ------------------------------------------
+    expected = str(getattr(contract, "expected_sha", "") or "").strip().lower()
+    remote_name = str(getattr(contract, "remote", "") or "").strip()
+    ref = str(getattr(contract, "ref", "") or "").strip()
+    workspace = str(getattr(contract, "workspace_path", "") or "").strip()
+    publication_repo = str(getattr(contract, "publication_repo", "") or "").strip()
+
+    details["expected_sha"] = expected or None
+    details["remote"] = remote_name or None
+    details["remote_ref"] = ref or None
+    details["workspace_path"] = workspace or None
+
+    if not expected or not remote_name or not ref:
+        details["reason"] = "contract_incomplete"
+        return details
+
+    if not _FULL_SHA_RE.fullmatch(expected):
+        details["reason"] = "contract_incomplete"
+        return details
+
+    # --- 2. Workspace existence ------------------------------------------------
+    if not workspace:
+        details["reason"] = "workspace_missing"
+        return details
+
+    workspace_path = Path(workspace).expanduser()
+    if not workspace_path.is_dir():
+        details["reason"] = "workspace_missing"
+        return details
+
+    # --- 3. Resolve remote URL from workspace ---------------------------------
+    # ``remote_name`` is a git remote name (e.g. ``origin``), not a URL.
+    # We resolve via ``git remote get-url --push <name>`` with a minimal,
+    # GIT_DIR-isolated environment to prevent GIT_DIR/GIT_WORK_TREE injection.
+    git_bin = shutil.which("git")
+    if not git_bin or not os.path.isabs(git_bin):
+        details["reason"] = "git_unavailable"
+        return details
+
+    # Resolve the push URL (push URL takes priority for authorization).
+    _probe_env = {
+        "HOME": str(workspace_path),  # fallback; stripped via GIT_CONFIG_NOSYSTEM
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PATH": _HERMETIC_GIT_PATH,
+        "LANG": "C.UTF-8",
+    }
+    # Unset GIT_DIR and GIT_WORK_TREE so the probe is anchored to the workspace.
+    _probe_env.pop("GIT_DIR", None)
+    _probe_env.pop("GIT_WORK_TREE", None)
+
+    try:
+        probe = subprocess.run(
+            [git_bin, "-C", str(workspace_path),
+             "remote", "get-url", "--push", remote_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=_probe_env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        details["reason"] = "contract_incomplete"
+        return details
+
+    if probe.returncode != 0:
+        details["reason"] = "contract_incomplete"
+        return details
+
+    remote_url = (probe.stdout or "").strip()
+    if not remote_url:
+        details["reason"] = "contract_incomplete"
+        return details
+
+    # --- 4. Classify remote and enforce push-target equality ------------------
+    # Local file remote: ``/absolute/path``, ``./relative``, ``../relative``,
+    # or ``file://...``.  We permit only validated local paths; the workspace
+    # must exist, and we never hand a credential to a file remote.
+    is_local = (
+        remote_url.startswith("file://")
+        or remote_url.startswith("/")
+        or remote_url.startswith("./")
+        or remote_url.startswith("../")
+        or (os.path.sep == "/" and os.path.isabs(remote_url))
+    )
+
+    if is_local:
+        # Local bare-remote: use the URL as-is; no credential; file protocol allowed.
+        return _hermetic_ls_remote(
+            git_bin=git_bin,
+            remote_url=remote_url,
+            ref=ref,
+            expected_sha=expected,
+            token=None,
+            allow_file=True,
+        )
+
+    # GitHub remote?
+    github_match = _GITHUB_REMOTE_OWNER_RE.fullmatch(remote_url)
+    if github_match is None:
+        # Unknown transport: no credential; no special protocol; public attempt only.
+        result = _hermetic_ls_remote(
+            git_bin=git_bin,
+            remote_url=remote_url,
+            ref=ref,
+            expected_sha=expected,
+            token=None,
+            allow_file=False,
+        )
+        if not result.get("verified") and result.get("reason") == "ref_absent":
+            # Could be auth-required; but we have no credential for unknown targets.
+            result["reason"] = "target_unbound"
+        return result
+
+    # GitHub remote: extract owner/repo and enforce push-target equality.
+    gh_owner = github_match.group("owner")
+    gh_repo = github_match.group("repo")
+    gh_slug = f"{gh_owner}/{gh_repo}"
+
+    if publication_repo and gh_slug.lower() != publication_repo.lower():
+        details["reason"] = "target_mismatch"
+        return details
+
+    # Check the deny list for the resolved slug.
+    try:
+        denied = denied_publication_repos("releaser")
+    except Exception:
+        denied = {}
+    if gh_slug.lower() in {k.lower() for k in denied}:
+        details["reason"] = "target_denied"
+        return details
+
+    # Canonical credential-free HTTPS URL for the readback probe.
+    canonical_url = f"https://github.com/{gh_owner}/{gh_repo}.git"
+
+    # --- 5. Public (no-credential) attempt ------------------------------------
+    pub_result = _hermetic_ls_remote(
+        git_bin=git_bin,
+        remote_url=canonical_url,
+        ref=ref,
+        expected_sha=expected,
+        token=None,
+        allow_file=False,
+    )
+    if pub_result.get("verified"):
+        return pub_result
+    # Definitive negative outcomes without credentials need no retry.
+    if pub_result.get("reason") == "sha_mismatch":
+        details.update(pub_result)
+        return details
+    # ref_absent from a public attempt is ambiguous (might need auth).
+
+    # --- 6. Authorization checks before credential use ------------------------
+    # Check task/run identity from the sealed worker runtime.
+    identity = trusted_worker_identity()
+    if identity is None:
+        details["reason"] = "identity_mismatch"
+        return details
+    if task_id and (identity[0] != task_id or identity[1] != run_id):
+        details["reason"] = "identity_mismatch"
+        return details
+
+    # Retrieve the sealed github_write credential.
+    token = get_trusted_worker_credential("github_write")
+    if token is None:
+        details["reason"] = "auth_missing"
+        return details
+
+    # --- 7. Credentialed attempt ----------------------------------------------
+    return _hermetic_ls_remote(
+        git_bin=git_bin,
+        remote_url=canonical_url,
+        ref=ref,
+        expected_sha=expected,
+        token=token,
+        allow_file=False,
+    )
 
 
 # Descriptive aliases keep call sites readable while preserving one contract.
