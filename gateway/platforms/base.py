@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
@@ -5595,7 +5596,7 @@ class BasePlatformAdapter(ABC):
                     self.platform, chat_id, exc_info=True,
                 )
 
-        return SessionSource(
+        source = SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
             chat_name=chat_name,
@@ -5616,6 +5617,11 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
+        # Keep the live receiving transport separate from ``source.profile``,
+        # which profile_routes may use only as a runtime/session namespace.
+        # The weak reference is intentionally in-process and is not serialized.
+        setattr(source, "_transport_adapter_ref", weakref.ref(self))
+        return source
     
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

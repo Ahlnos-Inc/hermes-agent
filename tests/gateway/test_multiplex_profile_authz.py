@@ -127,6 +127,24 @@ def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     ) is default_adapter
 
 
+def test_hand_built_routed_source_remains_fail_closed_without_provenance(monkeypatch):
+    """A restored source cannot claim the default transport by profile route."""
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._profile_adapters["routed"] = {}
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="attacker",
+        chat_id="dm-chat",
+        user_name="attacker",
+        chat_type="dm",
+        profile="routed",
+    )
+
+    assert runner._adapter_for_source(source) is None
+    assert runner._is_user_authorized(source) is False
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

@@ -18039,7 +18039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import uuid
 
         if not adapter:
-            return ""
+            return "[clarify prompt could not be delivered]"
 
         choice_list = list(choices) if choices else None
         clarify_id = uuid.uuid4().hex[:10]
