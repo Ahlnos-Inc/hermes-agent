@@ -272,12 +272,29 @@ class TestTelegramSendClarify:
         assert cm.has_pending("sk-timeout") is False
 
     @pytest.mark.asyncio
-    async def test_profile_routed_telegram_clarify_uses_receiving_adapter(self):
-        """A logical profile route must not silently discard its shared Telegram transport."""
+    async def test_profile_routed_telegram_clarify_uses_receiving_adapter(self, monkeypatch):
+        """A route's runtime profile cannot override ingress policy or transport."""
         import gateway.run as gateway_run
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
+        secondary_adapter = _make_adapter()
+        setattr(adapter, "_group_policy", "allowlist")
+        setattr(secondary_adapter, "_group_policy", "open")
+        monkeypatch.setattr(
+            TelegramAdapter,
+            "enforces_own_access_policy",
+            property(lambda _adapter: True),
+        )
+        for name in (
+            "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+            "TELEGRAM_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(name, raising=False)
         delivered = asyncio.Event()
         prompt_msg = MagicMock()
         prompt_msg.message_id = 105
@@ -309,7 +326,9 @@ class TestTelegramSendClarify:
             ],
         )
         runner.adapters = {Platform.TELEGRAM: adapter}
-        runner._profile_adapters = {}
+        runner._profile_adapters = {"marketing": {Platform.TELEGRAM: secondary_adapter}}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
         setattr(adapter, "gateway_runner", runner)
 
         source = adapter.build_source(
@@ -319,6 +338,11 @@ class TestTelegramSendClarify:
             user_id="12345",
         )
         assert source.profile == "marketing"
+        # The route selects a logical runtime but this message entered through
+        # the default credential. Its allowlist policy and its clarify prompt
+        # must use that same verified transport, not marketing's own adapter.
+        assert runner._is_user_authorized(source) is True
+        assert runner._adapter_for_source(source) is adapter
 
         result = await asyncio.wait_for(
             asyncio.to_thread(
