@@ -21,8 +21,13 @@ import logging
 import os
 import re
 import secrets
+import signal
+import sqlite3
+import stat
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -30,6 +35,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+from urllib.parse import unquote, urlsplit
 
 from hermes_constants import get_default_hermes_root
 
@@ -91,10 +97,13 @@ WORKER_CREDENTIAL_ARTIFACT_MAX_AGE_SECONDS = 24 * 60 * 60
 # token-free; the only secret it reads is the already-projected GH_TOKEN.
 GIT_ENV_TOKEN_HELPER = (
     "!f() { "
-    "host=; "
+    "protocol=; host=; "
     "while IFS= read -r line; do "
-    "case \"$line\" in host=*) host=\"${line#host=}\";; esac; "
+    "case \"$line\" in "
+    "protocol=*) protocol=\"${line#protocol=}\";; "
+    "host=*) host=\"${line#host=}\";; esac; "
     "done; "
+    "[ \"$protocol\" = https ] || return 0; "
     "[ \"$host\" = github.com ] || return 0; "
     "printf 'username=x-access-token\\npassword=%s\\n' \"$GH_TOKEN\"; "
     "}; f"
@@ -387,6 +396,42 @@ _TRUSTED_WORKER_CREDENTIALS: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
+class _FileSeal:
+    """Identity captured for one immutable bootstrap-owned executable."""
+
+    path: str
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _DirectorySeal:
+    """Identity captured for one bootstrap-owned directory."""
+
+    path: str
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class SealedGitRuntime:
+    """Bootstrap-sealed executable, helper runtime, PATH, and temp root."""
+
+    git: _FileSeal
+    version: str
+    exec_path: _DirectorySeal
+    shell: _FileSeal
+    path: str
+    path_dirs: tuple[_DirectorySeal, ...]
+    temp_root: _DirectorySeal
+
+
+@dataclass(frozen=True)
 class TrustedWorkerCredentialRuntime:
     """Process-local identity and values admitted at worker bootstrap.
 
@@ -403,6 +448,9 @@ class TrustedWorkerCredentialRuntime:
     manifest_verified: bool
     kanban_db_path: str
     capabilities: tuple[str, ...]
+    git_runtime: SealedGitRuntime | None = field(
+        default=None, repr=False, compare=False
+    )
     _values: tuple[tuple[str, str], ...] = field(
         default=(), repr=False, compare=False
     )
@@ -413,6 +461,8 @@ class TrustedWorkerCredentialRuntime:
 
 _TRUSTED_WORKER_RUNTIME: TrustedWorkerCredentialRuntime | None = None
 _TERMINAL_ARTIFACT_DIR: Path | None = None
+_PUBLICATION_READBACK_CALLS: dict[tuple[str, int], int] = {}
+_PUBLICATION_CREDENTIAL_ATTEMPTS: set[tuple[str, int]] = set()
 
 
 def _normalize_profile(profile: str) -> str:
@@ -422,6 +472,295 @@ def _normalize_profile(profile: str) -> str:
         return normalize_and_validate_profile_name(profile)
     except (TypeError, ValueError):
         raise WorkerCredentialError("worker credential profile is invalid") from None
+
+
+_GIT_BOOTSTRAP_CANDIDATES = (
+    ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+    if sys.platform == "darwin"
+    else ("/usr/bin/git", "/bin/git", "/usr/local/bin/git")
+)
+_GIT_BOOTSTRAP_TIMEOUT_SECONDS = 10
+_TRUSTED_TEMP_ROOT_PREFIX = "hermes-publication-runtime-"
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _worker_can_write(st: os.stat_result) -> bool:
+    """Return whether the current uid's normal Unix mode grants write access."""
+    uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+    groups = set(os.getgroups()) if hasattr(os, "getgroups") else set()
+    groups.add(os.getegid() if hasattr(os, "getegid") else os.getgid())
+    if st.st_uid == uid:
+        return bool(st.st_mode & stat.S_IWUSR)
+    if st.st_gid in groups:
+        return bool(st.st_mode & stat.S_IWGRP)
+    return bool(st.st_mode & stat.S_IWOTH)
+
+
+def _immutable_real_path(path: Path, *, directory: bool) -> Path | None:
+    """Resolve an OS path and reject every worker-steerable ancestor."""
+    try:
+        real = path.resolve(strict=True)
+        item_stat = real.stat()
+    except (OSError, RuntimeError):
+        return None
+    if directory:
+        if not stat.S_ISDIR(item_stat.st_mode):
+            return None
+    elif not stat.S_ISREG(item_stat.st_mode) or not os.access(real, os.X_OK):
+        return None
+
+    candidates = [real, *real.parents]
+    for candidate in candidates:
+        try:
+            candidate_stat = candidate.stat()
+        except OSError:
+            return None
+        if candidate != real and not stat.S_ISDIR(candidate_stat.st_mode):
+            return None
+        if _worker_can_write(candidate_stat):
+            return None
+        if stat.S_ISDIR(candidate_stat.st_mode) and candidate_stat.st_mode & (
+            stat.S_IWGRP | stat.S_IWOTH
+        ):
+            return None
+    return real
+
+
+def _sha256_file(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    return digest.hexdigest()
+                digest.update(chunk)
+    except OSError:
+        return None
+
+
+def _seal_file(path: Path) -> _FileSeal | None:
+    real = _immutable_real_path(path, directory=False)
+    if real is None:
+        return None
+    try:
+        st = real.stat()
+    except OSError:
+        return None
+    digest = _sha256_file(real)
+    if digest is None:
+        return None
+    return _FileSeal(
+        path=str(real),
+        device=st.st_dev,
+        inode=st.st_ino,
+        mode=stat.S_IMODE(st.st_mode),
+        size=st.st_size,
+        mtime_ns=st.st_mtime_ns,
+        sha256=digest,
+    )
+
+
+def _seal_directory(path: Path, *, immutable: bool = True) -> _DirectorySeal | None:
+    if immutable:
+        real = _immutable_real_path(path, directory=True)
+        if real is None:
+            return None
+    else:
+        try:
+            real = path.resolve(strict=True)
+            if real.is_symlink() or not real.is_dir():
+                return None
+        except (OSError, RuntimeError):
+            return None
+    try:
+        st = real.stat()
+    except OSError:
+        return None
+    return _DirectorySeal(
+        path=str(real),
+        device=st.st_dev,
+        inode=st.st_ino,
+        mode=stat.S_IMODE(st.st_mode),
+    )
+
+
+def _seal_matches_file(seal: _FileSeal, *, rehash: bool) -> bool:
+    try:
+        path = Path(seal.path)
+        st = path.stat()
+    except OSError:
+        return False
+    if (
+        st.st_dev,
+        st.st_ino,
+        stat.S_IMODE(st.st_mode),
+        st.st_size,
+        st.st_mtime_ns,
+    ) != (seal.device, seal.inode, seal.mode, seal.size, seal.mtime_ns):
+        return False
+    return not rehash or _sha256_file(path) == seal.sha256
+
+
+def _seal_matches_directory(seal: _DirectorySeal) -> bool:
+    try:
+        path = Path(seal.path)
+        st = path.stat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and not path.is_symlink()
+        and (st.st_dev, st.st_ino, stat.S_IMODE(st.st_mode))
+        == (seal.device, seal.inode, seal.mode)
+    )
+
+
+def _bootstrap_git_query(git: str, argument: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [git, argument],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env={
+                "HOME": os.devnull,
+                "PATH": "/usr/bin:/bin",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (completed.stdout or "").strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _seal_git_runtime() -> SealedGitRuntime | None:
+    """Seal the fixed Git runtime before any model/tool execution begins."""
+    for candidate in _GIT_BOOTSTRAP_CANDIDATES:
+        git = _seal_file(Path(candidate))
+        if git is None:
+            continue
+        version = _bootstrap_git_query(git.path, "--version")
+        exec_path_value = _bootstrap_git_query(git.path, "--exec-path")
+        if version is None or not version.startswith("git version ") or not exec_path_value:
+            continue
+        exec_path = _seal_directory(Path(exec_path_value))
+        shell = _seal_file(Path("/bin/sh"))
+        if exec_path is None or shell is None:
+            continue
+
+        path_seals: list[_DirectorySeal] = []
+        for value in dict.fromkeys((str(Path(git.path).parent), "/usr/bin", "/bin")):
+            sealed = _seal_directory(Path(value))
+            if sealed is None:
+                path_seals = []
+                break
+            path_seals.append(sealed)
+        if not path_seals:
+            continue
+
+        try:
+            temp_root_value = tempfile.mkdtemp(prefix=_TRUSTED_TEMP_ROOT_PREFIX)
+            temp_root_path = Path(temp_root_value)
+            parent = temp_root_path.parent.resolve(strict=True)
+            created = temp_root_path.lstat()
+            if (
+                temp_root_path.name.startswith(_TRUSTED_TEMP_ROOT_PREFIX) is False
+                or temp_root_path.is_symlink()
+                or not stat.S_ISDIR(created.st_mode)
+                or temp_root_path.parent.resolve(strict=True) != parent
+            ):
+                continue
+            directory_fd = os.open(temp_root_path, _DIRECTORY_OPEN_FLAGS)
+            try:
+                opened = os.fstat(directory_fd)
+                if (opened.st_dev, opened.st_ino) != (created.st_dev, created.st_ino):
+                    continue
+                os.fchmod(directory_fd, 0o700)
+                secured = os.fstat(directory_fd)
+            finally:
+                os.close(directory_fd)
+            if (
+                (secured.st_dev, secured.st_ino) != (created.st_dev, created.st_ino)
+                or stat.S_IMODE(secured.st_mode) != 0o700
+            ):
+                continue
+            temp_root = _seal_directory(temp_root_path, immutable=False)
+        except (OSError, RuntimeError):
+            temp_root = None
+        if temp_root is None or temp_root.mode != 0o700:
+            continue
+
+        return SealedGitRuntime(
+            git=git,
+            version=version,
+            exec_path=exec_path,
+            shell=shell,
+            path=os.pathsep.join(item.path for item in path_seals),
+            path_dirs=tuple(path_seals),
+            temp_root=temp_root,
+        )
+    return None
+
+
+def _git_runtime_is_current(runtime: SealedGitRuntime, *, rehash_git: bool) -> bool:
+    return (
+        _seal_matches_file(runtime.git, rehash=rehash_git)
+        and _seal_matches_file(runtime.shell, rehash=False)
+        and _seal_matches_directory(runtime.exec_path)
+        and _seal_matches_directory(runtime.temp_root)
+        and all(_seal_matches_directory(item) for item in runtime.path_dirs)
+    )
+
+
+def _safe_remove_directory(
+    path: Path,
+    *,
+    device: int,
+    inode: int,
+    parent_device: int | None = None,
+    parent_inode: int | None = None,
+) -> None:
+    """Best-effort removal anchored to the directory's current parent fd."""
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        return
+    parent_fd: int | None = None
+    try:
+        parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+        opened_parent = os.fstat(parent_fd)
+        if (
+            parent_device is not None
+            and parent_inode is not None
+            and (opened_parent.st_dev, opened_parent.st_ino)
+            != (parent_device, parent_inode)
+        ):
+            return
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (device, inode)
+        ):
+            return
+        shutil.rmtree(path.name, dir_fd=parent_fd)
+    except (OSError, RuntimeError):
+        return
+    finally:
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
 
 def _load_yaml(path: Path) -> Any:
@@ -682,14 +1021,24 @@ def bootstrap_worker_credential_context(
         for key in strip_env:
             target.pop(key, None)
 
+        raw_db_path = str(target.get("HERMES_KANBAN_DB") or "").strip()
+        try:
+            sealed_db = Path(raw_db_path).expanduser().resolve(strict=True)
+            sealed_db_path = str(sealed_db) if sealed_db.is_file() else ""
+        except (OSError, RuntimeError):
+            sealed_db_path = ""
+
         runtime = TrustedWorkerCredentialRuntime(
             profile=profile,
             task_id=task_id,
             run_id=run_id,
             manifest_digest=manifest.digest,
             manifest_verified=manifest_verified,
-            kanban_db_path=str(target.get("HERMES_KANBAN_DB") or "").strip(),
+            kanban_db_path=sealed_db_path,
             capabilities=tuple(sorted(admitted)),
+            git_runtime=(
+                _seal_git_runtime() if profile == "releaser" else None
+            ),
             _values=tuple(sorted(admitted.items())),
         )
         _TRUSTED_WORKER_RUNTIME = runtime
@@ -879,9 +1228,21 @@ def reset_worker_credential_context_for_tests() -> None:
     global _TRUSTED_WORKER_RUNTIME, _TERMINAL_ARTIFACT_DIR
 
     with _WORKER_CREDENTIAL_LOCK:
+        runtime = _TRUSTED_WORKER_RUNTIME
         _TRUSTED_WORKER_RUNTIME = None
         _TERMINAL_ARTIFACT_DIR = None
         _TRUSTED_WORKER_CREDENTIALS.clear()
+        _PUBLICATION_READBACK_CALLS.clear()
+        _PUBLICATION_CREDENTIAL_ATTEMPTS.clear()
+    git_runtime = runtime.git_runtime if runtime is not None else None
+    if git_runtime is not None and _seal_matches_directory(git_runtime.temp_root):
+        temp_root = Path(git_runtime.temp_root.path)
+        if temp_root.name.startswith(_TRUSTED_TEMP_ROOT_PREFIX):
+            _safe_remove_directory(
+                temp_root,
+                device=git_runtime.temp_root.device,
+                inode=git_runtime.temp_root.inode,
+            )
 
 
 @contextmanager
@@ -1012,44 +1373,95 @@ def github_write_resolve_key(owner: str | None) -> str | None:
     return GITHUB_WRITE_RESOLVE_KEYS.get(owner.strip().casefold())
 
 
-def denied_publication_repos(
+@dataclass(frozen=True)
+class _PublicationPolicy:
+    status: str
+    allowed_owners: frozenset[str] = frozenset()
+    denied_repos: Mapping[str, str] = field(default_factory=dict)
+
+
+_POLICY_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_POLICY_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _canonical_repo_slug(value: Any) -> tuple[str, str, str] | None:
+    if not isinstance(value, str) or value != value.strip() or value.count("/") != 1:
+        return None
+    owner, repo = value.split("/", 1)
+    if not _POLICY_OWNER_RE.fullmatch(owner) or not _POLICY_REPO_RE.fullmatch(repo):
+        return None
+    if repo in {".", ".."} or repo.casefold().endswith(".git"):
+        return None
+    return owner, repo, f"{owner}/{repo}"
+
+
+def _load_publication_policy(
     profile: str, root: Path | str | None = None
-) -> dict[str, str]:
-    """Repositories denied as a publication target, as ``{slug: reason}``.
-
-    Reads the same `rules/pr-target-repo-allowlist.json` the `gh` hook uses, so
-    there is one list rather than two that drift. That hook guards `gh`
-    commands; a plain `git push` through the projected credential helper never
-    reaches it, which is why credential selection has to consult the list too
-    (BUILD-795).
-
-    A missing or malformed file yields no denials. Failing closed here would
-    take the whole releaser lane offline in any home that has not synced the
-    rules directory, which is a worse outcome than losing a defence-in-depth
-    check that the `gh` hook still enforces on its own path. The caller reports
-    an unreadable file in its diagnostics so the gap is visible rather than
-    silent.
-    """
+) -> _PublicationPolicy:
+    """Parse the versioned publication policy once, preserving tri-state."""
     base = Path(root) if root is not None else get_default_hermes_root()
-    # The sync installs this per publishing profile, not centrally
-    # (`hermes-sync.sh::merge_pr_target_repo_allowlist_hook` writes
-    # `profiles/<releaser|coder>/rules/`). Reading the central root finds
-    # nothing and would silently disable the check.
     rules = base / "profiles" / _normalize_profile(profile) / "rules"
     try:
         payload = json.loads(
             (rules / "pr-target-repo-allowlist.json").read_text(encoding="utf-8")
         )
     except (OSError, ValueError):
-        return {}
-    denied = payload.get("denied_repos") if isinstance(payload, dict) else None
-    if not isinstance(denied, dict):
-        return {}
-    return {
-        str(slug).strip().casefold(): str(reason)
-        for slug, reason in denied.items()
-        if str(slug).strip()
-    }
+        return _PublicationPolicy("unavailable")
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "allowed_owners",
+        "denied_repos",
+    }:
+        return _PublicationPolicy("unavailable")
+    if payload.get("version") != 1 or isinstance(payload.get("version"), bool):
+        return _PublicationPolicy("unavailable")
+    owners = payload.get("allowed_owners")
+    denied = payload.get("denied_repos")
+    if (
+        not isinstance(owners, list)
+        or not owners
+        or not isinstance(denied, dict)
+        or any(not isinstance(item, str) or not _POLICY_OWNER_RE.fullmatch(item) for item in owners)
+        or len({item.casefold() for item in owners}) != len(owners)
+    ):
+        return _PublicationPolicy("unavailable")
+    normalized_denied: dict[str, str] = {}
+    for slug, reason in denied.items():
+        parsed = _canonical_repo_slug(slug)
+        if parsed is None or not isinstance(reason, str) or not reason.strip():
+            return _PublicationPolicy("unavailable")
+        normalized_denied[parsed[2].casefold()] = reason
+    return _PublicationPolicy(
+        "allowed",
+        allowed_owners=frozenset(item.casefold() for item in owners),
+        denied_repos=normalized_denied,
+    )
+
+
+def denied_publication_repos(
+    profile: str, root: Path | str | None = None
+) -> dict[str, str]:
+    """Compatibility fail-open view over the canonical strict policy parser."""
+    policy = _load_publication_policy(profile, root)
+    return dict(policy.denied_repos) if policy.status == "allowed" else {}
+
+
+def publication_policy_decision_for_repo(
+    profile: str,
+    repo: str | None,
+    root: Path | str | None = None,
+) -> str:
+    """Return the canonical allowed/denied/unavailable policy decision."""
+    policy = _load_publication_policy(profile, root)
+    parsed = _canonical_repo_slug(repo)
+    if policy.status != "allowed" or parsed is None:
+        return "unavailable" if policy.status != "allowed" else "denied"
+    if (
+        parsed[0].casefold() not in policy.allowed_owners
+        or parsed[2].casefold() in policy.denied_repos
+    ):
+        return "denied"
+    return "allowed"
 
 
 def vault_sourced_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]:
@@ -1760,175 +2172,632 @@ def render_profile_local_env_audit(root: Path | str | None = None) -> list[str]:
 # Trusted hermetic publication readback (BUILD-841)
 # ---------------------------------------------------------------------------
 
-# Minimal, static PATH for hermetic git subprocess: no ambient shell.
-_HERMETIC_GIT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PUBLICATION_READBACK_TIMEOUT_SECONDS = 20
+PUBLICATION_READBACK_CODES: frozenset[str] = frozenset(
+    {
+        "contract_incomplete",
+        "workspace_missing",
+        "target_unbound",
+        "target_mismatch",
+        "target_denied",
+        "policy_unavailable",
+        "identity_mismatch",
+        "identity_unavailable",
+        "auth_missing",
+        "remote_rejected",
+        "transport",
+        "timeout",
+        "ref_absent",
+        "malformed_response",
+        "sha_mismatch",
+        "git_unavailable",
+    }
+)
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_REMOTE_NAME_RE = re.compile(r"^[^\x00-\x20\x7f]{1,255}$")
+_MAX_REMOTE_URL_BYTES = 4096
+_MAX_GIT_OUTPUT_BYTES = 64 * 1024
+_PRIVATE_ATTEMPT_PREFIX = "attempt-"
+_HERMETIC_GIT_ENV_KEYS = frozenset(
+    {
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "PATH",
+        "GIT_EXEC_PATH",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TERMINAL_PROMPT",
+        "LANG",
+        "LC_ALL",
+    }
+)
 
-# Full 40-hex or 64-hex object ID; prefix SHAs and anything shorter fail closed.
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
-# Environment names to unconditionally absent from the hermetic subprocess.
-# We start with an empty env, so this list is documentation rather than a
-# strip list, but it records the threat model for audit purposes.
-_HERMETIC_STRIP_DOCUMENTED = frozenset({
-    "HOME", "GIT_DIR", "GIT_WORK_TREE", "GIT_EXEC_PATH", "GIT_COMMON_DIR",
-    "GIT_NAMESPACE", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND",
-    "GIT_CURL_VERBOSE", "GIT_TRACE", "GIT_TRACE2", "GIT_TRACE_PERFORMANCE",
-    "GIT_TRACE_PACKET", "GIT_TRACE2_EVENT", "GIT_ASKPASS", "GIT_CREDENTIAL_HELPER",
-    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS",
-    "HTTPS_PROXY", "HTTP_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy",
-    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-    "PYTHONSTARTUP", "PYTHONPATH",
-} | UNCONDITIONAL_STRIP_ENV | CAPABILITY_SENSITIVE_ENV)
+@dataclass(frozen=True)
+class _GitProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    failure: str | None = None
 
 
-def _hermetic_git_env(*, fresh_home: str, token: str | None = None) -> dict[str, str]:
-    """Build the minimal environment for one hermetic git ls-remote call.
+@dataclass(frozen=True)
+class _PrivateDirectory:
+    path: str
+    device: int
+    inode: int
 
-    Starts from an empty dict (never inherits the process environment) and
-    adds only the variables git and its credential helper strictly need.
-    This prevents HOME, GIT_*, SSH_*, proxy, TLS, LD_PRELOAD, and every
-    ambient credential from steering the credentialed request.
-    """
-    env: dict[str, str] = {
-        "HOME": fresh_home,
-        "PATH": _HERMETIC_GIT_PATH,
+
+@dataclass(frozen=True)
+class _ReadbackContractState:
+    expected_sha: str
+    remote: str
+    ref: str
+    workspace_path: str
+    publication_repo: str | None
+
+
+@dataclass(frozen=True)
+class _TargetPlan:
+    target: str
+    protocol: str
+    github_slug: str | None
+    bound: bool
+
+
+def _readback_result(
+    reason: str | None = None,
+    *,
+    observed_sha: str | None = None,
+    verified: bool = False,
+) -> dict[str, Any]:
+    if reason is not None and reason not in PUBLICATION_READBACK_CODES:
+        reason = "transport"
+    return {
+        "verified": bool(verified),
+        "observed_sha": observed_sha if _FULL_SHA_RE.fullmatch(observed_sha or "") else None,
+        "reason": reason,
+    }
+
+
+def safe_publication_readback_reason(value: Any) -> str:
+    """Collapse untrusted/exceptional failure labels into the fixed taxonomy."""
+    return value if isinstance(value, str) and value in PUBLICATION_READBACK_CODES else "transport"
+
+
+def sanitize_publication_readback(
+    value: Any,
+    *,
+    expected_sha: str | None = None,
+) -> dict[str, Any]:
+    """Return only controller-owned, secret-safe publication evidence keys."""
+    source = value if isinstance(value, Mapping) else {}
+    observed = source.get("observed_sha")
+    observed_sha = (
+        observed
+        if isinstance(observed, str) and _FULL_SHA_RE.fullmatch(observed)
+        else None
+    )
+    verified = (
+        source.get("verified") is True
+        and observed_sha is not None
+        and (expected_sha is None or observed_sha == expected_sha)
+    )
+    reason = source.get("reason")
+    if source.get("verified") is True and observed_sha is not None and not verified:
+        reason = "sha_mismatch"
+    return {
+        "verified": verified,
+        "observed_sha": observed_sha,
+        "reason": None if verified else safe_publication_readback_reason(reason),
+    }
+
+
+def _run_git_process(
+    command: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: str,
+    timeout: int,
+) -> _GitProcessResult:
+    """Run one bounded Git process group and discard output above the cap."""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=dict(env),
+            start_new_session=True,
+        )
+    except OSError:
+        return _GitProcessResult(-1, "", "", "git_unavailable")
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def drain(name: str, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    return
+                remaining = _MAX_GIT_OUTPUT_BYTES - len(captured[name])
+                if remaining > 0:
+                    captured[name].extend(chunk[:remaining])
+        except OSError:
+            return
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    def terminate_process_group() -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    failure: str | None = None
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        failure = "timeout"
+        terminate_process_group()
+    except OSError:
+        failure = "transport"
+        terminate_process_group()
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (AttributeError, OSError):
+                pass
+    return _GitProcessResult(
+        process.returncode if process.returncode is not None else -1,
+        bytes(captured["stdout"]).decode("utf-8", errors="replace"),
+        bytes(captured["stderr"]).decode("utf-8", errors="replace"),
+        failure,
+    )
+
+
+def _private_directory(runtime: SealedGitRuntime) -> _PrivateDirectory | None:
+    """Create one validated child below the immutable bootstrap temp root."""
+    if not _seal_matches_directory(runtime.temp_root):
+        return None
+    root = Path(runtime.temp_root.path)
+    try:
+        value = tempfile.mkdtemp(prefix=_PRIVATE_ATTEMPT_PREFIX, dir=str(root))
+        child = Path(value)
+        child_lstat = child.lstat()
+        if (
+            child.is_symlink()
+            or not stat.S_ISDIR(child_lstat.st_mode)
+            or child.parent.resolve(strict=True) != root
+            or not child.name.startswith(_PRIVATE_ATTEMPT_PREFIX)
+            or not _seal_matches_directory(runtime.temp_root)
+        ):
+            return None
+        identity = _PrivateDirectory(str(child), child_lstat.st_dev, child_lstat.st_ino)
+        directory_fd = os.open(child, _DIRECTORY_OPEN_FLAGS)
+        try:
+            opened = os.fstat(directory_fd)
+            if (opened.st_dev, opened.st_ino) != (identity.device, identity.inode):
+                return None
+            os.fchmod(directory_fd, 0o700)
+            current = os.fstat(directory_fd)
+        finally:
+            os.close(directory_fd)
+        if (
+            current.st_dev != identity.device
+            or current.st_ino != identity.inode
+            or stat.S_IMODE(current.st_mode) != 0o700
+        ):
+            return None
+        return identity
+    except (OSError, RuntimeError):
+        return None
+
+
+def _cleanup_private_directory(
+    runtime: SealedGitRuntime, private: _PrivateDirectory | None
+) -> None:
+    if private is None or not _seal_matches_directory(runtime.temp_root):
+        return
+    path = Path(private.path)
+    if (
+        path.parent != Path(runtime.temp_root.path)
+        or not path.name.startswith(_PRIVATE_ATTEMPT_PREFIX)
+    ):
+        return
+    _safe_remove_directory(
+        path,
+        device=private.device,
+        inode=private.inode,
+        parent_device=runtime.temp_root.device,
+        parent_inode=runtime.temp_root.inode,
+    )
+
+
+def _hermetic_git_env(
+    runtime: SealedGitRuntime,
+    private: _PrivateDirectory,
+    *,
+    token: str | None = None,
+) -> dict[str, str]:
+    env = {
+        "HOME": private.path,
+        "XDG_CONFIG_HOME": private.path,
+        "PATH": runtime.path,
+        "GIT_EXEC_PATH": runtime.exec_path.path,
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
-        "LANG": "C.UTF-8",
+        "LANG": "C",
+        "LC_ALL": "C",
     }
     if token is not None:
-        # GH_TOKEN is read by GIT_ENV_TOKEN_HELPER which we pass via -c.
         env["GH_TOKEN"] = token
     return env
 
 
-def _hermetic_ls_remote(
+def _caller_contract_tuple(contract: Any) -> tuple[Any, Any, Any, Any, Any]:
+    return (
+        getattr(contract, "expected_sha", None),
+        getattr(contract, "remote", None),
+        getattr(contract, "ref", None),
+        getattr(contract, "workspace_path", None),
+        getattr(contract, "publication_repo", None),
+    )
+
+
+def _read_current_publication_contract(
+    contract: Any,
     *,
-    git_bin: str,
-    remote_url: str,
-    ref: str,
-    expected_sha: str,
-    token: str | None,
-    allow_file: bool,
-) -> dict[str, Any]:
-    """One hermetic ``git ls-remote`` attempt; returns the readback result dict.
+    task_id: str,
+    run_id: int,
+) -> tuple[_ReadbackContractState | None, TrustedWorkerCredentialRuntime | None, str | None]:
+    context = trusted_worker_receipt_context()
+    runtime = _TRUSTED_WORKER_RUNTIME
+    if (
+        context is None
+        or runtime is None
+        or run_id <= 0
+        or context[0] != task_id
+        or context[1] != run_id
+    ):
+        return None, runtime, "identity_mismatch"
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = Path(context[2]).absolute().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 100")
+        connection.execute("BEGIN DEFERRED")
+        row = connection.execute(
+            "SELECT t.status AS task_status, t.current_run_id, "
+            "t.publication_expected_sha, t.publication_remote, t.publication_ref, "
+            "t.workspace_path, t.publication_repo, r.task_id AS run_task_id, "
+            "r.profile AS run_profile, r.status AS run_status, r.ended_at "
+            "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND r.id = ?",
+            (task_id, run_id),
+        ).fetchone()
+        connection.rollback()
+        connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        try:
+            if connection is not None:
+                connection.close()
+        except sqlite3.Error:
+            pass
+        return None, runtime, "identity_unavailable"
+    if (
+        row is None
+        or row["task_status"] != "running"
+        or row["current_run_id"] != run_id
+        or row["run_task_id"] != task_id
+        or str(row["run_profile"] or "").casefold() != runtime.profile.casefold()
+        or row["run_status"] != "running"
+        or row["ended_at"] is not None
+    ):
+        return None, runtime, "identity_mismatch"
+    db_tuple = (
+        row["publication_expected_sha"],
+        row["publication_remote"],
+        row["publication_ref"],
+        row["workspace_path"],
+        row["publication_repo"],
+    )
+    if db_tuple != _caller_contract_tuple(contract):
+        return None, runtime, "identity_mismatch"
+    return (
+        _ReadbackContractState(
+            expected_sha=str(db_tuple[0] or ""),
+            remote=str(db_tuple[1] or ""),
+            ref=str(db_tuple[2] or ""),
+            workspace_path=str(db_tuple[3] or ""),
+            publication_repo=(str(db_tuple[4]) if db_tuple[4] is not None else None),
+        ),
+        runtime,
+        None,
+    )
 
-    Uses a fresh 0700 temporary HOME/cwd so no ambient gitconfig, SSH agent,
-    proxy, or injected code can reach the subprocess.  External protocols and
-    HTTP redirects are disabled.  The ``file://`` transport is enabled only
-    when ``allow_file`` is True (local bare-remote path).
-    """
-    import tempfile
 
-    details: dict[str, Any] = {
-        "expected_sha": expected_sha or None,
-        "remote_ref": ref or None,
-        "observed_sha": None,
-        "verified": False,
-    }
+def _valid_literal_ref(ref: str) -> bool:
+    if not ref.startswith("refs/") or len(ref.encode("utf-8")) > 1024:
+        return False
+    if ref.endswith((".", "/")) or ".." in ref or "@{" in ref or "//" in ref:
+        return False
+    if ref.endswith("^{}") or ref == "@":
+        return False
+    forbidden = set(" ~^:?*[\\")
+    if any(ord(char) < 32 or ord(char) == 127 or char in forbidden for char in ref):
+        return False
+    return all(
+        component and not component.startswith(".") and not component.endswith(".lock")
+        for component in ref.split("/")
+    )
 
-    cmd = [git_bin]
-    cmd += ["-c", "http.followRedirects=false"]
-    cmd += ["-c", "protocol.allow=never"]
-    if allow_file:
-        cmd += ["-c", "protocol.file.allow=always"]
+
+def _parse_github_target(value: str) -> tuple[str, str, str] | None:
+    if not value or len(value.encode("utf-8")) > _MAX_REMOTE_URL_BYTES:
+        return None
+    scp = re.fullmatch(
+        r"(?:(?P<user>git)@)?github\.com:(?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})/"
+        r"(?P<repo>[A-Za-z0-9_.-]{1,100})(?:\.git)?",
+        value,
+        re.IGNORECASE,
+    )
+    if scp is not None:
+        owner, repo = scp.group("owner"), scp.group("repo")
+        if repo.casefold().endswith(".git"):
+            repo = repo[:-4]
+        return owner, repo, f"{owner}/{repo}"
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.casefold() not in {"https", "ssh"}:
+            return None
+        if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+            return None
+        if parsed.password is not None or parsed.query or parsed.fragment or "%" in parsed.path:
+            return None
+        if parsed.scheme.casefold() == "https":
+            if parsed.username is not None or parsed.port not in {None, 443}:
+                return None
+        elif parsed.username not in {None, "git"} or parsed.port not in {None, 22}:
+            return None
+    except ValueError:
+        return None
+    pieces = parsed.path.strip("/").split("/")
+    if len(pieces) != 2:
+        return None
+    owner, repo = pieces
+    if repo.casefold().endswith(".git"):
+        repo = repo[:-4]
+    canonical = _canonical_repo_slug(f"{owner}/{repo}")
+    return canonical
+
+
+def _parse_local_target(value: str, workspace: Path) -> str | None:
+    if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    if value.startswith("file://"):
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "file"
+            or parsed.netloc not in {"", "localhost"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        local = Path(unquote(parsed.path))
+        if not local.is_absolute():
+            return None
     else:
-        cmd += ["-c", "protocol.https.allow=always"]
-    if token is not None:
-        cmd += ["-c", f"credential.helper={GIT_ENV_TOKEN_HELPER}"]
-    cmd += ["ls-remote", "--exit-code", "--refs", remote_url, ref]
-
+        if not value.startswith(("/", "./", "../")):
+            return None
+        local = Path(value)
+        if not local.is_absolute():
+            local = workspace / local
     try:
-        import tempfile as _tempfile
-        tmp_dir = _tempfile.mkdtemp(prefix="hermes-pub-rdback-")
-    except OSError:
-        details["reason"] = "transport"
-        return details
+        return str(local.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return None
 
+
+def _probe_publication_target(
+    state: _ReadbackContractState,
+    runtime: SealedGitRuntime,
+    workspace: Path,
+) -> tuple[str | None, str | None]:
+    private = _private_directory(runtime)
+    if private is None:
+        return None, "transport"
     try:
-        import stat as _stat
-        try:
-            os.chmod(tmp_dir, 0o700)
-        except OSError:
-            pass
-
-        env = _hermetic_git_env(fresh_home=tmp_dir, token=token)
-
-        try:
-            from hermes_cli import kanban_db as _kb
-            timeout = getattr(_kb, "PUBLICATION_READBACK_TIMEOUT_SECONDS", 30)
-        except Exception:
-            timeout = 30
-
-        try:
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                env=env,
-                cwd=tmp_dir,
-            )
-        except subprocess.TimeoutExpired:
-            details["reason"] = "timeout"
-            return details
-        except OSError:
-            details["reason"] = "git_unavailable"
-            return details
+        command = [
+            runtime.git.path,
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.ext.allow=never",
+            "-C",
+            str(workspace),
+            "remote",
+            "get-url",
+            "--push",
+            state.remote,
+        ]
+        completed = _run_git_process(
+            command,
+            env=_hermetic_git_env(runtime, private),
+            cwd=private.path,
+            timeout=10,
+        )
     finally:
-        # Best-effort cleanup; never block on failure.
-        try:
-            import shutil as _shutil
-            _shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
+        _cleanup_private_directory(runtime, private)
+    if completed.failure is not None:
+        return None, completed.failure
     if completed.returncode != 0:
-        # Without credential: failed readback means ref is absent (or needs auth).
-        # With credential: anything non-zero is a definitive remote rejection.
-        details["reason"] = "remote_rejected" if token is not None else "ref_absent"
-        return details
+        return None, "target_mismatch" if state.publication_repo else "target_unbound"
+    lines = completed.stdout.splitlines()
+    if len(lines) != 1 or not lines[0] or len(lines[0].encode("utf-8")) > _MAX_REMOTE_URL_BYTES:
+        return None, "target_mismatch" if state.publication_repo else "target_unbound"
+    return lines[0], None
 
-    # Parse output: accept exactly one line for the exact ref (tab-separated).
-    # ``--refs`` excludes peeled ``^{}`` objects, but we double-check anyway.
-    matching: list[str] = []
-    for line in (completed.stdout or "").splitlines():
-        if "	" in line:
-            sha_part, ref_part = line.split("	", 1)
-        else:
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            sha_part, ref_part = parts[0], parts[1]
-        sha_part = sha_part.strip().lower()
-        ref_part = ref_part.strip()
-        # Reject peeled objects and refs that are not an exact match.
-        if ref_part != ref or ref_part.endswith("^{}"):
+
+def _target_plan(
+    remote_url: str,
+    *,
+    state: _ReadbackContractState,
+    workspace: Path,
+) -> tuple[_TargetPlan | None, str | None]:
+    bound_slug = _canonical_repo_slug(state.publication_repo) if state.publication_repo else None
+    if state.publication_repo and bound_slug is None:
+        return None, "contract_incomplete"
+    github = _parse_github_target(remote_url)
+    if bound_slug is not None:
+        if github is None or github[2].casefold() != bound_slug[2].casefold():
+            return None, "target_mismatch"
+        return (
+            _TargetPlan(
+                target=f"https://github.com/{bound_slug[0]}/{bound_slug[1]}.git",
+                protocol="https",
+                github_slug=bound_slug[2],
+                bound=True,
+            ),
+            None,
+        )
+    local = _parse_local_target(remote_url, workspace)
+    if local is not None and github is None:
+        return _TargetPlan(local, "file", None, False), None
+    if github is not None:
+        return (
+            _TargetPlan(
+                f"https://github.com/{github[0]}/{github[1]}.git",
+                "https",
+                github[2],
+                False,
+            ),
+            None,
+        )
+    try:
+        unknown = urlsplit(remote_url)
+    except ValueError:
+        return None, "target_unbound"
+    try:
+        invalid_unknown = (
+            unknown.scheme.casefold() != "https"
+            or unknown.hostname is None
+            or unknown.username is not None
+            or unknown.password is not None
+            or unknown.port not in {None, 443}
+            or bool(unknown.query)
+            or bool(unknown.fragment)
+        )
+    except ValueError:
+        return None, "target_unbound"
+    if invalid_unknown:
+        return None, "target_unbound"
+    return _TargetPlan(remote_url, "https", None, False), None
+
+
+def _ls_remote_command(
+    runtime: SealedGitRuntime,
+    plan: _TargetPlan,
+    ref: str,
+    *,
+    credentialed: bool,
+) -> list[str]:
+    command = [
+        runtime.git.path,
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        f"protocol.{plan.protocol}.allow=always",
+    ]
+    if credentialed:
+        command += ["-c", f"credential.helper={GIT_ENV_TOKEN_HELPER}"]
+    return command + ["ls-remote", "--exit-code", "--refs", "--", plan.target, ref]
+
+
+def _parse_ls_remote(stdout: str, *, ref: str, expected: str) -> dict[str, Any]:
+    records: list[str] = []
+    malformed = False
+    for line in stdout.splitlines():
+        parts = line.split("	")
+        if len(parts) != 2:
+            malformed = True
             continue
-        matching.append(sha_part)
+        sha, returned_ref = parts
+        if returned_ref != ref or returned_ref.endswith("^{}"):
+            malformed = True
+            continue
+        records.append(sha)
+    if malformed or len(records) != 1 or not _FULL_SHA_RE.fullmatch(records[0]):
+        return _readback_result("malformed_response")
+    observed = records[0]
+    if observed != expected:
+        return _readback_result("sha_mismatch", observed_sha=observed)
+    return _readback_result(None, observed_sha=observed, verified=True)
 
-    if not matching:
-        details["reason"] = "ref_absent"
-        return details
-    if len(matching) > 1:
-        details["reason"] = "malformed_response"
-        return details
 
-    observed = matching[0]
-    if not _FULL_SHA_RE.fullmatch(observed):
-        details["reason"] = "malformed_response"
-        return details
+_PUBLIC_AUTH_DENIAL_PATTERNS = (
+    re.compile(r"(?mi)^(?:remote:\s*)?Repository not found\.?\s*$"),
+    re.compile(r"(?mi)^fatal: Authentication failed for 'https://github\.com/[^']+'\.?\s*$"),
+    re.compile(r"(?mi)^fatal: could not read Username for 'https://github\.com': terminal prompts disabled\s*$"),
+    re.compile(r"(?mi)^remote: Invalid username or token\.\s*$"),
+    re.compile(
+        r"(?mi)^fatal: unable to access 'https://github\.com/[^']+': "
+        r"The requested URL returned error: (?:401|403|404)\s*$"
+    ),
+)
 
-    details["observed_sha"] = observed
-    details["verified"] = observed == expected_sha
-    if not details["verified"]:
-        details["reason"] = "sha_mismatch"
-    return details
+
+def _is_public_access_denial(stderr: str) -> bool:
+    return any(pattern.search(stderr) is not None for pattern in _PUBLIC_AUTH_DENIAL_PATTERNS)
+
+
+def _run_ls_remote(
+    runtime: SealedGitRuntime,
+    private: _PrivateDirectory,
+    plan: _TargetPlan,
+    state: _ReadbackContractState,
+    *,
+    token: str | None,
+) -> _GitProcessResult:
+    return _run_git_process(
+        _ls_remote_command(runtime, plan, state.ref, credentialed=token is not None),
+        env=_hermetic_git_env(runtime, private, token=token),
+        cwd=private.path,
+        timeout=PUBLICATION_READBACK_TIMEOUT_SECONDS,
+    )
 
 
 def trusted_publication_readback(
@@ -1937,211 +2806,123 @@ def trusted_publication_readback(
     task_id: str = "",
     run_id: int | None = None,
 ) -> dict[str, Any]:
-    """Hermetic publication readback with task/run-bound credential authorization.
+    """Perform the sole task/run-bound, public-first publication proof action."""
+    caller = _caller_contract_tuple(contract)
+    expected = str(caller[0] or "")
+    remote = str(caller[1] or "")
+    ref = str(caller[2] or "")
+    workspace_value = str(caller[3] or "")
+    if (
+        not _FULL_SHA_RE.fullmatch(expected)
+        or not _REMOTE_NAME_RE.fullmatch(remote)
+        or remote.startswith("-")
+        or not _valid_literal_ref(ref)
+    ):
+        return _readback_result("contract_incomplete")
+    workspace = Path(workspace_value)
+    if not workspace_value or not workspace.is_absolute() or not workspace.is_dir():
+        return _readback_result("workspace_missing")
+    exact_run_id = run_id if type(run_id) is int else 0
 
-    Enforces, in order:
+    state, trusted_runtime, identity_reason = _read_current_publication_contract(
+        contract,
+        task_id=task_id,
+        run_id=exact_run_id,
+    )
+    if identity_reason is not None or state is None or trusted_runtime is None:
+        return _readback_result(identity_reason or "identity_mismatch")
+    git_runtime = trusted_runtime.git_runtime
+    if git_runtime is None or not _git_runtime_is_current(git_runtime, rehash_git=False):
+        return _readback_result("git_unavailable")
 
-    1. Contract completeness and full-SHA validation.
-    2. Workspace existence.
-    3. Remote URL resolution and transport classification
-       (local file / public GitHub / private GitHub / unknown).
-    4. Push-target equality: the remote's owner/repo must equal
-       ``publication_repo`` when the latter is set.
-    5. Public (no-credential) attempt first.
-    6. For private GitHub targets: task/run identity verification, then
-       the sealed ``github_write`` credential — only after all checks pass.
+    budget_key = (task_id, exact_run_id)
+    with _WORKER_CREDENTIAL_LOCK:
+        calls = _PUBLICATION_READBACK_CALLS.get(budget_key, 0) + 1
+        _PUBLICATION_READBACK_CALLS[budget_key] = calls
+    if calls > 2:
+        return _readback_result("transport")
 
-    Only the approved finite codes from ``_APPROVED_READBACK_CODES`` are
-    returned in the ``reason`` field; raw stdout/stderr, exception text,
-    URLs, environment contents, and credential material are never persisted.
-    """
-    details: dict[str, Any] = {
-        "expected_sha": None,
-        "remote": None,
-        "remote_ref": None,
-        "workspace_path": None,
-        "observed_sha": None,
-        "verified": False,
-    }
+    remote_url, probe_reason = _probe_publication_target(state, git_runtime, workspace)
+    if probe_reason is not None or remote_url is None:
+        return _readback_result(probe_reason or "target_unbound")
+    plan, plan_reason = _target_plan(remote_url, state=state, workspace=workspace)
+    if plan_reason is not None or plan is None:
+        return _readback_result(plan_reason or "target_unbound")
 
-    # --- 1. Validate contract fields ------------------------------------------
-    expected = str(getattr(contract, "expected_sha", "") or "").strip().lower()
-    remote_name = str(getattr(contract, "remote", "") or "").strip()
-    ref = str(getattr(contract, "ref", "") or "").strip()
-    workspace = str(getattr(contract, "workspace_path", "") or "").strip()
-    publication_repo = str(getattr(contract, "publication_repo", "") or "").strip()
+    if plan.bound:
+        policy_decision = publication_policy_decision_for_repo(
+            trusted_runtime.profile,
+            plan.github_slug,
+        )
+        if policy_decision == "unavailable":
+            return _readback_result("policy_unavailable")
+        if policy_decision != "allowed":
+            return _readback_result("target_denied")
 
-    details["expected_sha"] = expected or None
-    details["remote"] = remote_name or None
-    details["remote_ref"] = ref or None
-    details["workspace_path"] = workspace or None
-
-    if not expected or not remote_name or not ref:
-        details["reason"] = "contract_incomplete"
-        return details
-
-    if not _FULL_SHA_RE.fullmatch(expected):
-        details["reason"] = "contract_incomplete"
-        return details
-
-    # --- 2. Workspace existence ------------------------------------------------
-    if not workspace:
-        details["reason"] = "workspace_missing"
-        return details
-
-    workspace_path = Path(workspace).expanduser()
-    if not workspace_path.is_dir():
-        details["reason"] = "workspace_missing"
-        return details
-
-    # --- 3. Resolve remote URL from workspace ---------------------------------
-    # ``remote_name`` is a git remote name (e.g. ``origin``), not a URL.
-    # We resolve via ``git remote get-url --push <name>`` with a minimal,
-    # GIT_DIR-isolated environment to prevent GIT_DIR/GIT_WORK_TREE injection.
-    git_bin = shutil.which("git")
-    if not git_bin or not os.path.isabs(git_bin):
-        details["reason"] = "git_unavailable"
-        return details
-
-    # Resolve the push URL (push URL takes priority for authorization).
-    _probe_env = {
-        "HOME": str(workspace_path),  # fallback; stripped via GIT_CONFIG_NOSYSTEM
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_TERMINAL_PROMPT": "0",
-        "PATH": _HERMETIC_GIT_PATH,
-        "LANG": "C.UTF-8",
-    }
-    # Unset GIT_DIR and GIT_WORK_TREE so the probe is anchored to the workspace.
-    _probe_env.pop("GIT_DIR", None)
-    _probe_env.pop("GIT_WORK_TREE", None)
-
+    public_dir = _private_directory(git_runtime)
+    if public_dir is None:
+        return _readback_result("transport")
     try:
-        probe = subprocess.run(
-            [git_bin, "-C", str(workspace_path),
-             "remote", "get-url", "--push", remote_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            env=_probe_env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        details["reason"] = "contract_incomplete"
-        return details
-
-    if probe.returncode != 0:
-        details["reason"] = "contract_incomplete"
-        return details
-
-    remote_url = (probe.stdout or "").strip()
-    if not remote_url:
-        details["reason"] = "contract_incomplete"
-        return details
-
-    # --- 4. Classify remote and enforce push-target equality ------------------
-    # Local file remote: ``/absolute/path``, ``./relative``, ``../relative``,
-    # or ``file://...``.  We permit only validated local paths; the workspace
-    # must exist, and we never hand a credential to a file remote.
-    is_local = (
-        remote_url.startswith("file://")
-        or remote_url.startswith("/")
-        or remote_url.startswith("./")
-        or remote_url.startswith("../")
-        or (os.path.sep == "/" and os.path.isabs(remote_url))
-    )
-
-    if is_local:
-        # Local bare-remote: use the URL as-is; no credential; file protocol allowed.
-        return _hermetic_ls_remote(
-            git_bin=git_bin,
-            remote_url=remote_url,
-            ref=ref,
-            expected_sha=expected,
+        public = _run_ls_remote(
+            git_runtime,
+            public_dir,
+            plan,
+            state,
             token=None,
-            allow_file=True,
         )
+    finally:
+        _cleanup_private_directory(git_runtime, public_dir)
+    if public.failure is not None:
+        return _readback_result(public.failure)
+    if public.returncode == 0:
+        return _parse_ls_remote(public.stdout, ref=state.ref, expected=state.expected_sha)
+    if public.returncode == 2:
+        return _readback_result("ref_absent")
+    if not _is_public_access_denial(public.stderr):
+        return _readback_result("transport")
+    if not plan.bound:
+        return _readback_result("target_unbound")
 
-    # GitHub remote?
-    github_match = _GITHUB_REMOTE_OWNER_RE.fullmatch(remote_url)
-    if github_match is None:
-        # Unknown transport: no credential; no special protocol; public attempt only.
-        result = _hermetic_ls_remote(
-            git_bin=git_bin,
-            remote_url=remote_url,
-            ref=ref,
-            expected_sha=expected,
-            token=None,
-            allow_file=False,
-        )
-        if not result.get("verified") and result.get("reason") == "ref_absent":
-            # Could be auth-required; but we have no credential for unknown targets.
-            result["reason"] = "target_unbound"
-        return result
-
-    # GitHub remote: extract owner/repo and enforce push-target equality.
-    gh_owner = github_match.group("owner")
-    gh_repo = github_match.group("repo")
-    gh_slug = f"{gh_owner}/{gh_repo}"
-
-    if publication_repo and gh_slug.lower() != publication_repo.lower():
-        details["reason"] = "target_mismatch"
-        return details
-
-    # Check the deny list for the resolved slug.
+    credential_dir = _private_directory(git_runtime)
+    if credential_dir is None:
+        return _readback_result("transport")
     try:
-        denied = denied_publication_repos("releaser")
-    except Exception:
-        denied = {}
-    if gh_slug.lower() in {k.lower() for k in denied}:
-        details["reason"] = "target_denied"
-        return details
-
-    # Canonical credential-free HTTPS URL for the readback probe.
-    canonical_url = f"https://github.com/{gh_owner}/{gh_repo}.git"
-
-    # --- 5. Public (no-credential) attempt ------------------------------------
-    pub_result = _hermetic_ls_remote(
-        git_bin=git_bin,
-        remote_url=canonical_url,
-        ref=ref,
-        expected_sha=expected,
-        token=None,
-        allow_file=False,
-    )
-    if pub_result.get("verified"):
-        return pub_result
-    # Definitive negative outcomes without credentials need no retry.
-    if pub_result.get("reason") == "sha_mismatch":
-        details.update(pub_result)
-        return details
-    # ref_absent from a public attempt is ambiguous (might need auth).
-
-    # --- 6. Authorization checks before credential use ------------------------
-    # Check task/run identity from the sealed worker runtime.
-    identity = trusted_worker_identity()
-    if identity is None:
-        details["reason"] = "identity_mismatch"
-        return details
-    if task_id and (identity[0] != task_id or identity[1] != run_id):
-        details["reason"] = "identity_mismatch"
-        return details
-
-    # Retrieve the sealed github_write credential.
-    token = get_trusted_worker_credential("github_write")
-    if token is None:
-        details["reason"] = "auth_missing"
-        return details
-
-    # --- 7. Credentialed attempt ----------------------------------------------
-    return _hermetic_ls_remote(
-        git_bin=git_bin,
-        remote_url=canonical_url,
-        ref=ref,
-        expected_sha=expected,
-        token=token,
-        allow_file=False,
-    )
+        current, current_runtime, current_reason = _read_current_publication_contract(
+            contract,
+            task_id=task_id,
+            run_id=exact_run_id,
+        )
+        if current_reason is not None or current is None or current_runtime is None:
+            return _readback_result(current_reason or "identity_mismatch")
+        with _WORKER_CREDENTIAL_LOCK:
+            if budget_key in _PUBLICATION_CREDENTIAL_ATTEMPTS:
+                return _readback_result("transport")
+            _PUBLICATION_CREDENTIAL_ATTEMPTS.add(budget_key)
+        if not _git_runtime_is_current(git_runtime, rehash_git=True):
+            return _readback_result("git_unavailable")
+        token = get_trusted_worker_credential("github_write")
+        if token is None:
+            return _readback_result("auth_missing")
+        credentialed = _run_ls_remote(
+            git_runtime,
+            credential_dir,
+            plan,
+            current,
+            token=token,
+        )
+    finally:
+        _cleanup_private_directory(git_runtime, credential_dir)
+    if credentialed.failure is not None:
+        return _readback_result(credentialed.failure)
+    if credentialed.returncode == 0:
+        return _parse_ls_remote(
+            credentialed.stdout,
+            ref=state.ref,
+            expected=state.expected_sha,
+        )
+    if credentialed.returncode == 2:
+        return _readback_result("ref_absent")
+    return _readback_result("remote_rejected")
 
 
 # Descriptive aliases keep call sites readable while preserving one contract.

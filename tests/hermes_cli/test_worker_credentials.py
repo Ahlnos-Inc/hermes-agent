@@ -124,6 +124,7 @@ def test_trusted_worker_identity_cannot_be_switched_by_environment_mutation(
     monkeypatch.setenv("HERMES_PROFILE", "releaser")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_receipt_owner")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    (tmp_path / "owner.db").touch()
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "owner.db"))
     monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, manifest.digest)
 
