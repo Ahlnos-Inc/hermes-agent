@@ -37,6 +37,8 @@ def test_early_startup_exception_scrubs_worker_credentials(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-early-failure")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "14")
     monkeypatch.setenv(wc.GITHUB_WRITE_HANDOFF_ENV, "private-handoff")
+    monkeypatch.setenv(wc.GITHUB_REVIEW_HANDOFF_ENV, "private-review-handoff")
+    monkeypatch.setenv(wc.GITHUB_REVIEW_SOURCE_KEY, "review-source")
     monkeypatch.setenv("GH_TOKEN", "ambient-token")
     monkeypatch.setenv("GITHUB_APP_ID", "app-id")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", "/tmp/private-key")
@@ -50,6 +52,8 @@ def test_early_startup_exception_scrubs_worker_credentials(monkeypatch):
     main_mod._bootstrap_worker_credentials_early()
 
     assert wc.GITHUB_WRITE_HANDOFF_ENV not in os.environ
+    assert wc.GITHUB_REVIEW_HANDOFF_ENV not in os.environ
+    assert wc.GITHUB_REVIEW_SOURCE_KEY not in os.environ
     assert "GH_TOKEN" not in os.environ
     assert "GITHUB_APP_ID" not in os.environ
     assert "GITHUB_APP_PRIVATE_KEY_PATH" not in os.environ

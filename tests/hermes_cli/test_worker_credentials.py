@@ -56,6 +56,92 @@ def _github_manifest(root: Path) -> None:
     )
 
 
+def _reviewer_manifest(root: Path) -> None:
+    _write_manifest(
+        root,
+        "version: 1\n"
+        "profiles:\n"
+        "  reviewer:\n"
+        "    actions: [github_review]\n"
+        "  verifier:\n"
+        "    actions: []\n",
+    )
+
+
+def test_github_review_capability_is_closed_private_and_strip_derived():
+    definition = wc.CAPABILITIES["github_review"]
+
+    assert definition == wc.CapabilityDefinition(
+        name="github_review",
+        source_key=wc.GITHUB_REVIEW_SOURCE_KEY,
+        handoff_env="HERMES_WORKER_CREDENTIAL_GITHUB_REVIEW",
+        projection_env=("GH_TOKEN",),
+        projection_kind="worker_environment",
+    )
+    assert definition.source_key is not None
+    assert definition.handoff_env is not None
+    assert definition.handoff_env in wc._HANDOFF_ENV_TO_CAPABILITY
+    assert wc._HANDOFF_ENV_TO_CAPABILITY[definition.handoff_env] == "github_review"
+    assert len(
+        [
+            candidate
+            for candidate in wc.CAPABILITIES.values()
+            if candidate.handoff_env == definition.handoff_env
+        ]
+    ) == 1
+    assert {
+        definition.source_key,
+        definition.handoff_env,
+        *definition.projection_env,
+    } <= wc.worker_credential_strip_env()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        """version: 1
+profiles:
+  reviewer:
+    actions: [github_write, github_review]
+""",
+        """version: 2
+profiles:
+  reviewer:
+    actions:
+      github_write: {}
+      github_review: {}
+""",
+    ],
+)
+def test_manifest_rejects_github_write_and_review_projection_conflict(tmp_path, body):
+    _write_manifest(tmp_path, body)
+
+    with pytest.raises(wc.WorkerCredentialError, match="conflicting GH_TOKEN projections"):
+        wc.load_manifest(tmp_path)
+
+
+def test_manifest_github_write_conflict_is_registry_derived(tmp_path, monkeypatch):
+    capability = "synthetic_github_projection"
+    monkeypatch.setitem(
+        wc.CAPABILITIES,
+        capability,
+        wc.CapabilityDefinition(
+            name=capability,
+            source_key="SYNTHETIC_GITHUB_SOURCE",
+            handoff_env=f"{wc.PRIVATE_HANDOFF_PREFIX}SYNTHETIC_GITHUB",
+            projection_env=("GH_TOKEN",),
+        ),
+    )
+    _write_manifest(
+        tmp_path,
+        "version: 1\nprofiles:\n  reviewer:\n"
+        f"    actions: [github_write, {capability}]\n",
+    )
+
+    with pytest.raises(wc.WorkerCredentialError, match=capability):
+        wc.load_manifest(tmp_path)
+
+
 def test_manifest_normalizes_grants_and_digest_is_whitespace_stable(tmp_path):
     _write_manifest(
         tmp_path,
@@ -194,6 +280,141 @@ def test_authorized_releaser_gets_private_handoff_only(tmp_path, monkeypatch, ca
     assert "GITHUB_TOKEN" not in child_env
     assert wc.BWS_BOOTSTRAP_ENV not in child_env
     assert child_env[wc.MANIFEST_DIGEST_ENV] == plan.manifest_digest
+
+
+def test_authorized_reviewer_gets_private_handoff_and_names_only_audit(
+    tmp_path, monkeypatch, caplog
+):
+    _reviewer_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    base_env = {
+        wc.BWS_BOOTSTRAP_ENV: "controller-bootstrap",
+        wc.GITHUB_REVIEW_SOURCE_KEY: "ambient-review-source",
+        "GH_TOKEN": "ambient-gh-token",
+        "GITHUB_TOKEN": "ambient-github-token",
+    }
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_REVIEW_SOURCE_KEY: SENTINEL}
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger=wc._log.name):
+        plan = wc.resolve_worker_credentials(
+            "Reviewer", root=tmp_path, base_env=base_env, run_id=846
+        )
+
+    assert plan.ok, plan.error
+    assert plan.capabilities == ("github_review",)
+    assert plan.diagnostics == ("vault_bootstrap=present", "github_review=present")
+    assert SENTINEL not in repr(plan)
+    assert SENTINEL not in caplog.text
+
+    child_env = wc.build_worker_environment(base_env, plan)
+    assert child_env[wc.GITHUB_REVIEW_HANDOFF_ENV] == SENTINEL
+    assert wc.GITHUB_REVIEW_SOURCE_KEY not in child_env
+    assert "GH_TOKEN" not in child_env
+    assert "GITHUB_TOKEN" not in child_env
+    assert wc.BWS_BOOTSTRAP_ENV not in child_env
+
+    report = wc.render_worker_credential_audit(root=tmp_path)
+    assert "reviewer" in report
+    assert "github_review" in report
+    assert wc.GITHUB_REVIEW_SOURCE_KEY in report
+    assert "GH_TOKEN" in report
+    assert SENTINEL not in report
+
+
+def test_denied_profile_cannot_admit_a_forged_github_review_handoff(
+    tmp_path, monkeypatch
+):
+    _reviewer_manifest(tmp_path)
+    manifest = wc.load_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-forged-review")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "847")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, manifest.digest)
+    monkeypatch.setenv(wc.GITHUB_REVIEW_HANDOFF_ENV, SENTINEL)
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh")
+
+    runtime = wc.bootstrap_worker_credential_context()
+
+    assert runtime is not None
+    assert runtime.manifest_verified
+    assert runtime.capabilities == ()
+    assert not wc.has_trusted_worker_action("github_review")
+    assert wc.GITHUB_REVIEW_HANDOFF_ENV not in os.environ
+    projected = {"PATH": "/usr/bin:/bin"}
+    assert wc.project_worker_terminal_environment(projected)
+    assert "GH_TOKEN" not in projected
+
+
+@pytest.mark.parametrize("tamper", ["task", "run", "digest"])
+def test_github_review_runtime_rejects_forged_identity_or_stale_digest(
+    tmp_path, monkeypatch, tamper
+):
+    _reviewer_manifest(tmp_path)
+    manifest = wc.load_manifest(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-review-bound")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "848")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, manifest.digest)
+    monkeypatch.setenv(wc.GITHUB_REVIEW_HANDOFF_ENV, SENTINEL)
+
+    runtime = wc.bootstrap_worker_credential_context()
+    assert runtime is not None
+    assert wc.has_trusted_worker_action("github_review")
+
+    if tamper == "task":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-forged")
+    elif tamper == "run":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "849")
+    else:
+        _write_manifest(
+            tmp_path,
+            "version: 1\nprofiles:\n  reviewer:\n"
+            "    actions: [github_review]\n  verifier:\n    actions: []\n"
+            "  coder:\n    actions: []\n",
+        )
+
+    assert not wc.has_trusted_worker_action("github_review")
+    assert wc.get_trusted_worker_credential("github_review") is None
+    projected = {"PATH": "/usr/bin:/bin"}
+    assert wc.project_worker_terminal_environment(projected)
+    assert "GH_TOKEN" not in projected
+
+
+@pytest.mark.parametrize("failure", ["bootstrap", "source"])
+def test_github_review_resolution_fails_closed_when_controller_input_is_missing(
+    tmp_path, monkeypatch, failure
+):
+    _reviewer_manifest(tmp_path)
+    _enable_bitwarden(tmp_path)
+    base_env = {}
+    if failure == "source":
+        base_env[wc.BWS_BOOTSTRAP_ENV] = "controller-bootstrap"
+        monkeypatch.setattr(
+            wc,
+            "_fetch_bitwarden_result",
+            lambda **_kwargs: FetchResult(secrets={}),
+        )
+
+    plan = wc.resolve_worker_credentials(
+        "reviewer", root=tmp_path, base_env=base_env, run_id=850
+    )
+
+    assert not plan.ok
+    assert plan._handoff == ()
+    expected = {
+        "bootstrap": "missing BWS bootstrap",
+        "source": "secret for github_review is missing",
+    }
+    assert expected[failure] in (plan.error or "")
+    assert SENTINEL not in repr(plan)
 
 
 @pytest.mark.parametrize(

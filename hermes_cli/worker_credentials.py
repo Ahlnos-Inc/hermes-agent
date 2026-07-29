@@ -49,6 +49,7 @@ GOOGLE_ADS_CONTROLLER_BWS_TOKEN_ENV = "HERMES_GOOGLE_ADS_CONTROLLER_BWS_TOKEN"
 # Ambient name that must always be STRIPPED from workers (kept in
 # UNCONDITIONAL_STRIP_ENV below). It is NOT the resolve source anymore.
 GITHUB_WRITE_SOURCE_KEY = "GH_TOKEN_SECRET_WRITE"
+GITHUB_REVIEW_SOURCE_KEY = "GITHUB_REVIEWER_TOKEN"
 # The BWS secrets github_write RESOLVES from, keyed by the GitHub owner of the
 # repository the worker will publish to (BUILD-603).
 #
@@ -72,6 +73,7 @@ GITHUB_WRITE_RESOLVE_KEYS: Mapping[str, str] = {
 # cannot accidentally inherit the controller's bootstrap or GitHub aliases.
 PRIVATE_HANDOFF_PREFIX = "HERMES_WORKER_CREDENTIAL_"
 GITHUB_WRITE_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}GITHUB_WRITE"
+GITHUB_REVIEW_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}GITHUB_REVIEW"
 BWS_BOOTSTRAP_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}BWS_BOOTSTRAP"
 META_MARKETING_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}META_MARKETING_READ"
 INSTAGRAM_GRAPH_HANDOFF_ENV = f"{PRIVATE_HANDOFF_PREFIX}INSTAGRAM_GRAPH_READ"
@@ -159,6 +161,12 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
         projection_env=("GH_TOKEN",),
         selected_by="repository owner",
     ),
+    "github_review": CapabilityDefinition(
+        name="github_review",
+        source_key=GITHUB_REVIEW_SOURCE_KEY,
+        handoff_env=GITHUB_REVIEW_HANDOFF_ENV,
+        projection_env=("GH_TOKEN",),
+    ),
     # BUILD-601: the three credentials marketing-operator actually needs, which
     # replaced its ``bws_bootstrap`` grant -- the last full-vault-token grant on
     # the system. Deliberately three single-secret capabilities
@@ -226,6 +234,34 @@ CAPABILITIES: Mapping[str, CapabilityDefinition] = {
     ),
 }
 
+
+def _github_token_projection_conflicts(
+    capabilities: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Return non-publish grants that would feed the write helper's token."""
+    if "github_write" not in capabilities:
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name in capabilities
+            if name != "github_write"
+            and (definition := CAPABILITIES.get(name)) is not None
+            and "GH_TOKEN" in definition.projection_env
+        )
+    )
+
+
+def _require_unambiguous_github_token_projection(
+    capabilities: tuple[str, ...] | list[str],
+) -> None:
+    conflicts = _github_token_projection_conflicts(capabilities)
+    if conflicts:
+        raise WorkerCredentialError(
+            "worker credential manifest has conflicting GH_TOKEN projections: "
+            f"github_write and {', '.join(conflicts)}"
+        )
+
 # Every name a capability sources from, plus the aliases those sources are
 # conventionally exported under. Stripped from EVERY worker, including one
 # granted the capability: a grant is delivered through the private handoff and
@@ -246,6 +282,7 @@ CAPABILITY_SENSITIVE_ENV = frozenset(
     for name in (
         *((definition.source_key,) if definition.source_key else ()),
         *definition.source_keys,
+        *((definition.handoff_env,) if definition.handoff_env else ()),
         *definition.ambient_strip_env,
         # The names a grant is PROJECTED under belong here too: an ambient
         # copy under the same name would be indistinguishable from the
@@ -512,6 +549,7 @@ def _normalize_manifest(raw: Any, path: Path | None) -> WorkerCredentialManifest
                 else:
                     normalized_configs[action] = {}
                 actions.append(action)
+        _require_unambiguous_github_token_projection(actions)
         profiles[profile] = tuple(sorted(actions))
         action_configs[profile] = normalized_configs
 
@@ -812,6 +850,9 @@ def project_worker_terminal_environment(
     if runtime is None:
         return False
 
+    # A github_write helper reads the final GH_TOKEN. Refuse any co-grant that
+    # could replace that token, even if a forged runtime bypassed manifest load.
+    _require_unambiguous_github_token_projection(list(runtime.capabilities))
     token = get_trusted_worker_credential("github_write", environ=os.environ)
     _run_dir, gh_config_dir, git_config = _terminal_artifacts()
     # Remove ambient command-scope config knobs before installing the exact
