@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -542,6 +544,37 @@ def test_process_runner_caps_output_and_kills_timeout_process_group() -> None:
     assert result.failure == "timeout"
     assert len(result.stdout.encode("utf-8")) <= wc._MAX_GIT_OUTPUT_BYTES
     assert elapsed < 10
+
+
+def test_git_process_cleanup_uses_taskkill_tree_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows timeout cleanup must kill descendants as well as the Git parent."""
+    calls: list[object] = []
+    process = SimpleNamespace(
+        pid=12345,
+        kill=lambda: calls.append("process.kill"),
+    )
+
+    def taskkill(command, **kwargs):
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr(wc.subprocess, "run", taskkill)
+
+    wc._terminate_git_process_tree(process, is_windows=True)
+
+    assert calls == [
+        (
+            ["taskkill", "/F", "/T", "/PID", "12345"],
+            {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "stdin": subprocess.DEVNULL,
+                "timeout": 5,
+                "check": False,
+            },
+        )
+    ]
 
 
 def test_kanban_adapter_delegates_to_canonical_action_and_sanitizes_output(

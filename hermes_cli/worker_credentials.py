@@ -2293,6 +2293,42 @@ def sanitize_publication_readback(
     }
 
 
+def _terminate_git_process_tree(
+    process: subprocess.Popen[Any], *, is_windows: bool | None = None
+) -> None:
+    """Force-stop the bounded Git process and every child it launched."""
+    windows = os.name == "nt" if is_windows is None else is_windows
+    if windows:
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            if getattr(completed, "returncode", 0) == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
+
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        if killpg is not None:
+            killpg(process.pid, sigkill)
+        else:
+            process.kill()
+    except OSError:
+        pass
+
+
 def _run_git_process(
     command: list[str],
     *,
@@ -2301,16 +2337,21 @@ def _run_git_process(
     timeout: int,
 ) -> _GitProcessResult:
     """Run one bounded Git process group and discard output above the cap."""
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            env=dict(env),
-            start_new_session=True,
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "cwd": cwd,
+        "env": dict(env),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
     except OSError:
         return _GitProcessResult(-1, "", "", "git_unavailable")
 
@@ -2336,13 +2377,7 @@ def _run_git_process(
         reader.start()
 
     def terminate_process_group() -> None:
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except OSError:
-            pass
+        _terminate_git_process_tree(process)
         try:
             process.wait(timeout=5)
         except (OSError, subprocess.SubprocessError):
