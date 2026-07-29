@@ -480,6 +480,11 @@ _GIT_BOOTSTRAP_CANDIDATES = (
     else ("/usr/bin/git", "/bin/git", "/usr/local/bin/git")
 )
 _GIT_BOOTSTRAP_TIMEOUT_SECONDS = 10
+# Hosted Linux test runners occasionally report a transient filesystem error
+# while creating the 0700 runtime directory under parallel load.  A second
+# complete seal is bounded, happens before any credential is admitted or
+# network action is possible, and still requires every immutable seal to pass.
+_GIT_RUNTIME_SEAL_ATTEMPTS = 2
 _TRUSTED_TEMP_ROOT_PREFIX = "hermes-publication-runtime-"
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
@@ -656,7 +661,7 @@ def _seal_git_runtime() -> SealedGitRuntime | None:
     if sys.platform == "win32":  # windows-footgun: ok — explicit POSIX-only gate
         return None
 
-    for candidate in _GIT_BOOTSTRAP_CANDIDATES:
+    for candidate in _GIT_BOOTSTRAP_CANDIDATES * _GIT_RUNTIME_SEAL_ATTEMPTS:
         git = _seal_file(Path(candidate))
         if git is None:
             continue

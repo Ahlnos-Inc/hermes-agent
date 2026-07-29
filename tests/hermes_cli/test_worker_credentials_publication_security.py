@@ -82,6 +82,36 @@ def test_bootstrap_seals_system_git_runtime_and_action_never_rediscovers_path(
     }
 
 
+def test_seal_git_runtime_retries_transient_temp_root_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One transient pre-credential temp failure cannot disable trusted Git."""
+    real_mkdtemp = wc.tempfile.mkdtemp
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary resource exhaustion")
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(wc, "_GIT_BOOTSTRAP_CANDIDATES", ("/usr/bin/git",))
+    monkeypatch.setattr(wc.tempfile, "mkdtemp", fail_once)
+
+    runtime = wc._seal_git_runtime()
+
+    assert runtime is not None
+    assert attempts == 2
+    assert runtime.temp_root.mode == 0o700
+    assert wc._git_runtime_is_current(runtime, rehash_git=True)
+    wc._safe_remove_directory(
+        Path(runtime.temp_root.path),
+        device=runtime.temp_root.device,
+        inode=runtime.temp_root.inode,
+    )
+
+
 def test_git_runtime_is_revalidated_before_secret_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
