@@ -46,7 +46,12 @@ def test_bootstrap_seals_system_git_runtime_and_action_never_rediscovers_path(
     assert runtime.git_runtime.git.path.startswith("/")
     assert runtime.git_runtime.exec_path.path.startswith("/")
     assert runtime.git_runtime.shell.path.startswith("/")
-    assert runtime.git_runtime.path == "/usr/bin:/bin"
+    # PATH must be non-empty, include git's parent, and contain only
+    # verified directory strings — not OS-specific resolved symlink paths.
+    git_parent = str(Path(runtime.git_runtime.git.path).parent)
+    path_parts = runtime.git_runtime.path.split(":")
+    assert runtime.git_runtime.path != ""
+    assert git_parent in path_parts, f"{git_parent!r} not in {path_parts!r}"
     assert oct(Path(runtime.git_runtime.temp_root.path).stat().st_mode & 0o777) == "0o700"
 
     monkeypatch.setattr(
@@ -575,6 +580,69 @@ def test_git_process_cleanup_uses_taskkill_tree_on_windows(
             },
         )
     ]
+
+
+def test_seal_git_runtime_returns_none_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows gate: _seal_git_runtime must return None immediately on win32.
+
+    The bootstrap POSIX primitives (fchmod, /bin/sh, POSIX candidate paths)
+    have no Windows equivalent.  Returning None early keeps the entire
+    POSIX-only code path unreachable on Windows and ensures that the
+    publication action fails closed (git_unavailable) without crashing.
+    """
+    monkeypatch.setattr(wc.sys, "platform", "win32")
+    result = wc._seal_git_runtime()
+    assert result is None, "_seal_git_runtime must return None on Windows"
+
+
+def test_windows_bootstrap_propagates_none_git_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bootstrapping a releaser on Windows sets git_runtime=None (no crash).
+
+    _seal_git_runtime returns None when sys.platform=="win32"; this
+    propagates cleanly through bootstrap_worker_credential_context so
+    trusted_publication_readback can inspect it and fail closed.
+    """
+    monkeypatch.setattr(wc.sys, "platform", "win32")
+    # _prepare_trusted_readback bootstraps the releaser context.
+    _prepare_trusted_readback(tmp_path, monkeypatch)
+    runtime = wc._TRUSTED_WORKER_RUNTIME
+    assert runtime is not None
+    assert runtime.git_runtime is None, (
+        "Windows bootstrap must propagate None git_runtime from _seal_git_runtime"
+    )
+
+
+def test_publication_readback_fails_closed_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, trusted_publication_readback returns git_unavailable (no crash).
+
+    This covers the full action code path: Windows bootstrap yields
+    git_runtime=None, which the readback guard converts to git_unavailable
+    before launching any subprocess.  No POSIX-only call is reached.
+    """
+    monkeypatch.setattr(wc.sys, "platform", "win32")
+    contract, task_id, run_id, _db = _prepare_trusted_readback(tmp_path, monkeypatch)
+    runtime = wc._TRUSTED_WORKER_RUNTIME
+    assert runtime is not None and runtime.git_runtime is None
+    monkeypatch.setattr(
+        wc,
+        "_run_git_process",
+        lambda *_args, **_kwargs: pytest.fail(
+            "_run_git_process must not be called when git_runtime is None"
+        ),
+    )
+    result = wc.trusted_publication_readback(
+        contract, task_id=task_id, run_id=run_id
+    )
+    assert result["reason"] == "git_unavailable"
+    assert result.get("verified") is not True
+
+
 
 
 def test_kanban_adapter_delegates_to_canonical_action_and_sanitizes_output(

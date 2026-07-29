@@ -646,7 +646,16 @@ def _bootstrap_git_query(git: str, argument: str) -> str | None:
 
 
 def _seal_git_runtime() -> SealedGitRuntime | None:
-    """Seal the fixed Git runtime before any model/tool execution begins."""
+    """Seal the fixed Git runtime before any model/tool execution begins.
+
+    Returns None on Windows: the POSIX bootstrap (fchmod, /bin/sh, stable
+    candidate paths) has no Windows equivalent.  Callers receive a None
+    git_runtime and the publication readback action fails closed with
+    "git_unavailable" without crashing.
+    """
+    if sys.platform == "win32":  # windows-footgun: ok — explicit POSIX-only gate
+        return None
+
     for candidate in _GIT_BOOTSTRAP_CANDIDATES:
         git = _seal_file(Path(candidate))
         if git is None:
@@ -660,8 +669,15 @@ def _seal_git_runtime() -> SealedGitRuntime | None:
         if exec_path is None or shell is None:
             continue
 
+        # path_candidates preserves the original input strings for the PATH
+        # env var passed to hermetic git subprocesses.  path_seals holds the
+        # seal of each resolved real directory for tamper-detection via
+        # _git_runtime_is_current.  On Linux, /bin is often a symlink to
+        # /usr/bin; using the input string in PATH keeps git-helper lookup
+        # correct while the seal verifies the real underlying directory.
+        path_candidates = list(dict.fromkeys((str(Path(git.path).parent), "/usr/bin", "/bin")))
         path_seals: list[_DirectorySeal] = []
-        for value in dict.fromkeys((str(Path(git.path).parent), "/usr/bin", "/bin")):
+        for value in path_candidates:
             sealed = _seal_directory(Path(value))
             if sealed is None:
                 path_seals = []
@@ -707,7 +723,7 @@ def _seal_git_runtime() -> SealedGitRuntime | None:
             version=version,
             exec_path=exec_path,
             shell=shell,
-            path=os.pathsep.join(item.path for item in path_seals),
+            path=os.pathsep.join(path_candidates),
             path_dirs=tuple(path_seals),
             temp_root=temp_root,
         )
