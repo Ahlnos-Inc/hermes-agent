@@ -49,7 +49,8 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.profile_routing import ProfileRoute
 
 
 def _make_adapter(extra=None):
@@ -271,6 +272,79 @@ class TestTelegramSendClarify:
         assert cm.has_pending("sk-timeout") is False
 
     @pytest.mark.asyncio
+    async def test_profile_routed_telegram_clarify_uses_receiving_adapter(self):
+        """A logical profile route must not silently discard its shared Telegram transport."""
+        import gateway.run as gateway_run
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        delivered = asyncio.Event()
+        prompt_msg = MagicMock()
+        prompt_msg.message_id = 105
+
+        async def send_message(**kwargs):
+            delivered.set()
+            pending = cm.get_pending_for_session(
+                "sk-routed",
+                include_choice_prompts=True,
+            )
+            assert pending is not None
+            assert cm.resolve_gateway_clarify(pending.clarify_id, "alpha") is True
+            return prompt_msg
+
+        send_message_mock = AsyncMock(side_effect=send_message)
+        bot = MagicMock()
+        bot.send_message = send_message_mock
+        adapter._bot = bot
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(
+                    name="marketing-chat",
+                    platform="telegram",
+                    profile="marketing",
+                    chat_id="-100123",
+                ),
+            ],
+        )
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._profile_adapters = {}
+        setattr(adapter, "gateway_runner", runner)
+
+        source = adapter.build_source(
+            chat_id="-100123",
+            chat_type="group",
+            thread_id="77",
+            user_id="12345",
+        )
+        assert source.profile == "marketing"
+
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                runner._run_clarify_callback_sync,
+                adapter=runner._adapter_for_source(source),
+                chat_id=source.chat_id,
+                session_key="sk-routed",
+                thread_metadata={"thread_id": source.thread_id},
+                loop=asyncio.get_running_loop(),
+                question="Which option?",
+                choices=["alpha", "beta"],
+            ),
+            timeout=0.2,
+        )
+
+        assert result == "alpha"
+        await asyncio.wait_for(delivered.wait(), timeout=0.2)
+        assert send_message_mock.await_args is not None
+        prompt_kwargs = send_message_mock.await_args.kwargs
+        assert prompt_kwargs["message_thread_id"] == 77
+        assert "reply_markup" in prompt_kwargs
+        assert "1. alpha" in prompt_kwargs["text"]
+        assert "2. beta" in prompt_kwargs["text"]
+        assert cm.has_pending("sk-routed") is False
+
+    @pytest.mark.asyncio
     async def test_gateway_runner_unscheduled_send_clears_resolver(self, monkeypatch):
         """A send cancelled before scheduling is definitively absent."""
         import gateway.run as gateway_run
@@ -300,6 +374,28 @@ class TestTelegramSendClarify:
         assert adapter._bot.send_message.await_count == 0
         assert adapter._clarify_state == {}
         assert cm.has_pending("sk-cancel") is False
+
+    @pytest.mark.asyncio
+    async def test_gateway_runner_missing_adapter_never_returns_silent_empty_response(self):
+        """A missing transport must be explicit so the agent can surface ordinary text."""
+        import gateway.run as gateway_run
+        from tools import clarify_gateway as cm
+
+        runner = object.__new__(gateway_run.GatewayRunner)
+
+        result = await asyncio.to_thread(
+            runner._run_clarify_callback_sync,
+            adapter=None,
+            chat_id="-100123",
+            session_key="sk-no-adapter",
+            thread_metadata={"thread_id": "77"},
+            loop=asyncio.get_running_loop(),
+            question="Which option?",
+            choices=["alpha", "beta"],
+        )
+
+        assert result == "[clarify prompt could not be delivered]"
+        assert cm.has_pending("sk-no-adapter") is False
 
     @pytest.mark.asyncio
     async def test_gateway_runner_timeout_keeps_resolver_for_unknown_delivery(self, monkeypatch):

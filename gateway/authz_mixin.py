@@ -77,6 +77,17 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        transport_adapter = adapter_ref() if callable(adapter_ref) else None
+        platform = getattr(source, "platform", None)
+        if transport_adapter is not None and platform is not None:
+            if transport_adapter is (getattr(self, "adapters", None) or {}).get(platform):
+                return transport_adapter
+            for profile_adapters in (
+                getattr(self, "_profile_adapters", None) or {}
+            ).values():
+                if transport_adapter is profile_adapters.get(platform):
+                    return transport_adapter
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
