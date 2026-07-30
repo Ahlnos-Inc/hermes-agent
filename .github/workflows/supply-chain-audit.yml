@@ -237,12 +237,15 @@ jobs:
         id: pr-labels
         uses: ./.github/actions/retry
         env:
-          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          # Mandatory enforcement read: without a working credential this step
+          # exits before the label is ever checked, so a correctly-labelled PR
+          # fails the gate. Fork: AUTOFIX_BOT_PAT is upstream-only (BUILD-871).
+          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
         with:
           command: gh pr view "${{ github.event.pull_request.number }}" --json labels --jq '.labels[].name'
       - name: Require explicit MCP catalog review label
         env:
-          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           PR="${{ github.event.pull_request.number }}"

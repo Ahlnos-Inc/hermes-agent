@@ -133,32 +133,70 @@ def test_classify(files, expected):
 
 
 # ---------------------------------------------------------------------------
-# BUILD-871: the classifier is only as good as its ability to read the diff.
+# BUILD-871: the gates are only as good as their ability to read GitHub.
+#
+# An undefined secret resolves to the empty STRING, which Actions counts as a
+# provided value — so `${{ secrets.SOME_UPSTREAM_PAT }}` overrides an input's
+# `default:` and hands gh no credential at all. That broke the change
+# classifier (every lane failed open, so the CI-sensitive label gate demanded
+# its label on every PR) and it silently breaks any mandatory label read the
+# same way. These guards parse the real YAML nodes rather than the file text,
+# so a fix surviving only in a comment does not satisfy them.
 # ---------------------------------------------------------------------------
 
 _REPO = Path(__file__).resolve().parents[2]
-_SECRET_REF = "secrets.AUTOFIX_BOT_PAT"
+_UPSTREAM_ONLY_SECRET = "AUTOFIX_BOT_PAT"
 
 
-def test_detect_changes_falls_back_to_the_ambient_credential():
-    """The action must not run gh with an empty credential.
+def _yaml(rel: str) -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load((_REPO / rel).read_text())
 
-    An input the caller passes as an unset secret arrives as the empty STRING,
-    which GitHub Actions counts as "provided" — so it overrides the input's
-    `default:` and the gh call runs unauthenticated. The compare API then fails,
-    the changed-file list comes back empty, and classify() fails open with every
-    lane true, including ci_review. That turned the CI-sensitive review gate
-    into a label every PR in the repo had to carry.
+
+def _guarded(expr: object) -> bool:
+    """True when an expression cannot evaluate to the empty string."""
+    text = str(expr)
+    return _UPSTREAM_ONLY_SECRET not in text or "||" in text
+
+
+def test_the_classifier_can_authenticate():
+    """The compare call must never run with an empty credential: an empty file
+    list makes classify() fail open with every lane true, which turns the
+    CI-sensitive review gate into a label every PR has to carry."""
+    action = _yaml(".github/actions/detect-changes/action.yml")
+    step = next(s for s in action["runs"]["steps"] if s.get("id") == "classify")
+    assert step["env"]["GH_TOKEN"] == "${{ inputs.github-token || github.token }}"
+
+
+def test_no_mandatory_gate_reads_labels_with_an_unguarded_secret():
+    """Every label read that BLOCKS a merge needs a fallback.
+
+    Without one the step exits before the label is checked, so a correctly
+    labelled PR fails the gate — the failure mode is unsatisfiable rather than
+    merely noisy, and it appears the moment the classifier starts working.
     """
+    for workflow, job in (
+        (".github/workflows/lint.yml", "ci-review"),
+        (".github/workflows/supply-chain-audit.yml", "mcp-catalog-review"),
+        (".github/workflows/ci.yml", "detect"),
+    ):
+        for step in _yaml(workflow)["jobs"][job]["steps"]:
+            for key, value in (step.get("env") or {}).items():
+                assert _guarded(value), f"{workflow}:{job}: unguarded {key}"
+            for key, value in (step.get("with") or {}).items():
+                assert _guarded(value), f"{workflow}:{job}: unguarded input {key}"
+
+
+def test_the_classifier_sees_both_sides_of_a_rename():
+    """A rename reports the NEW path in `filename` and the OLD one in
+    `previous_filename`. Reading only the former loses the sensitive path when
+    a workflow or an eslint config is renamed away from a gated name."""
     action = (_REPO / ".github/actions/detect-changes/action.yml").read_text()
-    assert "inputs.github-token || github.token" in action
+    assert ".previous_filename" in action
 
 
-def test_the_classifier_caller_guards_its_upstream_only_secret():
-    """Every reference to the upstream-only PAT on the classifier path needs a
-    fallback, or the fork passes an empty string straight through."""
-    for workflow in ("ci.yml", "lint.yml"):
-        text = (_REPO / ".github/workflows" / workflow).read_text()
-        for line in text.splitlines():
-            if _SECRET_REF in line:
-                assert "||" in line, f"{workflow}: unguarded {_SECRET_REF}: {line.strip()}"
+def test_a_truncated_compare_is_treated_as_unknown():
+    """The compare endpoint caps `files` at 300 whatever the pagination, and a
+    truncated list can omit the one sensitive path a gate exists to catch."""
+    action = (_REPO / ".github/actions/detect-changes/action.yml").read_text()
+    assert "-ge 300" in action and "failing open" in action

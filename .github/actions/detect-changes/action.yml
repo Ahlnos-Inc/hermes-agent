@@ -79,10 +79,25 @@ runs:
           # run — safe, but wasteful and it masks the API failure).
           CHANGED=""
           for i in 1 2 3; do
+            # Both names per entry: a rename reports the NEW path in
+            # `filename` and the OLD one in `previous_filename`, so taking
+            # only the former loses the sensitive path when an
+            # eslint.config.* or a workflow is renamed away.
             if CHANGED="$(gh api \
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[].filename')"; then
+              --jq '.files[] | .filename, (.previous_filename // empty)')"; then
+              # The compare endpoint caps `files` at 300 REGARDLESS of
+              # pagination. A list at the cap may be truncated, and a
+              # truncated list can silently omit the one sensitive path the
+              # gates exist to catch — so classify it as unknown and let
+              # every lane run rather than trusting a partial answer.
+              if [ "$(gh api --paginate \
+                    "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+                    --jq '.files | length')" -ge 300 ]; then
+                echo "::warning::compare returned the 300-file maximum — the list may be truncated, failing open (all lanes run)"
+                CHANGED=""
+              fi
               break
             fi
             if [ "$i" = 3 ]; then
