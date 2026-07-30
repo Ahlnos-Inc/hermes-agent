@@ -2097,31 +2097,45 @@ def _deliver_result(
 # later firing instead.
 # ---------------------------------------------------------------------------
 
-# Give up on a held payload once it is this stale.  A day-late money alert is
-# still worth delivering; a week-late one is noise, and holding forever would
-# grow jobs.json without bound.
-_PENDING_DELIVERY_MAX_AGE_SECONDS = 24 * 3600
+# Give up on a held payload once it is this stale.  Deliberately longer than a
+# day: a retry only happens when the job FIRES, so a 24h cap would expire a
+# daily job's payload before its next firing ever got to try.  Three days gives
+# every realistic schedule at least two attempts, and a week-late alert is
+# noise anyway.
+_PENDING_DELIVERY_MAX_AGE_SECONDS = 72 * 3600
 # jobs.json is loaded and rewritten under a lock on every run of every job, so
-# a multi-megabyte report must not be parked in it.  An over-size payload is
-# dropped loudly rather than held.
+# the whole queue must stay small.
 _PENDING_DELIVERY_MAX_BYTES = 64_000
 # An outage spanning several firings holds one payload PER firing — a single
 # slot would let each new alert overwrite the last, losing exactly the money
 # alert this whole mechanism exists to protect.  The queue is bounded by count
 # as well as by total bytes.
 _PENDING_DELIVERY_MAX_ENTRIES = 10
+# Only payloads that fit in ONE platform message are held.  Telegram's sender
+# chunks anything over its 4096-unit limit and sends the chunks in sequence, so
+# a connect failure on chunk 2 leaves chunk 1 delivered — and re-sending the
+# whole payload would duplicate it.  Wrapping adds a header + footer (~200
+# chars), so the raw payload cap sits well under the limit.  Long reports are
+# dropped loudly instead, as before this change.
+_PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 1800
+# Held error strings are for the operator's log line, not a transcript. Cap
+# them so a pathological adapter message cannot bloat jobs.json.
+_PENDING_DELIVERY_MAX_ERROR_CHARS = 500
 
 # Delivery failures that PROVE the payload never left this host, so re-sending
 # it cannot duplicate a message.  Deliberately narrow: everything not listed
 # here is dropped as before.
+#
+# "connection reset" is NOT here on purpose: a peer can reset AFTER accepting
+# and processing the request, so a reset proves nothing about delivery.
 _RETRYABLE_DELIVERY_MARKERS = (
     "connecterror",
+    "connecttimeout",
     "getaddrinfo",
     "nodename nor servname",
     "name or service not known",
     "temporary failure in name resolution",
     "connection refused",
-    "connection reset",
     "network is unreachable",
     "interpreter is shutting down",
 )
@@ -2137,7 +2151,11 @@ def _is_retryable_delivery_error(error: Optional[str]) -> bool:
     text = (error or "").lower()
     if not text:
         return False
-    if any(marker in text for marker in _AMBIGUOUS_DELIVERY_MARKERS):
+    # A CONNECT timeout means no connection was ever established, so it is
+    # proof of non-delivery rather than an ambiguous one. Take it out of the
+    # text before the ambiguity check so it cannot veto itself — a separate
+    # bare "Timed out" elsewhere in the message still vetoes.
+    if any(marker in text.replace("connecttimeout", "") for marker in _AMBIGUOUS_DELIVERY_MARKERS):
         return False
     return any(marker in text for marker in _RETRYABLE_DELIVERY_MARKERS)
 
@@ -2150,42 +2168,73 @@ def _pending_delivery_queue(job: dict) -> list:
     return [entry for entry in queue if isinstance(entry, dict) and entry.get("content")]
 
 
-def _write_pending_delivery_queue(job: dict, queue: list) -> None:
-    """Persist the queue (dropping the oldest entries to stay inside the caps).
+def _entry_bytes(entry: dict) -> int:
+    """Persisted size of one queue entry — payload AND its held error string."""
+    return sum(
+        len(str(entry.get(field) or "").encode("utf-8", "replace"))
+        for field in ("content", "last_error", "queued_at")
+    )
+
+
+def _write_pending_delivery_queue(job: dict, queue: list, *, resolved=()) -> None:
+    """Persist the queue, merging with whatever is on disk RIGHT NOW.
+
+    ``queue`` was computed from a job snapshot that may be stale: another
+    process's run of the same job can have appended its own held payload since.
+    A blind overwrite would drop it, so the write re-reads the record inside the
+    store lock and keeps any entry this run never saw.  ``resolved`` lists the
+    payloads this run has already delivered or dropped — those must NOT come
+    back, which is what separates "someone else added this" from "I just
+    finished with this".
 
     Writes the in-memory ``job`` too, so a later step in the SAME run sees what
-    was just persisted rather than the stale snapshot it was handed.
+    was persisted rather than the snapshot it was handed.
     """
     job_id = job.get("id")
-    while queue and (
-        len(queue) > _PENDING_DELIVERY_MAX_ENTRIES
-        or sum(len(e["content"].encode("utf-8", "replace")) for e in queue) > _PENDING_DELIVERY_MAX_BYTES
-    ):
-        dropped = queue.pop(0)
-        logger.error(
-            "Job '%s': dropping cron output held since %s — the held-output "
-            "queue is over its %d entry / %d byte cap",
-            job_id, dropped.get("queued_at"),
-            _PENDING_DELIVERY_MAX_ENTRIES, _PENDING_DELIVERY_MAX_BYTES,
-        )
+    resolved_contents = set(resolved)
+    written: list = []
 
-    value = queue or None
+    def _merge(record: dict) -> None:
+        merged = list(queue)
+        known = {e.get("content") for e in merged} | resolved_contents
+        persisted = record.get("pending_delivery")
+        if isinstance(persisted, list):
+            for entry in persisted:
+                if isinstance(entry, dict) and entry.get("content") not in known:
+                    merged.append(entry)
+
+        while merged and (
+            len(merged) > _PENDING_DELIVERY_MAX_ENTRIES
+            or sum(_entry_bytes(e) for e in merged) > _PENDING_DELIVERY_MAX_BYTES
+        ):
+            dropped = merged.pop(0)
+            logger.error(
+                "Job '%s': dropping cron output held since %s — the held-output "
+                "queue is over its %d entry / %d byte cap",
+                job_id, dropped.get("queued_at"),
+                _PENDING_DELIVERY_MAX_ENTRIES, _PENDING_DELIVERY_MAX_BYTES,
+            )
+        record["pending_delivery"] = merged or None
+        written.append(merged)
+
     try:
-        from cron.jobs import update_job
+        from cron.jobs import mutate_job
 
-        update_job(job_id, {"pending_delivery": value})
+        mutate_job(job_id, _merge)
     except Exception as exc:
-        # Losing the write after a SUCCESSFUL re-delivery is the dangerous
-        # direction — the entry stays queued and goes out again next run.
+        # Failing AFTER a successful re-delivery is the dangerous direction —
+        # the entry stays queued and goes out again on the next run.
         logger.error(
             "Job '%s': could not persist the held-output queue (a duplicate or "
             "a loss may follow): %s", job_id, exc,
         )
         return
-    if value is None:
-        job.pop("pending_delivery", None)
+    if not written:
+        return  # job no longer exists (removed at its repeat limit)
+    if written[0]:
+        job["pending_delivery"] = written[0]
     else:
-        job["pending_delivery"] = value
+        job.pop("pending_delivery", None)
 
 
 def _hold_undelivered_output(
@@ -2206,14 +2255,19 @@ def _hold_undelivered_output(
         return
 
     job_id = job.get("id")
-    if len(content.encode("utf-8", "replace")) > _PENDING_DELIVERY_MAX_BYTES:
+    if len(content) > _PENDING_DELIVERY_MAX_PAYLOAD_CHARS:
+        # Anything this long is chunked by the sender, so part of it may
+        # already have landed — re-sending the whole thing would duplicate
+        # those chunks. Drop it loudly instead.
         logger.error(
-            "Job '%s': undelivered output is larger than %d bytes — dropping "
-            "instead of holding it for re-delivery (error: %s)",
-            job_id, _PENDING_DELIVERY_MAX_BYTES, delivery_error,
+            "Job '%s': undelivered output is longer than %d characters — it "
+            "would be sent in chunks, so it cannot be safely re-delivered; "
+            "dropping it (error: %s)",
+            job_id, _PENDING_DELIVERY_MAX_PAYLOAD_CHARS, delivery_error,
         )
         return
 
+    delivery_error = delivery_error[:_PENDING_DELIVERY_MAX_ERROR_CHARS]
     queue = _pending_delivery_queue(job)
     # Re-holding after a failed retry updates the existing entry in place: it
     # keeps the ORIGINAL queued_at, so the age cap measures the payload's age
@@ -2274,6 +2328,7 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
         return
 
     job_id = job.get("id")
+    resolved: list = []
     # Persist after EACH entry rather than once at the end, so the window in
     # which a crash re-sends an already-delivered payload is one entry wide
     # instead of the whole queue.
@@ -2287,7 +2342,8 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 job_id, age, entry.get("attempts", 0),
                 _PENDING_DELIVERY_MAX_AGE_SECONDS, entry.get("last_error"),
             )
-            _write_pending_delivery_queue(job, pending[1:])
+            resolved.append(entry["content"])
+            _write_pending_delivery_queue(job, pending[1:], resolved=resolved)
             pending = pending[1:]
             continue
 
@@ -2300,14 +2356,14 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
         except Exception as exc:
             error = str(exc)
 
-        if error and not delivered_targets:
-            if _is_retryable_delivery_error(error):
+        if not delivered_targets:
+            if error and _is_retryable_delivery_error(error):
                 entry["attempts"] = int(entry.get("attempts") or 0) + 1
-                entry["last_error"] = error
+                entry["last_error"] = error[:_PENDING_DELIVERY_MAX_ERROR_CHARS]
                 # The link is still down. Keep this entry AND everything behind
                 # it, in order — retrying the rest now would only pile up
                 # failures and could reorder the channel on recovery.
-                _write_pending_delivery_queue(job, pending)
+                _write_pending_delivery_queue(job, pending, resolved=resolved)
                 logger.warning(
                     "Job '%s': re-delivery of output held since %s failed "
                     "(attempt %d) — still holding %d payload(s): %s",
@@ -2315,11 +2371,22 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                     len(pending), error,
                 )
                 return
-            logger.error(
-                "Job '%s': dropping cron output held since %s — retry failed "
-                "with a non-retryable error after %s attempt(s): %s",
-                job_id, entry.get("queued_at"), entry.get("attempts", 0), error,
-            )
+            if error:
+                logger.error(
+                    "Job '%s': dropping cron output held since %s — retry "
+                    "failed with a non-retryable error after %s attempt(s): %s",
+                    job_id, entry.get("queued_at"), entry.get("attempts", 0), error,
+                )
+            else:
+                # No error AND no target: _deliver_result found nowhere to send
+                # (the job was switched to deliver=local, or its origin is
+                # gone). Nothing is retryable about that, and calling it
+                # "re-delivered" would be a lie in the log.
+                logger.warning(
+                    "Job '%s': dropping cron output held since %s — the job no "
+                    "longer resolves to any delivery target",
+                    job_id, entry.get("queued_at"),
+                )
         else:
             # Delivered — including the partial case, where re-sending again
             # would duplicate the message for whichever target already has it.
@@ -2328,7 +2395,8 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 job_id, entry.get("queued_at"), entry.get("attempts", 0),
                 f"; partial: {error}" if error else "",
             )
-        _write_pending_delivery_queue(job, pending[1:])
+        resolved.append(entry["content"])
+        _write_pending_delivery_queue(job, pending[1:], resolved=resolved)
         pending = pending[1:]
 
 

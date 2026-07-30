@@ -154,16 +154,17 @@ def test_successful_delivery_holds_nothing(store):
     assert get_job("capture").get("pending_delivery") is None
 
 
-def test_oversized_payload_is_dropped_loudly(store, caplog):
-    """jobs.json is rewritten under a lock on every run of every job — a huge
-    report is dropped with an ERROR rather than parked in it."""
-    big = "x" * (s._PENDING_DELIVERY_MAX_BYTES + 1)
+def test_chunked_payload_is_dropped_loudly(store, caplog):
+    """A payload long enough to be split across platform messages cannot be
+    re-sent safely: chunk 1 may already have landed when chunk 2 failed, so a
+    retry would duplicate it. Dropped with an ERROR instead."""
+    big = "x" * (s._PENDING_DELIVERY_MAX_PAYLOAD_CHARS + 1)
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
         _patch_pipeline(mp, _fail_connect, final=big)
         s.run_one_job({"id": "capture", "name": "capture"})
 
     assert get_job("capture").get("pending_delivery") is None
-    assert any("larger than" in r.getMessage() for r in caplog.records)
+    assert any("sent in chunks" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +424,128 @@ def test_redelivery_failure_does_not_fail_the_run(store):
 
 
 # ---------------------------------------------------------------------------
+# Against the real job lifecycle (no mark_job_run stub)
+# ---------------------------------------------------------------------------
+
+def _patch_pipeline_real_lifecycle(monkeypatch, deliver, *, final):
+    """Like _patch_pipeline but leaves the REAL mark_job_run in place, so the
+    hold has to survive the same record rewrite production does."""
+    monkeypatch.setattr(s, "run_job", lambda job, *, defer_agent_teardown=None: (True, "out", final, None))
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.md")
+    monkeypatch.setattr(s, "_deliver_result", deliver)
+
+
+def test_hold_survives_the_real_mark_job_run(store):
+    """mark_job_run rewrites the whole record right after the hold is written.
+    A recurring job's held payload must still be there afterwards."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline_real_lifecycle(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    queue = get_job("capture")["pending_delivery"]
+    assert [e["content"] for e in queue] == ["💳 order A"]
+
+    sent = []
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline_real_lifecycle(mp, _succeed(sent), final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    assert sent == ["💳 order A"]
+    assert get_job("capture").get("pending_delivery") is None
+
+
+def test_a_finished_one_shot_says_so_when_it_takes_a_payload_with_it(store, caplog):
+    """Documented limit: mark_job_run removes a finite job at its repeat limit,
+    taking any held payload with it — it never fires again, so nothing could
+    flush it. That loss must be loud, not silent."""
+    save_jobs([{
+        "id": "oneshot",
+        "name": "one-shot alert",
+        "prompt": "",
+        "script": "x.sh",
+        "no_agent": True,
+        "schedule": {"kind": "once", "run_at": "2026-07-30T12:00:00", "display": "once"},
+        "schedule_display": "once",
+        "repeat": {"times": 1, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": "2999-01-01T00:00:00",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "-1003907677753"},
+    }])
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
+        _patch_pipeline_real_lifecycle(mp, _fail_connect, final="💳 one-shot alert")
+        s.run_one_job(get_job("oneshot"))
+
+    assert get_job("oneshot") is None
+    assert any("can no longer be re-delivered" in r.getMessage() for r in caplog.records)
+
+
+def test_a_concurrent_hold_is_not_clobbered(store):
+    """The queue is written from a snapshot that may be stale. Another run of
+    the same job appending its own payload mid-flight must not be overwritten —
+    the write re-reads and merges inside the store lock."""
+    from cron.jobs import mutate_job
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    stale = get_job("capture")  # snapshot taken BEFORE the concurrent append
+
+    # A second process holds its own payload while this run is working.
+    mutate_job("capture", lambda rec: rec.__setitem__("pending_delivery", [
+        *rec["pending_delivery"],
+        {"content": "💳 order B", "queued_at": "2026-07-30T12:00:00", "attempts": 1, "last_error": "x"},
+    ]))
+
+    sent = []
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
+        s.run_one_job(stale)
+
+    # A was delivered from the stale snapshot; B survived the write and is
+    # still queued for the next run.
+    assert sent == ["💳 order A"]
+    assert [e["content"] for e in get_job("capture")["pending_delivery"]] == ["💳 order B"]
+
+
+def test_a_job_with_nowhere_to_deliver_drops_its_payload(store, caplog):
+    """The job was switched to deliver=local (or lost its origin) before the
+    retry. _deliver_result reaches nobody and reports no error — that is not a
+    re-delivery, and the log must not claim it was."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    def _no_target(job, content, adapters=None, loop=None, delivered_targets=None):
+        return None  # local-only job: nothing sent, nothing wrong
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.WARNING):
+        _patch_pipeline(mp, _no_target, final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    assert get_job("capture").get("pending_delivery") is None
+    assert any("no longer resolves to any delivery target" in r.getMessage()
+               for r in caplog.records)
+    assert not any("re-delivered" in r.getMessage() for r in caplog.records)
+
+
+def test_held_error_string_is_truncated(store):
+    """A pathological adapter message must not bloat jobs.json."""
+    def _huge_error(job, content, adapters=None, loop=None, delivered_targets=None):
+        return "httpx.ConnectError: " + ("detail " * 5000)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _huge_error)
+        s.run_one_job({"id": "capture", "name": "capture"})
+
+    entry = get_job("capture")["pending_delivery"][0]
+    assert len(entry["last_error"]) == s._PENDING_DELIVERY_MAX_ERROR_CHARS
+
+
+# ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
 
@@ -431,6 +554,14 @@ def test_redelivery_failure_does_not_fail_the_run(store):
     ("delivery to telegram:-100 skipped — interpreter is shutting down", True),
     ("delivery to email:x failed: [Errno 61] Connection refused", True),
     ("delivery to telegram:-100 failed: Name or service not known", True),
+    # A CONNECT timeout means no connection was established — proof of
+    # non-delivery, even though the word "timeout" is in it.
+    ("delivery to telegram:-100 failed: httpx.ConnectTimeout", True),
+    # ...but a bare timeout alongside it still vetoes: that send may be live.
+    ("httpx.ConnectTimeout on target A; delivery error: Timed out on target B", False),
+    # A reset can arrive AFTER the peer accepted and processed the request, so
+    # it proves nothing about delivery.
+    ("delivery to telegram:-100 failed: [Errno 54] Connection reset by peer", False),
     ("delivery error: Telegram send failed: Timed out", False),
     ("live adapter confirmation timed out", False),
     ("platform 'telegram' not configured/enabled", False),
