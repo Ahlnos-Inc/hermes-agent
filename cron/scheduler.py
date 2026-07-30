@@ -2219,15 +2219,28 @@ def _platform_message_limit(platform_name: str) -> Optional[int]:
 
 
 def _message_size(text: str) -> int:
-    """Length in UTF-16 code units — what Telegram measures, and never less
-    than the codepoint count every other platform measures.  One conservative
-    number instead of a per-platform length function that can be wrong."""
+    """An upper bound on the length any sender will measure this text at.
+
+    One conservative number instead of a per-platform length function, because
+    every per-platform guess here has been wrong at least once:
+
+    * Telegram counts UTF-16 code units, so astral characters cost 2;
+    * IRC splits on UTF-8 BYTES, so a CJK character costs 3;
+    * both chunk the FORMATTED text, and MarkdownV2 escaping can put a
+      backslash before every character — at most doubling it.  (The HTML branch
+      passes content through instead of converting, so it does not inflate.)
+
+    Taking the larger of the two counts and doubling it bounds all three.  The
+    cost of the bound is holding fewer long payloads; the cost of getting it
+    wrong is a duplicated money alert.
+    """
     try:
         from gateway.platforms.base import utf16_len
 
-        return utf16_len(text)
+        units = utf16_len(text)
     except Exception:
-        return len(text)
+        units = len(text)
+    return max(units, len(text.encode("utf-8", "replace"))) * 2
 
 
 def _payload_is_single_message(job: dict, content: str) -> bool:
@@ -2252,7 +2265,11 @@ def _payload_is_single_message(job: dict, content: str) -> bool:
             return False
         for target in targets:
             limit = _platform_message_limit(target.get("platform"))
-            if limit is None or (limit and size > limit):
+            # No limit (0) and no registry answer (None) both mean nothing will
+            # chunk this: the standalone sender only chunks against a resolved
+            # limit, and a live adapter only exists for a platform the registry
+            # knows — so an unanswered platform has neither sender that splits.
+            if limit and size > limit:
                 return False
         return True
     except Exception as exc:

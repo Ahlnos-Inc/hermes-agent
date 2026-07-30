@@ -179,29 +179,26 @@ def test_a_payload_inside_the_target_limit_is_held(store, monkeypatch):
     assert len(get_job("capture")["pending_delivery"]) == 1
 
 
-def test_an_unresolvable_limit_fails_closed(store, monkeypatch, caplog):
-    """If the limit cannot be resolved, assume it chunks. A duplicated money
-    alert is worse than a dropped-and-logged one."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: None)
-
-    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
-        s.run_one_job(get_job("capture"))
-
-    assert get_job("capture").get("pending_delivery") is None
-    assert any("single message" in r.getMessage() for r in caplog.records)
-
-
-def test_a_short_payload_is_held_whatever_the_platform(store, monkeypatch):
-    """Under the universal floor no platform chunks, so an unknown limit is
-    not a reason to drop a money alert."""
+def test_an_unanswered_platform_is_treated_as_never_chunking(store, monkeypatch):
+    """A platform the registry cannot answer for has no live adapter either
+    (adapters are built from registry entries), and the standalone sender only
+    chunks against a resolved limit — so nothing splits it."""
     monkeypatch.setattr(s, "_platform_message_limit", lambda name: None)
 
     with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final="💳 Card order paid · 33Y55Z")
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
         s.run_one_job(get_job("capture"))
 
     assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_the_size_bound_covers_byte_and_escape_inflation(store):
+    """UTF-16 units alone under-count twice: IRC splits on UTF-8 bytes (CJK
+    costs 3), and both senders chunk the FORMATTED text, where MarkdownV2
+    escaping can double it. The bound has to cover both."""
+    assert s._message_size("abc") == 6                 # 3 chars, escape-doubled
+    assert s._message_size("界" * 200) >= 450 * 2      # 600 UTF-8 bytes, doubled
+    assert s._message_size("💳" * 600) >= 1200 * 2     # 1200 UTF-16 units
 
 
 def test_the_limit_lookup_reads_the_registry(store, monkeypatch):
