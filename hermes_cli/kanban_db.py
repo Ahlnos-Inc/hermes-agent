@@ -1672,6 +1672,23 @@ class ContinuationBlocker:
 
 
 @dataclass(frozen=True)
+class IssuanceContract:
+    """Immutable record of an issued fix→review pair (BUILD-862).
+
+    Populated once during graph issuance and never mutated; presence proves the
+    edge was authorized by the human-approved gate.
+    """
+
+    id: int
+    gate_id: str
+    fix_task_id: str
+    review_task_id: str
+    fix_assignee: str
+    review_assignee: str
+    issued_at: int
+
+
+@dataclass(frozen=True)
 class OwnedRunResource:
     id: int
     task_id: str
@@ -2202,6 +2219,20 @@ CREATE TABLE IF NOT EXISTS architecture_graph_issuances (
     issued_at        INTEGER NOT NULL
 );
 
+-- BUILD-862: immutable, append-only per-pair contract derived at graph
+-- issuance time. Proves a fix→review edge was authorized by the human-approved
+-- gate so a future issued rearm cannot be forged from mutable task_links rows.
+CREATE TABLE IF NOT EXISTS architecture_graph_issuance_contracts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id         TEXT NOT NULL,
+    fix_task_id     TEXT NOT NULL,
+    review_task_id  TEXT NOT NULL,
+    fix_assignee    TEXT NOT NULL,
+    review_assignee TEXT NOT NULL,
+    issued_at       INTEGER NOT NULL,
+    UNIQUE(fix_task_id, review_task_id)
+);
+
 -- One immutable, idempotent compilation per workflow. The graph specification
 -- digest lets retries return the original ids while rejecting a request that
 -- reuses the workflow identity for different work.
@@ -2404,6 +2435,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_architecture_gates_active_scope
     ON architecture_gates(board_key, creator_principal, request_scope_id)
     WHERE state IN ('open', 'validated_awaiting_approval', 'policy_accepted', 'human_approved')
       AND request_scope_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agi_contracts_pair
+    ON architecture_graph_issuance_contracts(fix_task_id, review_task_id);
+-- BUILD-862: blocker rows are permanent once opened; only resolution is
+-- allowed. The trigger fires before any DELETE and aborts it unconditionally.
+CREATE TRIGGER IF NOT EXISTS continuation_blockers_no_delete
+BEFORE DELETE ON continuation_blockers
+BEGIN
+    SELECT RAISE(ABORT, 'continuation_blocker_delete_denied');
+END;
 """
 
 
@@ -4189,6 +4229,47 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # BUILD-862: issuance contracts table (may not exist on pre-862 DBs).
+    contracts_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "        "AND name = 'architecture_graph_issuance_contracts'"
+    ).fetchone() is not None
+    if not contracts_exists:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS architecture_graph_issuance_contracts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                gate_id         TEXT NOT NULL,
+                fix_task_id     TEXT NOT NULL,
+                review_task_id  TEXT NOT NULL,
+                fix_assignee    TEXT NOT NULL,
+                review_assignee TEXT NOT NULL,
+                issued_at       INTEGER NOT NULL,
+                UNIQUE(fix_task_id, review_task_id)
+            )"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agi_contracts_pair "            "ON architecture_graph_issuance_contracts(fix_task_id, review_task_id)"
+        )
+
+    # BUILD-862: no-delete trigger on continuation_blockers.
+    # Guard: only install the trigger when the table already exists; on a
+    # legacy DB that hasn't seen the full DDL yet, the table may be absent and
+    # SQLite rejects trigger creation against a missing table.  The trigger is
+    # also declared in the top-level DDL so a brand-new DB gets it automatically.
+    cb_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "        "AND name = 'continuation_blockers'"
+    ).fetchone() is not None
+    trigger_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "        "AND name = 'continuation_blockers_no_delete'"
+    ).fetchone() is not None
+    if cb_table_exists and not trigger_exists:
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS continuation_blockers_no_delete
+            BEFORE DELETE ON continuation_blockers
+            BEGIN
+                SELECT RAISE(ABORT, 'continuation_blocker_delete_denied');
+            END"""
+        )
+
     _backfill_workflow_step_notify_subs(conn)
 
 
@@ -5911,6 +5992,29 @@ def issue_architecture_graph(
                VALUES (?, ?, ?, ?, ?)""",
             (gate_id, idempotency_key, json.dumps(task_ids), context.principal, now),
         )
+        # BUILD-862: populate immutable pair-contracts for every coder→reviewer
+        # edge so the issued rearm path can validate without trusting mutable rows.
+        for index, (_, child_assignee, _, parents) in enumerate(normalized):
+            if _canonical_assignee(child_assignee) != "reviewer":
+                continue
+            for parent in parents:
+                parent_assignee = normalized[parent][1]
+                if _canonical_assignee(parent_assignee) != "coder":
+                    continue
+                conn.execute(
+                    """INSERT OR IGNORE INTO architecture_graph_issuance_contracts
+                           (gate_id, fix_task_id, review_task_id,
+                            fix_assignee, review_assignee, issued_at)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        gate_id,
+                        task_ids[parent],
+                        task_ids[index],
+                        _canonical_assignee(parent_assignee),
+                        _canonical_assignee(child_assignee),
+                        now,
+                    ),
+                )
         _append_gate_audit(conn, gate, "architecture_graph_issued")
         return task_ids
 
@@ -6598,6 +6702,62 @@ def _consume_discovery_capability(
     if cur.rowcount != 1:
         raise _gate_denied(gate, "create", "discovery_capability_used")
     _append_gate_audit(conn, gate, "discovery_capability_used")
+
+
+# ---------------------------------------------------------------------------
+# BUILD-862: Issuance contract helpers
+# ---------------------------------------------------------------------------
+
+def _issuance_contract_from_row(row: sqlite3.Row) -> IssuanceContract:
+    return IssuanceContract(
+        id=int(row["id"]),
+        gate_id=str(row["gate_id"]),
+        fix_task_id=str(row["fix_task_id"]),
+        review_task_id=str(row["review_task_id"]),
+        fix_assignee=str(row["fix_assignee"]),
+        review_assignee=str(row["review_assignee"]),
+        issued_at=int(row["issued_at"]),
+    )
+
+
+def get_issuance_contract(
+    conn: sqlite3.Connection,
+    fix_task_id: str,
+    review_task_id: str,
+) -> Optional["IssuanceContract"]:
+    """Return the immutable pair-contract if the edge was issued, else None.
+
+    This is the sole authority for whether a rearm is in-graph: mutable
+    task_links rows are intentionally NOT consulted here (BUILD-862).
+    """
+    row = conn.execute(
+        "SELECT * FROM architecture_graph_issuance_contracts "        "WHERE fix_task_id = ? AND review_task_id = ?",
+        (fix_task_id, review_task_id),
+    ).fetchone()
+    return _issuance_contract_from_row(row) if row is not None else None
+
+
+def _review_dominates_fix_successors(
+    conn: sqlite3.Connection,
+    fix_task_id: str,
+    review_task_id: str,
+) -> bool:
+    """Return True iff review lies on every path from fix to the rest of the graph.
+
+    Walk all descendants of fix without traversing through review.  If any
+    task is reachable by that walk, a bypass path exists and dominance fails.
+    """
+    reachable_bypass: set[str] = set()
+    stack = [fix_task_id]
+    while stack:
+        current = stack.pop()
+        for child in child_ids(conn, current):
+            if child == review_task_id:
+                continue  # do not traverse through review
+            if child not in reachable_bypass:
+                reachable_bypass.add(child)
+                stack.append(child)
+    return len(reachable_bypass) == 0
 
 
 def classify_policy_quarantine(
@@ -8101,6 +8261,274 @@ def _transition_to_dependency(
         )
 
 
+# BUILD-862 issued-graph rearm constant
+ISSUED_REARM_BOUND = REWORK_ABSOLUTE_LIMIT
+
+
+def _issued_rearm_round_count(conn: sqlite3.Connection, review_task_id: str) -> int:
+    """Count unique rework_requested rounds already committed for review."""
+    return len(_rework_history_rows(conn, review_task_id))
+
+
+def _execute_issued_rearm(
+    conn: sqlite3.Connection,
+    contract: IssuanceContract,
+    review_task_id: str,
+    fix_task_id: str,
+    *,
+    request_key: str,
+    finding: str,
+    actor: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewed_sha: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> ReworkResult:
+    """Atomic issued-graph rearm: validate all admission criteria then CAS.
+
+    This is the sole path for re-arming a coder fix that was already issued in
+    an architecture graph (BUILD-862). It bypasses _transition_to_dependency
+    (which would add a new link — forbidden by the gate) and directly CASes
+    fix done→ready and review blocked→todo inside one BEGIN IMMEDIATE txn.
+
+    Three sanitized audit events are appended:
+      1. rework_requested on the review task (idempotency authority).
+      2. rework_for on the fix task (symmetric mirror).
+      3. issued_rearm_activated gate-audit on the gate architect task.
+    """
+    with write_txn(conn):
+        # --- Idempotency check (must be first inside txn) ---
+        prior = conn.execute(
+            """SELECT id, run_id, payload FROM task_events
+                 WHERE task_id = ? AND kind = 'rework_requested'
+                   AND json_extract(payload, '$.request_key') = ?
+                 ORDER BY id DESC LIMIT 1""",
+            (review_task_id, request_key),
+        ).fetchone()
+        if prior is not None:
+            try:
+                prior_payload = json.loads(prior["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior_payload = {}
+            fix_row = get_task(conn, fix_task_id)
+            current_status = fix_row.status if fix_row else "unknown"
+            return ReworkResult(
+                review_task_id=review_task_id,
+                fix_task_id=fix_task_id,
+                fix_action="replayed",
+                review_status=prior_payload.get("review_status", "todo"),
+                request_event_id=int(prior["id"]),
+                replayed_same_run=(
+                    expected_run_id is not None
+                    and prior["run_id"] is not None
+                    and int(prior["run_id"]) == int(expected_run_id)
+                ),
+            )
+
+        # --- Load both task rows for validation ---
+        fix_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (fix_task_id,)
+        ).fetchone()
+        review_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (review_task_id,)
+        ).fetchone()
+        if fix_row is None:
+            raise ValueError(f"issued rearm: unknown fix task {fix_task_id!r}")
+        if review_row is None:
+            raise ValueError(f"issued rearm: unknown review task {review_task_id!r}")
+
+        # --- Role validation ---
+        if _canonical_assignee(fix_row["assignee"]) != "coder":
+            raise ValueError(
+                "issued rearm: fix task must be assigned to coder, "                f"got {fix_row['assignee']!r}"
+            )
+        if _canonical_assignee(review_row["assignee"]) != "reviewer":
+            raise ValueError(
+                "issued rearm: review task must be assigned to reviewer, "                f"got {review_row['assignee']!r}"
+            )
+
+        # --- Status validation ---
+        if fix_row["status"] != "done":
+            raise ValueError(
+                f"issued rearm: fix task must be done, got {fix_row['status']!r}"
+            )
+        if review_row["status"] != "blocked":
+            raise ValueError(
+                "issued rearm: review task must be blocked (reviewer called "                f"kanban_block), got {review_row['status']!r}"
+            )
+
+        # --- Quarantine / invalidation ---
+        if fix_row["policy_quarantined"] or fix_row["policy_invalidated"]:
+            raise ValueError("issued rearm: fix task is quarantined or invalidated")
+        if review_row["policy_quarantined"] or review_row["policy_invalidated"]:
+            raise ValueError("issued rearm: review task is quarantined or invalidated")
+
+        # --- Active-worker fence for review ---
+        # In the issued rearm flow the reviewer calls kanban_block FIRST, which
+        # ends its run via _end_run (setting current_run_id=NULL on the task row).
+        # We therefore validate expected_run_id against task_runs directly rather
+        # than against the now-NULL current_run_id column.
+        if expected_run_id is None:
+            raise ValueError(
+                "issued rearm requires expected_run_id (the reviewer's blocking run)"
+            )
+        review_run = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), review_task_id),
+        ).fetchone()
+        if review_run is None:
+            raise ValueError(
+                "issued rearm: expected_run_id does not point to a known run "
+                "for this review task"
+            )
+        if review_run["outcome"] != "blocked":
+            raise ValueError(
+                f"issued rearm: expected run outcome is {review_run['outcome']!r}; "
+                "kanban_block must be called before kanban_request_rework"
+            )
+        # Guard against stale callers: no newer run for the review task should exist.
+        latest = conn.execute(
+            "SELECT MAX(id) AS max_id FROM task_runs WHERE task_id = ?",
+            (review_task_id,),
+        ).fetchone()
+        if latest is None or int(latest["max_id"] or 0) != int(expected_run_id):
+            raise ValueError(
+                "issued rearm: stale expected_run_id; a newer run exists for the "
+                "review task (concurrent rearm or already processed)"
+            )
+
+        # --- Fix task must have no active worker ---
+        if _task_has_active_run_identity(fix_row, None):
+            raise ValueError(
+                "issued rearm: fix task still has an active worker run; "                "cannot rearm until it terminates"
+            )
+
+        # --- Bound check ---
+        round_count = _issued_rearm_round_count(conn, review_task_id)
+        if round_count >= ISSUED_REARM_BOUND:
+            raise ValueError(
+                f"issued rearm: bound exceeded ({round_count} >= {ISSUED_REARM_BOUND}); "                "use kanban_block to escalate to human review"
+            )
+
+        # --- Dominance check ---
+        if not _review_dominates_fix_successors(conn, fix_task_id, review_task_id):
+            raise ValueError(
+                "issued rearm: dominance check failed — review does not dominate all fix successors; "                "a bypass path exists that would skip the second review"
+            )
+
+        # --- reviewed_sha format (non-empty, plausible hex SHA) ---
+        if reviewed_sha is not None:
+            cleaned_sha = str(reviewed_sha).strip()
+            if cleaned_sha and not (len(cleaned_sha) in (40, 64) and
+                all(c in "0123456789abcdefABCDEF" for c in cleaned_sha)):
+                raise ValueError(
+                    f"issued rearm: reviewed_sha must be a valid hex SHA, got {cleaned_sha!r}"
+                )
+            reviewed_sha = cleaned_sha or None
+
+        # --- Atomically CAS: fix done→ready, review blocked→todo ---
+        now = int(time.time())
+
+        fix_cur = conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'done'",
+            (fix_task_id,),
+        )
+        if fix_cur.rowcount != 1:
+            raise ValueError(
+                "issued rearm: fix CAS failed (concurrent status change on fix task)"
+            )
+
+        # Update the already-ended blocked run to record the rework transition.
+        # block_task already ended the run (current_run_id is NULL on the task row);
+        # we update the task_runs row in-place to reflect the new outcome and
+        # carry forward the finding/summary/metadata for audit purposes.
+        conn.execute(
+            """UPDATE task_runs
+                  SET outcome  = 'rework_requested',
+                      status   = 'rework_requested',
+                      summary  = ?,
+                      metadata = ?
+                WHERE id      = ?
+                  AND task_id = ?""",
+            (
+                summary or finding,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                int(expected_run_id),
+                review_task_id,
+            ),
+        )
+        run_id = int(expected_run_id)
+
+        # Determine review's new status (todo if still has unsatisfied parents)
+        review_parents = conn.execute(
+            """SELECT p.status, p.policy_quarantined, p.policy_invalidated
+                 FROM tasks p JOIN task_links l ON l.parent_id = p.id
+                WHERE l.child_id = ?""",
+            (review_task_id,),
+        ).fetchall()
+        new_review_status = "todo" if any(
+            not _parent_is_satisfied(p) for p in review_parents
+        ) else "ready"
+
+        review_cur = conn.execute(
+            "UPDATE tasks SET status = ?, block_kind = NULL, "            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "            "worker_pid = NULL, worker_started_at = NULL, "            "worker_pgid = NULL, worker_sid = NULL "            "WHERE id = ? AND status = 'blocked'",
+            (new_review_status, review_task_id),
+        )
+        if review_cur.rowcount != 1:
+            raise ValueError(
+                "issued rearm: review CAS failed (concurrent status change on review task)"
+            )
+
+        # --- Build sanitized audit payload (no secrets, no mutable evidence) ---
+        rearm_payload: dict[str, Any] = {
+            "review_task_id": review_task_id,
+            "fix_task_id": fix_task_id,
+            "request_key": request_key,
+            "actor": actor,
+            "finding": finding,
+            "fix_disposition": "issued_rearm",
+            "fix_action": "issued_rearm",
+            "disposition": "issued_rearm",
+            "summary": summary,
+            "metadata": metadata,
+            "gate_id": contract.gate_id,
+            "fix_assignee": contract.fix_assignee,
+            "review_assignee": contract.review_assignee,
+            "review_status": new_review_status,
+            "round_count_after": round_count + 1,
+        }
+        if reviewed_sha is not None:
+            rearm_payload["reviewed_sha"] = reviewed_sha
+
+        # Event 1: rework_requested on review (idempotency authority)
+        request_event_id = _append_event(
+            conn, review_task_id, "rework_requested", rearm_payload, run_id=run_id,
+        )
+        # Event 2: rework_for on fix (symmetric mirror)
+        _append_event(conn, fix_task_id, "rework_for", rearm_payload)
+
+        # Event 3: gate audit — issued_rearm_activated on the architect task
+        gate = get_architecture_gate(conn, contract.gate_id)
+        if gate is not None:
+            _append_gate_audit(
+                conn, gate, "issued_rearm_activated",
+                extra={
+                    "fix_task_id": fix_task_id,
+                    "review_task_id": review_task_id,
+                    "request_key": request_key,
+                    "round_count_after": round_count + 1,
+                },
+            )
+
+        return ReworkResult(
+            review_task_id=review_task_id,
+            fix_task_id=fix_task_id,
+            fix_action="issued_rearm",
+            review_status=new_review_status,
+            request_event_id=request_event_id,
+        )
+
+
 def request_rework(
     conn: sqlite3.Connection,
     review_task_id: str,
@@ -8115,14 +8543,22 @@ def request_rework(
     expected_run_id: Optional[int] = None,
     require_no_active_run: bool = False,
     mutation_context: Optional[MutationContext] = None,
+    reviewed_sha: Optional[str] = None,
 ) -> ReworkResult:
     """Atomically materialize/adopt a fix and re-arm its review card.
 
     This function is intentionally the only composition point for the
-    review→fix loop.  The idempotency lookup, task insert, graph edge, run
+    review->fix loop.  The idempotency lookup, task insert, graph edge, run
     closure, projection update, and audit events all happen under one
     ``write_txn`` so a retry can observe either the old graph or the complete
     transition, never a half-created remediation card.
+
+    When ``fix`` is an ExistingFixTask AND an immutable issuance contract exists
+    for the (fix, review) pair (BUILD-862), the call is routed to
+    _execute_issued_rearm which validates all admission criteria and atomically
+    CASes fix done->ready and review blocked->todo WITHOUT adding any new task
+    or link.  Legacy ExistingFixTask calls with no contract follow the original
+    _transition_to_dependency path.
     """
     review_task_id = str(review_task_id or "").strip()
     finding = str(finding or "").strip()
@@ -8142,6 +8578,28 @@ def request_rework(
     human_gate_task_id = str(human_gate_task_id or "").strip() or None
     if not isinstance(fix, (NewFixTask, ExistingFixTask)):
         raise TypeError("fix must be NewFixTask or ExistingFixTask")
+
+    # BUILD-862: issued-graph rearm detection.  Check BEFORE the
+    # _transition_to_dependency call so we can take the dedicated path that
+    # does NOT add a new task_links edge (forbidden inside a gated graph).
+    if isinstance(fix, ExistingFixTask):
+        fix_task_id_candidate = str(fix.task_id or "").strip()
+        if fix_task_id_candidate and fix_task_id_candidate != review_task_id:
+            contract = get_issuance_contract(conn, fix_task_id_candidate, review_task_id)
+            if contract is not None:
+                return _execute_issued_rearm(
+                    conn,
+                    contract,
+                    review_task_id,
+                    fix_task_id_candidate,
+                    request_key=request_key,
+                    finding=finding,
+                    actor=actor,
+                    summary=summary,
+                    metadata=metadata,
+                    reviewed_sha=reviewed_sha,
+                    expected_run_id=expected_run_id,
+                )
 
     def materialize(conn_in: sqlite3.Connection):
         if isinstance(fix, ExistingFixTask):

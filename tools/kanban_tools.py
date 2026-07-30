@@ -1995,6 +1995,11 @@ def _handle_request_rework(args: dict, **kw) -> str:
         if not isinstance(human_gate_task_id, str):
             return tool_error("human_gate_task_id must be a string")
         human_gate_task_id = human_gate_task_id.strip() or None
+    reviewed_sha = args.get("reviewed_sha")
+    if reviewed_sha is not None:
+        if not isinstance(reviewed_sha, str):
+            return tool_error("reviewed_sha must be a string")
+        reviewed_sha = reviewed_sha.strip() or None
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
@@ -2062,6 +2067,7 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 human_gate_task_id=human_gate_task_id,
                 expected_run_id=expected_run_id,
                 require_no_active_run=expected_run_id is None,
+                reviewed_sha=reviewed_sha,
             )
             result_fields = {
                 "fix_task_id": result.fix_task_id,
@@ -4252,6 +4258,14 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
                     "nonterminal direct child of this review, dependency-gated "
                     "on it, and the review must have no other nonterminal direct "
                     "child that would be released accidentally."
+                ),
+            },
+            "reviewed_sha": {
+                "type": "string",
+                "description": (
+                    "Git commit SHA the reviewer verified. Required for "
+                    "issued-graph (BUILD-862) rearms; stored in the audit record "
+                    "to prove which exact coder artifact was reviewed."
                 ),
             },
             "board": _board_schema_prop(),
