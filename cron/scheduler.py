@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -2111,13 +2112,22 @@ _PENDING_DELIVERY_MAX_BYTES = 64_000
 # alert this whole mechanism exists to protect.  The queue is bounded by count
 # as well as by total bytes.
 _PENDING_DELIVERY_MAX_ENTRIES = 10
-# Only payloads that fit in ONE platform message are held.  Telegram's sender
-# chunks anything over its 4096-unit limit and sends the chunks in sequence, so
-# a connect failure on chunk 2 leaves chunk 1 delivered — and re-sending the
-# whole payload would duplicate it.  Wrapping adds a header + footer (~200
-# chars), so the raw payload cap sits well under the limit.  Long reports are
-# dropped loudly instead, as before this change.
-_PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 1800
+# Only payloads that fit in ONE platform message are held.  Every sender chunks
+# past its own limit and sends the chunks in sequence, so a connect failure on
+# chunk 2 leaves chunk 1 delivered — and re-sending the whole payload would
+# duplicate it.
+#
+# The cap is on the RAW payload, but what gets sent is the wrapped payload, on
+# whichever platform has the smallest limit.  Headroom, worst case: Discord's
+# 2000-character limit, minus a cron wrapper that costs ~300 characters for a
+# long job name.  1200 clears that with room to spare, and still clears
+# Telegram's 4096 even if MarkdownV2 escaping doubles the wrapped text.
+_PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 1200
+# Attachments are sent as their own requests after the text, so a payload with
+# media is inherently multi-send and has the same partial-delivery problem
+# regardless of length.  Matching the marker the extractor looks for; a false
+# positive only costs a dropped-and-logged hold.
+_PENDING_DELIVERY_MEDIA_MARKER = "MEDIA:"
 # Held error strings are for the operator's log line, not a transcript. Cap
 # them so a pathological adapter message cannot bloat jobs.json.
 _PENDING_DELIVERY_MAX_ERROR_CHARS = 500
@@ -2176,32 +2186,58 @@ def _entry_bytes(entry: dict) -> int:
     )
 
 
-def _write_pending_delivery_queue(job: dict, queue: list, *, resolved=()) -> None:
-    """Persist the queue, merging with whatever is on disk RIGHT NOW.
+def _entry_key(entry: dict):
+    """Stable identity of a held entry.  Falls back to content for a
+    hand-edited record written without an id."""
+    return entry.get("id") or ("content", entry.get("content"))
 
-    ``queue`` was computed from a job snapshot that may be stale: another
-    process's run of the same job can have appended its own held payload since.
-    A blind overwrite would drop it, so the write re-reads the record inside the
-    store lock and keeps any entry this run never saw.  ``resolved`` lists the
-    payloads this run has already delivered or dropped — those must NOT come
-    back, which is what separates "someone else added this" from "I just
-    finished with this".
+
+def _write_pending_delivery_queue(job: dict, queue: list, *, carried=()) -> None:
+    """Persist the queue, reconciled against whatever is on disk RIGHT NOW.
+
+    ``queue`` was computed from a job snapshot that may be stale: another run of
+    the same job can have delivered an entry, or appended one of its own, since
+    this run read the record.  So storage — not the caller — is the authority on
+    every entry this run did not itself create:
+
+    * an entry this run CARRIED from its snapshot is written back only if it is
+      still in storage.  If it is gone, another run delivered it, and putting it
+      back would re-announce money that already went out;
+    * an entry this run CREATED is always written — storage cannot know it yet;
+    * an entry only STORAGE has is kept — another run just held it.
+
+    The result is re-sorted oldest-first, because a merge can otherwise place a
+    newer entry ahead of an older one and invert the channel's order.
 
     Writes the in-memory ``job`` too, so a later step in the SAME run sees what
     was persisted rather than the snapshot it was handed.
     """
     job_id = job.get("id")
-    resolved_contents = set(resolved)
+    carried_keys = set(carried)
     written: list = []
 
     def _merge(record: dict) -> None:
-        merged = list(queue)
-        known = {e.get("content") for e in merged} | resolved_contents
         persisted = record.get("pending_delivery")
-        if isinstance(persisted, list):
-            for entry in persisted:
-                if isinstance(entry, dict) and entry.get("content") not in known:
-                    merged.append(entry)
+        persisted = persisted if isinstance(persisted, list) else []
+        persisted_keys = {_entry_key(e) for e in persisted if isinstance(e, dict)}
+
+        merged = [
+            entry for entry in queue
+            if _entry_key(entry) not in carried_keys  # created by this run
+            or _entry_key(entry) in persisted_keys    # carried AND still stored
+        ]
+        merged_keys = {_entry_key(e) for e in merged}
+        for entry in persisted:
+            if not isinstance(entry, dict):
+                continue
+            key = _entry_key(entry)
+            # Skip what this run already handled: a carried entry it resolved,
+            # or one it is deliberately re-writing.
+            if key in merged_keys or key in carried_keys:
+                continue
+            merged.append(entry)
+
+        merged.sort(key=lambda e: str(e.get("queued_at") or ""))
 
         while merged and (
             len(merged) > _PENDING_DELIVERY_MAX_ENTRIES
@@ -2266,9 +2302,18 @@ def _hold_undelivered_output(
             job_id, _PENDING_DELIVERY_MAX_PAYLOAD_CHARS, delivery_error,
         )
         return
+    if _PENDING_DELIVERY_MEDIA_MARKER in content:
+        logger.error(
+            "Job '%s': undelivered output carries media, which is sent as "
+            "separate requests after the text — it cannot be safely "
+            "re-delivered; dropping it (error: %s)",
+            job_id, delivery_error,
+        )
+        return
 
     delivery_error = delivery_error[:_PENDING_DELIVERY_MAX_ERROR_CHARS]
     queue = _pending_delivery_queue(job)
+    carried = [_entry_key(e) for e in queue]
     # Re-holding after a failed retry updates the existing entry in place: it
     # keeps the ORIGINAL queued_at, so the age cap measures the payload's age
     # rather than the age of the last attempt (which would never expire while
@@ -2281,6 +2326,9 @@ def _hold_undelivered_output(
         attempts = existing["attempts"]
     else:
         queue.append({
+            # A stable id, so a concurrent run can tell "the entry I carried" ,
+            # from "the entry someone else added" even when the text matches.
+            "id": uuid.uuid4().hex,
             "content": content,
             "queued_at": _hermes_now().isoformat(),
             "attempts": 1,
@@ -2288,7 +2336,7 @@ def _hold_undelivered_output(
         })
         attempts = 1
 
-    _write_pending_delivery_queue(job, queue)
+    _write_pending_delivery_queue(job, queue, carried=carried)
     logger.warning(
         "Job '%s': delivery failed with a connect-phase error (attempt %d) — "
         "holding the output for re-delivery on a later run: %s",
@@ -2328,7 +2376,10 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
         return
 
     job_id = job.get("id")
-    resolved: list = []
+    # Every entry here came from this run's snapshot, so storage stays the
+    # authority on all of them: an entry another run delivered while this one
+    # worked must not be written back (see _write_pending_delivery_queue).
+    carried = [_entry_key(e) for e in pending]
     # Persist after EACH entry rather than once at the end, so the window in
     # which a crash re-sends an already-delivered payload is one entry wide
     # instead of the whole queue.
@@ -2342,8 +2393,7 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 job_id, age, entry.get("attempts", 0),
                 _PENDING_DELIVERY_MAX_AGE_SECONDS, entry.get("last_error"),
             )
-            resolved.append(entry["content"])
-            _write_pending_delivery_queue(job, pending[1:], resolved=resolved)
+            _write_pending_delivery_queue(job, pending[1:], carried=carried)
             pending = pending[1:]
             continue
 
@@ -2363,7 +2413,7 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 # The link is still down. Keep this entry AND everything behind
                 # it, in order — retrying the rest now would only pile up
                 # failures and could reorder the channel on recovery.
-                _write_pending_delivery_queue(job, pending, resolved=resolved)
+                _write_pending_delivery_queue(job, pending, carried=carried)
                 logger.warning(
                     "Job '%s': re-delivery of output held since %s failed "
                     "(attempt %d) — still holding %d payload(s): %s",
@@ -2395,8 +2445,7 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 job_id, entry.get("queued_at"), entry.get("attempts", 0),
                 f"; partial: {error}" if error else "",
             )
-        resolved.append(entry["content"])
-        _write_pending_delivery_queue(job, pending[1:], resolved=resolved)
+        _write_pending_delivery_queue(job, pending[1:], carried=carried)
         pending = pending[1:]
 
 

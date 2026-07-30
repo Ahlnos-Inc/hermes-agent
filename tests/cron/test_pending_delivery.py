@@ -511,6 +511,75 @@ def test_a_concurrent_hold_is_not_clobbered(store):
     assert [e["content"] for e in get_job("capture")["pending_delivery"]] == ["💳 order B"]
 
 
+def test_a_stale_run_cannot_resurrect_a_delivered_entry(store):
+    """Two runs of the same job both hold snapshot [A]. One delivers A and
+    clears it; the other fails retryably and writes its snapshot back. Storage
+    — not the stale caller — decides: A stays gone, or the next firing would
+    re-announce money that already went out."""
+    from cron.jobs import mutate_job
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    stale = get_job("capture")  # run 2's snapshot, taken before run 1 delivers
+
+    # Run 1 delivers A and clears the queue.
+    mutate_job("capture", lambda rec: rec.__setitem__("pending_delivery", None))
+
+    # Run 2 now flushes from its stale snapshot and fails.
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final=s.SILENT_MARKER)
+        s.run_one_job(stale)
+
+    assert get_job("capture").get("pending_delivery") is None
+
+
+def test_a_merge_keeps_the_queue_oldest_first(store):
+    """A concurrent hold can be older than what this run is writing. The merge
+    re-sorts, so recovery still replays in the order the alerts happened."""
+    from cron.jobs import mutate_job
+
+    stale = get_job("capture")  # snapshot with an empty queue
+
+    mutate_job("capture", lambda rec: rec.__setitem__("pending_delivery", [{
+        "id": "older", "content": "💳 order OLD",
+        "queued_at": "2020-01-01T00:00:00", "attempts": 1, "last_error": "x",
+    }]))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order NEW")
+        s.run_one_job(stale)
+
+    assert [e["content"] for e in get_job("capture")["pending_delivery"]] == [
+        "💳 order OLD", "💳 order NEW",
+    ]
+
+
+def test_a_payload_with_media_is_not_held(store, caplog):
+    """Attachments are sent as their own requests after the text, so a media
+    payload is multi-send at any length — retrying it duplicates the text."""
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
+        _patch_pipeline(mp, _fail_connect, final="Daily chart\nMEDIA:/tmp/chart.png")
+        s.run_one_job({"id": "capture", "name": "capture"})
+
+    assert get_job("capture").get("pending_delivery") is None
+    assert any("carries media" in r.getMessage() for r in caplog.records)
+
+
+def test_the_payload_cap_leaves_room_for_the_wrapper(store):
+    """The cap is on the RAW payload but the WRAPPED payload is what gets sent.
+    A payload at the cap, wrapped for a long-named job, must still fit in one
+    message on the smallest-limit platform (Discord, 2000)."""
+    job = get_job("capture")
+    wrapper = (
+        f"Cronjob Response: {job['name']}\n(job_id: {job['id']})\n-------------\n\n"
+        f"\n\nTo stop or manage this job, send me a new message "
+        f'(e.g. "stop reminder {job["name"]}").'
+    )
+    assert len(wrapper) + s._PENDING_DELIVERY_MAX_PAYLOAD_CHARS < 2000
+
+
 def test_a_job_with_nowhere_to_deliver_drops_its_payload(store, caplog):
     """The job was switched to deliver=local (or lost its origin) before the
     retry. _deliver_result reaches nobody and reports no error — that is not a
