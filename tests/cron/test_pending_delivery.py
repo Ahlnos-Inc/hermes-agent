@@ -79,7 +79,7 @@ def test_connect_phase_failure_holds_the_payload(store):
     """AC1 (half 1): a delivery that provably reached nobody is not lost."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     held = get_job("capture")["pending_delivery"]
     assert len(held) == 1
@@ -97,7 +97,7 @@ def test_timeout_is_never_held(store):
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _timeout)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
 
@@ -110,7 +110,7 @@ def test_ambiguity_vetoes_a_retryable_marker(store):
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _mixed)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
 
@@ -123,7 +123,7 @@ def test_permanent_failure_is_not_held(store):
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _permanent)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
 
@@ -138,7 +138,7 @@ def test_partial_delivery_is_not_held(store):
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _partial)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
 
@@ -148,23 +148,68 @@ def test_successful_delivery_holds_nothing(store):
     sent = []
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _succeed(sent))
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert len(sent) == 1
     assert get_job("capture").get("pending_delivery") is None
 
 
-def test_chunked_payload_is_dropped_loudly(store, caplog):
-    """A payload long enough to be split across platform messages cannot be
-    re-sent safely: chunk 1 may already have landed when chunk 2 failed, so a
-    retry would duplicate it. Dropped with an ERROR instead."""
-    big = "x" * (s._PENDING_DELIVERY_MAX_PAYLOAD_CHARS + 1)
+def test_a_multi_message_payload_is_dropped_loudly(store, caplog, monkeypatch):
+    """A payload the sender would split cannot be re-sent safely: chunk 1 may
+    already have landed when chunk 2 hit the connect error, so a retry would
+    duplicate it. Measured per target, against the WRAPPED text."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (500, len))
+
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
-        _patch_pipeline(mp, _fail_connect, final=big)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
-    assert any("sent in chunks" in r.getMessage() for r in caplog.records)
+    assert any("single message" in r.getMessage() for r in caplog.records)
+
+
+def test_a_payload_inside_the_target_limit_is_held(store, monkeypatch):
+    """The same payload against a platform that takes it in one message."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (5000, len))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        s.run_one_job(get_job("capture"))
+
+    assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_an_unresolvable_limit_fails_closed(store, monkeypatch, caplog):
+    """If the limit cannot be resolved, assume it chunks. A duplicated money
+    alert is worse than a dropped-and-logged one."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (None, len))
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        s.run_one_job(get_job("capture"))
+
+    assert get_job("capture").get("pending_delivery") is None
+    assert any("single message" in r.getMessage() for r in caplog.records)
+
+
+def test_a_short_payload_is_held_whatever_the_platform(store, monkeypatch):
+    """Under the universal floor no platform chunks, so an unknown limit is
+    not a reason to drop a money alert."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (None, len))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 Card order paid · 33Y55Z")
+        s.run_one_job(get_job("capture"))
+
+    assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_the_real_telegram_limit_resolves(store):
+    """The size check is only as good as its limit lookup — prove it resolves
+    against the real platform code, not just a stub."""
+    limit, len_fn = s._platform_message_limit("telegram")
+    assert limit and limit >= 4096
+    assert len_fn("ab") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +221,7 @@ def test_held_payload_is_redelivered_on_the_next_run_exactly_once(store):
     channel receives the payload once — not twice, and not never."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     held = get_job("capture")["pending_delivery"][0]["content"]
     assert "33Y55Z" in held
@@ -204,7 +249,7 @@ def test_held_payload_goes_out_before_this_runs_own_output(store):
     lands before the one this run just produced."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect, final="first alert")
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     sent = []
     with pytest.MonkeyPatch.context() as mp:
@@ -339,7 +384,7 @@ def test_failed_retry_bumps_attempts_and_keeps_the_original_stamp(store):
     every retry would make it immortal for as long as the outage lasts."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
     first = get_job("capture")["pending_delivery"][0]
 
     with pytest.MonkeyPatch.context() as mp:
@@ -357,7 +402,7 @@ def test_stale_payload_is_dropped_without_delivering(store, caplog):
     line instead of being re-sent forever."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     job = get_job("capture")
     job["pending_delivery"][0]["queued_at"] = "2020-01-01T00:00:00"
@@ -377,7 +422,7 @@ def test_unparseable_stamp_is_treated_as_expired(store):
     """Hand-edited or legacy state must not pin a payload in jobs.json forever."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     job = get_job("capture")
     job["pending_delivery"][0]["queued_at"] = "not-a-timestamp"
@@ -393,7 +438,7 @@ def test_retry_failing_permanently_drops_the_payload(store, caplog):
     """Held for a connect error, retried into a permanent one: stop holding."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     def _permanent(job, content, adapters=None, loop=None, delivered_targets=None):
         return "unknown platform 'telegram'"
@@ -410,7 +455,7 @@ def test_redelivery_failure_does_not_fail_the_run(store):
     """A re-delivery blow-up must not take down the run that is carrying it."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     def _explode(job, content, adapters=None, loop=None, delivered_targets=None):
         raise RuntimeError("httpx.ConnectError: name resolution blew up")
@@ -561,23 +606,51 @@ def test_a_payload_with_media_is_not_held(store, caplog):
     payload is multi-send at any length — retrying it duplicates the text."""
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
         _patch_pipeline(mp, _fail_connect, final="Daily chart\nMEDIA:/tmp/chart.png")
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
     assert any("carries media" in r.getMessage() for r in caplog.records)
 
 
-def test_the_payload_cap_leaves_room_for_the_wrapper(store):
-    """The cap is on the RAW payload but the WRAPPED payload is what gets sent.
-    A payload at the cap, wrapped for a long-named job, must still fit in one
-    message on the smallest-limit platform (Discord, 2000)."""
-    job = get_job("capture")
-    wrapper = (
-        f"Cronjob Response: {job['name']}\n(job_id: {job['id']})\n-------------\n\n"
-        f"\n\nTo stop or manage this job, send me a new message "
-        f'(e.g. "stop reminder {job["name"]}").'
-    )
-    assert len(wrapper) + s._PENDING_DELIVERY_MAX_PAYLOAD_CHARS < 2000
+def test_the_size_check_measures_the_wrapped_text(store, monkeypatch):
+    """The wrapper is a few hundred characters — measuring the raw payload
+    would let a payload just under the limit go multi-message once wrapped."""
+    wrapped = s._wrap_cron_delivery(get_job("capture"), "x" * 600, True)
+    assert len(wrapped) > 600 + 150
+
+    # A limit that the raw payload clears but the wrapped text does not.
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (len(wrapped) - 1, len))
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        s.run_one_job(get_job("capture"))
+
+    assert get_job("capture").get("pending_delivery") is None
+
+
+def test_two_concurrent_runs_holding_the_same_text_queue_it_once(store):
+    """Each run mints its own entry id, so the id-keyed merge would keep both
+    and announce the same thing twice on recovery. Content is the identity of
+    record, and the merge honours it."""
+    stale_one = get_job("capture")
+    stale_two = get_job("capture")
+
+    s._hold_undelivered_output(stale_one, "💳 order A", CONNECT_ERROR, [])
+    s._hold_undelivered_output(stale_two, "💳 order A", CONNECT_ERROR, [])
+
+    queue = get_job("capture")["pending_delivery"]
+    assert len(queue) == 1
+    assert queue[0]["attempts"] == 2
+
+
+def test_the_merge_orders_by_instant_not_by_string(store):
+    """Across a DST fold the ISO strings sort the wrong way round: 01:30-07:00
+    reads as earlier than 01:15-08:00 but happened after it."""
+    ordered = s._coalesce_identical_payloads(sorted([
+        {"id": "b", "content": "second", "queued_at": "2026-11-01T01:30:00-07:00"},
+        {"id": "a", "content": "first", "queued_at": "2026-11-01T01:15:00-07:00"},
+        {"id": "c", "content": "third", "queued_at": "2026-11-01T01:15:00-08:00"},
+    ], key=s._queued_at_order))
+    assert [e["content"] for e in ordered] == ["first", "second", "third"]
 
 
 def test_a_job_with_nowhere_to_deliver_drops_its_payload(store, caplog):
@@ -608,7 +681,7 @@ def test_held_error_string_is_truncated(store):
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _huge_error)
-        s.run_one_job({"id": "capture", "name": "capture"})
+        s.run_one_job(get_job("capture"))
 
     entry = get_job("capture")["pending_delivery"][0]
     assert len(entry["last_error"]) == s._PENDING_DELIVERY_MAX_ERROR_CHARS

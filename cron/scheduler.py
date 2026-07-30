@@ -1499,6 +1499,25 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _wrap_cron_delivery(job: dict, content: str, wrap_response: bool) -> str:
+    """The exact text a cron delivery puts on the wire.
+
+    Shared with the held-payload size check (BUILD-870), which has to measure
+    what actually gets SENT — the wrapper is a few hundred characters, enough
+    to push a payload over a platform's single-message limit on its own.
+    """
+    if not wrap_response:
+        return content
+    task_name = job.get("name", job.get("id", ""))
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job.get('id', '')})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
 def _deliver_result(
     job: dict,
     content: str,
@@ -1559,18 +1578,7 @@ def _deliver_result(
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    delivery_content = _wrap_cron_delivery(job, content, wrap_response)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -2115,14 +2123,13 @@ _PENDING_DELIVERY_MAX_ENTRIES = 10
 # Only payloads that fit in ONE platform message are held.  Every sender chunks
 # past its own limit and sends the chunks in sequence, so a connect failure on
 # chunk 2 leaves chunk 1 delivered — and re-sending the whole payload would
-# duplicate it.
-#
-# The cap is on the RAW payload, but what gets sent is the wrapped payload, on
-# whichever platform has the smallest limit.  Headroom, worst case: Discord's
-# 2000-character limit, minus a cron wrapper that costs ~300 characters for a
-# long job name.  1200 clears that with room to spare, and still clears
-# Telegram's 4096 even if MarkdownV2 escaping doubles the wrapped text.
-_PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 1200
+# duplicate it.  The real test is per-target and runs against the WRAPPED text
+# (see _payload_is_single_message); this constant is only a storage-sanity
+# ceiling so a huge report never reaches that check.
+_PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 4000
+# Shorter than every message limit we know of (IRC's 450 is the smallest), so a
+# payload this size is single-message on any platform, known limit or not.
+_UNIVERSALLY_SINGLE_MESSAGE_CHARS = 450
 # Attachments are sent as their own requests after the text, so a payload with
 # media is inherently multi-send and has the same partial-delivery problem
 # regardless of length.  Matching the marker the extractor looks for; a false
@@ -2186,10 +2193,118 @@ def _entry_bytes(entry: dict) -> int:
     )
 
 
+def _platform_message_limit(platform_name: str):
+    """``(limit, len_fn)`` for a delivery platform, or ``(None, len)`` when the
+    limit cannot be resolved.  Same sources the sender chunks against: the
+    adapter class attribute for built-ins, the registry entry for plugins."""
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(str(platform_name).lower())
+    except Exception:
+        return None, len
+    try:
+        from gateway.platforms.telegram import TelegramAdapter
+        from gateway.platforms.base import utf16_len
+
+        if platform is Platform.TELEGRAM:
+            # Telegram counts UTF-16 code units, not codepoints.
+            return getattr(TelegramAdapter, "MAX_MESSAGE_LENGTH", 4096), utf16_len
+    except Exception:
+        if str(platform_name).lower() == "telegram":
+            return 4096, len
+    try:
+        from gateway.platform_registry import platform_registry
+
+        entry = platform_registry.get(platform.value)
+        limit = getattr(entry, "max_message_length", 0) if entry else 0
+        return (limit or None), len
+    except Exception:
+        return None, len
+
+
+def _payload_is_single_message(job: dict, content: str) -> bool:
+    """True when this payload reaches every target in ONE send.
+
+    A multi-send payload cannot be re-delivered safely: an earlier chunk may
+    already have landed when a later one hit the connect error, so a retry
+    would duplicate it.  Fails CLOSED — an unresolvable limit means "assume it
+    chunks" — because a duplicated money alert is worse than a dropped-and-
+    logged one.
+    """
+    try:
+        text = _wrap_cron_delivery(job, content, _cron_wrap_response_enabled())
+        if len(text) <= _UNIVERSALLY_SINGLE_MESSAGE_CHARS:
+            return True
+        targets = _resolve_delivery_targets(job) or []
+        if not targets:
+            # Nothing to measure against. A job with no resolvable target does
+            # not produce a delivery error in the first place, so this is the
+            # unknown case, not the local-only case — fail closed.
+            return False
+        for target in targets:
+            limit, len_fn = _platform_message_limit(target.get("platform"))
+            if not limit or len_fn(text) > limit:
+                return False
+        return True
+    except Exception as exc:
+        logger.debug("Job '%s': could not size the payload: %s", job.get("id"), exc)
+        return False
+
+
+def _cron_wrap_response_enabled() -> bool:
+    """``cron.wrap_response`` (default on) — the same read _deliver_result does."""
+    try:
+        return bool((load_config() or {}).get("cron", {}).get("wrap_response", True))
+    except Exception:
+        return True
+
+
 def _entry_key(entry: dict):
     """Stable identity of a held entry.  Falls back to content for a
     hand-edited record written without an id."""
     return entry.get("id") or ("content", entry.get("content"))
+
+
+def _queued_at_order(entry: dict):
+    """Sort key that orders entries by the INSTANT they were queued.
+
+    Comparing the ISO strings looks equivalent and is not: across a DST fold
+    ``01:30-07:00`` sorts before ``01:15-08:00`` even though it happened after,
+    which would replay two alerts in the wrong order.
+    """
+    from datetime import datetime as _dt
+
+    try:
+        stamp = _dt.fromisoformat(str(entry.get("queued_at")))
+    except (TypeError, ValueError):
+        return (1, 0.0)  # unparseable stamps sort last, deterministically
+    if stamp.tzinfo is None:
+        stamp = stamp.astimezone()  # naive == local, matching _hermes_now()
+    return (0, stamp.timestamp())
+
+
+def _coalesce_identical_payloads(queue: list) -> list:
+    """Collapse entries with the same text into the oldest one.
+
+    Within a single run the hold path already updates the matching entry in
+    place, but two runs holding the same text concurrently each create their
+    own id, and the id-keyed merge would then keep both — announcing the same
+    thing twice on recovery.  Content is the identity of record here (see
+    _hold_undelivered_output), so the merge has to honour it too.
+    """
+    coalesced: list = []
+    by_content: dict = {}
+    for entry in queue:
+        first = by_content.get(entry.get("content"))
+        if first is None:
+            by_content[entry.get("content")] = entry
+            coalesced.append(entry)
+            continue
+        first["attempts"] = int(first.get("attempts") or 0) + int(entry.get("attempts") or 0)
+        if entry.get("last_error"):
+            first["last_error"] = entry["last_error"]
+    return coalesced
 
 
 def _write_pending_delivery_queue(job: dict, queue: list, *, carried=()) -> None:
@@ -2237,7 +2352,8 @@ def _write_pending_delivery_queue(job: dict, queue: list, *, carried=()) -> None
                 continue
             merged.append(entry)
 
-        merged.sort(key=lambda e: str(e.get("queued_at") or ""))
+        merged.sort(key=_queued_at_order)
+        merged = _coalesce_identical_payloads(merged)
 
         while merged and (
             len(merged) > _PENDING_DELIVERY_MAX_ENTRIES
@@ -2291,15 +2407,17 @@ def _hold_undelivered_output(
         return
 
     job_id = job.get("id")
-    if len(content) > _PENDING_DELIVERY_MAX_PAYLOAD_CHARS:
-        # Anything this long is chunked by the sender, so part of it may
-        # already have landed — re-sending the whole thing would duplicate
-        # those chunks. Drop it loudly instead.
+    if (
+        len(content) > _PENDING_DELIVERY_MAX_PAYLOAD_CHARS
+        or not _payload_is_single_message(job, content)
+    ):
+        # Sent in chunks, so part of it may already have landed — re-sending
+        # the whole thing would duplicate those chunks. Drop it loudly.
         logger.error(
-            "Job '%s': undelivered output is longer than %d characters — it "
-            "would be sent in chunks, so it cannot be safely re-delivered; "
+            "Job '%s': undelivered output does not fit in a single message on "
+            "every delivery target — it cannot be safely re-delivered; "
             "dropping it (error: %s)",
-            job_id, _PENDING_DELIVERY_MAX_PAYLOAD_CHARS, delivery_error,
+            job_id, delivery_error,
         )
         return
     if _PENDING_DELIVERY_MEDIA_MARKER in content:
