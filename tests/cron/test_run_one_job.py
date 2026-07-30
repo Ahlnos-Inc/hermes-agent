@@ -27,8 +27,10 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, delivered_targets=None):
         calls.append(("deliver", job["id"]))
+        if delivered_targets is not None:
+            delivered_targets.append("test:chat")
         return None
 
     def fake_mark(jid, ok, err=None, delivery_error=None):
@@ -184,7 +186,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, delivered_targets=None):
         order.append("deliver")
         return None
 
@@ -219,7 +221,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def boom_deliver(job, content, adapters=None, loop=None):
+    def boom_deliver(job, content, adapters=None, loop=None, delivered_targets=None):
         order.append("deliver-raise")
         raise RuntimeError("send blew up")
 
@@ -287,7 +289,7 @@ def test_run_one_job_records_telegram_delivery_timeout_per_job(monkeypatch):
 
     # Simulate _deliver_result surfacing the standalone Telegram timeout string
     # (what _send_telegram returns on a bare "Timed out").
-    def timeout_deliver(job, content, adapters=None, loop=None):
+    def timeout_deliver(job, content, adapters=None, loop=None, delivered_targets=None):
         return "telegram:-100123:0: Telegram send failed: Timed out"
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -321,7 +323,7 @@ def test_run_one_job_records_delivery_error_when_delivery_raises(monkeypatch):
     )
     monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
 
-    def raising_deliver(job, content, adapters=None, loop=None):
+    def raising_deliver(job, content, adapters=None, loop=None, delivered_targets=None):
         raise TimeoutError("Telegram send failed: Timed out")
 
     monkeypatch.setattr(s, "_deliver_result", raising_deliver)

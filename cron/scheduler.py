@@ -1498,7 +1498,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    delivered_targets: Optional[list] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1508,6 +1514,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the adapter path fails or is unavailable.
 
     Returns None on success, or an error string on failure.
+
+    ``delivered_targets`` is an optional out-parameter (same holder-list idiom
+    as ``run_job(defer_agent_teardown=...)``): every target this call actually
+    reached is appended as ``"<platform>:<chat_id>"``.  The error string alone
+    cannot distinguish "nothing was sent" from "target A got it, target B did
+    not", and BUILD-870's retry MUST NOT re-send a payload that already landed
+    somewhere.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
@@ -1948,6 +1961,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    if delivered_targets is not None:
+                        delivered_targets.append(f"{platform_name}:{chat_id}")
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -2058,6 +2073,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            if delivered_targets is not None:
+                delivered_targets.append(f"{platform_name}:{chat_id}")
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
@@ -2067,6 +2084,201 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Held-payload re-delivery (BUILD-870)
+#
+# A cron job's script commits its own "already announced" state (e.g. the
+# Vitatide capture-alert crons mark a payment seen the moment they print it),
+# but delivery happens HERE, afterwards.  A failed delivery used to be recorded
+# and dropped, so the payload was gone for good: money arrived and nobody was
+# told.  Hold the undelivered payload on the job record and re-send it on a
+# later firing instead.
+# ---------------------------------------------------------------------------
+
+# Give up on a held payload once it is this stale.  A day-late money alert is
+# still worth delivering; a week-late one is noise, and holding forever would
+# grow jobs.json without bound.
+_PENDING_DELIVERY_MAX_AGE_SECONDS = 24 * 3600
+# jobs.json is loaded and rewritten under a lock on every run of every job, so
+# a multi-megabyte report must not be parked in it.  An over-size payload is
+# dropped loudly rather than held.
+_PENDING_DELIVERY_MAX_BYTES = 64_000
+
+# Delivery failures that PROVE the payload never left this host, so re-sending
+# it cannot duplicate a message.  Deliberately narrow: everything not listed
+# here is dropped as before.
+_RETRYABLE_DELIVERY_MARKERS = (
+    "connecterror",
+    "getaddrinfo",
+    "nodename nor servname",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "interpreter is shutting down",
+)
+# A bare timeout is NOT retryable: the send may be in flight, and BUILD-731
+# already decided (for the same reason) not to retry one.  A duplicated money
+# alert is worse than a late one, so ambiguity anywhere in the message vetoes
+# the retry even when a retryable marker also appears.
+_AMBIGUOUS_DELIVERY_MARKERS = ("timed out", "timeout")
+
+
+def _is_retryable_delivery_error(error: Optional[str]) -> bool:
+    """True when ``error`` proves the payload was never handed to the platform."""
+    text = (error or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _AMBIGUOUS_DELIVERY_MARKERS):
+        return False
+    return any(marker in text for marker in _RETRYABLE_DELIVERY_MARKERS)
+
+
+def _hold_undelivered_output(
+    job: dict,
+    content: str,
+    delivery_error: Optional[str],
+    delivered_targets: list,
+) -> None:
+    """Park a payload that provably reached nobody so a later firing re-sends it.
+
+    Silent on every path that must NOT be retried: a clean delivery, a partial
+    delivery (re-sending would duplicate for the targets that did receive it),
+    and any error class that is permanent or ambiguous.
+    """
+    if not delivery_error or delivered_targets:
+        return
+    if not _is_retryable_delivery_error(delivery_error):
+        return
+
+    job_id = job.get("id")
+    if len(content.encode("utf-8", "replace")) > _PENDING_DELIVERY_MAX_BYTES:
+        logger.error(
+            "Job '%s': undelivered output is larger than %d bytes — dropping "
+            "instead of holding it for re-delivery (error: %s)",
+            job_id, _PENDING_DELIVERY_MAX_BYTES, delivery_error,
+        )
+        return
+
+    pending = job.get("pending_delivery") or {}
+    # Re-holding after a failed retry keeps the ORIGINAL queued_at so the age
+    # cap measures the payload's age, not the age of the last attempt (which
+    # would never expire while the outage lasts).
+    queued_at = pending.get("queued_at") or _hermes_now().isoformat()
+    attempts = int(pending.get("attempts") or 0) + 1
+    try:
+        from cron.jobs import update_job
+
+        update_job(job_id, {
+            "pending_delivery": {
+                "content": content,
+                "queued_at": queued_at,
+                "attempts": attempts,
+                "last_error": delivery_error,
+            },
+        })
+    except Exception as exc:
+        logger.error(
+            "Job '%s': could not hold undelivered output for re-delivery: %s",
+            job_id, exc,
+        )
+        return
+    logger.warning(
+        "Job '%s': delivery failed with a connect-phase error (attempt %d) — "
+        "holding the output for re-delivery on a later run: %s",
+        job_id, attempts, delivery_error,
+    )
+
+
+def _pending_delivery_age_seconds(pending: dict) -> float:
+    """Age of a held payload in seconds; ``inf`` when the stamp is unusable."""
+    from datetime import datetime as _dt
+
+    try:
+        return (_hermes_now() - _dt.fromisoformat(pending.get("queued_at"))).total_seconds()
+    except (TypeError, ValueError):
+        # An unparseable stamp is hand-edited or legacy state.  Treat it as
+        # expired: dropping one payload beats holding it forever.
+        return float("inf")
+
+
+def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
+    """Re-send this job's held payload, if it has one.
+
+    Runs on every firing of the job — including a silent one — so an alert held
+    through an outage goes out as soon as the network is back.  Never raises:
+    a re-delivery problem must not fail the run that is carrying it.
+
+    ponytail: a finite one-shot whose delivery fails is beyond this — it is
+    removed by mark_job_run() and never fires again, so there is nothing left to
+    retry on.  Recurring jobs (every money cron) are covered.
+    """
+    pending = job.get("pending_delivery") or {}
+    content = pending.get("content")
+    if not content:
+        return
+
+    job_id = job.get("id")
+    from cron.jobs import update_job
+
+    age = _pending_delivery_age_seconds(pending)
+    if age > _PENDING_DELIVERY_MAX_AGE_SECONDS:
+        logger.error(
+            "Job '%s': dropping cron output held for re-delivery — %.0fs old "
+            "after %s attempt(s), past the %ds limit (last error: %s)",
+            job_id, age, pending.get("attempts", 0),
+            _PENDING_DELIVERY_MAX_AGE_SECONDS, pending.get("last_error"),
+        )
+        try:
+            update_job(job_id, {"pending_delivery": None})
+        except Exception as exc:
+            logger.error("Job '%s': could not clear held output: %s", job_id, exc)
+        return
+
+    delivered_targets: list = []
+    try:
+        error = _deliver_result(
+            job, content, adapters=adapters, loop=loop,
+            delivered_targets=delivered_targets,
+        )
+    except Exception as exc:
+        error = str(exc)
+
+    if error and not delivered_targets:
+        if _is_retryable_delivery_error(error):
+            # Keep holding — same bookkeeping as the first failure, so attempts
+            # and the original queued_at both carry forward.
+            _hold_undelivered_output(job, content, error, delivered_targets)
+        else:
+            logger.error(
+                "Job '%s': dropping cron output held for re-delivery — retry "
+                "failed with a non-retryable error after %s attempt(s): %s",
+                job_id, pending.get("attempts", 0), error,
+            )
+            try:
+                update_job(job_id, {"pending_delivery": None})
+            except Exception as exc:
+                logger.error("Job '%s': could not clear held output: %s", job_id, exc)
+        return
+
+    # Delivered — including the partial case, where re-sending again would
+    # duplicate the message for whichever target already has it.
+    try:
+        update_job(job_id, {"pending_delivery": None})
+    except Exception as exc:
+        logger.error(
+            "Job '%s': re-delivered held output but could not clear it (a "
+            "duplicate may follow): %s", job_id, exc,
+        )
+    job.pop("pending_delivery", None)
+    logger.info(
+        "Job '%s': re-delivered output held since %s (%s attempt(s))%s",
+        job_id, pending.get("queued_at"), pending.get("attempts", 0),
+        f"; partial: {error}" if error else "",
+    )
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -3964,6 +4176,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
+            # Flush anything an earlier run produced but could not deliver
+            # (BUILD-870), BEFORE this run's own delivery so the channel keeps
+            # chronological order.  Unconditional: this run may itself be
+            # silent, and the held payload still has to go out.
+            try:
+                _flush_pending_delivery(job, adapters=adapters, loop=loop)
+            except Exception as exc:
+                logger.error("Job '%s': held-output re-delivery raised: %s", job["id"], exc)
+
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a
             # plausible-looking final_response from the truncated output --
@@ -4007,11 +4228,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 should_deliver = False
 
             if should_deliver:
+                delivered_targets: list = []
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job, deliver_content, adapters=adapters, loop=loop,
+                        delivered_targets=delivered_targets,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+                # The script has already committed its own "announced" state, so
+                # a payload that reached nobody is lost unless we hold it here.
+                _hold_undelivered_output(job, deliver_content, delivery_error, delivered_targets)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
