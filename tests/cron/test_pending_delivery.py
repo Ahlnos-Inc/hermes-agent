@@ -81,7 +81,9 @@ def test_connect_phase_failure_holds_the_payload(store):
         _patch_pipeline(mp, _fail_connect)
         s.run_one_job({"id": "capture", "name": "capture"})
 
-    pending = get_job("capture")["pending_delivery"]
+    held = get_job("capture")["pending_delivery"]
+    assert len(held) == 1
+    pending = held[0]
     assert "33Y55Z" in pending["content"]
     assert pending["attempts"] == 1
     assert pending["last_error"] == CONNECT_ERROR
@@ -175,7 +177,7 @@ def test_held_payload_is_redelivered_on_the_next_run_exactly_once(store):
         _patch_pipeline(mp, _fail_connect)
         s.run_one_job({"id": "capture", "name": "capture"})
 
-    held = get_job("capture")["pending_delivery"]["content"]
+    held = get_job("capture")["pending_delivery"][0]["content"]
     assert "33Y55Z" in held
 
     sent = []
@@ -211,18 +213,115 @@ def test_held_payload_goes_out_before_this_runs_own_output(store):
     assert [c for c in sent] == ["first alert", "second alert"]
 
 
+def test_every_alert_in_one_outage_survives(store):
+    """An outage spans several firings. A single held slot would let each new
+    alert overwrite the last, losing exactly the money alert this mechanism
+    exists to protect — so the hold is a queue, flushed oldest first.
+    """
+    for alert in ("💳 order A", "💳 order B", "💳 order C"):
+        with pytest.MonkeyPatch.context() as mp:
+            _patch_pipeline(mp, _fail_connect, final=alert)
+            s.run_one_job(get_job("capture"))
+
+    assert [e["content"] for e in get_job("capture")["pending_delivery"]] == [
+        "💳 order A", "💳 order B", "💳 order C",
+    ]
+
+    sent = []
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    assert sent == ["💳 order A", "💳 order B", "💳 order C"]
+    assert get_job("capture").get("pending_delivery") is None
+
+
+def test_a_repeated_identical_alert_is_queued_once(store):
+    """A job that emits the SAME notice every tick through an outage (a failing
+    script, say) must not fill the queue with copies of it."""
+    for _ in range(4):
+        with pytest.MonkeyPatch.context() as mp:
+            _patch_pipeline(mp, _fail_connect, final="same failure notice")
+            s.run_one_job(get_job("capture"))
+
+    queue = get_job("capture")["pending_delivery"]
+    assert len(queue) == 1
+    # 7 = 1 (run 1's own send) + 2 per later run (the flush retry, then that
+    # run's own send of the same text). `attempts` counts real failed sends.
+    assert queue[0]["attempts"] == 7
+
+
+def test_queue_cap_drops_the_oldest_loudly(store, caplog):
+    """AC3: bounded. jobs.json is rewritten on every run of every job, so the
+    queue cannot grow without limit — and a drop is never silent."""
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
+        for n in range(s._PENDING_DELIVERY_MAX_ENTRIES + 2):
+            _patch_pipeline(mp, _fail_connect, final=f"alert {n}")
+            s.run_one_job(get_job("capture"))
+
+    queue = get_job("capture")["pending_delivery"]
+    assert len(queue) == s._PENDING_DELIVERY_MAX_ENTRIES
+    assert queue[0]["content"] == "alert 2"  # the two oldest were dropped
+    assert len([r for r in caplog.records if "over its" in r.getMessage()]) == 2
+
+
+def test_a_still_down_link_keeps_the_rest_of_the_queue_in_order(store):
+    """The first re-delivery failure stops the flush: retrying the rest would
+    pile up failures, and a later partial success could reorder the channel."""
+    for alert in ("💳 order A", "💳 order B"):
+        with pytest.MonkeyPatch.context() as mp:
+            _patch_pipeline(mp, _fail_connect, final=alert)
+            s.run_one_job(get_job("capture"))
+
+    attempted = []
+
+    def _still_down(job, content, adapters=None, loop=None, delivered_targets=None):
+        attempted.append(content)
+        return CONNECT_ERROR
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _still_down, final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    assert attempted == ["💳 order A"]  # stopped after the first failure
+    queue = get_job("capture")["pending_delivery"]
+    assert [e["content"] for e in queue] == ["💳 order A", "💳 order B"]
+    # A: sent once per run (3 runs). B: sent once, then only ever queued
+    # behind A, which never clears — so it is never re-attempted.
+    assert queue[0]["attempts"] == 3 and queue[1]["attempts"] == 1
+
+
+def test_this_runs_output_queues_behind_the_held_ones(store):
+    """Chronological order survives a flush that failed: the new alert goes to
+    the BACK of the queue, not in front of the one still waiting."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order B")
+        s.run_one_job(get_job("capture"))
+
+    sent = []
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    assert sent == ["💳 order A", "💳 order B"]
+
+
 def test_failed_retry_bumps_attempts_and_keeps_the_original_stamp(store):
     """AC3: the age cap measures the PAYLOAD's age. Refreshing queued_at on
     every retry would make it immortal for as long as the outage lasts."""
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect)
         s.run_one_job({"id": "capture", "name": "capture"})
-    first = get_job("capture")["pending_delivery"]
+    first = get_job("capture")["pending_delivery"][0]
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect, final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
-    second = get_job("capture")["pending_delivery"]
+    second = get_job("capture")["pending_delivery"][0]
 
     assert second["queued_at"] == first["queued_at"]
     assert second["attempts"] == 2
@@ -237,7 +336,7 @@ def test_stale_payload_is_dropped_without_delivering(store, caplog):
         s.run_one_job({"id": "capture", "name": "capture"})
 
     job = get_job("capture")
-    job["pending_delivery"]["queued_at"] = "2020-01-01T00:00:00"
+    job["pending_delivery"][0]["queued_at"] = "2020-01-01T00:00:00"
 
     sent = []
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
@@ -257,7 +356,7 @@ def test_unparseable_stamp_is_treated_as_expired(store):
         s.run_one_job({"id": "capture", "name": "capture"})
 
     job = get_job("capture")
-    job["pending_delivery"]["queued_at"] = "not-a-timestamp"
+    job["pending_delivery"][0]["queued_at"] = "not-a-timestamp"
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _succeed([]), final=s.SILENT_MARKER)
@@ -297,7 +396,7 @@ def test_redelivery_failure_does_not_fail_the_run(store):
         assert s.run_one_job(get_job("capture")) is True
 
     # Still held: the raise was a connect-phase failure like any other.
-    assert get_job("capture")["pending_delivery"]["attempts"] == 2
+    assert get_job("capture")["pending_delivery"][0]["attempts"] == 2
 
 
 # ---------------------------------------------------------------------------

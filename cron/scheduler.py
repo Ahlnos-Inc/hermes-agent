@@ -2105,6 +2105,11 @@ _PENDING_DELIVERY_MAX_AGE_SECONDS = 24 * 3600
 # a multi-megabyte report must not be parked in it.  An over-size payload is
 # dropped loudly rather than held.
 _PENDING_DELIVERY_MAX_BYTES = 64_000
+# An outage spanning several firings holds one payload PER firing — a single
+# slot would let each new alert overwrite the last, losing exactly the money
+# alert this whole mechanism exists to protect.  The queue is bounded by count
+# as well as by total bytes.
+_PENDING_DELIVERY_MAX_ENTRIES = 10
 
 # Delivery failures that PROVE the payload never left this host, so re-sending
 # it cannot duplicate a message.  Deliberately narrow: everything not listed
@@ -2137,13 +2142,59 @@ def _is_retryable_delivery_error(error: Optional[str]) -> bool:
     return any(marker in text for marker in _RETRYABLE_DELIVERY_MARKERS)
 
 
+def _pending_delivery_queue(job: dict) -> list:
+    """This job's held payloads, oldest first.  Tolerates a hand-edited record."""
+    queue = job.get("pending_delivery")
+    if not isinstance(queue, list):
+        return []
+    return [entry for entry in queue if isinstance(entry, dict) and entry.get("content")]
+
+
+def _write_pending_delivery_queue(job: dict, queue: list) -> None:
+    """Persist the queue (dropping the oldest entries to stay inside the caps).
+
+    Writes the in-memory ``job`` too, so a later step in the SAME run sees what
+    was just persisted rather than the stale snapshot it was handed.
+    """
+    job_id = job.get("id")
+    while queue and (
+        len(queue) > _PENDING_DELIVERY_MAX_ENTRIES
+        or sum(len(e["content"].encode("utf-8", "replace")) for e in queue) > _PENDING_DELIVERY_MAX_BYTES
+    ):
+        dropped = queue.pop(0)
+        logger.error(
+            "Job '%s': dropping cron output held since %s — the held-output "
+            "queue is over its %d entry / %d byte cap",
+            job_id, dropped.get("queued_at"),
+            _PENDING_DELIVERY_MAX_ENTRIES, _PENDING_DELIVERY_MAX_BYTES,
+        )
+
+    value = queue or None
+    try:
+        from cron.jobs import update_job
+
+        update_job(job_id, {"pending_delivery": value})
+    except Exception as exc:
+        # Losing the write after a SUCCESSFUL re-delivery is the dangerous
+        # direction — the entry stays queued and goes out again next run.
+        logger.error(
+            "Job '%s': could not persist the held-output queue (a duplicate or "
+            "a loss may follow): %s", job_id, exc,
+        )
+        return
+    if value is None:
+        job.pop("pending_delivery", None)
+    else:
+        job["pending_delivery"] = value
+
+
 def _hold_undelivered_output(
     job: dict,
     content: str,
     delivery_error: Optional[str],
     delivered_targets: list,
 ) -> None:
-    """Park a payload that provably reached nobody so a later firing re-sends it.
+    """Queue a payload that provably reached nobody so a later firing re-sends it.
 
     Silent on every path that must NOT be retried: a clean delivery, a partial
     delivery (re-sending would duplicate for the targets that did receive it),
@@ -2163,29 +2214,27 @@ def _hold_undelivered_output(
         )
         return
 
-    pending = job.get("pending_delivery") or {}
-    # Re-holding after a failed retry keeps the ORIGINAL queued_at so the age
-    # cap measures the payload's age, not the age of the last attempt (which
-    # would never expire while the outage lasts).
-    queued_at = pending.get("queued_at") or _hermes_now().isoformat()
-    attempts = int(pending.get("attempts") or 0) + 1
-    try:
-        from cron.jobs import update_job
-
-        update_job(job_id, {
-            "pending_delivery": {
-                "content": content,
-                "queued_at": queued_at,
-                "attempts": attempts,
-                "last_error": delivery_error,
-            },
+    queue = _pending_delivery_queue(job)
+    # Re-holding after a failed retry updates the existing entry in place: it
+    # keeps the ORIGINAL queued_at, so the age cap measures the payload's age
+    # rather than the age of the last attempt (which would never expire while
+    # the outage lasts).  Identity is the content, so a job that keeps emitting
+    # the same failure notice every tick through an outage queues it once.
+    existing = next((e for e in queue if e.get("content") == content), None)
+    if existing is not None:
+        existing["attempts"] = int(existing.get("attempts") or 0) + 1
+        existing["last_error"] = delivery_error
+        attempts = existing["attempts"]
+    else:
+        queue.append({
+            "content": content,
+            "queued_at": _hermes_now().isoformat(),
+            "attempts": 1,
+            "last_error": delivery_error,
         })
-    except Exception as exc:
-        logger.error(
-            "Job '%s': could not hold undelivered output for re-delivery: %s",
-            job_id, exc,
-        )
-        return
+        attempts = 1
+
+    _write_pending_delivery_queue(job, queue)
     logger.warning(
         "Job '%s': delivery failed with a connect-phase error (attempt %d) — "
         "holding the output for re-delivery on a later run: %s",
@@ -2193,12 +2242,12 @@ def _hold_undelivered_output(
     )
 
 
-def _pending_delivery_age_seconds(pending: dict) -> float:
+def _pending_delivery_age_seconds(entry: dict) -> float:
     """Age of a held payload in seconds; ``inf`` when the stamp is unusable."""
     from datetime import datetime as _dt
 
     try:
-        return (_hermes_now() - _dt.fromisoformat(pending.get("queued_at"))).total_seconds()
+        return (_hermes_now() - _dt.fromisoformat(entry.get("queued_at"))).total_seconds()
     except (TypeError, ValueError):
         # An unparseable stamp is hand-edited or legacy state.  Treat it as
         # expired: dropping one payload beats holding it forever.
@@ -2206,79 +2255,79 @@ def _pending_delivery_age_seconds(pending: dict) -> float:
 
 
 def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
-    """Re-send this job's held payload, if it has one.
+    """Re-send this job's held payloads, oldest first, if it has any.
 
     Runs on every firing of the job — including a silent one — so an alert held
-    through an outage goes out as soon as the network is back.  Never raises:
-    a re-delivery problem must not fail the run that is carrying it.
+    through an outage goes out as soon as the network is back.  Never raises: a
+    re-delivery problem must not fail the run that is carrying it.
+
+    An entry is cleared only AFTER its delivery came back clean, so a crash in
+    that window re-sends rather than drops.  For a money alert a rare duplicate
+    beats a rare silent loss; that is the same trade the whole ticket is about.
 
     ponytail: a finite one-shot whose delivery fails is beyond this — it is
     removed by mark_job_run() and never fires again, so there is nothing left to
     retry on.  Recurring jobs (every money cron) are covered.
     """
-    pending = job.get("pending_delivery") or {}
-    content = pending.get("content")
-    if not content:
+    queue = _pending_delivery_queue(job)
+    if not queue:
         return
 
     job_id = job.get("id")
-    from cron.jobs import update_job
-
-    age = _pending_delivery_age_seconds(pending)
-    if age > _PENDING_DELIVERY_MAX_AGE_SECONDS:
-        logger.error(
-            "Job '%s': dropping cron output held for re-delivery — %.0fs old "
-            "after %s attempt(s), past the %ds limit (last error: %s)",
-            job_id, age, pending.get("attempts", 0),
-            _PENDING_DELIVERY_MAX_AGE_SECONDS, pending.get("last_error"),
-        )
-        try:
-            update_job(job_id, {"pending_delivery": None})
-        except Exception as exc:
-            logger.error("Job '%s': could not clear held output: %s", job_id, exc)
-        return
-
-    delivered_targets: list = []
-    try:
-        error = _deliver_result(
-            job, content, adapters=adapters, loop=loop,
-            delivered_targets=delivered_targets,
-        )
-    except Exception as exc:
-        error = str(exc)
-
-    if error and not delivered_targets:
-        if _is_retryable_delivery_error(error):
-            # Keep holding — same bookkeeping as the first failure, so attempts
-            # and the original queued_at both carry forward.
-            _hold_undelivered_output(job, content, error, delivered_targets)
-        else:
+    remaining: list = []
+    for index, entry in enumerate(queue):
+        content = entry["content"]
+        age = _pending_delivery_age_seconds(entry)
+        if age > _PENDING_DELIVERY_MAX_AGE_SECONDS:
             logger.error(
-                "Job '%s': dropping cron output held for re-delivery — retry "
-                "failed with a non-retryable error after %s attempt(s): %s",
-                job_id, pending.get("attempts", 0), error,
+                "Job '%s': dropping cron output held for re-delivery — %.0fs "
+                "old after %s attempt(s), past the %ds limit (last error: %s)",
+                job_id, age, entry.get("attempts", 0),
+                _PENDING_DELIVERY_MAX_AGE_SECONDS, entry.get("last_error"),
             )
-            try:
-                update_job(job_id, {"pending_delivery": None})
-            except Exception as exc:
-                logger.error("Job '%s': could not clear held output: %s", job_id, exc)
-        return
+            continue
 
-    # Delivered — including the partial case, where re-sending again would
-    # duplicate the message for whichever target already has it.
-    try:
-        update_job(job_id, {"pending_delivery": None})
-    except Exception as exc:
-        logger.error(
-            "Job '%s': re-delivered held output but could not clear it (a "
-            "duplicate may follow): %s", job_id, exc,
+        delivered_targets: list = []
+        try:
+            error = _deliver_result(
+                job, content, adapters=adapters, loop=loop,
+                delivered_targets=delivered_targets,
+            )
+        except Exception as exc:
+            error = str(exc)
+
+        if error and not delivered_targets:
+            if _is_retryable_delivery_error(error):
+                entry["attempts"] = int(entry.get("attempts") or 0) + 1
+                entry["last_error"] = error
+                # The link is still down. Keep this entry AND everything behind
+                # it, in order — retrying the rest now would only pile up
+                # failures and could reorder the channel on recovery.
+                remaining.append(entry)
+                remaining.extend(queue[index + 1:])
+                logger.warning(
+                    "Job '%s': re-delivery of output held since %s failed "
+                    "(attempt %d) — still holding %d payload(s): %s",
+                    job_id, entry.get("queued_at"), entry["attempts"],
+                    len(remaining), error,
+                )
+                break
+            logger.error(
+                "Job '%s': dropping cron output held since %s — retry failed "
+                "with a non-retryable error after %s attempt(s): %s",
+                job_id, entry.get("queued_at"), entry.get("attempts", 0), error,
+            )
+            continue
+
+        # Delivered — including the partial case, where re-sending again would
+        # duplicate the message for whichever target already has it.
+        logger.info(
+            "Job '%s': re-delivered output held since %s (%s attempt(s))%s",
+            job_id, entry.get("queued_at"), entry.get("attempts", 0),
+            f"; partial: {error}" if error else "",
         )
-    job.pop("pending_delivery", None)
-    logger.info(
-        "Job '%s': re-delivered output held since %s (%s attempt(s))%s",
-        job_id, pending.get("queued_at"), pending.get("attempts", 0),
-        f"; partial: {error}" if error else "",
-    )
+
+    _write_pending_delivery_queue(job, remaining)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
