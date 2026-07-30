@@ -291,6 +291,29 @@ def test_a_still_down_link_keeps_the_rest_of_the_queue_in_order(store):
     assert queue[0]["attempts"] == 3 and queue[1]["attempts"] == 1
 
 
+def test_a_delivered_entry_is_cleared_before_the_next_one_is_tried(store):
+    """The queue is persisted after EACH entry, so a crash part-way through a
+    flush cannot re-send what already went out."""
+    for alert in ("💳 order A", "💳 order B"):
+        with pytest.MonkeyPatch.context() as mp:
+            _patch_pipeline(mp, _fail_connect, final=alert)
+            s.run_one_job(get_job("capture"))
+
+    def _first_ok_then_down(job, content, adapters=None, loop=None, delivered_targets=None):
+        if content == "💳 order A":
+            if delivered_targets is not None:
+                delivered_targets.append("telegram:-1003907677753")
+            return None
+        return CONNECT_ERROR
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _first_ok_then_down, final=s.SILENT_MARKER)
+        s.run_one_job(get_job("capture"))
+
+    # A is gone from the queue; only B is still waiting.
+    assert [e["content"] for e in get_job("capture")["pending_delivery"]] == ["💳 order B"]
+
+
 def test_this_runs_output_queues_behind_the_held_ones(store):
     """Chronological order survives a flush that failed: the new alert goes to
     the BACK of the queue, not in front of the one still waiting."""

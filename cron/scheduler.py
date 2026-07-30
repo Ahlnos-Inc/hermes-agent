@@ -2269,14 +2269,16 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
     removed by mark_job_run() and never fires again, so there is nothing left to
     retry on.  Recurring jobs (every money cron) are covered.
     """
-    queue = _pending_delivery_queue(job)
-    if not queue:
+    pending = _pending_delivery_queue(job)
+    if not pending:
         return
 
     job_id = job.get("id")
-    remaining: list = []
-    for index, entry in enumerate(queue):
-        content = entry["content"]
+    # Persist after EACH entry rather than once at the end, so the window in
+    # which a crash re-sends an already-delivered payload is one entry wide
+    # instead of the whole queue.
+    while pending:
+        entry = pending[0]
         age = _pending_delivery_age_seconds(entry)
         if age > _PENDING_DELIVERY_MAX_AGE_SECONDS:
             logger.error(
@@ -2285,12 +2287,14 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 job_id, age, entry.get("attempts", 0),
                 _PENDING_DELIVERY_MAX_AGE_SECONDS, entry.get("last_error"),
             )
+            _write_pending_delivery_queue(job, pending[1:])
+            pending = pending[1:]
             continue
 
         delivered_targets: list = []
         try:
             error = _deliver_result(
-                job, content, adapters=adapters, loop=loop,
+                job, entry["content"], adapters=adapters, loop=loop,
                 delivered_targets=delivered_targets,
             )
         except Exception as exc:
@@ -2303,31 +2307,29 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
                 # The link is still down. Keep this entry AND everything behind
                 # it, in order — retrying the rest now would only pile up
                 # failures and could reorder the channel on recovery.
-                remaining.append(entry)
-                remaining.extend(queue[index + 1:])
+                _write_pending_delivery_queue(job, pending)
                 logger.warning(
                     "Job '%s': re-delivery of output held since %s failed "
                     "(attempt %d) — still holding %d payload(s): %s",
                     job_id, entry.get("queued_at"), entry["attempts"],
-                    len(remaining), error,
+                    len(pending), error,
                 )
-                break
+                return
             logger.error(
                 "Job '%s': dropping cron output held since %s — retry failed "
                 "with a non-retryable error after %s attempt(s): %s",
                 job_id, entry.get("queued_at"), entry.get("attempts", 0), error,
             )
-            continue
-
-        # Delivered — including the partial case, where re-sending again would
-        # duplicate the message for whichever target already has it.
-        logger.info(
-            "Job '%s': re-delivered output held since %s (%s attempt(s))%s",
-            job_id, entry.get("queued_at"), entry.get("attempts", 0),
-            f"; partial: {error}" if error else "",
-        )
-
-    _write_pending_delivery_queue(job, remaining)
+        else:
+            # Delivered — including the partial case, where re-sending again
+            # would duplicate the message for whichever target already has it.
+            logger.info(
+                "Job '%s': re-delivered output held since %s (%s attempt(s))%s",
+                job_id, entry.get("queued_at"), entry.get("attempts", 0),
+                f"; partial: {error}" if error else "",
+            )
+        _write_pending_delivery_queue(job, pending[1:])
+        pending = pending[1:]
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
