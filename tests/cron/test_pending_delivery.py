@@ -268,8 +268,11 @@ def test_the_replay_marker_names_when_it_was_held(store):
     )
     assert expected in marker
 
-    # A hand-edited or legacy stamp still produces a usable header.
-    assert "an earlier run" in s._replay_prefix({"queued_at": None})
+    # A hand-edited or legacy stamp still produces a usable header. None of
+    # these may raise: the flush would read the exception as a delivery failure
+    # and drop the very alert this mechanism exists to save.
+    for bad in (None, "", "not-a-timestamp", "9999-12-31T23:59:59-14:00", 12345):
+        assert "Held from" in s._replay_prefix({"queued_at": bad})
 
 
 def test_held_payload_goes_out_before_this_runs_own_output(store):

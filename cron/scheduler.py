@@ -1500,12 +1500,7 @@ def _is_channel_dm_topic(
 
 
 def _wrap_cron_delivery(job: dict, content: str, wrap_response: bool) -> str:
-    """The exact text a cron delivery puts on the wire.
-
-    Shared with the held-payload size check (BUILD-870), which has to measure
-    what actually gets SENT — the wrapper is a few hundred characters, enough
-    to push a payload over a platform's single-message limit on its own.
-    """
+    """The exact text a cron delivery puts on the wire."""
     if not wrap_response:
         return content
     task_name = job.get("name", job.get("id", ""))
@@ -2161,7 +2156,10 @@ def _replay_prefix(entry: dict) -> str:
             .astimezone(_hermes_now().tzinfo)
             .strftime("%Y-%m-%d %H:%M")
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a stored stamp near datetime.max overflows when
+        # astimezone() shifts it. Never let a bad stamp raise — the caller
+        # would read the exception as a delivery failure and drop the alert.
         held_at = str(stamp or "an earlier run")
     return f"⏳ Held from {held_at} — delivery had failed\n\n"
 
