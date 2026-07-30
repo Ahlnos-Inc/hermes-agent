@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -488,3 +489,144 @@ def test_clean_after_unblock_spawns(kanban_home, all_assignees_spawnable):
         assert res2.dirty_workspace == []
         assert res2.spawned != [], "clean-after-unblock must spawn"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_claim_vs_dirty_block_race_serializes(kanban_home, all_assignees_spawnable):
+    """claim_task and _block_dirty_ready_task racing on the same task must
+    serialize without duplicating state transitions (BUILD-858 §5.2).
+
+    One writer wins the SQLite CAS and applies exactly one terminal transition
+    (running or blocked); the other writer loses atomically without writing
+    anything.  Invariants verified for each possible winner:
+
+    * dirty-block winner  — zero task_runs, zero claimed events, exactly one
+      blocked event with code='dirty_workspace', final status='blocked'.
+    * claim winner        — one task_runs row, one claimed event, no
+      dirty_workspace blocked event, final status='running'.
+
+    Run ROUNDS times to expose ordering races without sleep-based assertions.
+    """
+    ROUNDS = 20
+
+    dirty_ws = kanban_home / "race_test_ws"
+    _init_git_repo(dirty_ws)
+    (dirty_ws / "dirty.txt").write_text("x\n", encoding="utf-8")
+
+    for round_num in range(ROUNDS):
+        with kb.connect() as conn:
+            t = kb.create_task(
+                conn, title=f"race-task-{round_num}", assignee="coder",
+                workspace_kind="dir", workspace_path=str(dirty_ws),
+            )
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+
+        claim_result: list = []
+        block_result: list = []
+        errors: list = []
+
+        def _run_claim() -> None:
+            try:
+                with kb.connect() as c:
+                    result = kb.claim_task(c, t)
+                    claim_result.append(result)
+            except Exception as exc:
+                errors.append(("claim", exc))
+
+        def _run_dirty_block() -> None:
+            try:
+                ws_diag = kb._capture_workspace_diag(str(dirty_ws))
+                with kb.connect() as c:
+                    result = kb._block_dirty_ready_task(c, t, ws_diag)
+                    block_result.append(result)
+            except Exception as exc:
+                errors.append(("block", exc))
+
+        t1 = threading.Thread(target=_run_claim)
+        t2 = threading.Thread(target=_run_dirty_block)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert not errors, f"Round {round_num}: unexpected errors: {errors}"
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, t)
+            final_status = task.status
+
+            assert final_status in {"running", "blocked"}, (
+                f"Round {round_num}: unexpected final status {final_status!r}"
+            )
+
+            if final_status == "blocked":
+                # Dirty-block won: no run must exist, no claimed event.
+                assert task.current_run_id is None, (
+                    f"Round {round_num}: dirty-block must not create a run"
+                )
+                runs = conn.execute(
+                    "SELECT id FROM task_runs WHERE task_id = ?", (t,),
+                ).fetchall()
+                assert runs == [], (
+                    f"Round {round_num}: dirty-block must not write task_runs; "
+                    f"got {runs}"
+                )
+                claimed_evts = conn.execute(
+                    "SELECT id FROM task_events "
+                    "WHERE task_id = ? AND kind = 'claimed'",
+                    (t,),
+                ).fetchall()
+                assert claimed_evts == [], (
+                    f"Round {round_num}: dirty-block must not emit claimed events; "
+                    f"got {len(claimed_evts)}"
+                )
+                dirty_evts = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'blocked'",
+                    (t,),
+                ).fetchall()
+                assert len(dirty_evts) == 1, (
+                    f"Round {round_num}: expected exactly one blocked event; "
+                    f"got {len(dirty_evts)}"
+                )
+                import json as _json
+                code = _json.loads(dirty_evts[0]["payload"] or "{}").get("code")
+                assert code == "dirty_workspace", (
+                    f"Round {round_num}: blocked event code must be 'dirty_workspace'; "
+                    f"got {code!r}"
+                )
+            else:
+                # Claim won: one task_run and one claimed event must exist.
+                assert task.current_run_id is not None, (
+                    f"Round {round_num}: claimed task must have a run"
+                )
+                runs = conn.execute(
+                    "SELECT id FROM task_runs WHERE task_id = ?", (t,),
+                ).fetchall()
+                assert len(runs) == 1, (
+                    f"Round {round_num}: exactly one task_run expected; "
+                    f"got {len(runs)}"
+                )
+                claimed_evts = conn.execute(
+                    "SELECT id FROM task_events "
+                    "WHERE task_id = ? AND kind = 'claimed'",
+                    (t,),
+                ).fetchall()
+                assert len(claimed_evts) == 1, (
+                    f"Round {round_num}: exactly one claimed event expected; "
+                    f"got {len(claimed_evts)}"
+                )
+                # No dirty_workspace blocked event should exist for a claim winner.
+                dirty_evts = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'blocked'",
+                    (t,),
+                ).fetchall()
+                import json as _json
+                dirty_codes = [
+                    _json.loads(e["payload"] or "{}").get("code")
+                    for e in dirty_evts
+                ]
+                assert "dirty_workspace" not in dirty_codes, (
+                    f"Round {round_num}: claim winner must not have dirty_workspace "
+                    f"blocked event; got codes {dirty_codes}"
+                )

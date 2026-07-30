@@ -11235,21 +11235,15 @@ def claim_task(
         ).fetchone()
         if ws_row and ws_row["workspace_path"] and ws_row["workspace_kind"] \
            and ws_row["workspace_kind"] != "scratch":
-            collision = conn.execute(
-                "SELECT id FROM tasks "
-                "WHERE status = 'running' "
-                "  AND workspace_kind = ? "
-                "  AND workspace_path = ? "
-                "  AND id != ? "
-                "LIMIT 1",
-                (ws_row["workspace_kind"], ws_row["workspace_path"], task_id),
-            ).fetchone()
-            if collision:
+            collision_id = _find_workspace_collision(
+                conn, task_id, ws_row["workspace_kind"], ws_row["workspace_path"],
+            )
+            if collision_id is not None:
                 _append_event(
                     conn, task_id, "claim_rejected",
                     {
                         "reason": "workspace_collision",
-                        "conflict_with": collision["id"],
+                        "conflict_with": collision_id,
                         "workspace_kind": ws_row["workspace_kind"],
                         "workspace_path": ws_row["workspace_path"],
                     },

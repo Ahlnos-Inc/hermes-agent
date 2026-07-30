@@ -279,6 +279,8 @@ def test_i4_concurrent_gate_completion_exact_once(kanban_home):
     """Two concurrent complete_task calls on a blocked human gate must yield:
     - exactly one returns True (CAS winner)
     - exactly one completed event
+    - zero gate task_runs (no claim, no synthetic run — BUILD-858 §5.3)
+    - zero claimed events (gate was never dispatched)
     - exactly one promoted event on the implementation child
     - no duplicate runs or claim events
     (BUILD-858 §5.3)
@@ -296,7 +298,7 @@ def test_i4_concurrent_gate_completion_exact_once(kanban_home):
     def _try_complete(idx: int) -> None:
         try:
             with kb.connect() as c:
-                ok = kb.complete_task(c, gate, result=f"approved by caller {idx}")
+                ok = kb.complete_task(c, gate)
                 results.append(ok)
         except Exception as exc:
             errors.append((idx, exc))
@@ -335,6 +337,26 @@ def test_i4_concurrent_gate_completion_exact_once(kanban_home):
         ).fetchall()
         assert len(promoted_events) == 1, \
             f"expected exactly one child promoted event; got {len(promoted_events)}"
+
+        # Zero task_runs: complete_task on a never-claimed blocked gate
+        # must not synthesize a run (BUILD-858 §5.3 no-run contract).
+        gate_runs = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ?", (gate,),
+        ).fetchall()
+        assert gate_runs == [], (
+            "no task_runs must be created for a human-gate completion "
+            f"without result/summary/metadata; got {gate_runs}"
+        )
+
+        # Zero claimed events: the gate was never dispatched.
+        claimed_events = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (gate,),
+        ).fetchall()
+        assert claimed_events == [], (
+            f"no claimed events expected on an initial-blocked gate; "
+            f"got {len(claimed_events)}"
+        )
 
 
 # ---------------------------------------------------------------------------
