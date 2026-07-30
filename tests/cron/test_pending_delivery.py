@@ -8,8 +8,10 @@ was gone for good: money captured, nobody told. Live trigger: 2026-07-30
 08:05-08:24, when the host lost DNS and every Telegram send failed with
 `httpx.ConnectError: [Errno 8] nodename nor servname provided`.
 
-The rule these tests pin down: hold a payload ONLY when the failure proves it
-reached nobody, and re-send it at most once.
+The rules these tests pin down: hold a payload ONLY when the failure proves it
+reached nobody; re-send it in order; and mark every replay, because the
+deliberate trade here (Nicholas, 2026-07-30) is never to lose an alert rather
+than never to duplicate one.
 """
 import logging
 
@@ -18,6 +20,8 @@ import pytest
 import cron.scheduler as s
 from cron.jobs import get_job, save_jobs
 
+
+REPLAY_MARKER = "⏳ Held from"
 
 CONNECT_ERROR = (
     "live adapter delivery to telegram:-1003907677753 failed: httpx.ConnectError: "
@@ -69,6 +73,15 @@ def _succeed(sent):
             delivered_targets.append("telegram:-1003907677753")
         return None
     return _deliver
+
+
+def _bodies(sent):
+    """Payloads as the channel sees them, minus the replay header.
+
+    A re-delivery is prefixed so a replayed alert can never be mistaken for a
+    second capture; a first-time send is not.
+    """
+    return [t.split("\n\n", 1)[1] if t.startswith(REPLAY_MARKER) else t for t in sent]
 
 
 # ---------------------------------------------------------------------------
@@ -154,93 +167,38 @@ def test_successful_delivery_holds_nothing(store):
     assert get_job("capture").get("pending_delivery") is None
 
 
-def test_a_multi_message_payload_is_dropped_loudly(store, caplog, monkeypatch):
-    """A payload the sender would split cannot be re-sent safely: chunk 1 may
-    already have landed when chunk 2 hit the connect error, so a retry would
-    duplicate it. Measured per target, against the WRAPPED text."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 500)
+def test_a_long_payload_is_still_held(store):
+    """The decision (Nicholas, 2026-07-30): never lose an alert. There is no
+    "will this be chunked?" predicate any more — five attempts at one were each
+    wrong in a different way, and every one of them silently duplicated when it
+    was. A replay is marked instead (see the re-delivery tests)."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="x" * 3000)
+        s.run_one_job(get_job("capture"))
 
+    assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_a_payload_with_media_is_still_held(store):
+    """Same trade: attachments are separate sends, so a replay can repeat the
+    text — visibly, which beats losing the alert."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="Daily chart\nMEDIA:/tmp/chart.png")
+        s.run_one_job(get_job("capture"))
+
+    assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_a_payload_too_big_for_the_store_is_dropped_loudly(store, caplog):
+    """jobs.json is rewritten under a lock on every run of every job, so there
+    is still a size ceiling — a storage bound, not a safety predicate."""
+    big = "x" * (s._PENDING_DELIVERY_MAX_PAYLOAD_CHARS + 1)
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        _patch_pipeline(mp, _fail_connect, final=big)
         s.run_one_job(get_job("capture"))
 
     assert get_job("capture").get("pending_delivery") is None
-    assert any("single message" in r.getMessage() for r in caplog.records)
-
-
-def test_a_payload_inside_the_target_limit_is_held(store, monkeypatch):
-    """The same payload against a platform that takes it in one message."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 5000)
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
-        s.run_one_job(get_job("capture"))
-
-    assert len(get_job("capture")["pending_delivery"]) == 1
-
-
-def test_an_unanswered_platform_is_treated_as_never_chunking(store, monkeypatch):
-    """A platform the registry cannot answer for has no live adapter either
-    (adapters are built from registry entries), and the standalone sender only
-    chunks against a resolved limit — so nothing splits it."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: None)
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
-        s.run_one_job(get_job("capture"))
-
-    assert len(get_job("capture")["pending_delivery"]) == 1
-
-
-def test_the_size_bound_covers_byte_and_escape_inflation(store):
-    """UTF-16 units alone under-count twice: IRC splits on UTF-8 bytes (CJK
-    costs 3), and both senders chunk the FORMATTED text, where MarkdownV2
-    escaping can double it. The bound has to cover both."""
-    assert s._message_size("abc") == 6                 # 3 chars, escape-doubled
-    assert s._message_size("界" * 200) >= 450 * 2      # 600 UTF-8 bytes, doubled
-    assert s._message_size("💳" * 600) >= 1200 * 2     # 1200 UTF-16 units
-
-
-def test_the_limit_lookup_reads_the_registry(store, monkeypatch):
-    """The size check is only as good as its lookup. A platform the registry
-    knows reports its limit; 0 means the platform does not chunk at all; an
-    unpopulated registry reports nothing, and the caller fails closed."""
-    from types import SimpleNamespace
-
-    known = {"telegram": SimpleNamespace(max_message_length=4096),
-             "signal": SimpleNamespace(max_message_length=0)}
-    monkeypatch.setattr("gateway.platform_registry.platform_registry.get", known.get)
-
-    assert s._platform_message_limit("telegram") == 4096
-    assert s._platform_message_limit("signal") == 0      # no limit, never chunks
-    assert s._platform_message_limit("nope") is None     # unknown -> fail closed
-
-
-def test_a_platform_that_never_chunks_holds_any_payload(store, monkeypatch):
-    """Sol's case: Signal has no chunking limit, so a 600-character payload is
-    one send and must still be held."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 0)
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
-        s.run_one_job(get_job("capture"))
-
-    assert len(get_job("capture")["pending_delivery"]) == 1
-
-
-def test_size_is_measured_in_utf16_units(store, monkeypatch):
-    """Sol's case: Telegram counts UTF-16 code units, so emoji cost 2 each. A
-    payload that looks short by codepoint can still be chunked."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 1000)
-    emoji = "💳" * 600  # 600 codepoints, 1200 UTF-16 units
-
-    assert len(emoji) < 1000 < s._message_size(emoji)
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final=emoji)
-        s.run_one_job(get_job("capture"))
-
-    assert get_job("capture").get("pending_delivery") is None
+    assert any("too large to park" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +221,7 @@ def test_held_payload_is_redelivered_on_the_next_run_exactly_once(store):
         _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert sent == [held]
+    assert _bodies(sent) == [held]
     assert get_job("capture").get("pending_delivery") is None
 
     # Tick N+2: nothing left to re-send.
@@ -272,7 +230,46 @@ def test_held_payload_is_redelivered_on_the_next_run_exactly_once(store):
         _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert sent == []
+    assert _bodies(sent) == []
+
+
+def test_a_replay_is_marked_and_a_fresh_send_is_not(store):
+    """The trade this design makes: a payload is never dropped for fear of
+    duplicating it, so a replay has to be unmistakable. A second capture of the
+    same amount must never be confusable with a re-sent one."""
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="💳 order A")
+        s.run_one_job(get_job("capture"))
+
+    sent = []
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _succeed(sent), final="💳 order B")
+        s.run_one_job(get_job("capture"))
+
+    replay, fresh = sent
+    assert replay.startswith(REPLAY_MARKER) and replay.endswith("💳 order A")
+    assert "delivery had failed" in replay
+    assert fresh == "💳 order B"  # this run's own output is not marked
+
+
+def test_the_replay_marker_names_when_it_was_held(store):
+    """The header carries the time the payload was queued, so an operator can
+    place the replay against the outage rather than against now."""
+    from datetime import datetime
+
+    queued = "2026-07-30T08:12:00-07:00"
+    marker = s._replay_prefix({"queued_at": queued})
+    # Rendered in hermes's timezone, matching every other timestamp in the
+    # channel — not in whatever zone the string happened to carry.
+    expected = (
+        datetime.fromisoformat(queued)
+        .astimezone(s._hermes_now().tzinfo)
+        .strftime("%Y-%m-%d %H:%M")
+    )
+    assert expected in marker
+
+    # A hand-edited or legacy stamp still produces a usable header.
+    assert "an earlier run" in s._replay_prefix({"queued_at": None})
 
 
 def test_held_payload_goes_out_before_this_runs_own_output(store):
@@ -287,7 +284,7 @@ def test_held_payload_goes_out_before_this_runs_own_output(store):
         _patch_pipeline(mp, _succeed(sent), final="second alert")
         s.run_one_job(get_job("capture"))
 
-    assert [c for c in sent] == ["first alert", "second alert"]
+    assert _bodies(sent) == ["first alert", "second alert"]
 
 
 def test_every_alert_in_one_outage_survives(store):
@@ -309,7 +306,7 @@ def test_every_alert_in_one_outage_survives(store):
         _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert sent == ["💳 order A", "💳 order B", "💳 order C"]
+    assert _bodies(sent) == ["💳 order A", "💳 order B", "💳 order C"]
     assert get_job("capture").get("pending_delivery") is None
 
 
@@ -360,7 +357,7 @@ def test_a_still_down_link_keeps_the_rest_of_the_queue_in_order(store):
         _patch_pipeline(mp, _still_down, final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert attempted == ["💳 order A"]  # stopped after the first failure
+    assert _bodies(attempted) == ["💳 order A"]  # stopped after the first failure
     queue = get_job("capture")["pending_delivery"]
     assert [e["content"] for e in queue] == ["💳 order A", "💳 order B"]
     # A: sent once per run (3 runs). B: sent once, then only ever queued
@@ -377,7 +374,7 @@ def test_a_delivered_entry_is_cleared_before_the_next_one_is_tried(store):
             s.run_one_job(get_job("capture"))
 
     def _first_ok_then_down(job, content, adapters=None, loop=None, delivered_targets=None):
-        if content == "💳 order A":
+        if content.endswith("💳 order A"):
             if delivered_targets is not None:
                 delivered_targets.append("telegram:-1003907677753")
             return None
@@ -407,7 +404,7 @@ def test_this_runs_output_queues_behind_the_held_ones(store):
         _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert sent == ["💳 order A", "💳 order B"]
+    assert _bodies(sent) == ["💳 order A", "💳 order B"]
 
 
 def test_failed_retry_bumps_attempts_and_keeps_the_original_stamp(store):
@@ -443,7 +440,7 @@ def test_stale_payload_is_dropped_without_delivering(store, caplog):
         _patch_pipeline(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(job)
 
-    assert sent == []
+    assert _bodies(sent) == []
     assert get_job("capture").get("pending_delivery") is None
     dropped = [r for r in caplog.records if "held for re-delivery" in r.getMessage()]
     assert dropped and "capture" in dropped[0].getMessage()
@@ -526,7 +523,7 @@ def test_hold_survives_the_real_mark_job_run(store):
         _patch_pipeline_real_lifecycle(mp, _succeed(sent), final=s.SILENT_MARKER)
         s.run_one_job(get_job("capture"))
 
-    assert sent == ["💳 order A"]
+    assert _bodies(sent) == ["💳 order A"]
     assert get_job("capture").get("pending_delivery") is None
 
 
@@ -583,7 +580,7 @@ def test_a_concurrent_hold_is_not_clobbered(store):
 
     # A was delivered from the stale snapshot; B survived the write and is
     # still queued for the next run.
-    assert sent == ["💳 order A"]
+    assert _bodies(sent) == ["💳 order A"]
     assert [e["content"] for e in get_job("capture")["pending_delivery"]] == ["💳 order B"]
 
 
@@ -630,32 +627,6 @@ def test_a_merge_keeps_the_queue_oldest_first(store):
     assert [e["content"] for e in get_job("capture")["pending_delivery"]] == [
         "💳 order OLD", "💳 order NEW",
     ]
-
-
-def test_a_payload_with_media_is_not_held(store, caplog):
-    """Attachments are sent as their own requests after the text, so a media
-    payload is multi-send at any length — retrying it duplicates the text."""
-    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
-        _patch_pipeline(mp, _fail_connect, final="Daily chart\nMEDIA:/tmp/chart.png")
-        s.run_one_job(get_job("capture"))
-
-    assert get_job("capture").get("pending_delivery") is None
-    assert any("carries media" in r.getMessage() for r in caplog.records)
-
-
-def test_the_size_check_measures_the_wrapped_text(store, monkeypatch):
-    """The wrapper is a few hundred characters — measuring the raw payload
-    would let a payload just under the limit go multi-message once wrapped."""
-    wrapped = s._wrap_cron_delivery(get_job("capture"), "x" * 600, True)
-    assert len(wrapped) > 600 + 150
-
-    # A limit that the raw payload clears but the wrapped text does not.
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: len(wrapped) - 1)
-    with pytest.MonkeyPatch.context() as mp:
-        _patch_pipeline(mp, _fail_connect, final="x" * 600)
-        s.run_one_job(get_job("capture"))
-
-    assert get_job("capture").get("pending_delivery") is None
 
 
 def test_two_concurrent_runs_holding_the_same_text_queue_it_once(store):

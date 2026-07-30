@@ -2120,24 +2120,50 @@ _PENDING_DELIVERY_MAX_BYTES = 64_000
 # alert this whole mechanism exists to protect.  The queue is bounded by count
 # as well as by total bytes.
 _PENDING_DELIVERY_MAX_ENTRIES = 10
-# Only payloads that fit in ONE platform message are held.  Every sender chunks
-# past its own limit and sends the chunks in sequence, so a connect failure on
-# chunk 2 leaves chunk 1 delivered — and re-sending the whole payload would
-# duplicate it.  The real test is per-target and runs against the WRAPPED text
-# (see _payload_is_single_message); this constant is only a storage-sanity
-# ceiling so a huge report never reaches that check.
+# Storage-sanity ceiling on one payload.  jobs.json is loaded and rewritten
+# under a lock on every run of every job, so a giant report is dropped loudly
+# rather than parked in it.  This is a SIZE bound, not a safety predicate.
 _PENDING_DELIVERY_MAX_PAYLOAD_CHARS = 4000
-# Shorter than every message limit we know of (IRC's 450 is the smallest), so a
-# payload this size is single-message on any platform, known limit or not.
-_UNIVERSALLY_SINGLE_MESSAGE_CHARS = 450
-# Attachments are sent as their own requests after the text, so a payload with
-# media is inherently multi-send and has the same partial-delivery problem
-# regardless of length.  Matching the marker the extractor looks for; a false
-# positive only costs a dropped-and-logged hold.
-_PENDING_DELIVERY_MEDIA_MARKER = "MEDIA:"
 # Held error strings are for the operator's log line, not a transcript. Cap
 # them so a pathological adapter message cannot bloat jobs.json.
 _PENDING_DELIVERY_MAX_ERROR_CHARS = 500
+
+# ---------------------------------------------------------------------------
+# Why there is no "will this be chunked?" check here.
+#
+# A payload large enough for a sender to split can partially land: chunk 1
+# delivered, chunk 2 hits the connect error, and re-delivery repeats chunk 1.
+# Predicting that from cron turned out to be unreliable in five distinct ways —
+# Telegram counts UTF-16 units while IRC splits on UTF-8 bytes; both chunk the
+# FORMATTED text, and format_message linkifies bare Jira ids (BUILD-123 becomes
+# a ~50-character markdown link, ~10x); adapters exist for platforms with no
+# registry entry, so a resolved limit of "none" does not mean "never chunks".
+# Every one of those, when wrong, silently duplicates.
+#
+# So the trade was made explicitly (Nicholas, 2026-07-30): never lose an alert,
+# and make a replay unmistakable instead. Every re-delivery is prefixed with
+# the marker below, so a duplicated chunk reads as a replay rather than as a
+# second capture. Money alerts are ~430 characters wrapped and do not chunk on
+# any configured platform; this covers the case where something someday does.
+# ---------------------------------------------------------------------------
+
+
+def _replay_prefix(entry: dict) -> str:
+    """Header that marks a re-delivery as a replay of a held payload."""
+    from datetime import datetime as _dt
+
+    stamp = entry.get("queued_at")
+    try:
+        # Rendered in the same timezone as _hermes_now(), so the header lines
+        # up with every other timestamp the operator sees in the channel.
+        held_at = (
+            _dt.fromisoformat(str(stamp))
+            .astimezone(_hermes_now().tzinfo)
+            .strftime("%Y-%m-%d %H:%M")
+        )
+    except (TypeError, ValueError):
+        held_at = str(stamp or "an earlier run")
+    return f"⏳ Held from {held_at} — delivery had failed\n\n"
 
 # Delivery failures that PROVE the payload never left this host, so re-sending
 # it cannot duplicate a message.  Deliberately narrow: everything not listed
@@ -2191,98 +2217,6 @@ def _entry_bytes(entry: dict) -> int:
         len(str(entry.get(field) or "").encode("utf-8", "replace"))
         for field in ("content", "last_error", "queued_at")
     )
-
-
-def _platform_message_limit(platform_name: str) -> Optional[int]:
-    """The length at which this platform's senders start chunking.
-
-    ``0`` means the platform provably does NOT chunk (the registry documents
-    ``max_message_length = 0`` as "no limit", and both the live adapter and
-    ``tools.send_message_tool`` skip chunking without one).  ``None`` means it
-    could not be determined — the caller fails closed on that.
-
-    The registry is the single source of truth here on purpose: it is what the
-    standalone sender chunks against, and it is populated from the same adapter
-    metadata the live adapters use.  In a process where plugins were never
-    loaded (a bare ``hermes cron tick``) it answers nothing, so held payloads
-    there are limited to the universally-safe size rather than guessed at.
-    """
-    try:
-        from gateway.platform_registry import platform_registry
-
-        entry = platform_registry.get(str(platform_name or "").lower())
-    except Exception:
-        return None
-    if entry is None:
-        return None
-    return int(getattr(entry, "max_message_length", 0) or 0)
-
-
-def _message_size(text: str) -> int:
-    """An upper bound on the length any sender will measure this text at.
-
-    One conservative number instead of a per-platform length function, because
-    every per-platform guess here has been wrong at least once:
-
-    * Telegram counts UTF-16 code units, so astral characters cost 2;
-    * IRC splits on UTF-8 BYTES, so a CJK character costs 3;
-    * both chunk the FORMATTED text, and MarkdownV2 escaping can put a
-      backslash before every character — at most doubling it.  (The HTML branch
-      passes content through instead of converting, so it does not inflate.)
-
-    Taking the larger of the two counts and doubling it bounds all three.  The
-    cost of the bound is holding fewer long payloads; the cost of getting it
-    wrong is a duplicated money alert.
-    """
-    try:
-        from gateway.platforms.base import utf16_len
-
-        units = utf16_len(text)
-    except Exception:
-        units = len(text)
-    return max(units, len(text.encode("utf-8", "replace"))) * 2
-
-
-def _payload_is_single_message(job: dict, content: str) -> bool:
-    """True when this payload reaches every target in ONE send.
-
-    A multi-send payload cannot be re-delivered safely: an earlier chunk may
-    already have landed when a later one hit the connect error, so a retry
-    would duplicate it.  Fails CLOSED — an unresolvable limit means "assume it
-    chunks" — because a duplicated money alert is worse than a dropped-and-
-    logged one.
-    """
-    try:
-        text = _wrap_cron_delivery(job, content, _cron_wrap_response_enabled())
-        size = _message_size(text)
-        if size <= _UNIVERSALLY_SINGLE_MESSAGE_CHARS:
-            return True
-        targets = _resolve_delivery_targets(job) or []
-        if not targets:
-            # Nothing to measure against. A job with no resolvable target does
-            # not produce a delivery error in the first place, so this is the
-            # unknown case, not the local-only case — fail closed.
-            return False
-        for target in targets:
-            limit = _platform_message_limit(target.get("platform"))
-            # No limit (0) and no registry answer (None) both mean nothing will
-            # chunk this: the standalone sender only chunks against a resolved
-            # limit, and a live adapter only exists for a platform the registry
-            # knows — so an unanswered platform has neither sender that splits.
-            if limit and size > limit:
-                return False
-        return True
-    except Exception as exc:
-        logger.debug("Job '%s': could not size the payload: %s", job.get("id"), exc)
-        return False
-
-
-def _cron_wrap_response_enabled() -> bool:
-    """``cron.wrap_response`` (default on) — the same read _deliver_result does."""
-    try:
-        return bool((load_config() or {}).get("cron", {}).get("wrap_response", True))
-    except Exception:
-        return True
 
 
 def _entry_key(entry: dict):
@@ -2432,25 +2366,11 @@ def _hold_undelivered_output(
         return
 
     job_id = job.get("id")
-    if (
-        len(content) > _PENDING_DELIVERY_MAX_PAYLOAD_CHARS
-        or not _payload_is_single_message(job, content)
-    ):
-        # Sent in chunks, so part of it may already have landed — re-sending
-        # the whole thing would duplicate those chunks. Drop it loudly.
+    if len(content) > _PENDING_DELIVERY_MAX_PAYLOAD_CHARS:
         logger.error(
-            "Job '%s': undelivered output does not fit in a single message on "
-            "every delivery target — it cannot be safely re-delivered; "
-            "dropping it (error: %s)",
-            job_id, delivery_error,
-        )
-        return
-    if _PENDING_DELIVERY_MEDIA_MARKER in content:
-        logger.error(
-            "Job '%s': undelivered output carries media, which is sent as "
-            "separate requests after the text — it cannot be safely "
-            "re-delivered; dropping it (error: %s)",
-            job_id, delivery_error,
+            "Job '%s': undelivered output is longer than %d characters — too "
+            "large to park in jobs.json, dropping it (error: %s)",
+            job_id, _PENDING_DELIVERY_MAX_PAYLOAD_CHARS, delivery_error,
         )
         return
 
@@ -2543,7 +2463,8 @@ def _flush_pending_delivery(job: dict, *, adapters=None, loop=None) -> None:
         delivered_targets: list = []
         try:
             error = _deliver_result(
-                job, entry["content"], adapters=adapters, loop=loop,
+                job, _replay_prefix(entry) + entry["content"],
+                adapters=adapters, loop=loop,
                 delivered_targets=delivered_targets,
             )
         except Exception as exc:
