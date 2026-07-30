@@ -158,7 +158,7 @@ def test_a_multi_message_payload_is_dropped_loudly(store, caplog, monkeypatch):
     """A payload the sender would split cannot be re-sent safely: chunk 1 may
     already have landed when chunk 2 hit the connect error, so a retry would
     duplicate it. Measured per target, against the WRAPPED text."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (500, len))
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 500)
 
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
         _patch_pipeline(mp, _fail_connect, final="x" * 600)
@@ -170,7 +170,7 @@ def test_a_multi_message_payload_is_dropped_loudly(store, caplog, monkeypatch):
 
 def test_a_payload_inside_the_target_limit_is_held(store, monkeypatch):
     """The same payload against a platform that takes it in one message."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (5000, len))
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 5000)
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect, final="x" * 600)
@@ -182,7 +182,7 @@ def test_a_payload_inside_the_target_limit_is_held(store, monkeypatch):
 def test_an_unresolvable_limit_fails_closed(store, monkeypatch, caplog):
     """If the limit cannot be resolved, assume it chunks. A duplicated money
     alert is worse than a dropped-and-logged one."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (None, len))
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: None)
 
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
         _patch_pipeline(mp, _fail_connect, final="x" * 600)
@@ -195,7 +195,7 @@ def test_an_unresolvable_limit_fails_closed(store, monkeypatch, caplog):
 def test_a_short_payload_is_held_whatever_the_platform(store, monkeypatch):
     """Under the universal floor no platform chunks, so an unknown limit is
     not a reason to drop a money alert."""
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (None, len))
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: None)
 
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect, final="💳 Card order paid · 33Y55Z")
@@ -204,12 +204,46 @@ def test_a_short_payload_is_held_whatever_the_platform(store, monkeypatch):
     assert len(get_job("capture")["pending_delivery"]) == 1
 
 
-def test_the_real_telegram_limit_resolves(store):
-    """The size check is only as good as its limit lookup — prove it resolves
-    against the real platform code, not just a stub."""
-    limit, len_fn = s._platform_message_limit("telegram")
-    assert limit and limit >= 4096
-    assert len_fn("ab") == 2
+def test_the_limit_lookup_reads_the_registry(store, monkeypatch):
+    """The size check is only as good as its lookup. A platform the registry
+    knows reports its limit; 0 means the platform does not chunk at all; an
+    unpopulated registry reports nothing, and the caller fails closed."""
+    from types import SimpleNamespace
+
+    known = {"telegram": SimpleNamespace(max_message_length=4096),
+             "signal": SimpleNamespace(max_message_length=0)}
+    monkeypatch.setattr("gateway.platform_registry.platform_registry.get", known.get)
+
+    assert s._platform_message_limit("telegram") == 4096
+    assert s._platform_message_limit("signal") == 0      # no limit, never chunks
+    assert s._platform_message_limit("nope") is None     # unknown -> fail closed
+
+
+def test_a_platform_that_never_chunks_holds_any_payload(store, monkeypatch):
+    """Sol's case: Signal has no chunking limit, so a 600-character payload is
+    one send and must still be held."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final="x" * 600)
+        s.run_one_job(get_job("capture"))
+
+    assert len(get_job("capture")["pending_delivery"]) == 1
+
+
+def test_size_is_measured_in_utf16_units(store, monkeypatch):
+    """Sol's case: Telegram counts UTF-16 code units, so emoji cost 2 each. A
+    payload that looks short by codepoint can still be chunked."""
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: 1000)
+    emoji = "💳" * 600  # 600 codepoints, 1200 UTF-16 units
+
+    assert len(emoji) < 1000 < s._message_size(emoji)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _patch_pipeline(mp, _fail_connect, final=emoji)
+        s.run_one_job(get_job("capture"))
+
+    assert get_job("capture").get("pending_delivery") is None
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +653,7 @@ def test_the_size_check_measures_the_wrapped_text(store, monkeypatch):
     assert len(wrapped) > 600 + 150
 
     # A limit that the raw payload clears but the wrapped text does not.
-    monkeypatch.setattr(s, "_platform_message_limit", lambda name: (len(wrapped) - 1, len))
+    monkeypatch.setattr(s, "_platform_message_limit", lambda name: len(wrapped) - 1)
     with pytest.MonkeyPatch.context() as mp:
         _patch_pipeline(mp, _fail_connect, final="x" * 600)
         s.run_one_job(get_job("capture"))

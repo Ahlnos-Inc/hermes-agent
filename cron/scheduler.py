@@ -2193,34 +2193,41 @@ def _entry_bytes(entry: dict) -> int:
     )
 
 
-def _platform_message_limit(platform_name: str):
-    """``(limit, len_fn)`` for a delivery platform, or ``(None, len)`` when the
-    limit cannot be resolved.  Same sources the sender chunks against: the
-    adapter class attribute for built-ins, the registry entry for plugins."""
-    try:
-        from gateway.config import Platform
+def _platform_message_limit(platform_name: str) -> Optional[int]:
+    """The length at which this platform's senders start chunking.
 
-        platform = Platform(str(platform_name).lower())
-    except Exception:
-        return None, len
-    try:
-        from gateway.platforms.telegram import TelegramAdapter
-        from gateway.platforms.base import utf16_len
+    ``0`` means the platform provably does NOT chunk (the registry documents
+    ``max_message_length = 0`` as "no limit", and both the live adapter and
+    ``tools.send_message_tool`` skip chunking without one).  ``None`` means it
+    could not be determined — the caller fails closed on that.
 
-        if platform is Platform.TELEGRAM:
-            # Telegram counts UTF-16 code units, not codepoints.
-            return getattr(TelegramAdapter, "MAX_MESSAGE_LENGTH", 4096), utf16_len
-    except Exception:
-        if str(platform_name).lower() == "telegram":
-            return 4096, len
+    The registry is the single source of truth here on purpose: it is what the
+    standalone sender chunks against, and it is populated from the same adapter
+    metadata the live adapters use.  In a process where plugins were never
+    loaded (a bare ``hermes cron tick``) it answers nothing, so held payloads
+    there are limited to the universally-safe size rather than guessed at.
+    """
     try:
         from gateway.platform_registry import platform_registry
 
-        entry = platform_registry.get(platform.value)
-        limit = getattr(entry, "max_message_length", 0) if entry else 0
-        return (limit or None), len
+        entry = platform_registry.get(str(platform_name or "").lower())
     except Exception:
-        return None, len
+        return None
+    if entry is None:
+        return None
+    return int(getattr(entry, "max_message_length", 0) or 0)
+
+
+def _message_size(text: str) -> int:
+    """Length in UTF-16 code units — what Telegram measures, and never less
+    than the codepoint count every other platform measures.  One conservative
+    number instead of a per-platform length function that can be wrong."""
+    try:
+        from gateway.platforms.base import utf16_len
+
+        return utf16_len(text)
+    except Exception:
+        return len(text)
 
 
 def _payload_is_single_message(job: dict, content: str) -> bool:
@@ -2234,7 +2241,8 @@ def _payload_is_single_message(job: dict, content: str) -> bool:
     """
     try:
         text = _wrap_cron_delivery(job, content, _cron_wrap_response_enabled())
-        if len(text) <= _UNIVERSALLY_SINGLE_MESSAGE_CHARS:
+        size = _message_size(text)
+        if size <= _UNIVERSALLY_SINGLE_MESSAGE_CHARS:
             return True
         targets = _resolve_delivery_targets(job) or []
         if not targets:
@@ -2243,8 +2251,8 @@ def _payload_is_single_message(job: dict, content: str) -> bool:
             # unknown case, not the local-only case — fail closed.
             return False
         for target in targets:
-            limit, len_fn = _platform_message_limit(target.get("platform"))
-            if not limit or len_fn(text) > limit:
+            limit = _platform_message_limit(target.get("platform"))
+            if limit is None or (limit and size > limit):
                 return False
         return True
     except Exception as exc:
