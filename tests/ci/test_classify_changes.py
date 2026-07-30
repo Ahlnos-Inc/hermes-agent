@@ -130,3 +130,35 @@ CASES = {
 @pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
 def test_classify(files, expected):
     assert classify(files) == expected
+
+
+# ---------------------------------------------------------------------------
+# BUILD-871: the classifier is only as good as its ability to read the diff.
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[2]
+_SECRET_REF = "secrets.AUTOFIX_BOT_PAT"
+
+
+def test_detect_changes_falls_back_to_the_ambient_credential():
+    """The action must not run gh with an empty credential.
+
+    An input the caller passes as an unset secret arrives as the empty STRING,
+    which GitHub Actions counts as "provided" — so it overrides the input's
+    `default:` and the gh call runs unauthenticated. The compare API then fails,
+    the changed-file list comes back empty, and classify() fails open with every
+    lane true, including ci_review. That turned the CI-sensitive review gate
+    into a label every PR in the repo had to carry.
+    """
+    action = (_REPO / ".github/actions/detect-changes/action.yml").read_text()
+    assert "inputs.github-token || github.token" in action
+
+
+def test_the_classifier_caller_guards_its_upstream_only_secret():
+    """Every reference to the upstream-only PAT on the classifier path needs a
+    fallback, or the fork passes an empty string straight through."""
+    for workflow in ("ci.yml", "lint.yml"):
+        text = (_REPO / ".github/workflows" / workflow).read_text()
+        for line in text.splitlines():
+            if _SECRET_REF in line:
+                assert "||" in line, f"{workflow}: unguarded {_SECRET_REF}: {line.strip()}"

@@ -7,7 +7,11 @@ description: >-
 
 inputs:
   github-token:
-    description: Token for the GitHub API (gh CLI). Pass secrets.AUTOFIX_BOT_PAT from the calling workflow.
+    description: >-
+      Credential for the GitHub API (gh CLI). Optional — omit it, or pass an
+      upstream-only secret with a `|| secrets.GITHUB_TOKEN` fallback. An
+      unguarded reference to a secret this repo does not define resolves to
+      the empty string and disables the compare call entirely.
     required: false
     default: ${{ github.token }}
 
@@ -47,7 +51,13 @@ runs:
       id: classify
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.github-token }}
+        # Fall back to the ambient workflow token when the caller passes an
+        # empty value. A caller writing `github-token: ${{ secrets.SOME_PAT }}`
+        # for a secret that does not exist in this repo passes the empty
+        # STRING, which counts as "provided" and therefore overrides the
+        # `default:` above — so gh ran with no credential at all, the compare
+        # call failed, and every lane failed open (BUILD-871).
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
