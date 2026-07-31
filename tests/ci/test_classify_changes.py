@@ -8,6 +8,9 @@ change could have broken.
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,6 +23,8 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 
+# A KNOWN diff that touches .github/: everything runs except the MCP catalog
+# review, which is deliberately skipped — we can see its files were untouched.
 DEFAULT = {
     "python": True,
     "frontend": True,
@@ -31,6 +36,12 @@ DEFAULT = {
     "mcp_catalog": False,
     "ci_review": True,
 }
+
+# An UNKNOWN diff (push/dispatch, or the compare call failed or was truncated).
+# Here the MCP review runs too: nobody can see whether its files were touched,
+# and skipping a review gate on an unreadable diff is how a gate silently stops
+# gating (BUILD-871).
+UNKNOWN = {**DEFAULT, "mcp_catalog": True}
 
 
 def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
@@ -122,8 +133,8 @@ CASES = {
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),
     "action change → all": ([".github/actions/detect-changes/action.yml"], DEFAULT),
-    "empty diff → all": ([], DEFAULT),
-    "blank lines → all": (["", "  "], DEFAULT),
+    "empty diff → all, including the MCP gate": ([], UNKNOWN),
+    "blank lines → all, including the MCP gate": (["", "  "], UNKNOWN),
 }
 
 
@@ -139,64 +150,110 @@ def test_classify(files, expected):
 # provided value — so `${{ secrets.SOME_UPSTREAM_PAT }}` overrides an input's
 # `default:` and hands gh no credential at all. That broke the change
 # classifier (every lane failed open, so the CI-sensitive label gate demanded
-# its label on every PR) and it silently breaks any mandatory label read the
-# same way. These guards parse the real YAML nodes rather than the file text,
-# so a fix surviving only in a comment does not satisfy them.
+# its label on every PR) and it breaks any mandatory label read the same way.
 # ---------------------------------------------------------------------------
 
 _REPO = Path(__file__).resolve().parents[2]
+_ACTION = _REPO / ".github/actions/detect-changes/action.yml"
 _UPSTREAM_ONLY_SECRET = "AUTOFIX_BOT_PAT"
 
+# Every job whose failure BLOCKS a merge and that reads state from the API.
+_MANDATORY_GATES = (
+    (".github/workflows/ci.yml", "detect"),
+    (".github/workflows/lint.yml", "ci-review"),
+    (".github/workflows/supply-chain-audit.yml", "mcp-catalog-review"),
+)
 
-def _yaml(rel: str) -> dict:
+
+def _yaml(path):
     yaml = pytest.importorskip("yaml")
-    return yaml.safe_load((_REPO / rel).read_text())
+    return yaml.safe_load(Path(path).read_text())
 
 
-def _guarded(expr: object) -> bool:
-    """True when an expression cannot evaluate to the empty string."""
-    text = str(expr)
-    return _UPSTREAM_ONLY_SECRET not in text or "||" in text
+def _classify_step():
+    action = _yaml(_ACTION)
+    return next(s for s in action["runs"]["steps"] if s.get("id") == "classify")
+
+
+def _compare_jq() -> str:
+    """The jq expression the action actually runs against the compare payload."""
+    script = _classify_step()["run"]
+    line = next(ln for ln in script.splitlines() if "--jq '.files[]" in ln)
+    return line.split("--jq '", 1)[1].rsplit("'", 1)[0]
 
 
 def test_the_classifier_can_authenticate():
     """The compare call must never run with an empty credential: an empty file
-    list makes classify() fail open with every lane true, which turns the
-    CI-sensitive review gate into a label every PR has to carry."""
-    action = _yaml(".github/actions/detect-changes/action.yml")
-    step = next(s for s in action["runs"]["steps"] if s.get("id") == "classify")
-    assert step["env"]["GH_TOKEN"] == "${{ inputs.github-token || github.token }}"
+    list makes classify() fail open, and this is where that started."""
+    assert _classify_step()["env"]["GH_TOKEN"] == "${{ inputs.github-token || github.token }}"
 
 
-def test_no_mandatory_gate_reads_labels_with_an_unguarded_secret():
-    """Every label read that BLOCKS a merge needs a fallback.
+@pytest.mark.parametrize("workflow,job", _MANDATORY_GATES)
+def test_a_mandatory_gate_never_reads_with_an_empty_credential(workflow, job):
+    """A blocking gate that cannot authenticate exits before it checks
+    anything, so a correctly labelled PR fails it. Every credential it passes
+    must be present AND unable to evaluate to the empty string."""
+    steps = _yaml(_REPO / workflow)["jobs"][job]["steps"]
+    reads = [s for s in steps if "gh " in str(s.get("with", {}).get("command", ""))
+             or "gh " in str(s.get("run", ""))
+             or s.get("uses", "").endswith("detect-changes")]
+    assert reads, f"{workflow}:{job}: no API-reading step found — did the job change shape?"
+    for step in reads:
+        supplied = {**(step.get("env") or {}), **(step.get("with") or {})}
+        creds = {k: v for k, v in supplied.items()
+                 if "TOKEN" in k.upper() or k == "github-token"}
+        assert creds, f"{workflow}:{job}: an API read with no credential at all"
+        for key, value in creds.items():
+            assert "||" in str(value) or _UPSTREAM_ONLY_SECRET not in str(value), (
+                f"{workflow}:{job}: {key} can evaluate to the empty string"
+            )
 
-    Without one the step exits before the label is checked, so a correctly
-    labelled PR fails the gate — the failure mode is unsatisfiable rather than
-    merely noisy, and it appears the moment the classifier starts working.
-    """
-    for workflow, job in (
-        (".github/workflows/lint.yml", "ci-review"),
-        (".github/workflows/supply-chain-audit.yml", "mcp-catalog-review"),
-        (".github/workflows/ci.yml", "detect"),
-    ):
-        for step in _yaml(workflow)["jobs"][job]["steps"]:
-            for key, value in (step.get("env") or {}).items():
-                assert _guarded(value), f"{workflow}:{job}: unguarded {key}"
-            for key, value in (step.get("with") or {}).items():
-                assert _guarded(value), f"{workflow}:{job}: unguarded input {key}"
+
+def _run_compare_jq(payload: dict) -> list[str]:
+    """Run the action's real jq expression over a compare payload."""
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("jq not installed")
+    out = subprocess.run(
+        [jq, "-r", _compare_jq()], input=json.dumps(payload),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    # The action splits the tab-separated row into one path per line and drops
+    # the blanks; mirror that here so the test covers the same pipeline.
+    return [p for p in out.replace("\t", "\n").splitlines() if p]
 
 
-def test_the_classifier_sees_both_sides_of_a_rename():
+def test_the_compare_expression_reports_both_sides_of_a_rename():
     """A rename reports the NEW path in `filename` and the OLD one in
-    `previous_filename`. Reading only the former loses the sensitive path when
-    a workflow or an eslint config is renamed away from a gated name."""
-    action = (_REPO / ".github/actions/detect-changes/action.yml").read_text()
-    assert ".previous_filename" in action
+    `previous_filename`. Taking only the former loses the gated name when an
+    eslint config or a workflow is renamed away from it — and classify() would
+    then report ci_review=false for a PR that really did touch one."""
+    paths = _run_compare_jq({"files": [
+        {"filename": "docs/notes.md", "previous_filename": "eslint.config.mjs"},
+        {"filename": "README.md"},
+    ]})
+    assert "eslint.config.mjs" in paths and "docs/notes.md" in paths
+    assert classify(paths)["ci_review"] is True
 
 
-def test_a_truncated_compare_is_treated_as_unknown():
-    """The compare endpoint caps `files` at 300 whatever the pagination, and a
+def test_the_compare_expression_emits_one_row_per_file():
+    """The row count is the FILE count, which is what the truncation check
+    counts — so a file without a previous_filename must not emit a blank."""
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("jq not installed")
+    rows = subprocess.run(
+        [jq, "-r", _compare_jq()], input=json.dumps({"files": [{"filename": "a.py"}] * 3}),
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert len(rows) == 3
+
+
+def test_a_truncated_compare_is_treated_as_an_unreadable_diff():
+    """The endpoint caps `files` at 300 whatever the pagination, and a
     truncated list can omit the one sensitive path a gate exists to catch."""
-    action = (_REPO / ".github/actions/detect-changes/action.yml").read_text()
-    assert "-ge 300" in action and "failing open" in action
+    script = _classify_step()["run"]
+    assert '[ "${FILE_COUNT:-0}" -ge 300 ]' in script, "the cap check must survive"
+    assert script.count("gh api") == 1, "the cap must not cost a second API call"
+    # An unreadable diff runs every gate, the MCP catalog review included.
+    assert classify([])["mcp_catalog"] is True

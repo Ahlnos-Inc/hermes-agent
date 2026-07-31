@@ -79,22 +79,23 @@ runs:
           # run — safe, but wasteful and it masks the API failure).
           CHANGED=""
           for i in 1 2 3; do
-            # Both names per entry: a rename reports the NEW path in
-            # `filename` and the OLD one in `previous_filename`, so taking
-            # only the former loses the sensitive path when an
-            # eslint.config.* or a workflow is renamed away.
-            if CHANGED="$(gh api \
+            # One line per FILE, both of its names tab-separated: a rename
+            # reports the NEW path in `filename` and the OLD one in
+            # `previous_filename`, and taking only the former loses the gated
+            # name when a workflow or an eslint config is renamed away from it.
+            # One line per file also makes the row count the FILE count, so the
+            # truncation check below needs no second API call.
+            if RAW="$(gh api \
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[] | .filename, (.previous_filename // empty)')"; then
-              # The compare endpoint caps `files` at 300 REGARDLESS of
-              # pagination. A list at the cap may be truncated, and a
-              # truncated list can silently omit the one sensitive path the
-              # gates exist to catch — so classify it as unknown and let
-              # every lane run rather than trusting a partial answer.
-              if [ "$(gh api --paginate \
-                    "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-                    --jq '.files | length')" -ge 300 ]; then
+              --jq '.files[] | [.filename, (.previous_filename // "")] | @tsv')"; then
+              FILE_COUNT="$(printf '%s\n' "$RAW" | grep -c . || true)"
+              CHANGED="$(printf '%s\n' "$RAW" | tr '\t' '\n' | grep -v '^$' || true)"
+              # The compare endpoint caps `files` at 300 whatever the
+              # pagination. A list at the cap may be truncated, and a truncated
+              # list can omit the one sensitive path a gate exists to catch —
+              # so treat it as an unreadable diff rather than a partial answer.
+              if [ "${FILE_COUNT:-0}" -ge 300 ]; then
                 echo "::warning::compare returned the 300-file maximum — the list may be truncated, failing open (all lanes run)"
                 CHANGED=""
               fi
