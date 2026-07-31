@@ -91,6 +91,12 @@ def _set_cron_session_title(session_db, session_id, base_title):
 
 # How this machine fails when IT is offline, as opposed to how a broken target
 # fails.  All lowercase — matched against the lowered error text.
+#
+# Overlaps on purpose with _RETRYABLE_DELIVERY_MARKERS (~line 2213) below,
+# which lists connect-phase failure phrasings for a different question ("did
+# the payload leave this host?"). Deliberately NOT merged — keep both lists
+# in sync by hand if either grows a new phrasing for the same underlying
+# error, they will drift silently otherwise.
 _NETWORK_OUTAGE_SIGNATURES = (
     "enotfound",
     "eai_again",
@@ -99,6 +105,15 @@ _NETWORK_OUTAGE_SIGNATURES = (
     "temporary failure in name resolution",
     "network is unreachable",
     "no route to host",
+    "connecterror",
+    "connecttimeout",
+    "connection refused",
+    # Node/libuv errno spellings — the finance cron scripts are .cjs and fail
+    # with these when the link drops mid-connection instead of at DNS time.
+    "econnrefused",
+    "etimedout",
+    "enetunreach",
+    "ehostunreach",
 )
 
 
@@ -110,12 +125,30 @@ def _network_looks_down(probe_host: str = "api.telegram.org") -> bool:
     host is genuinely broken" (probe resolves → that alert is real).  The
     probe host is the delivery endpoint itself: if IT cannot resolve, the
     alert could not have reached anyone as a real alert anyway.
+
+    socket.getaddrinfo() has no timeout of its own — a wedged OS resolver
+    (broken VPN/DNS) can hang for minutes (#63309), and this runs inline in
+    the scheduler's sequential worker pool (max_workers=1), so a hang here
+    would stall every other cron job behind it. Run the probe on a daemon
+    thread with a bounded join instead: if it hasn't reported back by the
+    bound, the probe is INCONCLUSIVE — return False so the real ⚠️ alert
+    survives rather than a wedge getting misreported as "confirmed offline".
     """
-    try:
-        socket.getaddrinfo(probe_host, 443)
-        return False
-    except OSError:
-        return True
+    outcome: list[bool] = []
+
+    def _probe() -> None:
+        try:
+            socket.getaddrinfo(probe_host, 443)
+            outcome.append(False)
+        except OSError:
+            outcome.append(True)
+
+    thread = threading.Thread(target=_probe, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    if not outcome:
+        return False  # still running / wedged — inconclusive, not "down"
+    return outcome[0]
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
