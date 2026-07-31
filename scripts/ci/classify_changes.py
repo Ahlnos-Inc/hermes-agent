@@ -103,7 +103,14 @@ def classify(files: list[str]) -> dict[str, bool]:
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
     }
-    if not files or any(f.startswith(".github/") for f in files):
+    if not files:
+        # The diff is UNKNOWN (a push/dispatch event, or the compare call
+        # failed). Every lane runs, and unlike the branch below that includes
+        # the MCP catalog review: we cannot see whether its files were touched,
+        # and skipping a review gate on a diff nobody can read is how a gate
+        # silently stops gating (BUILD-871).
+        return {lane: True for lane in ret}
+    if any(f.startswith(".github/") for f in files):
         ret["python"] = True
         ret["docker_meta"] = True
         ret["frontend"] = True
@@ -113,7 +120,9 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["npm_lock"] = True
         ret["ci_review"] = True
 
-        # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+        # explicitly skip mcp catalog here. it's not needed unless those files
+        # are modified — and here, unlike above, the diff is known, so we can
+        # see that they were not.
     return ret
 
 
