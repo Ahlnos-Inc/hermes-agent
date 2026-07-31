@@ -9,6 +9,7 @@ ledger, and re-alerts on a re-block after an unblock (new event id).
 from gateway.kanban_watchers import (
     _collect_unsubscribed_failure_events,
     _collect_human_blocked_events,
+    _collect_block_resolutions,
     _human_block_event_is_current,
 )
 from gateway.kanban_notifications import render_kanban_event
@@ -180,3 +181,83 @@ def test_rework_escalation_reaches_zero_subscription_home_sweep(tmp_path):
     assert "5 rounds" in rendered
     assert task_id in rendered
     assert "exact-sha-checkout" in rendered
+
+
+def _alert_block(conn, task_id):
+    """Block the task, collect the alert, and mark it delivered."""
+    _set_blocked(conn, task_id)
+    kb._append_event(conn, task_id, "blocked", {"reason": "x", "kind": "needs_input"})
+    items = _collect_human_blocked_events(kb, conn)
+    assert len(items) == 1
+    kb.record_notify_delivery(
+        conn,
+        delivery_key=items[0]["delivery_key"],
+        task_id=task_id, platform="telegram", chat_id="-100", thread_id="1",
+        first_event_id=items[0]["event"].id, last_event_id=items[0]["event"].id,
+        status="delivered",
+    )
+    return items[0]
+
+
+def test_unblock_after_alert_yields_resolution_notice(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn, title="stuck thing")
+    alert = _alert_block(conn, task_id)
+    assert _collect_block_resolutions(kb, conn) == []  # still blocked
+    assert kb.unblock_task(conn, task_id)
+    out = _collect_block_resolutions(kb, conn)
+    assert len(out) == 1
+    assert out[0]["task_id"] == task_id
+    assert out[0]["block_delivery_key"] == alert["delivery_key"]
+    assert out[0]["resolution_kind"] == "unblocked"
+    assert out[0]["delivery_key"].startswith(f"human-block-resolved/{task_id}/")
+
+
+def test_unalerted_block_resolution_is_silent(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
+    kb._append_event(conn, task_id, "blocked", {"reason": "x", "kind": "needs_input"})
+    assert kb.unblock_task(conn, task_id)  # block was never alerted
+    assert _collect_block_resolutions(kb, conn) == []
+
+
+def test_resolution_notice_dedups_via_ledger(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _alert_block(conn, task_id)
+    assert kb.unblock_task(conn, task_id)
+    out = _collect_block_resolutions(kb, conn)
+    assert len(out) == 1
+    kb.record_notify_delivery(
+        conn,
+        delivery_key=out[0]["delivery_key"],
+        task_id=task_id, platform="telegram", chat_id="-100", thread_id="1",
+        first_event_id=out[0]["resolution_event_id"],
+        last_event_id=out[0]["resolution_event_id"],
+        status="delivered",
+    )
+    assert _collect_block_resolutions(kb, conn) == []
+
+
+def test_reblock_after_resolution_waits_for_new_alert(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    first = _alert_block(conn, task_id)
+    assert kb.unblock_task(conn, task_id)
+    out = _collect_block_resolutions(kb, conn)
+    kb.record_notify_delivery(
+        conn, delivery_key=out[0]["delivery_key"], task_id=task_id,
+        platform="telegram", chat_id="-100", thread_id="1",
+        first_event_id=out[0]["resolution_event_id"],
+        last_event_id=out[0]["resolution_event_id"], status="delivered",
+    )
+    # Re-block: newest alerted block becomes the new epoch; no stale notice
+    # until IT resolves, then exactly one fresh notice.
+    second = _alert_block(conn, task_id)
+    assert second["delivery_key"] != first["delivery_key"]
+    assert _collect_block_resolutions(kb, conn) == []
+    assert kb.unblock_task(conn, task_id)
+    out2 = _collect_block_resolutions(kb, conn)
+    assert len(out2) == 1
+    assert out2[0]["block_delivery_key"] == second["delivery_key"]
