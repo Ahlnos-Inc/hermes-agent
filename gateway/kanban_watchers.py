@@ -321,6 +321,13 @@ SUPERSEDED_EVENT_PARAMS = (
     *SUPERSEDING_EVENT_KINDS, *HUMAN_BLOCK_HEALING_STATUSES,
 )
 
+# Events that resolve a previously alerted human block (BUILD-884). A block
+# alert with no follow-up reads as still live — Nicholas read two resolved
+# OPS-154 blocks as active because the console topic never said they healed.
+BLOCK_RESOLUTION_EVENT_KINDS = (
+    "unblocked", "promoted", "promoted_manual", "rework_requested", "completed",
+)
+
 
 def _is_human_block_state(status: Optional[str], block_kind: Optional[str]) -> bool:
     """Whether the task's live projection still requires human attention."""
@@ -470,6 +477,62 @@ def _human_block_event_is_current(kb, item: dict) -> bool:
             exc_info=True,
         )
         return False
+
+
+def _collect_block_resolutions(kb, conn) -> "list[dict]":
+    """Resolution notices for previously alerted human blocks (BUILD-884).
+
+    For each task whose newest human-block alert is in the delivery ledger,
+    find the first resolution event after that block. One notice per alerted
+    block, deduped via a ``human-block-resolved/`` ledger key. Bounded by the
+    same lookback window as the alert sweep so ancient history never fires.
+    """
+    cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
+    alerted: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT task_id, delivery_key FROM notify_deliveries "
+        "WHERE status = 'delivered' AND delivery_key LIKE 'human-block/%'",
+    ):
+        try:
+            block_id = int(str(row["delivery_key"]).rsplit("/", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        alerted[row["task_id"]] = max(alerted.get(row["task_id"], 0), block_id)
+    placeholders = ",".join("?" for _ in BLOCK_RESOLUTION_EVENT_KINDS)
+    out: list[dict] = []
+    for task_id, block_id in alerted.items():
+        resolved_key = f"human-block-resolved/{task_id}/{block_id}"
+        if conn.execute(
+            "SELECT 1 FROM notify_deliveries WHERE delivery_key = ?",
+            (resolved_key,),
+        ).fetchone():
+            continue
+        ev = conn.execute(
+            f"""SELECT id, kind, created_at FROM task_events
+                 WHERE task_id = ? AND id > ? AND kind IN ({placeholders})
+                   AND created_at >= ?
+                 ORDER BY id LIMIT 1""",
+            (task_id, block_id, *BLOCK_RESOLUTION_EVENT_KINDS, cutoff),
+        ).fetchone()
+        if ev is None:
+            continue
+        try:
+            task = kb.get_task(conn, task_id)
+        except Exception as exc:
+            if _is_corruption_db_error(kb, exc):
+                raise
+            task = None
+        out.append({
+            "task_id": task_id,
+            "task": task,
+            "block_delivery_key": f"human-block/{task_id}/{block_id}",
+            "delivery_key": resolved_key,
+            "resolution_event_id": int(ev["id"]),
+            "resolution_kind": ev["kind"],
+        })
+        if len(out) >= ORPHAN_FAILURE_BATCH_PER_TICK:
+            break
+    return out
 
 
 def _resolve_auto_decompose_settings(
@@ -1072,6 +1135,22 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: human-block sweep "
                                         "failed for board %s: %s", slug, exc,
                                     )
+                                try:
+                                    resolved = _collect_block_resolutions(
+                                        _kb, conn,
+                                    )
+                                    for r in resolved:
+                                        r["board"] = slug
+                                        r["db_path"] = resolved_db_path
+                                    block_resolutions.extend(resolved)
+                                except Exception as exc:
+                                    if _is_corruption_db_error(_kb, exc):
+                                        raise
+                                    logger.debug(
+                                        "kanban notifier: block-resolution "
+                                        "sweep failed for board %s: %s",
+                                        slug, exc,
+                                    )
                         except Exception as exc:
                             if _is_corruption_db_error(_kb, exc):
                                 # Close this board before publishing the
@@ -1104,6 +1183,7 @@ class GatewayKanbanWatchersMixin:
                     return deliveries, tui_sweeps, orphan_failures
 
                 human_blocked: list = []
+                block_resolutions: list = []
                 raw_target = kanban_cfg.get("human_block_alerts")
                 human_block_target = None
                 if isinstance(raw_target, dict):
@@ -1489,12 +1569,25 @@ class GatewayKanbanWatchersMixin:
                         "🧑‍🔧 Human input needed — reply here to unblock:\n"
                         + msg
                     )
-                    ok = await self._kanban_notify_channel(
+                    ok, sent_msg_id = await self._kanban_notify_channel(
                         msg,
                         chat_id=human_block_target["chat_id"],
                         thread_id=human_block_target["thread_id"],
                     )
                     if ok:
+                        if sent_msg_id:
+                            # In-memory only: reply-threading the eventual
+                            # resolution notice is best-effort and a gateway
+                            # restart just degrades it to an unthreaded line.
+                            alert_msg_ids = getattr(
+                                self, "_kanban_hb_alert_msg_ids", {}
+                            )
+                            self._kanban_hb_alert_msg_ids = alert_msg_ids
+                            alert_msg_ids[
+                                f"{item.get('board')}/{key}"
+                            ] = sent_msg_id
+                            if len(alert_msg_ids) > 500:
+                                alert_msg_ids.pop(next(iter(alert_msg_ids)))
                         await asyncio.to_thread(
                             self._kanban_record_human_block_delivery,
                             item, human_block_target,
@@ -1504,6 +1597,51 @@ class GatewayKanbanWatchersMixin:
                             "kanban notifier: human-block alert for %s on "
                             "board %s delivered to Kanban console topic",
                             item["task_id"], item.get("board"),
+                        )
+
+                # Resolution notices for alerted blocks that have since
+                # healed (BUILD-884) — without this, resolved blocks read
+                # as live on the console topic forever.
+                for item in block_resolutions:
+                    key = item["delivery_key"]
+                    last = hb_attempts.get(key, 0.0)
+                    if time.monotonic() - last < ORPHAN_FAILURE_RETRY_SECONDS:
+                        continue
+                    hb_attempts[key] = time.monotonic()
+                    task = item.get("task")
+                    title = (getattr(task, "title", "") or "")[:60]
+                    board = item.get("board")
+                    msg = (
+                        f"✅ Unblocked: {item['task_id']}"
+                        + (f" — {title}" if title else "")
+                        + (f" [{board}]" if board else "")
+                        + f" ({item['resolution_kind']})"
+                    )
+                    alert_msg_ids = getattr(
+                        self, "_kanban_hb_alert_msg_ids", {}
+                    )
+                    reply_to = alert_msg_ids.get(
+                        f"{board}/{item['block_delivery_key']}"
+                    )
+                    ok, _ = await self._kanban_notify_channel(
+                        msg,
+                        chat_id=human_block_target["chat_id"],
+                        thread_id=human_block_target["thread_id"],
+                        reply_to=reply_to,
+                    )
+                    if ok:
+                        await asyncio.to_thread(
+                            self._kanban_record_block_resolution,
+                            item, human_block_target,
+                        )
+                        hb_attempts.pop(key, None)
+                        alert_msg_ids.pop(
+                            f"{board}/{item['block_delivery_key']}", None,
+                        )
+                        logger.info(
+                            "kanban notifier: block-resolution notice for %s "
+                            "on board %s delivered to Kanban console topic",
+                            item["task_id"], board,
                         )
             except Exception as exc:
                 # exc_info: this tick has failed persistently before with only
@@ -1652,28 +1790,32 @@ class GatewayKanbanWatchersMixin:
 
     async def _kanban_notify_channel(
         self, message: str, *, chat_id: str, thread_id: str = "",
-    ) -> bool:
+        reply_to: Optional[str] = None,
+    ) -> "tuple[bool, Optional[str]]":
         """Deliver a notifier message to an explicit Telegram chat/topic.
 
-        Returns True only on a confirmed send."""
+        Returns ``(ok, message_id)``; ok is True only on a confirmed send.
+        ``reply_to`` threads the message under an earlier one (best-effort)."""
         from gateway.config import Platform as _Platform
         adapter = self.adapters.get(_Platform.TELEGRAM)
         if adapter is None:
-            return False
+            return False, None
         metadata: dict[str, Any] = {}
         if thread_id:
             metadata["thread_id"] = thread_id
         try:
-            result = await adapter.send(chat_id, message, metadata=metadata)
+            result = await adapter.send(
+                chat_id, message, reply_to=reply_to, metadata=metadata,
+            )
         except Exception as exc:
             logger.warning(
                 "kanban notifier: Telegram send to %s/%s failed: %s",
                 chat_id, thread_id or "-", exc,
             )
-            return False
+            return False, None
         if result is not None and getattr(result, "success", True) is False:
-            return False
-        return True
+            return False, None
+        return True, getattr(result, "message_id", None)
 
     async def _kanban_notify_home_fallback(self, message: str) -> bool:
         """Last-resort delivery of a failure notification to the Telegram home
@@ -1695,7 +1837,7 @@ class GatewayKanbanWatchersMixin:
                 "/sethome in Telegram to enable the fallback."
             )
             return False
-        ok = await self._kanban_notify_channel(
+        ok, _ = await self._kanban_notify_channel(
             message,
             chat_id=home.chat_id,
             thread_id=str(home.thread_id or ""),
@@ -1729,6 +1871,32 @@ class GatewayKanbanWatchersMixin:
             logger.warning(
                 "kanban notifier: human-block ledger write failed for %s: %s",
                 item.get("task_id"), exc,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_record_block_resolution(
+        self, item: dict, target: dict,
+    ) -> None:
+        """Sync helper: durable ledger row for a delivered resolution notice."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=item.get("board"))
+        try:
+            _kb.record_notify_delivery(
+                conn,
+                delivery_key=item["delivery_key"],
+                task_id=item["task_id"],
+                platform="telegram",
+                chat_id=target.get("chat_id") or "",
+                thread_id=target.get("thread_id") or "",
+                first_event_id=item["resolution_event_id"],
+                last_event_id=item["resolution_event_id"],
+                status="delivered",
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: block-resolution ledger write failed for "
+                "%s: %s", item.get("task_id"), exc,
             )
         finally:
             conn.close()
