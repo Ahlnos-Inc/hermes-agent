@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -88,6 +89,35 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
+# How this machine fails when IT is offline, as opposed to how a broken target
+# fails.  All lowercase — matched against the lowered error text.
+_NETWORK_OUTAGE_SIGNATURES = (
+    "enotfound",
+    "eai_again",
+    "getaddrinfo",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "no route to host",
+)
+
+
+def _network_looks_down(probe_host: str = "api.telegram.org") -> bool:
+    """One neutral DNS probe: is this machine's network/DNS actually gone?
+
+    Distinguishes "the laptop left its network" (probe fails too → every
+    outbound job is failing for the same non-reason) from "the job's target
+    host is genuinely broken" (probe resolves → that alert is real).  The
+    probe host is the delivery endpoint itself: if IT cannot resolve, the
+    alert could not have reached anyone as a real alert anyway.
+    """
+    try:
+        socket.getaddrinfo(probe_host, 443)
+        return False
+    except OSError:
+        return True
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -98,6 +128,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    # A laptop that left its network fails every outbound job the same way.
+    # Only claim "offline" when a neutral host ALSO fails to resolve —
+    # otherwise the target's DNS is genuinely broken and that IS a real alert.
+    # Re-words only; failed jobs still always deliver (BUILD-837).
+    if any(sig in lower for sig in _NETWORK_OUTAGE_SIGNATURES) and _network_looks_down():
+        return (
+            f"🌐 Cron '{job_name}' failed: no internet/DNS — this machine "
+            "looks offline (laptop on the move?). Likely not a real failure; "
+            "runs resume automatically once the network is back."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
