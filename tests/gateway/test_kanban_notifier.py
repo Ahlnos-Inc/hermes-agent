@@ -1641,15 +1641,29 @@ def test_cross_process_owner_wake_only_one_turn_scheduled(tmp_path, monkeypatch)
         adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
         return runner, adapter
 
+
     async def _scenario():
         real_sleep = asyncio.sleep
 
-        # Runner1 ticks first: it should claim the lease and schedule a bg task.
+        # Use a gate to keep the agent turn in-flight while runner2 ticks.
+        # Without this, the AsyncMock completes synchronously during the
+        # watcher's single fake_sleep yield, releasing the lease before
+        # runner2 has a chance to see it (race condition).
+        release_gate = asyncio.Event()
+
+        async def _gated_agent(*args, **kwargs):
+            await release_gate.wait()
+            return "Cross-proc wake reply."
+
         runner1, adapter1 = _make_owner_runner()
+        # Replace the default mock with one that blocks mid-turn until we
+        # explicitly release the gate.
+        runner1._handle_message_with_agent = AsyncMock(side_effect=_gated_agent)
+
+        # Runner1 ticks first: it should claim the lease and schedule a bg task.
         await _run_one_notifier_tick(monkeypatch, runner1)
 
-        # Invariant: runner1 scheduled exactly one agent turn.
-        # Wait for the background task to start.
+        # Wait for the background task to start (the bg task blocks on the gate).
         for _ in range(20):
             await real_sleep(0)
             if adapter1._background_tasks:
@@ -1658,7 +1672,9 @@ def test_cross_process_owner_wake_only_one_turn_scheduled(tmp_path, monkeypatch)
             "runner1 must have spawned a background task for the owner wake"
         )
 
-        # Verify the lease exists in the DB.
+        # Verify the lease exists in the DB.  The lease was claimed before
+        # handle_message() was called, so it must be present while the bg task
+        # is still blocked on the gate.
         with kb.connect() as conn:
             lease_row = conn.execute(
                 "SELECT task_id, event_id FROM owner_wake_leases WHERE task_id = ?",
@@ -1674,13 +1690,16 @@ def test_cross_process_owner_wake_only_one_turn_scheduled(tmp_path, monkeypatch)
             "runner2 must start with empty in-process inflight dict"
         )
 
-        # Runner2 ticks: the DB lease is already held by runner1, so it must skip.
+        # Runner2 ticks: the DB lease is still held (bg task blocked), so it must skip.
         await _run_one_notifier_tick(monkeypatch, runner2)
 
         assert runner2._handle_message_with_agent.await_count == 0, (
             "BUILD-695 P2: second runner must NOT schedule a duplicate owner turn "
             "when the cross-process lease is already held"
         )
+
+        # Release the gate so runner1's bg task can complete.
+        release_gate.set()
 
         # Drain runner1's background task so _advance_after_wake fires.
         while adapter1._background_tasks:
@@ -1731,6 +1750,7 @@ def test_cross_process_owner_wake_only_one_turn_scheduled(tmp_path, monkeypatch)
         )
 
     asyncio.run(_scenario())
+
 
 
 def test_cross_process_owner_wake_expired_lease_enables_recovery(

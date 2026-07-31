@@ -110,6 +110,28 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
+def _trusted_owner_context(
+    kb,
+    *,
+    gateway_source: Optional[dict[str, Any]],
+    inherited_task=None,
+) -> Optional[dict[str, str]]:
+    """Resolve owner identity only from trusted turn/task control context."""
+    inherited = getattr(inherited_task, "owner_context", None)
+    if inherited:
+        return kb.normalize_owner_context(inherited)
+    if gateway_source is None:
+        return None
+    try:
+        return kb.normalize_owner_context(gateway_source)
+    except ValueError:
+        logger.debug(
+            "gateway source is incomplete; skipping owner-agent wake route",
+            exc_info=True,
+        )
+        return None
+
+
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
@@ -173,7 +195,11 @@ def _auto_subscribe_gateway_source(
                 "reason": "session_subscription_exists",
             }
         return _auto_subscribe_home_channels(kb, conn, task_id)
-    notifier_profile = os.environ.get("HERMES_PROFILE") or None
+    notifier_profile = (
+        str(gateway_source.get("profile") or "").strip() or None
+        if gateway_source is not None
+        else os.environ.get("HERMES_PROFILE") or None
+    )
     try:
         kb.add_notify_sub(
             conn,
@@ -495,21 +521,6 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
-def _redacted_tool_error(prefix: str, exc: BaseException) -> str:
-    """``tool_error`` for a caught Kanban-handler exception, with the exception
-    text routed through forced redaction (BUILD-625).
-
-    A generic handler ``except`` branch must never emit a raw exception string
-    into the tool JSON: an error message can echo a credential-shaped input (a
-    token in a connection URL, a secret in a rejected value), and that JSON is
-    produced BEFORE the transport/formatter redaction pass. We keep the
-    sanitized exception type + message — actionable for debugging — but never
-    the raw exception object or a traceback.
-    """
-    detail = redact_sensitive_text(f"{type(exc).__name__}: {exc}", force=True)
-    return tool_error(f"{prefix}: {detail}")
-
-
 class KanbanTerminalAction(str, Enum):
     """Worker lifecycle transitions that end the current agent run."""
 
@@ -546,13 +557,6 @@ class KanbanTerminalControl(str):
         if self.action is KanbanTerminalAction.COMPLETE:
             return "Kanban task completed."
         if self.action is KanbanTerminalAction.REWORK:
-            try:
-                payload = json.loads(str(self))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
-            if isinstance(payload, dict) and payload.get("escalated"):
-                target = payload.get("escalation_target_task_id") or "human triage"
-                return f"Kanban review escalated to {target}; human approval is required."
             return "Kanban rework requested; review task parked until the fix is delivered."
         if self.action is KanbanTerminalAction.PUBLICATION:
             return "Kanban publication handoff requested; task parked until the remote ref is verified."
@@ -1356,7 +1360,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "publication_expected_sha": task.publication_expected_sha,
         "publication_remote": task.publication_remote,
         "publication_ref": task.publication_ref,
-        "publication_repo": task.publication_repo,
         "is_publication": task.is_publication,
         "project_id": task.project_id,
         "created_by": task.created_by,
@@ -1557,10 +1560,10 @@ def _handle_show(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         # Invalid board slug surfaces as ValueError from _normalize_board_slug.
-        return _redacted_tool_error("kanban_show", e)
+        return tool_error(f"kanban_show: {e}")
     except Exception as e:
         logger.exception("kanban_show failed")
-        return _redacted_tool_error("kanban_show", e)
+        return tool_error(f"kanban_show: {e}")
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -1620,10 +1623,10 @@ def _handle_list(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_list", e)
+        return tool_error(f"kanban_list: {e}")
     except Exception as e:
         logger.exception("kanban_list failed")
-        return _redacted_tool_error("kanban_list", e)
+        return tool_error(f"kanban_list: {e}")
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -1652,7 +1655,6 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
-    review_outputs = args.get("review_outputs")
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -1705,16 +1707,6 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
-    if review_outputs is not None:
-        if not isinstance(review_outputs, (list, tuple)):
-            return tool_error(
-                "review_outputs must be a list of objects, got "
-                f"{type(review_outputs).__name__}"
-            )
-        review_outputs = list(review_outputs)
-        for index, item in enumerate(review_outputs):
-            if not isinstance(item, dict):
-                return tool_error(f"review_outputs[{index}] must be an object")
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
@@ -1770,7 +1762,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    review_outputs=review_outputs,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
@@ -1856,10 +1847,10 @@ def _handle_complete(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_complete", e)
+        return tool_error(f"kanban_complete: {e}")
     except Exception as e:
         logger.exception("kanban_complete failed")
-        return _redacted_tool_error("kanban_complete", e)
+        return tool_error(f"kanban_complete: {e}")
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1955,10 +1946,10 @@ def _handle_block(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_block", e)
+        return tool_error(f"kanban_block: {e}")
     except Exception as e:
         logger.exception("kanban_block failed")
-        return _redacted_tool_error("kanban_block", e)
+        return tool_error(f"kanban_block: {e}")
 
 
 def _handle_request_rework(args: dict, **kw) -> str:
@@ -1990,11 +1981,6 @@ def _handle_request_rework(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
-    human_gate_task_id = args.get("human_gate_task_id")
-    if human_gate_task_id is not None:
-        if not isinstance(human_gate_task_id, str):
-            return tool_error("human_gate_task_id must be a string")
-        human_gate_task_id = human_gate_task_id.strip() or None
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
@@ -2023,12 +2009,6 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 toolsets=normalized_lists["toolsets"],
                 max_runtime_seconds=fix_spec.get("max_runtime_seconds"),
             )
-            # Reject an invented profile before it becomes a fix card the
-            # dispatcher can never spawn (BUILD-743; same untrusted tool
-            # ingress class as kanban_create's BUILD-661 guard). A typo like
-            # "publisher" would otherwise strand the remediation in 'ready'.
-            if fix.assignee and not kb.assignee_is_dispatchable(fix.assignee):
-                return tool_error(kb.unknown_assignee_error(fix.assignee))
         else:
             fix = kb.ExistingFixTask(task_id=str(fix_task_id).strip())
 
@@ -2059,7 +2039,6 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 actor=actor,
                 summary=summary,
                 metadata=metadata,
-                human_gate_task_id=human_gate_task_id,
                 expected_run_id=expected_run_id,
                 require_no_active_run=expected_run_id is None,
             )
@@ -2068,9 +2047,6 @@ def _handle_request_rework(args: dict, **kw) -> str:
                 "fix_action": result.fix_action,
                 "review_status": result.review_status,
                 "request_event_id": result.request_event_id,
-                "escalated": result.escalated,
-                "escalation_target_task_id": result.escalation_target_task_id,
-                "escalation_reason": result.escalation_reason,
             }
             # A replay from a later run is idempotent data access, not a
             # lifecycle transition for this worker.  Returning ordinary tool
@@ -2086,10 +2062,10 @@ def _handle_request_rework(args: dict, **kw) -> str:
             if conn is not None:
                 conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_request_rework", e)
+        return tool_error(f"kanban_request_rework: {e}")
     except Exception as e:
         logger.exception("kanban_request_rework failed")
-        return _redacted_tool_error("kanban_request_rework", e)
+        return tool_error(f"kanban_request_rework: {e}")
 
 
 def _handle_request_publication(args: dict, **kw) -> str:
@@ -2204,10 +2180,10 @@ def _handle_request_publication(args: dict, **kw) -> str:
             if conn is not None:
                 conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_request_publication", e)
+        return tool_error(f"kanban_request_publication: {e}")
     except Exception as e:
         logger.exception("kanban_request_publication failed")
-        return _redacted_tool_error("kanban_request_publication", e)
+        return tool_error(f"kanban_request_publication: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -2255,10 +2231,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_heartbeat", e)
+        return tool_error(f"kanban_heartbeat: {e}")
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
-        return _redacted_tool_error("kanban_heartbeat", e)
+        return tool_error(f"kanban_heartbeat: {e}")
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -2347,10 +2323,10 @@ def _handle_comment(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_comment", e)
+        return tool_error(f"kanban_comment: {e}")
     except Exception as e:
         logger.exception("kanban_comment failed")
-        return _redacted_tool_error("kanban_comment", e)
+        return tool_error(f"kanban_comment: {e}")
 
 
 def _worker_architecture_context(kb: Any, conn: Any) -> Any:
@@ -2648,9 +2624,19 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
                     step["model_reasoning_effort"] = routing.get("reasoning_effort")
                 resolved_steps.append(step)
 
-            notifications, _notification_source = _trusted_workflow_notifications(
-                kw.get("gateway_source")
+            owner_context = _trusted_owner_context(
+                kb,
+                gateway_source=kw.get("gateway_source"),
             )
+            if owner_context:
+                # The owner agent turn is the sole automatic delivery back to
+                # the originating conversation. A parallel transport sub here
+                # would also inject the raw worker handoff into that chat.
+                notifications, _notification_source = [], "owner_agent"
+            else:
+                notifications, _notification_source = _trusted_workflow_notifications(
+                    kw.get("gateway_source")
+                )
             known_profiles = set(kb.list_profiles_on_disk())
             requested_profiles = {
                 str(step.get("assignee") or "").strip()
@@ -2698,11 +2684,19 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
                 conn,
                 workflow_key=workflow_key,
                 idempotency_key=idempotency_key,
-                created_by=os.environ.get("HERMES_PROFILE") or "orchestrator",
+                created_by=(
+                    owner_context["profile"]
+                    if owner_context
+                    else os.environ.get("HERMES_PROFILE") or "orchestrator"
+                ),
                 steps=resolved_steps,
                 notification=notifications or None,
                 tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-                session_id=_trusted_session_id(),
+                session_id=(
+                    owner_context["session_id"]
+                    if owner_context else _trusted_session_id()
+                ),
+                owner_context=owner_context,
                 workspace_kind=str(args.get("workspace_kind") or "scratch"),
                 workspace_path=args.get("workspace_path"),
                 priority=int(args.get("priority") or 0),
@@ -2716,73 +2710,25 @@ def _handle_compile_workflow(args: dict, **kw) -> str:
         finally:
             conn.close()
     except (ValueError, TypeError) as e:
-        return _redacted_tool_error("kanban_compile_workflow", e)
+        return tool_error(f"kanban_compile_workflow: {e}")
     except Exception as e:
         logger.exception("kanban_compile_workflow failed")
-        return _redacted_tool_error("kanban_compile_workflow", e)
+        return tool_error(f"kanban_compile_workflow: {e}")
 
 
 def _trusted_front_door_architecture_context(
     kb: Any, *, board: Any, assignee: Any, turn_id: Any,
 ) -> Any:
-    """Construct architecture authority from runtime identity, never tool args.
-
-    Identity comes from two independent facts, in this order:
-
-    1. This process is not a dispatcher worker (``HERMES_KANBAN_TASK``).
-    2. This *context* was declared an interactive front-door turn by the
-       gateway's own message handler (``front_door_turn()``).
-
-    (2) used to be ``HERMES_PROFILE == "orchestrator"``, which no production
-    path ever set — the sole assignment in the runtime is the dispatcher's
-    worker-spawn env, and every such process also carries ``HERMES_KANBAN_TASK``
-    and so is already refused by (1). The live gateway carries neither. The two
-    guards were mutually exclusive, so this function returned ``None``
-    unconditionally and the gate could not open in ANY mode: 0
-    ``architecture_gates`` rows across 558 tasks on all 7 live boards, with
-    ``off``, ``shadow`` and ``orchestrator_only`` behaviourally identical
-    (BUILD-814).
-
-    The fix deliberately does NOT set ``HERMES_PROFILE`` in the gateway's
-    launchd job. That would work, and it is the wrong shape: an environment
-    variable is inherited by every child process, so a subsystem whose entire
-    purpose is authority a caller cannot fabricate would be resting on the most
-    freely-propagated state in the runtime. ``front_door_turn()`` is a
-    ContextVar the gateway sets on the turn it is serving and drops when the
-    turn ends; it cannot cross a process boundary at all, and it fails closed.
-
-    None of this makes the authority unforgeable in-process — workers are plain
-    ``Popen`` children at the same uid with no sandbox (BUILD-800/808), so
-    anything in this address space can be reached by code running in it. It
-    makes it REACHABLE and accidentally-unacquirable, which is what a speed
-    bump on the front door needs to be, and what it demonstrably was not.
-    """
+    """Construct architecture authority from runtime identity, never tool args."""
     if os.environ.get("HERMES_KANBAN_TASK"):
         return None
+    if os.environ.get("HERMES_PROFILE") != "orchestrator":
+        return None
     try:
-        from gateway.session_context import front_door_turn, get_session_env
-        if not front_door_turn():
-            return None
+        from gateway.session_context import get_session_env
         session_id = get_session_env("HERMES_SESSION_ID", "")
-    except ImportError:
-        # No gateway package importable => not a gateway front door.
-        return None
     except Exception:
-        return None
-    # Which profile's front door this is. Under multiplex the gateway stamps
-    # the secondary profile onto the message source; the primary leaves it
-    # blank, so fall back to the profile this HERMES_HOME belongs to. An
-    # ``orchestrator_only`` policy must not gate another profile's front door.
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        profile = (
-            str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
-            or get_active_profile_name()
-        )
-    except Exception:
-        return None
-    if profile != "orchestrator":
-        return None
+        session_id = os.environ.get("HERMES_SESSION_ID", "")
     session_id = str(session_id).strip()
     trusted_turn_id = str(turn_id or "").strip()
     mode = _managed_architecture_gate_mode()
@@ -2979,23 +2925,15 @@ def _verify_worker_attachment(
     stored_path = Path(attachment.stored_path)
     try:
         stored_resolved = stored_path.resolve(strict=True)
-        # Trusted boundary derived from the CONNECTION's own board, not from the
-        # untrusted task_id and not from a separately-passed board arg that can
-        # disagree with the pinned db (HERMES_KANBAN_DB). BUILD-711.
-        trusted_root = kb._trusted_attachments_root(conn)
+        attachment_root = kb.task_attachments_dir(task_id, board=board).resolve(
+            strict=False
+        )
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"stored attachment path cannot be resolved: {exc}") from exc
-    except kb.ReviewArtifactError as exc:
-        raise ValueError(f"stored attachment root is unresolvable: {exc}") from exc
-    try:
-        owner_task_id = kb._validate_task_id_component(task_id)
-    except ValueError as exc:
-        raise ValueError(f"unsafe task id for attachment: {task_id!r}") from exc
-    try:
-        relative = stored_resolved.relative_to(trusted_root)
-    except ValueError:
-        raise ValueError("stored attachment path escaped the task attachment directory")
-    if len(relative.parts) != 2 or relative.parts[0] != owner_task_id:
+    if not (
+        stored_resolved == attachment_root
+        or attachment_root in stored_resolved.parents
+    ):
         raise ValueError("stored attachment path escaped the task attachment directory")
 
     _, stored_size, stored_sha256 = _read_worker_attachment_file(
@@ -3095,12 +3033,12 @@ def _handle_attach(args: dict, **kw) -> str:
             finally:
                 conn.close()
         except kb.AttachmentTooLarge as e:
-            return _redacted_tool_error("kanban_attach", e)
+            return tool_error(f"kanban_attach: {e}")
         except (ValueError, OSError) as e:
-            return _redacted_tool_error("kanban_attach", e)
+            return tool_error(f"kanban_attach: {e}")
         except Exception as e:
             logger.exception("kanban_attach path failed")
-            return _redacted_tool_error("kanban_attach", e)
+            return tool_error(f"kanban_attach: {e}")
 
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
@@ -3130,12 +3068,12 @@ def _handle_attach(args: dict, **kw) -> str:
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
-        return _redacted_tool_error("kanban_attach", e)
+        return tool_error(f"kanban_attach: {e}")
     except ValueError as e:
-        return _redacted_tool_error("kanban_attach", e)
+        return tool_error(f"kanban_attach: {e}")
     except Exception as e:
         logger.exception("kanban_attach failed")
-        return _redacted_tool_error("kanban_attach", e)
+        return tool_error(f"kanban_attach: {e}")
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -3234,7 +3172,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
-        return _redacted_tool_error("kanban_attach_url", e)
+        return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
@@ -3254,12 +3192,12 @@ def _handle_attach_url(args: dict, **kw) -> str:
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
-        return _redacted_tool_error("kanban_attach_url", e)
+        return tool_error(f"kanban_attach_url: {e}")
     except ValueError as e:
-        return _redacted_tool_error("kanban_attach_url", e)
+        return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:
         logger.exception("kanban_attach_url failed")
-        return _redacted_tool_error("kanban_attach_url", e)
+        return tool_error(f"kanban_attach_url: {e}")
 
 
 def _handle_attachments(args: dict, **kw) -> str:
@@ -3295,10 +3233,10 @@ def _handle_attachments(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_attachments", e)
+        return tool_error(f"kanban_attachments: {e}")
     except Exception as e:
         logger.exception("kanban_attachments failed")
-        return _redacted_tool_error("kanban_attachments", e)
+        return tool_error(f"kanban_attachments: {e}")
 
 
 
@@ -3321,10 +3259,6 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    source_refs = args.get("source_refs")
-    if source_refs is not None and not isinstance(source_refs, list):
-        return tool_error("source_refs must be a list of bounded source declarations")
-    publication_repo = args.get("publication_repo")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -3388,19 +3322,28 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+            if (
+                _inherit_workspace
+                and _self_task is not None
+                and _self_task.workspace_kind
+            ):
+                workspace_kind = _self_task.workspace_kind
+                workspace_path = _self_task.workspace_path
+                # Keep follow-up children inside the same project so the
+                # whole subtree shares one repo + branch convention.
+                if project_id is None and _self_task.project_id:
+                    project_id = _self_task.project_id
+            owner_context = _trusted_owner_context(
+                kb,
+                gateway_source=kw.get("gateway_source"),
+                inherited_task=_self_task,
+            )
+            if owner_context:
+                session_id = owner_context["session_id"]
             mutation_context = _worker_architecture_context(kb, conn)
             if mutation_context is None:
                 mutation_context = _trusted_front_door_architecture_context(
@@ -3409,12 +3352,6 @@ def _handle_create(args: dict, **kw) -> str:
                 if mutation_context is not None:
                     # Scope identity must not come from a model-visible argument.
                     session_id = mutation_context.session_id
-            # Reject an invented profile name before it becomes a card the
-            # dispatcher can never spawn (BUILD-661). Agents fan out by naming
-            # the executing profile; a typo like "publisher" would otherwise
-            # stall in 'ready' forever. Give the model the valid options back.
-            if not kb.assignee_is_dispatchable(str(assignee)):
-                return tool_error(kb.unknown_assignee_error(str(assignee)))
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -3441,14 +3378,13 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                owner_context=owner_context,
                 workflow_key=workflow_key,
                 current_step_key=current_step_key,
                 model_override=model_override,
                 model_provider_override=(model_routing_decision or {}).get("provider"),
                 model_reasoning_effort=(model_routing_decision or {}).get("reasoning_effort"),
                 mutation_context=mutation_context,
-                source_refs=source_refs,
-                publication_repo=publication_repo,
             )
             new_task = kb.get_task(conn, new_tid)
             task_status = new_task.status if new_task else None
@@ -3475,18 +3411,29 @@ def _handle_create(args: dict, **kw) -> str:
                         "vault_doc_impact gate skipped during kanban_create",
                         exc_info=True,
                     )
-            # Upstream v2026.6.19 added native session auto-subscribe for
-            # gateway/TUI sessions. Keep that boolean contract, and also keep
-            # the Ahlnos fork's richer gateway-source/home-channel metadata so
-            # orchestrator-created durable workflows still close the loop from
-            # local/TUI/Telegram front doors.
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
-            notification_state = _auto_subscribe_gateway_source(
-                kb, conn, new_tid, kw.get("gateway_source"),
-                session_subscribed=subscribed,
-            )
-            if not subscribed and isinstance(notification_state, dict):
-                subscribed = bool(notification_state.get("subscribed"))
+            # Native session/gateway subscriptions remain the fallback for
+            # legacy or unattached tasks. A complete owner route uses its own
+            # cursor so raw worker output cannot race the owner agent's update.
+            if owner_context:
+                # The durable owner-agent cursor was inserted atomically with
+                # the task. Do not additionally auto-subscribe the same chat:
+                # that would send the raw worker result before the owner agent
+                # can inspect it and produce its own user-facing update.
+                subscribed = True
+                notification_state = {
+                    "subscribed": True,
+                    "count": 1,
+                    "source": "owner_agent",
+                    "channels": [kb.OWNER_AGENT_NOTIFY_PLATFORM],
+                }
+            else:
+                subscribed = _maybe_auto_subscribe(conn, new_tid)
+                notification_state = _auto_subscribe_gateway_source(
+                    kb, conn, new_tid, kw.get("gateway_source"),
+                    session_subscribed=subscribed,
+                )
+                if not subscribed and isinstance(notification_state, dict):
+                    subscribed = bool(notification_state.get("subscribed"))
             skill_list = list(skills or []) if isinstance(skills, (list, tuple)) else []
             _append_kanban_route_telemetry(
                 "route.selected",
@@ -3540,10 +3487,10 @@ def _handle_create(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_create", e)
+        return tool_error(f"kanban_create: {e}")
     except Exception as e:
         logger.exception("kanban_create failed")
-        return _redacted_tool_error("kanban_create", e)
+        return tool_error(f"kanban_create: {e}")
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -3667,10 +3614,10 @@ def _handle_unblock(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
-        return _redacted_tool_error("kanban_unblock", e)
+        return tool_error(f"kanban_unblock: {e}")
     except Exception as e:
         logger.exception("kanban_unblock failed")
-        return _redacted_tool_error("kanban_unblock", e)
+        return tool_error(f"kanban_unblock: {e}")
 
 
 def _handle_link(args: dict, **kw) -> str:
@@ -3689,10 +3636,10 @@ def _handle_link(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         # Covers cycle + self-parent rejections
-        return _redacted_tool_error("kanban_link", e)
+        return tool_error(f"kanban_link: {e}")
     except Exception as e:
         logger.exception("kanban_link failed")
-        return _redacted_tool_error("kanban_link", e)
+        return tool_error(f"kanban_link: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3884,34 +3831,6 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
-                ),
-            },
-            "review_outputs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "review_task_id": {
-                            "type": "string",
-                            "description": (
-                                "Stable review task id whose current artifact "
-                                "this fix completed."
-                            ),
-                        },
-                        "attachment_id": {
-                            "type": "integer",
-                            "description": (
-                                "Exact attachment id returned by kanban_attach "
-                                "for the revised artifact."
-                            ),
-                        },
-                    },
-                    "required": ["review_task_id", "attachment_id"],
-                },
-                "description": (
-                    "For artifact-bound rework, select exactly one attachment "
-                    "per review task. The kernel verifies ownership, file "
-                    "existence, and SHA-256 before completing the fix."
                 ),
             },
             "board": _board_schema_prop(),
@@ -4183,17 +4102,11 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
     "name": "kanban_request_rework",
     "description": (
         "Reviewer/verifier terminal action. Atomically record a finding, "
-        "create or adopt one fix card when continuing automation, or escalate "
-        "without a fix when the bounded loop trips; link fix→review, close the "
+        "create or adopt exactly one fix card, link fix→review, close the "
         "current review run, and park or re-arm the review card. Use this "
         "when changes are requested; use kanban_block with kind='needs_input' "
         "only when a genuine human decision is required. request_key is "
-        "mandatory so retries cannot duplicate the fix or edge. When a "
-        "reviewer has a declared human approval card downstream, pass its "
-        "stable task id as human_gate_task_id. Provide a complete stable "
-        "metadata.rework.open_blockers snapshot when blocker progress is "
-        "known; the kernel bounds repeated non-progress and escalates to "
-        "that gate without minting another fix."
+        "mandatory so retries cannot duplicate the fix or edge."
     ),
     "parameters": {
         "type": "object",
@@ -4238,21 +4151,7 @@ KANBAN_REQUEST_REWORK_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
-                "description": (
-                    "Optional structured review metadata. For blocker progress, "
-                    "use {rework: {open_blockers: [{key, summary}, ...]}}; "
-                    "open_blockers must be the full stable snapshot for this "
-                    "round, not prose or a delta."
-                ),
-            },
-            "human_gate_task_id": {
-                "type": "string",
-                "description": (
-                    "Optional existing human approval task id. It must be a "
-                    "nonterminal direct child of this review, dependency-gated "
-                    "on it, and the review must have no other nonterminal direct "
-                    "child that would be released accidentally."
-                ),
+                "description": "Optional structured review metadata.",
             },
             "board": _board_schema_prop(),
         },
@@ -4382,38 +4281,6 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Optional namespace for multi-project isolation. "
                     "Defaults to HERMES_TENANT env if set."
-                ),
-            },
-            "publication_repo": {
-                "type": "string",
-                "description": (
-                    "Optional 'owner/repo' this task and the publication card "
-                    "it later requests are allowed to publish to. Recorded on "
-                    "the row at create time and never updated, so the "
-                    "credential preflight can refuse a GitHub write token when "
-                    "the workspace's own push url disagrees with it. Omit "
-                    "unless the task will push (BUILD-795)."
-                ),
-            },
-            "source_refs": {
-                "type": "array",
-                "maxItems": 16,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "ref": {"type": "string"},
-                        "task_id": {"type": "string"},
-                        "attachment_id": {"type": "integer"},
-                        "filename": {"type": "string"},
-                        "sha256": {"type": "string"},
-                        "git_commit": {"type": "string"},
-                        "git_ref": {"type": "string"},
-                    },
-                    "required": ["ref", "task_id", "sha256", "git_commit", "git_ref"],
-                },
-                "description": (
-                    "Bounded source declarations. Each entry pins a task attachment to "
-                    "its SHA-256, exact 40-character Git commit, and named Git ref."
                 ),
             },
             "priority": {
