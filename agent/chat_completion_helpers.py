@@ -963,6 +963,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("codex_ttfb_kill")
             except Exception:
                 pass
+            # Circuit breaker (#58962, BUILD-878): count the kill so a
+            # backend that repeatedly accepts the connection and then goes
+            # silent gives up after HERMES_STREAM_STALE_GIVEUP consecutive
+            # strikes instead of burning every retry attempt at full
+            # per-attempt cost. Previously only the stale-call detector
+            # below bumped this streak, so this failure mode never tripped
+            # the breaker.
+            _bump_stale_streak(agent)
             agent._emit_wait_notice(
                 f"⚠ no response from provider in {int(_elapsed)}s — "
                 f"reconnecting..."
@@ -1014,6 +1022,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("codex_stream_idle_kill")
             except Exception:
                 pass
+            # Circuit breaker (#58962, BUILD-878): count the kill — see the
+            # matching comment on the TTFB-kill branch above. A stream that
+            # emits one byte then goes silent every retry is the same
+            # "provider connected but never responded" class as the
+            # stale-call detector below, and must trip the same breaker.
+            _bump_stale_streak(agent)
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )

@@ -16,7 +16,9 @@ stall.
 
 from __future__ import annotations
 
+import re
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -357,6 +359,135 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
         assert "codex_ttfb_kill" not in closes
     finally:
         stop["flag"] = True
+
+
+def test_event_idle_kill_detected_promptly_with_no_polling_worker(tmp_path, monkeypatch):
+    """BUILD-878 regression: the idle watchdog must fire within threshold +
+    one join-grace tick even when the worker never wakes on its own (a real
+    dead stream doesn't busy-poll — it blocks on one read forever). Uses a
+    genuinely blocking ``threading.Event.wait()`` with no timeout instead of
+    the busy-loop stand-in the other tests use, so the main-thread watchdog
+    loop is the ONLY thing driving detection — proving detection is
+    timer-driven, not gated on the worker producing any activity."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    never = threading.Event()
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        never.wait()  # genuinely blocks — no polling, no busy-loop
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    t0 = time.time()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        elapsed = time.time() - t0
+        assert "codex_stream_idle_kill" in closes
+        # threshold=1s + join-grace; must be nowhere near a multiple of it.
+        assert elapsed < 10, f"idle watchdog took {elapsed:.1f}s for a 1s threshold"
+        # The log/exception must report actual idle time close to the 1s
+        # threshold, not some multiple of it (the reported figure that was
+        # actually ~5x threshold in the BUILD-878 incident).
+        reported = int(re.search(r"for (\d+)s after first byte", str(excinfo.value)).group(1))
+        assert reported <= 3, f"reported idle time {reported}s is not ~threshold (1s)"
+    finally:
+        never.set()
+
+
+def test_event_idle_kill_bumps_stale_streak(tmp_path, monkeypatch):
+    """BUILD-878: an idle-kill must count toward the cross-turn stale-streak
+    circuit breaker (#58962), same as the stale-call detector already does.
+
+    Before this fix, only the non-streaming stale-call branch called
+    ``_bump_stale_streak`` — a backend that accepts the connection, emits one
+    byte, then goes silent on every retry never tripped the breaker, so the
+    outer retry loop paid the full idle timeout on *every* attempt instead of
+    giving up after HERMES_STREAM_STALE_GIVEUP consecutive strikes.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+    agent._consecutive_stale_streams = 0
+
+    stop = {"flag": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert agent._consecutive_stale_streams >= 1
+    finally:
+        stop["flag"] = True
+
+
+def test_repeated_codex_idle_kills_trip_stale_giveup(tmp_path, monkeypatch):
+    """BUILD-878: once the idle-kill circuit breaker trips, the next call
+    must short-circuit immediately (no network attempt, no idle-timeout
+    wait) instead of paying the full per-attempt cost again. This is what
+    bounds total recovery time for a persistently-silent backend to roughly
+    (giveup_count x threshold) instead of (retry_count x threshold) with no
+    early exit — the "detection lag ~5x threshold" symptom BUILD-878 was
+    filed against.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "2")
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+    agent._consecutive_stale_streams = 2  # already at the giveup=2 threshold
+
+    calls = {"count": 0}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        calls["count"] += 1
+        raise AssertionError("must not attempt the network call past giveup")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    with pytest.raises(RuntimeError, match="unresponsive"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert calls["count"] == 0
+    # The streak is not reset on the short-circuit path.
+    assert agent._consecutive_stale_streams == 2
 
 
 def test_wait_notice_handles_infinite_local_stale_timeout():
