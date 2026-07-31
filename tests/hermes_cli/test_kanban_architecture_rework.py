@@ -482,6 +482,33 @@ def test_tampered_cycle_counter_fails_closed(kanban_home):
             _request_rework(conn, reviewer, coder, "rework-3")
 
 
+def test_gate_invalidated_after_issuance_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        gate, coder, reviewer, _ = _issued_loop(conn)
+        _complete_coder(conn, coder)
+        # The reviewer is already running when the gate gets invalidated
+        # (containment); its changes_requested verdict must not re-arm.
+        _claim_reviewer(conn, reviewer)
+        kb.invalidate_architecture_gate(conn, gate.gate_id, reason="containment")
+        _assert_denied(conn, reviewer, coder, "rework-1", "architecture_graph_issued")
+
+
+def test_tampered_rework_policy_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        gate, coder, reviewer, _ = _issued_loop(conn)
+        _complete_coder(conn, coder)
+        for tampered in ("not json", json.dumps({"max_rework_cycles": 99})):
+            conn.execute(
+                "UPDATE architecture_graph_issuances SET rework_policy = ? "
+                "WHERE gate_id = ?",
+                (tampered, gate.gate_id),
+            )
+            conn.commit()
+            _assert_denied(
+                conn, reviewer, coder, "rework-1", "architecture_rework_policy_invalid"
+            )
+
+
 def test_unattested_reviewed_sha_fails_closed(kanban_home):
     with kb.connect() as conn:
         _, coder, reviewer, _ = _issued_loop(conn)
