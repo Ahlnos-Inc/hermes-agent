@@ -254,6 +254,35 @@ def test_render_blocked_shows_workspace_path():
     assert "📁 /tmp/worktrees/t_ctx" in out
 
 
+def test_render_blocked_redacts_credentials_in_links():
+    """Links pass the same force-redact boundary as reason/ask: a vendor
+    credential embedded in a worker-supplied URL is masked. Generic query
+    params deliberately pass through unmasked — the global redactor's
+    web-URL policy (see ``agent/redact.py``): a block link may be a
+    pre-signed/magic URL the operator must be able to click.
+    """
+    marker = "AKIA" + "IOSFODNN7EXAMPLE"  # canonical AWS docs example id
+    task = _task_stub()
+    out = _render_event(task, {
+        "reason": "needs approval",
+        "kind": "needs_input",
+        "recurrences": 1,
+        "links": [
+            f"https://bucket.s3.example/post.png?X-Amz-Credential={marker}&sig=abc",
+        ],
+    })
+    assert marker not in out
+    assert "🔗 https://bucket.s3.example/post.png" in out
+
+    # Scraped-from-reason fallback is redacted the same way.
+    out2 = _render_event(task, {
+        "reason": f"see https://x.example/f?cred={marker} for the draft",
+        "kind": "needs_input",
+        "recurrences": 1,
+    })
+    assert marker not in out2
+
+
 def test_render_block_loop_detected_includes_context():
     task = _task_stub()
     out = _render_event(task, {

@@ -948,3 +948,62 @@ def test_human_block_alert_without_artifacts_sends_no_media(tmp_path, monkeypatc
     assert "needs a human" in hb[0]["text"]
     assert adapter.images == []
     assert adapter.documents == []
+
+
+def test_human_block_artifacts_upload_before_ledger_and_failure_still_records(
+    tmp_path, monkeypatch,
+):
+    """Upload runs BEFORE the dedup-ledger write (a crash after the ledger
+    row would drop the media forever), and an upload failure still records
+    delivery so a flaky media send can't re-page the operator every tick."""
+    db_path = tmp_path / "hb-order.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    img = tmp_path / "post.png"
+    img.write_bytes(b"\x89PNG fake")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ordering probe")
+        kb.block_task(
+            conn, tid,
+            reason="needs approval", kind="needs_input",
+            metadata={"artifacts": [str(img)]},
+        )
+    finally:
+        conn.close()
+
+    import hermes_cli.config as hconfig
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"human_block_alerts": {"chat_id": "hb", "thread_id": ""}}},
+    )
+
+    calls = []
+
+    class FailingMediaAdapter(RecordingAdapter):
+        async def send_multiple_images(self, chat_id, images, metadata=None):
+            calls.append("upload")
+            raise RuntimeError("telegram hiccup")
+
+        def extract_local_files(self, text):
+            return [], text
+
+    adapter = FailingMediaAdapter()
+    runner = _make_runner(adapter)
+    real_record = runner._kanban_record_human_block_delivery
+
+    def recording_ledger(item, target):
+        calls.append("ledger")
+        return real_record(item, target)
+
+    runner._kanban_record_human_block_delivery = recording_ledger
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert calls == ["upload", "ledger"]
+
+    # Delivery recorded despite the failed upload → next tick re-pages nothing.
+    adapter2 = FailingMediaAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
+    assert [m for m in adapter2.sent if "Human input needed" in m["text"]] == []

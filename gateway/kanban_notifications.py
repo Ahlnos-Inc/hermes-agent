@@ -83,12 +83,17 @@ def _block_context_lines(task: Any, payload: dict, message_so_far: str) -> list[
     if ask:
         lines.append(f"❓ {ask}")
     links = payload.get("links")
-    if not (isinstance(links, (list, tuple)) and links):
+    if isinstance(links, (list, tuple)) and links:
+        # Same force-redact boundary as reason/ask: masks vendor-prefix
+        # credentials embedded in a worker-supplied URL. Generic query
+        # params intentionally pass through (redact_sensitive_text's
+        # web-URL policy) — a link here may be a pre-signed/magic URL the
+        # operator must be able to click.
+        links = [_redact(link) for link in links if isinstance(link, str)]
+    else:
         # Legacy blocks: surface any URL the worker embedded in the reason.
-        links = _URL_RE.findall(str(payload.get("reason") or ""))
-    links = [
-        str(link).rstrip(".,;:") for link in links if isinstance(link, str)
-    ][:10]
+        links = _URL_RE.findall(_redact(str(payload.get("reason") or "")))
+    links = [str(link).rstrip(".,;:") for link in links][:10]
     lines.extend(f"🔗 {link}" for link in links)
     visible = message_so_far + "\n".join(lines)
     try:

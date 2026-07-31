@@ -1495,16 +1495,14 @@ class GatewayKanbanWatchersMixin:
                         thread_id=human_block_target["thread_id"],
                     )
                     if ok:
-                        await asyncio.to_thread(
-                            self._kanban_record_human_block_delivery,
-                            item, human_block_target,
-                        )
-                        hb_attempts.pop(key, None)
-                        logger.info(
-                            "kanban notifier: human-block alert for %s on "
-                            "board %s delivered to Kanban console topic",
-                            item["task_id"], item.get("board"),
-                        )
+                        # Artifacts upload BEFORE the ledger write (same
+                        # order as the completed-event path): a crash after
+                        # the ledger row would drop the media forever since
+                        # the event is never re-collected. The reverse
+                        # window merely re-pages, which is the established
+                        # at-least-once failure mode. An upload FAILURE
+                        # still records delivery — a flaky media send must
+                        # not re-page the operator every tick.
                         hb_payload = getattr(item["event"], "payload", None)
                         if (
                             isinstance(hb_payload, dict)
@@ -1535,6 +1533,16 @@ class GatewayKanbanWatchersMixin:
                                         "delivery for %s failed: %s",
                                         item["task_id"], art_exc,
                                     )
+                        await asyncio.to_thread(
+                            self._kanban_record_human_block_delivery,
+                            item, human_block_target,
+                        )
+                        hb_attempts.pop(key, None)
+                        logger.info(
+                            "kanban notifier: human-block alert for %s on "
+                            "board %s delivered to Kanban console topic",
+                            item["task_id"], item.get("board"),
+                        )
             except Exception as exc:
                 # exc_info: this tick has failed persistently before with only
                 # str(exc) ("'int' object has no attribute 'lower'"), which is
