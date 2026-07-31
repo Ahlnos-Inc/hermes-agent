@@ -630,3 +630,17 @@ def test_claim_vs_dirty_block_race_serializes(kanban_home, all_assignees_spawnab
                     f"Round {round_num}: claim winner must not have dirty_workspace "
                     f"blocked event; got codes {dirty_codes}"
                 )
+
+                # Every round shares one workspace path so the SAME-task race
+                # is exercised repeatedly. A claim winner is left 'running'
+                # forever by this test (nothing ever finishes its run), which
+                # would make the *next* round's fresh task collide with this
+                # one in _find_workspace_collision (both claim_task and
+                # _block_dirty_ready_task defer on a real collision rather
+                # than writing) -- stranding the next round's task in
+                # 'ready'. Retire the winner so the workspace is free again;
+                # this only releases the round's own claim, it does not touch
+                # the CAS behavior under test.
+                conn.execute(
+                    "UPDATE tasks SET status = 'done' WHERE id = ?", (t,),
+                )
