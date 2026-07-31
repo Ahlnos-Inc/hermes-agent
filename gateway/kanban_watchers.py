@@ -1140,14 +1140,35 @@ class GatewayKanbanWatchersMixin:
                             # per (task, kind) via the notify_deliveries
                             # ledger so a crash-retry loop pings home once,
                             # not once per recurrence.
+                            # BUILD-889: the human-block sweep runs FIRST so
+                            # the orphan sweep only excludes its events when
+                            # this board's collection actually succeeded — a
+                            # broken human sweep fails OPEN to the home sweep
+                            # instead of leaving the event unpaged everywhere.
+                            hb_collection_ok = False
+                            if human_block_target is not None:
+                                try:
+                                    blocked = _collect_human_blocked_events(
+                                        _kb, conn,
+                                    )
+                                    for b in blocked:
+                                        b["board"] = slug
+                                        b["db_path"] = resolved_db_path
+                                    human_blocked.extend(blocked)
+                                    hb_collection_ok = True
+                                except Exception as exc:
+                                    if _is_corruption_db_error(_kb, exc):
+                                        raise
+                                    logger.debug(
+                                        "kanban notifier: human-block sweep "
+                                        "failed for board %s: %s", slug, exc,
+                                    )
                             try:
-                                # BUILD-889: events the human-block sweep owns
-                                # must not ALSO page home as "unrouted".
+                                # Events the human-block sweep owns must not
+                                # ALSO page home as "unrouted".
                                 orphans = _collect_unsubscribed_failure_events(
                                     _kb, conn,
-                                    exclude_human_block_eligible=(
-                                        human_block_target is not None
-                                    ),
+                                    exclude_human_block_eligible=hb_collection_ok,
                                 )
                                 for o in orphans:
                                     o["board"] = slug
@@ -1161,21 +1182,6 @@ class GatewayKanbanWatchersMixin:
                                     "failed for board %s: %s", slug, exc,
                                 )
                             if human_block_target is not None:
-                                try:
-                                    blocked = _collect_human_blocked_events(
-                                        _kb, conn,
-                                    )
-                                    for b in blocked:
-                                        b["board"] = slug
-                                        b["db_path"] = resolved_db_path
-                                    human_blocked.extend(blocked)
-                                except Exception as exc:
-                                    if _is_corruption_db_error(_kb, exc):
-                                        raise
-                                    logger.debug(
-                                        "kanban notifier: human-block sweep "
-                                        "failed for board %s: %s", slug, exc,
-                                    )
                                 try:
                                     resolved = _collect_block_resolutions(
                                         _kb, conn,

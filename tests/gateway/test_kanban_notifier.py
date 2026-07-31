@@ -1065,3 +1065,33 @@ def test_human_block_falls_open_to_home_without_target(tmp_path, monkeypatch):
     assert len(mine) == 1, mine
     assert mine[0]["chat_id"] == "home-1"
     assert "Unrouted workflow failure" in mine[0]["text"]
+
+
+def test_human_block_sweep_failure_fails_open_to_home(tmp_path, monkeypatch):
+    """BUILD-889 hardening: if the human-block COLLECTION breaks, the orphan
+    sweep must stop excluding its events — the block still pages home rather
+    than vanishing from both sweeps."""
+    db_path = tmp_path / "hb-failopen-collect.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _block_unsubscribed_needs_input()
+
+    import hermes_cli.config as hconfig
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"human_block_alerts": {"chat_id": "hb-chat", "thread_id": "7"}}},
+    )
+
+    def _boom(_kb, _conn):
+        raise RuntimeError("human sweep query broke")
+
+    monkeypatch.setattr(kw, "_collect_human_blocked_events", _boom)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    mine = [m for m in adapter.sent if tid in m["text"]]
+    assert len(mine) == 1, mine
+    assert mine[0]["chat_id"] == "home-1"
+    assert "Unrouted workflow failure" in mine[0]["text"]
