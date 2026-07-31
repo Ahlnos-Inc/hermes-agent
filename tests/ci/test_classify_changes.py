@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -156,6 +157,30 @@ def test_classify(files, expected):
 _REPO = Path(__file__).resolve().parents[2]
 _ACTION = _REPO / ".github/actions/detect-changes/action.yml"
 _UPSTREAM_ONLY_SECRET = "AUTOFIX_BOT_PAT"
+# Sources that always resolve to a usable value. Anything else — an
+# upstream-only PAT, any secret this repo may not define — can be the empty
+# string, and an empty credential is what BUILD-871 was.
+_ALWAYS_PRESENT = ("github.token", "secrets.GITHUB_TOKEN")
+_EXPRESSION = re.compile(r"^\$\{\{(?P<body>[^{}]+)\}\}$")
+
+
+def _assert_cannot_resolve_empty(value: str, where: str) -> None:
+    """The value must be ONE Actions expression whose last fallback is a source
+    that always exists.
+
+    Checking merely for the presence of `||` is not enough: two separate
+    expressions joined by a literal `||`
+    (`${{ secrets.A }} || ${{ secrets.B }}`) reads as a fallback but evaluates
+    to the literal text, and a chain ending in another optional secret is still
+    emptyable.
+    """
+    match = _EXPRESSION.match(str(value).strip())
+    assert match, f"{where}: not a single Actions expression: {value!r}"
+    operands = [o.strip() for o in match.group("body").split("||")]
+    assert operands[-1] in _ALWAYS_PRESENT, (
+        f"{where}: last fallback {operands[-1]!r} can resolve to the empty "
+        f"string; expected one of {_ALWAYS_PRESENT}"
+    )
 
 # Every job whose failure BLOCKS a merge and that reads state from the API.
 _MANDATORY_GATES = (
@@ -204,9 +229,7 @@ def test_a_mandatory_gate_never_reads_with_an_empty_credential(workflow, job):
                  if "TOKEN" in k.upper() or k == "github-token"}
         assert creds, f"{workflow}:{job}: an API read with no credential at all"
         for key, value in creds.items():
-            assert "||" in str(value) or _UPSTREAM_ONLY_SECRET not in str(value), (
-                f"{workflow}:{job}: {key} can evaluate to the empty string"
-            )
+            _assert_cannot_resolve_empty(value, f"{workflow}:{job}: {key}")
 
 
 def _run_compare_jq(payload: dict) -> list[str]:
@@ -257,3 +280,25 @@ def test_a_truncated_compare_is_treated_as_an_unreadable_diff():
     assert script.count("gh api") == 1, "the cap must not cost a second API call"
     # An unreadable diff runs every gate, the MCP catalog review included.
     assert classify([])["mcp_catalog"] is True
+
+
+@pytest.mark.parametrize("value", [
+    "${{ secrets.AUTOFIX_BOT_PAT }}",                      # the original bug
+    "${{ secrets.AUTOFIX_BOT_PAT }} || ${{ github.token }}",  # literal text, not a fallback
+    "${{ secrets.AUTOFIX_BOT_PAT || secrets.SOME_OTHER_PAT }}",  # ends in another optional secret
+    "",
+    "${{ inputs.github-token }}",
+])
+def test_the_credential_guard_rejects_emptyable_expressions(value):
+    """The guard has to fail on the shapes that look right and are not."""
+    with pytest.raises(AssertionError):
+        _assert_cannot_resolve_empty(value, "fixture")
+
+
+@pytest.mark.parametrize("value", [
+    "${{ inputs.github-token || github.token }}",
+    "${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}",
+    "${{ github.token }}",
+])
+def test_the_credential_guard_accepts_a_real_fallback(value):
+    _assert_cannot_resolve_empty(value, "fixture")
