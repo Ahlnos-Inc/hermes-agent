@@ -1007,3 +1007,61 @@ def test_human_block_artifacts_upload_before_ledger_and_failure_still_records(
     adapter2 = FailingMediaAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
     assert [m for m in adapter2.sent if "Human input needed" in m["text"]] == []
+
+
+def _block_unsubscribed_needs_input(title="needs a human"):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title=title)
+        kb.block_task(conn, tid, reason="approve please", kind="needs_input")
+        return tid
+    finally:
+        conn.close()
+
+
+def test_human_block_not_double_delivered_to_home(tmp_path, monkeypatch):
+    """BUILD-889: with human_block_alerts configured, an unsubscribed
+    needs_input block pages the Kanban console topic exactly once — the
+    orphan home sweep must not also deliver it as an 'Unrouted workflow
+    failure'."""
+    db_path = tmp_path / "hb-dedup.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _block_unsubscribed_needs_input()
+
+    import hermes_cli.config as hconfig
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"human_block_alerts": {"chat_id": "hb-chat", "thread_id": "7"}}},
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    mine = [m for m in adapter.sent if tid in m["text"]]
+    assert len(mine) == 1, mine
+    assert mine[0]["chat_id"] == "hb-chat"
+    assert "Human input needed" in mine[0]["text"]
+    assert not any("Unrouted workflow failure" in m["text"] for m in adapter.sent)
+
+
+def test_human_block_falls_open_to_home_without_target(tmp_path, monkeypatch):
+    """BUILD-889 fail-open: with NO human_block_alerts configured, the home
+    sweep still delivers — never a silent drop."""
+    db_path = tmp_path / "hb-failopen.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _block_unsubscribed_needs_input()
+
+    import hermes_cli.config as hconfig
+    monkeypatch.setattr(hconfig, "load_config", lambda: {})
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_home(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    mine = [m for m in adapter.sent if tid in m["text"]]
+    assert len(mine) == 1, mine
+    assert mine[0]["chat_id"] == "home-1"
+    assert "Unrouted workflow failure" in mine[0]["text"]

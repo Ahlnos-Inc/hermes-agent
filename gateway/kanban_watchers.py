@@ -205,7 +205,9 @@ def _is_corruption_db_error(kb: Any, exc: BaseException) -> bool:
     )
 
 
-def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
+def _collect_unsubscribed_failure_events(
+    kb, conn, *, exclude_human_block_eligible: bool = False,
+) -> "list[dict]":
     """Recent failure-kind events on tasks with NO notify subscription.
 
     Dedup is one home delivery per (task, kind), recorded in the
@@ -219,10 +221,42 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
     old, already-healed block still pages home days later (BUILD-748: seven
     2026-07-24 02:13 alerts replayed 2026-07-22 blocks, two of which had been
     resolved and unblocked on 2026-07-22).
+
+    ``exclude_human_block_eligible``: pass True when the human-block sweep is
+    configured (``kanban.human_block_alerts``) — events that sweep owns are
+    dropped here so a deliberate human gate isn't ALSO paged to home as an
+    "Unrouted workflow failure" (BUILD-889). The exclusion mirrors the
+    human sweep's ELIGIBILITY conditions (state-based), not its delivery
+    ledger — a suppressed event must stay suppressed on later ticks even
+    while the human-sweep delivery is still retrying.
     """
     kinds = sorted(FAILURE_KINDS)
     placeholders = ",".join("?" for _ in kinds)
     cutoff = int(time.time()) - ORPHAN_FAILURE_LOOKBACK_SECONDS
+    hb_exclusion_sql = ""
+    hb_exclusion_params: tuple = ()
+    if exclude_human_block_eligible:
+        hb_kind_ph = ",".join("?" for _ in HUMAN_BLOCK_EVENT_KINDS)
+        hb_auto_ph = ",".join("?" for _ in HUMAN_BLOCK_AUTO_KINDS)
+        hb_live_auto_ph = ",".join("?" for _ in HUMAN_BLOCK_AUTO_BLOCK_KINDS)
+        hb_exclusion_sql = f"""
+              AND NOT (
+                  e.kind IN ({hb_kind_ph})
+                  AND COALESCE(json_extract(e.payload, '$.kind'), '')
+                      NOT IN ({hb_auto_ph})
+                  AND (
+                      t.status = 'triage'
+                      OR (
+                          t.status = 'blocked'
+                          AND COALESCE(t.block_kind, '')
+                              NOT IN ({hb_live_auto_ph})
+                      )
+                  )
+              )"""
+        hb_exclusion_params = (
+            *HUMAN_BLOCK_EVENT_KINDS, *HUMAN_BLOCK_AUTO_KINDS,
+            *HUMAN_BLOCK_AUTO_BLOCK_KINDS,
+        )
     rows = conn.execute(
         f"""SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, e.run_id
             FROM task_events e
@@ -236,10 +270,12 @@ def _collect_unsubscribed_failure_events(kb, conn) -> "list[dict]":
               AND NOT EXISTS (SELECT 1 FROM notify_deliveries nd
                               WHERE nd.delivery_key =
                                   'home-sweep/' || e.task_id || '/' || e.kind)
+              {hb_exclusion_sql}
             ORDER BY e.id
             LIMIT ?""",
         (
             *kinds, cutoff, *SUPERSEDED_EVENT_PARAMS,
+            *hb_exclusion_params,
             ORPHAN_FAILURE_BATCH_PER_TICK,
         ),
     ).fetchall()
@@ -1105,8 +1141,13 @@ class GatewayKanbanWatchersMixin:
                             # ledger so a crash-retry loop pings home once,
                             # not once per recurrence.
                             try:
+                                # BUILD-889: events the human-block sweep owns
+                                # must not ALSO page home as "unrouted".
                                 orphans = _collect_unsubscribed_failure_events(
                                     _kb, conn,
+                                    exclude_human_block_eligible=(
+                                        human_block_target is not None
+                                    ),
                                 )
                                 for o in orphans:
                                     o["board"] = slug
