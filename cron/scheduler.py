@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -88,6 +89,68 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
+# How this machine fails when IT is offline, as opposed to how a broken target
+# fails.  All lowercase — matched against the lowered error text.
+#
+# Overlaps on purpose with _RETRYABLE_DELIVERY_MARKERS (~line 2213) below,
+# which lists connect-phase failure phrasings for a different question ("did
+# the payload leave this host?"). Deliberately NOT merged — keep both lists
+# in sync by hand if either grows a new phrasing for the same underlying
+# error, they will drift silently otherwise.
+_NETWORK_OUTAGE_SIGNATURES = (
+    "enotfound",
+    "eai_again",
+    "getaddrinfo",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "no route to host",
+    "connecterror",
+    "connecttimeout",
+    "connection refused",
+    # Node/libuv errno spellings — the finance cron scripts are .cjs and fail
+    # with these when the link drops mid-connection instead of at DNS time.
+    "econnrefused",
+    "etimedout",
+    "enetunreach",
+    "ehostunreach",
+)
+
+
+def _network_looks_down(probe_host: str = "api.telegram.org") -> bool:
+    """One neutral DNS probe: is this machine's network/DNS actually gone?
+
+    Distinguishes "the laptop left its network" (probe fails too → every
+    outbound job is failing for the same non-reason) from "the job's target
+    host is genuinely broken" (probe resolves → that alert is real).  The
+    probe host is the delivery endpoint itself: if IT cannot resolve, the
+    alert could not have reached anyone as a real alert anyway.
+
+    socket.getaddrinfo() has no timeout of its own — a wedged OS resolver
+    (broken VPN/DNS) can hang for minutes (#63309), and this runs inline in
+    the scheduler's sequential worker pool (max_workers=1), so a hang here
+    would stall every other cron job behind it. Run the probe on a daemon
+    thread with a bounded join instead: if it hasn't reported back by the
+    bound, the probe is INCONCLUSIVE — return False so the real ⚠️ alert
+    survives rather than a wedge getting misreported as "confirmed offline".
+    """
+    outcome: list[bool] = []
+
+    def _probe() -> None:
+        try:
+            socket.getaddrinfo(probe_host, 443)
+            outcome.append(False)
+        except OSError:
+            outcome.append(True)
+
+    thread = threading.Thread(target=_probe, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    if not outcome:
+        return False  # still running / wedged — inconclusive, not "down"
+    return outcome[0]
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -98,6 +161,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    # A laptop that left its network fails every outbound job the same way.
+    # Only claim "offline" when a neutral host ALSO fails to resolve —
+    # otherwise the target's DNS is genuinely broken and that IS a real alert.
+    # Re-words only; failed jobs still always deliver (BUILD-837).
+    if any(sig in lower for sig in _NETWORK_OUTAGE_SIGNATURES) and _network_looks_down():
+        return (
+            f"🌐 Cron '{job_name}' failed: no internet/DNS — this machine "
+            "looks offline (laptop on the move?). Likely not a real failure; "
+            "runs resume automatically once the network is back."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
