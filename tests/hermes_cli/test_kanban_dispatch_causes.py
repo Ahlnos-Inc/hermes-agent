@@ -253,6 +253,7 @@ def test_summarize_dispatch_causes_buckets_each_new_cause():
         skipped_unassigned=["t7"],
         skipped_nonspawnable=["t8"],
         skipped_locked=True,
+        dirty_workspace=["t9"],
     )
     causes = kb.summarize_dispatch_causes([res])
     parts = {p.split("=")[0]: int(p.split("=")[1]) for p in causes.split(", ")}
@@ -265,6 +266,7 @@ def test_summarize_dispatch_causes_buckets_each_new_cause():
         "unassigned": 1,
         "nonspawnable": 1,
         "dispatch_lock_contended": 1,
+        "dirty_workspace": 1,
     }
 
 
