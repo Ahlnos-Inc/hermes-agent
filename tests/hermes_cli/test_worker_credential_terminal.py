@@ -192,8 +192,10 @@ def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     monkeypatch.setenv("HOME", str(poisoned_home))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
 
+    import shutil as _shutil
+    _git_dir = __import__("os").path.dirname(_shutil.which("git") or "/usr/bin/git")
     run_env = local._make_run_env({
-        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "PATH": f"{fake_bin}:{_git_dir}:/usr/bin:/bin",
         "HOME": str(poisoned_home),
     })
 

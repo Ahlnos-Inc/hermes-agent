@@ -1049,6 +1049,7 @@ class _PublicationContract:
     remote: Any
     ref: Any
     workspace_path: Any
+    publication_repo: Any = None
 
     @property
     def has_publication_fields(self) -> bool:
@@ -7124,10 +7125,10 @@ def _prepare_task_create(
                 "must be provided together"
             )
         publication_expected_sha = str(publication_expected_sha).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{7,64}", publication_expected_sha):
+        if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", publication_expected_sha):
             raise ValueError(
-                "publication_expected_sha must be a hexadecimal commit SHA "
-                "(7 to 64 characters)"
+                "publication_expected_sha must be a full hexadecimal commit SHA "
+                "(40 or 64 characters); prefix SHAs are not accepted"
             )
         publication_remote = str(publication_remote).strip()
         if (
@@ -12178,9 +12179,6 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-PUBLICATION_READBACK_TIMEOUT_SECONDS = 30
-
-
 def _read_publication_contract(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12188,7 +12186,7 @@ def _read_publication_contract(
     """Read the publication contract without opening a write transaction."""
     row = conn.execute(
         "SELECT publication_expected_sha, publication_remote, publication_ref, "
-        "workspace_path FROM tasks WHERE id = ?",
+        "publication_repo, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -12198,6 +12196,7 @@ def _read_publication_contract(
         remote=row["publication_remote"],
         ref=row["publication_ref"],
         workspace_path=row["workspace_path"],
+        publication_repo=row["publication_repo"],
     )
 
 
@@ -12210,75 +12209,33 @@ def _publication_contract_payload(
         "remote": contract.remote,
         "ref": contract.ref,
         "workspace_path": contract.workspace_path,
+        "publication_repo": contract.publication_repo,
     }
 
 
-def _read_publication_remote_ref(contract: _PublicationContract) -> dict[str, Any]:
-    """Read the recorded remote ref from the publication card's checkout.
+def _read_publication_remote_ref(
+    contract: _PublicationContract,
+    task_id: str = "",
+    run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Thin adapter to the sole canonical controller-sealed readback action."""
+    from .worker_credentials import (
+        sanitize_publication_readback,
+        trusted_publication_readback,
+    )
 
-    This is intentionally a read-only ``git ls-remote``. A push report or a
-    worker-supplied metadata flag never reaches this function; only the remote
-    object database's ref value can satisfy the completion gate.
-    """
-    expected = str(contract.expected_sha or "").strip().lower()
-    remote = str(contract.remote or "").strip()
-    ref = str(contract.ref or "").strip()
-    workspace = str(contract.workspace_path or "").strip()
-    details: dict[str, Any] = {
-        "expected_sha": expected or None,
-        "remote": remote or None,
-        "remote_ref": ref or None,
-        "workspace_path": workspace or None,
-        "observed_sha": None,
-        "verified": False,
-    }
-    if not expected or not remote or not ref:
-        details["reason"] = "publication contract is incomplete"
-        return details
-    if not workspace:
-        details["reason"] = "publication workspace is missing"
-        return details
-    workspace_path = Path(workspace).expanduser()
-    if not workspace_path.is_dir():
-        details["reason"] = "publication workspace does not exist"
-        return details
     try:
-        completed = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(workspace_path),
-                "ls-remote",
-                "--exit-code",
-                "--refs",
-                remote,
-                ref,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=PUBLICATION_READBACK_TIMEOUT_SECONDS,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        result = trusted_publication_readback(
+            contract,
+            task_id=task_id,
+            run_id=run_id,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        details["reason"] = f"git readback unavailable: {type(exc).__name__}"
-        return details
-    if completed.returncode != 0:
-        details["reason"] = "git ls-remote did not find the target ref"
-        return details
-    for line in (completed.stdout or "").splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and fields[1] == ref:
-            details["observed_sha"] = fields[0].lower()
-            break
-    if details["observed_sha"] is None:
-        details["reason"] = "git readback returned no exact target ref"
-        return details
-    details["verified"] = details["observed_sha"] == expected
-    if not details["verified"]:
-        details["reason"] = "remote ref SHA does not match expected SHA"
-    return details
+    except Exception:
+        result = {"reason": "transport"}
+    return sanitize_publication_readback(
+        result,
+        expected_sha=getattr(contract, "expected_sha", None),
+    )
 
 
 def _normalize_review_outputs(
@@ -12442,7 +12399,11 @@ def complete_task(
     # byte-identical to this snapshot before applying the status CAS.
     publication_contract = _read_publication_contract(conn, task_id)
     if publication_contract is not None and publication_contract.has_publication_fields:
-        publication_verification = _read_publication_remote_ref(publication_contract)
+        publication_verification = _read_publication_remote_ref(
+            publication_contract,
+            task_id=task_id,
+            run_id=expected_run_id,
+        )
 
     with write_txn(conn):
         quarantined = conn.execute(

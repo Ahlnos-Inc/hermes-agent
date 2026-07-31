@@ -6,18 +6,21 @@ import argparse
 import json
 import subprocess
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import worker_credentials as wc
 
 
 EXPECTED_SHA = "a" * 40
 
 
 @pytest.fixture
-def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    wc.reset_worker_credential_context_for_tests()
     home = tmp_path / ".hermes"
     home.mkdir()
     db = home / "kanban.db"
@@ -26,7 +29,8 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db(db)
-    return db
+    yield db
+    wc.reset_worker_credential_context_for_tests()
 
 
 def _create_requester(conn) -> str:
@@ -39,13 +43,80 @@ def _claim(conn, task_id: str) -> int:
     return int(claimed.current_run_id)
 
 
+def _bootstrap_publication_worker(
+    board: Path,
+    task_id: str,
+    run_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = board.parent
+    (home / wc.MANIFEST_FILENAME).write_text(
+        "version: 1\nprofiles:\n  releaser:\n    actions: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "releaser")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board))
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(home).digest)
+    runtime = wc.bootstrap_worker_credential_context()
+    assert runtime is not None and runtime.manifest_verified
+
+
+# Candidate git binaries in preference order — same fallback chain as
+# _find_git_binary() in kanban_db.py.
+_GIT_BINS = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git", "git")
+
+
+def _find_git() -> str:
+    """Return the first accessible non-stub git binary."""
+    import os as _os
+    for c in _GIT_BINS:
+        if _os.access(c, _os.X_OK):
+            return c
+    import shutil as _shutil
+    return _shutil.which("git") or "git"
+
+
+def _git_exec_path(git: str) -> str | None:
+    """Return the git exec-path via Cellar discovery (no subprocess.run)."""
+    import os as _os
+    try:
+        with _os.popen(
+            f'GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 "{git}" --version 2>/dev/null'
+        ) as p:
+            ver = p.read().split("git version ")[-1].strip()
+        for prefix in ("/opt/homebrew", "/usr/local"):
+            cellar = f"{prefix}/Cellar/git/{ver}/libexec/git-core"
+            try:
+                if "git-upload-pack" in _os.listdir(cellar):
+                    return cellar
+            except (PermissionError, FileNotFoundError):
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _git_env() -> dict:
+    """Build env for hermetic git calls: correct exec-path, no system config."""
+    import os as _os
+    git = _find_git()
+    env = {**_os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+    ep = _git_exec_path(git)
+    if ep:
+        env["GIT_EXEC_PATH"] = ep
+    return env
+
+
 def _git(*args: str, cwd: Path | None = None) -> str:
     result = subprocess.run(
-        ["git", *args],
+        [_find_git(), *args],
         cwd=cwd,
         check=True,
         capture_output=True,
         text=True,
+        env=_git_env(),
     )
     return result.stdout.strip()
 
@@ -132,7 +203,7 @@ def test_publication_handoff_creates_releaser_parent_and_parks_requester(
 
 
 def test_publication_completion_fails_closed_without_remote_readback(
-    board: Path, tmp_path: Path,
+    board: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "coder-workspace"
     remote = tmp_path / "remote.git"
@@ -166,6 +237,12 @@ def test_publication_completion_fails_closed_without_remote_readback(
         assert publisher is not None
         publisher = kb.claim_task(conn, publisher.id, claimer="releaser-worker")
         assert publisher is not None and publisher.current_run_id is not None
+        _bootstrap_publication_worker(
+            board,
+            publisher.id,
+            int(publisher.current_run_id),
+            monkeypatch,
+        )
 
         assert not kb.complete_task(
             conn,
@@ -210,7 +287,7 @@ def test_publication_completion_fails_closed_without_remote_readback(
 
 
 def test_publication_completion_succeeds_after_remote_ref_readback(
-    board: Path, tmp_path: Path,
+    board: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "coder-workspace"
     remote = tmp_path / "remote.git"
@@ -243,6 +320,12 @@ def test_publication_completion_succeeds_after_remote_ref_readback(
             conn, handoff.publication_task_id, claimer="releaser-worker",
         )
         assert publisher is not None and publisher.current_run_id is not None
+        _bootstrap_publication_worker(
+            board,
+            handoff.publication_task_id,
+            int(publisher.current_run_id),
+            monkeypatch,
+        )
         waiting = kb.get_task(conn, requester)
         assert waiting is not None and waiting.status == "todo"
         _git("push", "origin", "HEAD:refs/heads/main", cwd=workspace)
@@ -307,20 +390,15 @@ def test_publication_completion_readback_does_not_hold_write_lock(
 
         writer_thread = threading.Thread(target=writer, daemon=True)
 
-        def fake_run(command, *args, **kwargs):
+        def fake_readback(contract, **kwargs):
             assert not conn.in_transaction, "readback unexpectedly owns a DB transaction"
             writer_thread.start()
             assert writer_finished.wait(timeout=3), (
                 "second connection could not write during remote readback"
             )
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout=f"{EXPECTED_SHA} refs/heads/main\n",
-                stderr="",
-            )
+            return {"verified": True, "observed_sha": EXPECTED_SHA, "reason": None}
 
-        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+        monkeypatch.setattr(wc, "trusted_publication_readback", fake_readback)
         try:
             assert kb.complete_task(
                 conn,
@@ -379,10 +457,12 @@ def test_publication_completion_rejects_contract_changed_after_readback(
 
         mutation_thread = threading.Thread(target=mutate_contract, daemon=True)
         mutation_thread.start()
-        original_readback = kb._read_publication_remote_ref
-
-        def readback_then_wait(contract):
-            verification = original_readback(contract)
+        def readback_then_wait(contract, **kwargs):
+            verification = {
+                "verified": True,
+                "observed_sha": EXPECTED_SHA,
+                "reason": None,
+            }
             # The underlying git readback has returned. Let a second writer
             # mutate the contract before this function hands verification back
             # to complete_task, which is the stale-read window under test.
@@ -390,15 +470,6 @@ def test_publication_completion_rejects_contract_changed_after_readback(
             assert mutation_finished.wait(timeout=3)
             return verification
 
-        def fake_run(command, *args, **kwargs):
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout=f"{EXPECTED_SHA} refs/heads/main\n",
-                stderr="",
-            )
-
-        monkeypatch.setattr(kb.subprocess, "run", fake_run)
         monkeypatch.setattr(kb, "_read_publication_remote_ref", readback_then_wait)
         try:
             assert not kb.complete_task(
@@ -472,22 +543,19 @@ def test_publication_readback_failure_is_lock_free_and_leaves_board_open(
 
         writer_thread = threading.Thread(target=writer, daemon=True)
 
-        def fake_run(command, *args, **kwargs):
+        def fake_readback(contract, **kwargs):
             assert not conn.in_transaction, "readback unexpectedly owns a DB transaction"
             writer_thread.start()
             assert writer_finished.wait(timeout=3), (
                 "second connection could not write during failed readback"
             )
-            if failure_mode == "timeout":
-                raise subprocess.TimeoutExpired(command, timeout=30)
-            return subprocess.CompletedProcess(
-                command,
-                128,
-                stdout="",
-                stderr="fatal: unable to access remote",
-            )
+            return {
+                "verified": False,
+                "observed_sha": None,
+                "reason": "timeout" if failure_mode == "timeout" else "transport",
+            }
 
-        monkeypatch.setattr(kb.subprocess, "run", fake_run)
+        monkeypatch.setattr(wc, "trusted_publication_readback", fake_readback)
         before = kb.get_task(conn, publication_id)
         assert before is not None
         try:
@@ -525,9 +593,61 @@ def test_publication_readback_failure_is_lock_free_and_leaves_board_open(
         payload = json.loads(blocked["payload"])
         assert payload["reason"] == "publication_ref_not_verified"
         if failure_mode == "timeout":
-            assert payload["readback_reason"] == (
-                "git readback unavailable: TimeoutExpired"
-            )
+            assert payload["readback_reason"] == "timeout"
+
+
+def test_publication_failure_event_never_persists_untrusted_readback_details(
+    board: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "coder-workspace"
+    workspace.mkdir()
+    sentinel = "sentinel-publication-secret"
+
+    with kb.connect_closing(board) as conn:
+        _requester, publication_id, run_id = _prepare_claimed_publication(
+            conn,
+            workspace,
+            request_key="publish-secret-safe-event",
+        )
+        monkeypatch.setattr(
+            wc,
+            "trusted_publication_readback",
+            lambda *_args, **_kwargs: {
+                "verified": False,
+                "observed_sha": sentinel,
+                "reason": f"remote exception: {sentinel}",
+                "stderr": sentinel,
+                "remote_url": f"https://{sentinel}@example.invalid/repo.git",
+            },
+        )
+
+        assert not kb.complete_task(
+            conn,
+            publication_id,
+            result="must remain blocked",
+            expected_run_id=run_id,
+        )
+        blocked = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completion_blocked' ORDER BY id DESC LIMIT 1",
+            (publication_id,),
+        ).fetchone()
+        assert blocked is not None
+        payload_text = blocked["payload"]
+        assert sentinel not in payload_text
+        payload = json.loads(payload_text)
+        assert payload["readback_reason"] == "transport"
+        assert set(payload) == {
+            "verified",
+            "observed_sha",
+            "reason",
+            "readback_reason",
+            "expected_sha",
+            "remote",
+            "remote_ref",
+        }
 
 
 def test_publication_handoff_adopts_existing_publication_card(board: Path, tmp_path: Path) -> None:

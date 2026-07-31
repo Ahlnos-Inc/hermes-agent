@@ -124,6 +124,7 @@ def test_trusted_worker_identity_cannot_be_switched_by_environment_mutation(
     monkeypatch.setenv("HERMES_PROFILE", "releaser")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_receipt_owner")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    (tmp_path / "owner.db").touch()
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "owner.db"))
     monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, manifest.digest)
 
@@ -986,12 +987,15 @@ def test_a_grant_the_code_registry_does_not_define_is_rejected_at_load(tmp_path)
 def _git_repo(root: Path, remote_url: str | None, *, remote: str = "origin") -> Path:
     import subprocess
 
+    _git_env = {**__import__("os").environ, "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0"}
     root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, env=_git_env)
     if remote_url is not None:
         subprocess.run(
             ["git", "-C", str(root), "remote", "add", remote, remote_url],
             check=True,
+            env=_git_env,
         )
     return root
 
@@ -1190,6 +1194,8 @@ def test_owner_comes_from_the_push_url_not_the_fetch_url(tmp_path):
     """
     import subprocess
 
+    _git_env = {**__import__("os").environ, "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0"}
     repo = _git_repo(tmp_path / "split", "https://github.com/nlachica/hermes-config.git")
     subprocess.run(
         [
@@ -1197,6 +1203,7 @@ def test_owner_comes_from_the_push_url_not_the_fetch_url(tmp_path):
             "https://github.com/Ahlnos-Inc/aldnoah.git",
         ],
         check=True,
+        env=_git_env,
     )
 
     assert wc.github_owner_for_workspace(repo) == "Ahlnos-Inc"
