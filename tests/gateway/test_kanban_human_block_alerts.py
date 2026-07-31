@@ -376,3 +376,60 @@ def test_reblock_after_resolution_waits_for_new_alert(tmp_path):
     out2 = _collect_block_resolutions(kb, conn)
     assert len(out2) == 1
     assert out2[0]["block_delivery_key"] == second["delivery_key"]
+
+
+# ---------------------------------------------------------------------------
+# BUILD-889: when the human-block sweep owns an event, the orphan home sweep
+# must not double-deliver it as an "Unrouted workflow failure".
+
+
+def test_orphan_sweep_excludes_human_block_eligible_events_when_flagged(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
+    kb._append_event(
+        conn, task_id, "blocked",
+        {"reason": "needs approval", "kind": "needs_input"},
+    )
+    # Without the flag (no human-block target configured): home sweep keeps it.
+    assert [o["task_id"] for o in _collect_unsubscribed_failure_events(kb, conn)] == [task_id]
+    # With the flag: the human-block sweep owns this event.
+    assert _collect_unsubscribed_failure_events(
+        kb, conn, exclude_human_block_eligible=True,
+    ) == []
+
+
+def test_orphan_sweep_keeps_auto_resolving_blocks_even_when_flagged(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='transient' WHERE id=?",
+            (task_id,),
+        )
+    kb._append_event(conn, task_id, "blocked", {"reason": "flaky", "kind": "transient"})
+    out = _collect_unsubscribed_failure_events(
+        kb, conn, exclude_human_block_eligible=True,
+    )
+    # The human sweep skips auto-resolving kinds, so home must keep them.
+    assert [o["task_id"] for o in out] == [task_id]
+
+
+def test_orphan_sweep_keeps_non_human_failure_kinds_when_flagged(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    kb._append_event(conn, task_id, "crashed", {"error": "boom", "exit_kind": "signaled"})
+    out = _collect_unsubscribed_failure_events(
+        kb, conn, exclude_human_block_eligible=True,
+    )
+    assert [o["event"].kind for o in out] == ["crashed"]
+
+
+def test_orphan_sweep_excludes_gave_up_on_human_gated_task_when_flagged(tmp_path):
+    conn = _board(tmp_path)
+    task_id = _mktask(conn)
+    _set_blocked(conn, task_id)
+    kb._append_event(conn, task_id, "gave_up", {"error": "pid gone", "failures": 2})
+    assert _collect_unsubscribed_failure_events(
+        kb, conn, exclude_human_block_eligible=True,
+    ) == []
