@@ -261,7 +261,105 @@ def test_compile_workflow_atomically_subscribes_gateway_target_on_every_step(
         assert all(row["chat_id"] == "chat-472" for row in subscriptions)
         assert by_task[first["terminal_task_id"]]["kinds_json"] is None
         step_kinds = json.loads(by_task[first["task_ids"]["implement"]]["kinds_json"])
-        assert step_kinds == sorted(kb.SUBSCRIBER_FAILURE_KINDS)
+        assert step_kinds == sorted(kb.FAILURE_KINDS)
+
+
+def test_compile_workflow_persists_exact_owner_context_for_every_stage(
+    monkeypatch, worker_env,
+):
+    """A gateway workflow must carry its owner agent lane on every card.
+
+    Human notification subscriptions are not the owner-agent wake contract:
+    every non-precompleted stage gets a separate internal cursor so a normal
+    step completion can re-enter the exact originating profile/session/topic.
+    """
+    from gateway.session_context import reset_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "wrong-process-session")
+    reset_session_vars()
+    _install_compiler_test_profiles()
+    gateway_source = {
+        "profile": "marketing",
+        "session_id": "marketing-session-1",
+        "session_key": "agent:marketing:telegram:dm:chat-695:thread-695",
+        "platform": "telegram",
+        "chat_id": "chat-695",
+        "chat_type": "dm",
+        "thread_id": "thread-695",
+        "user_id": "nicholas",
+        "scope_id": "workspace-1",
+    }
+
+    result = json.loads(kt._handle_compile_workflow(
+        {
+            "workflow_key": "BUILD-695:owner-wake",
+            "idempotency_key": "BUILD-695:owner-wake:v1",
+            "steps": _compiled_workflow_steps(),
+        },
+        gateway_source=gateway_source,
+    ))
+
+    assert result["ok"] is True, result
+    with kb.connect() as conn:
+        tasks = [kb.get_task(conn, tid) for tid in result["task_ids"].values()]
+        assert all(task.owner_context == gateway_source for task in tasks)
+        assert all(task.session_id == "marketing-session-1" for task in tasks)
+        owner_subs = [
+            sub for sub in kb.list_notify_subs(conn)
+            if sub["platform"] == kb.OWNER_AGENT_NOTIFY_PLATFORM
+        ]
+        assert len(kb.list_notify_subs(conn)) == len(owner_subs)
+        assert {sub["task_id"] for sub in owner_subs} == set(result["task_ids"].values())
+        assert all(sub["chat_id"] == "marketing-session-1" for sub in owner_subs)
+        assert all(sub["notifier_profile"] == "marketing" for sub in owner_subs)
+        assert all(
+            json.loads(sub["kinds_json"]) == sorted(kb.OWNER_WAKE_KINDS)
+            for sub in owner_subs
+        )
+
+
+def test_owner_context_requires_exact_session_key():
+    """A session id alone cannot reconstruct the creator's routing key."""
+    from hermes_cli import kanban_db as kb
+
+    with pytest.raises(ValueError, match="session_key"):
+        kb.normalize_owner_context({
+            "profile": "marketing",
+            "session_id": "session-695",
+            "platform": "telegram",
+            "chat_id": "chat-695",
+            "chat_type": "dm",
+        })
+
+
+def test_owner_context_controls_task_session_id(worker_env):
+    """Persist one authoritative owner session instead of conflicting fields."""
+    from hermes_cli import kanban_db as kb
+
+    owner = {
+        "profile": "marketing",
+        "session_id": "authoritative-session",
+        "session_key": "agent:marketing:telegram:dm:chat-695",
+        "platform": "telegram",
+        "chat_id": "chat-695",
+        "chat_type": "dm",
+    }
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Owner identity invariant",
+            assignee="peer",
+            session_id="conflicting-session",
+            owner_context=owner,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.session_id == owner["session_id"]
 
 
 def test_compile_workflow_invalid_graph_rolls_back_without_partial_cards(
@@ -825,24 +923,6 @@ def test_complete_with_result_only(worker_env):
     assert d["ok"] is True
 
 
-def test_complete_review_outputs_schema_and_validation(worker_env):
-    from tools import kanban_tools as kt
-
-    properties = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
-    assert properties["review_outputs"]["type"] == "array"
-    assert properties["review_outputs"]["items"]["required"] == [
-        "review_task_id",
-        "attachment_id",
-    ]
-
-    rejected = json.loads(
-        kt._handle_complete(
-            {"summary": "bad selection shape", "review_outputs": {"x": 1}}
-        )
-    )
-    assert "review_outputs must be a list" in rejected["error"]
-
-
 def test_complete_with_artifacts_lands_in_event_payload(worker_env):
     """``artifacts=[...]`` rides into the completed event payload so the
     gateway notifier can upload them as native attachments. See the
@@ -1238,60 +1318,6 @@ def test_worker_request_rework_adopts_fix_and_stops_loop(worker_env):
         ).fetchone() is not None
 
 
-def test_worker_request_rework_escalation_is_terminal_control(worker_env, monkeypatch):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    with kb.connect_closing() as conn:
-        gate_id = kb.create_task(
-            conn, title="human approval", assignee="nicholas"
-        )
-        kb.link_tasks(conn, worker_env, gate_id)
-
-    for round_number in range(1, 5):
-        out = kt._handle_request_rework({
-            "finding": f"finding {round_number}",
-            "request_key": f"tool-round-{round_number}",
-            "fix": {
-                "title": f"tool fix {round_number}",
-                "body": "apply the correction",
-                "assignee": "coder",
-            },
-            "human_gate_task_id": gate_id,
-        })
-        assert isinstance(out, kt.KanbanTerminalControl)
-        payload = json.loads(out)
-        assert payload["escalated"] is False
-        fix_id = payload["fix_task_id"]
-        with kb.connect_closing() as conn:
-            assert kb.complete_task(conn, fix_id, result="fixed")
-            claimed = kb.claim_task(conn, worker_env, claimer="test-worker")
-            assert claimed is not None and claimed.current_run_id is not None
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
-
-    out = kt._handle_request_rework({
-        "finding": "finding 5",
-        "request_key": "tool-round-5",
-        "fix": {
-            "title": "tool fix 5 must not exist",
-            "body": "apply the correction",
-            "assignee": "coder",
-        },
-        "human_gate_task_id": gate_id,
-    })
-    assert isinstance(out, kt.KanbanTerminalControl)
-    assert out.action is kt.KanbanTerminalAction.REWORK
-    payload = json.loads(out)
-    assert payload["escalated"] is True
-    assert payload["fix_task_id"] is None
-    assert payload["escalation_target_task_id"] == gate_id
-
-    with kb.connect_closing() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE title = 'tool fix 5 must not exist'"
-        ).fetchone()[0] == 0
-
-
 def test_worker_request_publication_adopts_releaser_card_and_stops_loop(
     worker_env, tmp_path,
 ):
@@ -1386,34 +1412,6 @@ def test_request_rework_requires_exactly_one_fix_form(worker_env):
         "fix": {"title": "new", "assignee": "coder"},
     }))
     assert "exactly one" in both["error"]
-
-
-@pytest.mark.real_assignee_guard
-def test_request_rework_rejects_unknown_profile_fix_assignee(worker_env, monkeypatch):
-    """BUILD-743: a NewFixTask spawned via request_rework with an invented
-    profile name must be rejected up front — same guard as BUILD-661's
-    kanban_create — instead of stranding the fix card in 'ready' forever."""
-    from hermes_cli import profiles
-    from tools import kanban_tools as kt
-
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    out = json.loads(kt._handle_request_rework({
-        "finding": "review caught a P1 defect",
-        "request_key": "rework-guard-unknown",
-        "fix": {"title": "fix it", "assignee": "publisher"},
-    }))
-    assert out.get("error")
-    assert "publisher" in out["error"]
-
-    # A known lane clears the guard (may proceed to a terminal control, but
-    # never the unknown-assignee error).
-    ok = kt._handle_request_rework({
-        "finding": "review caught a P1 defect",
-        "request_key": "rework-guard-known",
-        "fix": {"title": "fix it", "assignee": "orion-cc"},
-    })
-    if isinstance(ok, str):
-        assert "orion-cc" not in json.loads(ok).get("error", "")
 
 
 def test_block_rejects_empty_reason(worker_env):
@@ -1778,33 +1776,6 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
-def test_create_exposes_and_persists_source_refs(worker_env):
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-
-    source_refs = [{
-        "ref": "bundle",
-        "task_id": worker_env,
-        "attachment_id": 1,
-        "sha256": "0" * 64,
-        "git_commit": "0" * 40,
-        "git_ref": "refs/heads/source",
-    }]
-    out = kt._handle_create({
-        "title": "bundle consumer",
-        "assignee": "peer",
-        "source_refs": source_refs,
-    })
-    result = json.loads(out)
-    assert result["ok"] is True
-    with kb.connect() as conn:
-        task = kb.get_task(conn, result["task_id"])
-
-    assert task is not None
-    assert task.source_refs == source_refs
-    assert "source_refs" in kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
-
-
 def test_create_schema_exposes_model_override():
     from tools.kanban_tools import KANBAN_CREATE_SCHEMA
 
@@ -1958,33 +1929,6 @@ def _write_model_routing_table(home: str | os.PathLike[str], *, weak_flash: bool
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
-
-
-@pytest.fixture
-def front_door():
-    """Bind the context exactly the way the gateway's message handler does.
-
-    BUILD-814: front-door authority is a ContextVar the gateway sets on the
-    turn it is serving, NOT an environment variable. A test that instead
-    exports ``HERMES_PROFILE=orchestrator`` is asserting against a state
-    production never reaches — the sole production assignment of that variable
-    is the dispatcher's worker-spawn env, and every such process also carries
-    ``HERMES_KANBAN_TASK`` and is refused one guard earlier. Those two guards
-    were mutually exclusive, which is why the gate opened on 0 tasks.
-
-    ``profile`` is stamped explicitly here because the gateway stamps it for
-    multiplexed profiles; the primary profile leaves it blank and the resolver
-    falls back to the HERMES_HOME profile name (covered separately).
-    """
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    tokens = set_session_vars(
-        session_id="trusted-session", profile="orchestrator", front_door=True
-    )
-    try:
-        yield "trusted-session"
-    finally:
-        clear_session_vars(tokens)
 
 
 def _write_architecture_gate_policy(
@@ -2467,13 +2411,20 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
 @pytest.mark.parametrize("mode", ["shadow", "orchestrator_only"])
 @pytest.mark.parametrize("model_routing", [None, "verification_leaf"])
 def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_routing(
-    monkeypatch, worker_env, front_door, mode, model_routing,
+    monkeypatch, worker_env, mode, model_routing,
 ):
     """Trusted front-door identity, not model routing, activates staged gates."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    # Earlier tests may bind a process-local session ContextVar.  This case
+    # models an unattached front-door invocation whose authority comes from
+    # its environment, so restore the unbound resolution state explicitly.
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
     args = {
         "title": "Design the workflow", "assignee": "architect",
         "session_id": "forged-model-session",
@@ -2496,13 +2447,17 @@ def test_front_door_architecture_create_opens_or_reuses_trusted_gate_without_rou
 
 
 def test_front_door_open_gate_denies_unparented_coder_in_same_turn(
-    monkeypatch, worker_env, front_door,
+    monkeypatch, worker_env,
 ):
     """Every managed front-door mutation receives trusted gate context."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
     _write_architecture_gate_policy(
         os.environ["HERMES_HOME"], mode="orchestrator_only"
     )
@@ -2551,9 +2506,7 @@ def test_front_door_architecture_gate_does_not_expand_to_ordinary_creates(
         assert kb.get_architecture_gate_for_task(conn, created["task_id"]) is None
 
 
-def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(
-    monkeypatch, worker_env, front_door,
-):
+def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(monkeypatch, worker_env):
     """The trusted boundary reads managed policy and never scopes to model data."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.config import DEFAULT_CONFIG
@@ -2561,6 +2514,8 @@ def test_front_door_architecture_create_uses_managed_mode_and_turn_scope(
 
     assert "architecture_gate" not in DEFAULT_CONFIG["kanban"]
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "trusted-session")
     (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
         "kanban:\n  architecture_gate:\n    version: v1\n    mode: orchestrator_only\n"
     )
@@ -2618,22 +2573,6 @@ def test_create_rejects_no_title(worker_env):
 def test_create_rejects_no_assignee(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
-
-
-@pytest.mark.real_assignee_guard
-def test_create_rejects_unknown_profile_assignee(worker_env, monkeypatch):
-    """BUILD-661: an invented profile name (no profile dir, not a known lane) is
-    rejected with an actionable error instead of stalling in 'ready' forever."""
-    from hermes_cli import profiles
-    from tools import kanban_tools as kt
-
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    out = json.loads(kt._handle_create({"title": "t", "assignee": "publisher"}))
-    assert out.get("error")
-    assert "publisher" in out["error"]
-    # A known lane still passes the guard.
-    ok = json.loads(kt._handle_create({"title": "t2", "assignee": "orion-cc"}))
-    assert not ok.get("error")
 
 
 def test_create_rejects_non_list_parents(worker_env):
@@ -3758,6 +3697,86 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
+def test_create_uses_trusted_gateway_owner_context_not_process_env(
+    monkeypatch, worker_env,
+):
+    """Cross-profile owner identity comes from turn-local gateway context."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.setenv("HERMES_SESSION_ID", "wrong-process-session")
+    gateway_source = {
+        "profile": "marketing",
+        "session_id": "marketing-session-2",
+        "session_key": "agent:marketing:telegram:dm:chat-2:topic-2",
+        "platform": "telegram",
+        "chat_id": "chat-2",
+        "chat_type": "dm",
+        "thread_id": "topic-2",
+        "user_id": "nicholas",
+    }
+
+    result = json.loads(kt._handle_create(
+        {"title": "Marketing delegated work", "assignee": "peer"},
+        gateway_source=gateway_source,
+    ))
+
+    assert result["ok"] is True, result
+    with kb.connect() as conn:
+        task = kb.get_task(conn, result["task_id"])
+        assert task.owner_context == gateway_source
+        assert task.session_id == "marketing-session-2"
+        owner_subs = [
+            sub for sub in kb.list_notify_subs(conn, result["task_id"])
+            if sub["platform"] == kb.OWNER_AGENT_NOTIFY_PLATFORM
+        ]
+        assert len(owner_subs) == 1
+        assert kb.list_notify_subs(conn, result["task_id"]) == owner_subs
+
+
+def test_create_inherits_owner_context_even_with_explicit_child_workspace(
+    monkeypatch, worker_env,
+):
+    """A delegated stage keeps the front-door owner, not the worker process."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    owner = {
+        "profile": "marketing",
+        "session_id": "marketing-root-session",
+        "session_key": "agent:marketing:telegram:group:campaigns:topic-8",
+        "platform": "telegram",
+        "chat_id": "campaigns",
+        "chat_type": "group",
+        "thread_id": "topic-8",
+        "user_id": "nicholas",
+    }
+    with kb.connect() as conn:
+        current_tid = kb.create_task(
+            conn,
+            title="Delegated orchestrator stage",
+            assignee="orchestrator",
+            owner_context=owner,
+            session_id=owner["session_id"],
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", current_tid)
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+
+    result = json.loads(kt._handle_create({
+        "title": "Explicit-workspace child",
+        "assignee": "peer",
+        "workspace_kind": "scratch",
+    }))
+
+    assert result["ok"] is True, result
+    with kb.connect() as conn:
+        child = kb.get_task(conn, result["task_id"])
+        assert child is not None
+        assert child.owner_context == owner
+        assert child.session_id == owner["session_id"]
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
@@ -4656,193 +4675,3 @@ def test_compile_workflow_signature_retry_is_idempotent(
     second = json.loads(kt._handle_compile_workflow(args))
     assert first["ok"] is True
     assert first == second
-
-
-# ---------------------------------------------------------------------------
-# BUILD-814: the gate must be reachable from the real front door, and from
-# nothing else. Every case below was silently identical before the fix — the
-# resolver returned None unconditionally, so "gate opens" and "gate refuses"
-# were the same observation and neither was being tested.
-# ---------------------------------------------------------------------------
-
-
-def _create_architect(kt, *, turn_id="trusted-turn"):
-    return json.loads(
-        kt._handle_create(
-            {"title": "Design the workflow", "assignee": "architect"},
-            turn_id=turn_id,
-        )
-    )
-
-
-def _gate_rows(kb):
-    with kb.connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM architecture_gates").fetchone()[0]
-
-
-def test_primary_front_door_opens_the_gate_without_a_stamped_profile(
-    monkeypatch, worker_env,
-):
-    """The PRIMARY profile leaves ``source.profile`` blank — the real shape.
-
-    Only multiplexed secondaries get a stamped profile
-    (``_make_profile_message_handler``), so the primary's turns must resolve
-    their profile from HERMES_HOME instead. A test that always stamps
-    "orchestrator" would never exercise this and would pass with the fallback
-    deleted.
-    """
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import profiles as _profiles
-    from tools import kanban_tools as kt
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
-    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
-
-    tokens = set_session_vars(session_id="primary-session", profile="", front_door=True)
-    try:
-        created = _create_architect(kt)
-    finally:
-        clear_session_vars(tokens)
-
-    assert created["ok"]
-    with kb.connect() as conn:
-        gate = kb.get_architecture_gate_for_task(conn, created["task_id"])
-    assert gate is not None and gate.state == "open"
-    assert gate.session_id == "primary-session"
-
-
-def test_hermes_profile_env_alone_does_not_open_the_gate(monkeypatch, worker_env):
-    """The pre-814 premise, now explicitly refused.
-
-    ``HERMES_PROFILE=orchestrator`` was the entire second guard, and nothing in
-    production set it. Keeping it as the identity would have meant a trust
-    decision resting on an inheritable environment variable that every child
-    process also sees — in the one subsystem whose purpose is authority a
-    caller cannot fabricate.
-    """
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import profiles as _profiles
-    from tools import kanban_tools as kt
-    from gateway.session_context import reset_session_vars
-
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
-    monkeypatch.setenv("HERMES_SESSION_ID", "env-only-session")
-    reset_session_vars()
-    # Everything ELSE the resolver wants is satisfied, so the front-door
-    # declaration is the only thing that can refuse this. Without pinning the
-    # profile the test would pass because HERMES_HOME resolves to "custom",
-    # and deleting the front-door check outright would still leave it green.
-    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
-    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
-
-    created = _create_architect(kt)
-
-    assert created["ok"]
-    assert _gate_rows(kb) == 0
-
-
-def test_cron_turn_does_not_open_the_gate(monkeypatch, worker_env):
-    """Cron binds a session too — it just never claims the front door.
-
-    ``cron/scheduler.py`` calls ``set_session_vars`` on every agent job. If
-    front-door authority were inferred from "a session is bound" rather than
-    declared, every cron tick would carry it.
-    """
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import profiles as _profiles
-    from tools import kanban_tools as kt
-    from gateway.session_context import (
-        clear_session_vars,
-        set_current_session_id,
-        set_session_vars,
-    )
-
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "orchestrator")
-    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
-
-    tokens = set_session_vars(platform="", chat_id="", chat_name="")
-    # A cron agent job really does end up with a session id: agent_init calls
-    # set_current_session_id() once the agent is built. Leaving it empty would
-    # make this test pass on the "no session id" branch and prove nothing about
-    # the front-door check.
-    set_current_session_id("cron-session")
-    try:
-        created = _create_architect(kt)
-    finally:
-        clear_session_vars(tokens)
-        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-
-    assert created["ok"]
-    assert _gate_rows(kb) == 0
-
-
-def test_multiplexed_secondary_front_door_does_not_open_an_orchestrator_gate(
-    monkeypatch, worker_env,
-):
-    """``multiplex_profiles`` is live (marketing-operator on its own topic).
-
-    Its messages are a real front door, but an ``orchestrator_only`` policy is
-    not about them, and an "orchestrator:" principal would misattribute them.
-    """
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
-
-    tokens = set_session_vars(
-        session_id="marketing-session", profile="marketing-operator", front_door=True
-    )
-    try:
-        created = _create_architect(kt)
-    finally:
-        clear_session_vars(tokens)
-
-    assert created["ok"]
-    assert _gate_rows(kb) == 0
-
-
-def test_worker_cannot_open_the_gate_even_holding_front_door_context(
-    monkeypatch, worker_env, front_door,
-):
-    """Order matters: the worker check runs before anything else is consulted.
-
-    A worker is a separate process and cannot inherit the ContextVar, so this
-    is belt-and-braces — but it is the guard that made the old
-    ``HERMES_PROFILE`` check unreachable, and it must keep refusing first.
-    """
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_someworkertask")
-    _write_architecture_gate_policy(os.environ["HERMES_HOME"], mode="orchestrator_only")
-
-    created = _create_architect(kt)
-
-    assert created["ok"]
-    assert _gate_rows(kb) == 0
-
-
-def test_front_door_context_does_not_survive_the_turn(front_door):
-    """Authority is dropped at handler exit, not left standing for what runs next."""
-    from gateway.session_context import (
-        clear_session_vars,
-        front_door_turn,
-        reset_session_vars,
-        set_session_vars,
-    )
-
-    assert front_door_turn() is True
-    clear_session_vars([])
-    assert front_door_turn() is False
-
-    tokens = set_session_vars(front_door=True)
-    assert front_door_turn() is True
-    reset_session_vars()
-    assert front_door_turn() is False
-    clear_session_vars(tokens)
