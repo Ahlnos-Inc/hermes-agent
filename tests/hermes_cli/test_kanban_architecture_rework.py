@@ -422,6 +422,20 @@ def test_changed_workspace_fails_closed(kanban_home):
         )
 
 
+def test_changed_workspace_kind_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        _, coder, reviewer, _ = _issued_loop(conn)
+        _complete_coder(conn, coder)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'tampered-kind' WHERE id = ?",
+            (coder,),
+        )
+        conn.commit()
+        _assert_denied(
+            conn, reviewer, coder, "rework-1", "architecture_rework_workspace_changed"
+        )
+
+
 def test_role_mismatch_fails_closed(kanban_home):
     with kb.connect() as conn:
         _, coder, reviewer, _ = _issued_loop(conn)
