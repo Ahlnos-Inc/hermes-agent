@@ -14119,6 +14119,11 @@ class DispatchResult:
     returned early here with no telemetry at all — a board sitting at its
     concurrency cap looked identical to a broken dispatcher in the "stuck"
     diagnostics. Zero when ``max_in_progress`` is unset or headroom exists."""
+    publication_skipped: list[str] = field(default_factory=list)
+    """Publication task ids skipped this tick because their remote readback
+    has not yet verified (BUILD-687). These tasks remain in ``ready`` and
+    will be retried on the next tick once the releaser has pushed the
+    commit and the remote ref matches ``publication_expected_sha``."""
 
 
 # Respawn-guard reasons that mean "a provider quota/auth wall, not a real
@@ -18640,6 +18645,40 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # BUILD-687: Dispatcher-level readback verification for publication tasks.
+    # Before spawning any ready task, check whether it carries a publication
+    # contract and, if so, verify that the remote ref has been observed at the
+    # expected SHA.  This prevents the dispatcher from spawning a releaser
+    # worker on a publication card whose remote ref has not yet been pushed
+    # — the releaser would immediately fail, get reaped, and the task would
+    # loop back to ``ready`` on the next tick.  Instead, we skip it cleanly
+    # and let the next tick retry once the push has landed.
+    #
+    # This is a pre-check only; the real gate lives in ``complete_task``.
+    # The dispatcher-level check is a performance / telemetry optimization:
+    # it avoids spawning useless releaser workers and surfaces the skip in
+    # the dispatch result so operators can see "publication not yet verified"
+    # rather than "dispatcher stuck".
+    _publication_skipped: list[str] = []
+    for _pub_row in conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "  AND publication_expected_sha IS NOT NULL "
+        "ORDER BY priority DESC, created_at ASC",
+    ):
+        _pub_id = _pub_row["id"]
+        _pub_contract = _read_publication_contract(conn, _pub_id)
+        if _pub_contract is None or not _pub_contract.has_publication_fields:
+            continue
+        _pub_readback = _read_publication_remote_ref(_pub_contract)
+        if not _pub_readback.get("verified"):
+            _publication_skipped.append(_pub_id)
+            _log.debug(
+                "kanban dispatch: skipping publication task %s "
+                "(readback not verified: %s)",
+                _pub_id,
+                _pub_readback.get("reason", "unknown"),
+            )
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
