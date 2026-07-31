@@ -3977,7 +3977,14 @@ KANBAN_BLOCK_SCHEMA = {
                     "{\"changed_files\": [...], \"tests_run\": 12, "
                     "\"failure_code\": \"iteration_budget_exhausted\", "
                     "…}. Persisted on the run row and shown in retry "
-                    "context."
+                    "context. For needs_input blocks, three keys also "
+                    "ride the human alert so the operator can act "
+                    "without a terminal: \"ask\" (one sentence: the "
+                    "exact decision or action needed), \"links\" "
+                    "(http(s) URLs to the content/ticket under review), "
+                    "\"artifacts\" (absolute local file paths uploaded "
+                    "into the alert for in-chat preview). Always pass "
+                    "them when blocking on a human."
                 ),
             },
             "board": _board_schema_prop(),

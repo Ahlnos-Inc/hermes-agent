@@ -1588,6 +1588,44 @@ class GatewayKanbanWatchersMixin:
                             ] = sent_msg_id
                             if len(alert_msg_ids) > 500:
                                 alert_msg_ids.pop(next(iter(alert_msg_ids)))
+                        # Artifacts upload BEFORE the ledger write (same
+                        # order as the completed-event path): a crash after
+                        # the ledger row would drop the media forever since
+                        # the event is never re-collected. The reverse
+                        # window merely re-pages, which is the established
+                        # at-least-once failure mode. An upload FAILURE
+                        # still records delivery — a flaky media send must
+                        # not re-page the operator every tick.
+                        hb_payload = getattr(item["event"], "payload", None)
+                        if (
+                            isinstance(hb_payload, dict)
+                            and hb_payload.get("artifacts")
+                        ):
+                            from gateway.config import Platform as _Platform
+                            hb_adapter = self.adapters.get(_Platform.TELEGRAM)
+                            if hb_adapter is not None:
+                                hb_metadata: dict[str, Any] = {}
+                                if human_block_target["thread_id"]:
+                                    hb_metadata["thread_id"] = (
+                                        human_block_target["thread_id"]
+                                    )
+                                try:
+                                    # task=None: a blocked task's ``result``
+                                    # is from a PRIOR run — scanning it would
+                                    # resend stale files.
+                                    await self._deliver_kanban_artifacts(
+                                        adapter=hb_adapter,
+                                        chat_id=human_block_target["chat_id"],
+                                        metadata=hb_metadata,
+                                        event_payload=hb_payload,
+                                        task=None,
+                                    )
+                                except Exception as art_exc:
+                                    logger.debug(
+                                        "kanban notifier: human-block artifact "
+                                        "delivery for %s failed: %s",
+                                        item["task_id"], art_exc,
+                                    )
                         await asyncio.to_thread(
                             self._kanban_record_human_block_delivery,
                             item, human_block_target,

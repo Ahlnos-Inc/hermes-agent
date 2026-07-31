@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+
+_URL_RE = re.compile(r"https?://[^\s>\])]+")
 
 
 def _redact(text: Any) -> str:
@@ -69,6 +72,47 @@ def _gave_up_evidence(payload: dict) -> str:
     return f" [{', '.join(facts)}]" if facts else ""
 
 
+def _block_context_lines(task: Any, payload: dict, message_so_far: str) -> list[str]:
+    """Actionable context for a block alert: the ask, content links, Jira
+    key, and workspace — everything the operator needs to unblock without
+    opening a terminal (see ``_block_context_from_metadata`` on the write
+    side). Bare Jira keys are enough: the Telegram adapter linkifies them.
+    """
+    lines: list[str] = []
+    ask = _redact(payload.get("ask") or "").strip()
+    if ask:
+        lines.append(f"❓ {ask}")
+    links = payload.get("links")
+    if isinstance(links, (list, tuple)) and links:
+        # Same force-redact boundary as reason/ask: masks vendor-prefix
+        # credentials embedded in a worker-supplied URL. Generic query
+        # params intentionally pass through (redact_sensitive_text's
+        # web-URL policy) — a link here may be a pre-signed/magic URL the
+        # operator must be able to click.
+        links = [_redact(link) for link in links if isinstance(link, str)]
+    else:
+        # Legacy blocks: surface any URL the worker embedded in the reason.
+        links = _URL_RE.findall(_redact(str(payload.get("reason") or "")))
+    links = [str(link).rstrip(".,;:") for link in links][:10]
+    lines.extend(f"🔗 {link}" for link in links)
+    visible = message_so_far + "\n".join(lines)
+    try:
+        from hermes_cli.kanban_continuation import extract_jira_keys
+
+        keys = extract_jira_keys(
+            getattr(task, "title", None),
+            getattr(task, "body", None),
+            getattr(task, "branch_name", None),
+        )
+    except Exception:
+        keys = []
+    lines.extend(f"🎫 {key}" for key in keys[:3] if key not in visible)
+    workspace = getattr(task, "workspace_path", None)
+    if workspace:
+        lines.append(f"📁 {workspace}")
+    return lines
+
+
 def render_kanban_event(
     *,
     task_id: str,
@@ -95,7 +139,12 @@ def render_kanban_event(
         return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
     if kind == "blocked":
         reason = _redact(payload.get("reason") or "").strip()
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked" + (f": {reason}" if reason else "")
+        base = (
+            f"⏸ {board_tag}{tag}Kanban {task_id} blocked — {title}"
+            + (f": {reason}" if reason else "")
+        )
+        context = _block_context_lines(task, payload, base)
+        return base + ("\n" + "\n".join(context) if context else "")
     if kind == "spawn_failed":
         error = _redact(payload.get("error") or "").strip()
         suffix = f"\n{error}" if error else ""
@@ -150,10 +199,12 @@ def render_kanban_event(
     if kind == "block_loop_detected":
         reason = _redact(payload.get("reason") or "").strip()
         recurrences = payload.get("recurrences")
-        return (
+        base = (
             f"🔁 {board_tag}{tag}Kanban {task_id} escalated to triage after "
             f"{recurrences} repeated blocks" + (f": {reason}" if reason else "")
         )
+        context = _block_context_lines(task, payload, base)
+        return base + ("\n" + "\n".join(context) if context else "")
     if kind == "rework_loop_escalated":
         rounds = payload.get("round_count") or "?"
         gate_id = str(payload.get("human_gate_task_id") or "").strip()
