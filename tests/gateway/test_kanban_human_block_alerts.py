@@ -180,3 +180,89 @@ def test_rework_escalation_reaches_zero_subscription_home_sweep(tmp_path):
     assert "5 rounds" in rendered
     assert task_id in rendered
     assert "exact-sha-checkout" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Unblock context rendering: a human-block alert must carry everything needed
+# to act — the ask, content links, Jira key, and workspace — not just a reason.
+
+
+def _render_event(task, payload, kind="blocked", task_id="t_ctx"):
+    event = kb.Event(
+        id=1, task_id=task_id, kind=kind, payload=payload,
+        created_at=0, run_id=None,
+    )
+    return render_kanban_event(task_id=task_id, task=task, event=event)
+
+
+def _task_stub(**kw):
+    defaults = dict(
+        title="review content", assignee=None, body=None,
+        branch_name=None, workspace_path=None, result=None,
+    )
+    defaults.update(kw)
+    return type("Task", (), defaults)()
+
+
+def test_render_blocked_includes_title_ask_and_links():
+    task = _task_stub(title="IG posts week 31")
+    out = _render_event(task, {
+        "reason": "needs approval",
+        "kind": "needs_input",
+        "recurrences": 1,
+        "ask": "Approve the 3 posts or reply with edits",
+        "links": ["https://drive.google.com/drive/folders/abc"],
+    })
+    assert "IG posts week 31" in out
+    assert "needs approval" in out
+    assert "❓ Approve the 3 posts or reply with edits" in out
+    assert "🔗 https://drive.google.com/drive/folders/abc" in out
+
+
+def test_render_blocked_scrapes_urls_from_reason_when_no_links():
+    task = _task_stub()
+    out = _render_event(task, {
+        "reason": "review draft at https://docs.google.com/d/xyz please",
+        "kind": "needs_input",
+        "recurrences": 1,
+    })
+    assert "🔗 https://docs.google.com/d/xyz" in out
+
+
+def test_render_blocked_surfaces_jira_key_from_task_body():
+    # The Telegram adapter linkifies bare Jira keys; the renderer only has to
+    # surface a key the message text doesn't already contain.
+    task = _task_stub(body="Tracked in BUILD-999.")
+    out = _render_event(task, {
+        "reason": "needs approval", "kind": "needs_input", "recurrences": 1,
+    })
+    assert "🎫 BUILD-999" in out
+
+    # Key already visible in the title → no duplicate ticket line.
+    task2 = _task_stub(title="BUILD-999 content review", body="BUILD-999")
+    out2 = _render_event(task2, {
+        "reason": "needs approval", "kind": "needs_input", "recurrences": 1,
+    })
+    assert "🎫" not in out2
+
+
+def test_render_blocked_shows_workspace_path():
+    task = _task_stub(workspace_path="/tmp/worktrees/t_ctx")
+    out = _render_event(task, {
+        "reason": "needs approval", "kind": "needs_input", "recurrences": 1,
+    })
+    assert "📁 /tmp/worktrees/t_ctx" in out
+
+
+def test_render_block_loop_detected_includes_context():
+    task = _task_stub()
+    out = _render_event(task, {
+        "reason": "still needs approval",
+        "kind": "needs_input",
+        "recurrences": 3,
+        "limit": 3,
+        "ask": "Approve or kill this",
+        "links": ["https://drive.google.com/x"],
+    }, kind="block_loop_detected")
+    assert "❓ Approve or kill this" in out
+    assert "🔗 https://drive.google.com/x" in out

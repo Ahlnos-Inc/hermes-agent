@@ -13878,6 +13878,48 @@ def edit_completed_task_result(
     return True
 
 
+_BLOCK_CONTEXT_MAX_ITEMS = 10
+_BLOCK_CONTEXT_ASK_MAX_CHARS = 500
+
+
+def _block_context_from_metadata(metadata: Optional[dict]) -> dict:
+    """Copy the operator-facing unblock context out of block metadata.
+
+    A ``needs_input`` block is a queue item on a human: the alert must say
+    what is being asked (``ask``), where the content lives (``links``), and
+    which files to preview in-chat (``artifacts``) — otherwise the operator
+    has to open a terminal to learn why the board is waiting on them. The
+    keys ride the blocked event payload (same key ``artifacts`` as
+    ``kanban_complete``) so the notifier renders them without chasing run
+    rows. Everything else in metadata stays run-row-only. Invalid entries
+    are dropped, never fatal — bad context must not fail a block.
+    """
+    out: dict = {}
+    if not isinstance(metadata, dict):
+        return out
+    ask = metadata.get("ask")
+    if isinstance(ask, str) and ask.strip():
+        out["ask"] = ask.strip()[:_BLOCK_CONTEXT_ASK_MAX_CHARS]
+    links = metadata.get("links")
+    if isinstance(links, (list, tuple)):
+        clean = [
+            item.strip() for item in links
+            if isinstance(item, str)
+            and item.strip().startswith(("http://", "https://"))
+        ]
+        if clean:
+            out["links"] = clean[:_BLOCK_CONTEXT_MAX_ITEMS]
+    artifacts = metadata.get("artifacts")
+    if isinstance(artifacts, (list, tuple)):
+        clean = [
+            item.strip() for item in artifacts
+            if isinstance(item, str) and item.strip()
+        ]
+        if clean:
+            out["artifacts"] = clean[:_BLOCK_CONTEXT_MAX_ITEMS]
+    return out
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -14073,6 +14115,7 @@ def block_task(
                     metadata=metadata,
                 )
             payload = {"reason": reason, "kind": kind, "recurrences": recurrences}
+            payload.update(_block_context_from_metadata(metadata))
             if event_kind == "block_loop_detected":
                 payload["limit"] = BLOCK_RECURRENCE_LIMIT
             _append_event(conn, task_id, event_kind, payload, run_id=run_id)
@@ -14286,6 +14329,7 @@ def operator_block_task(
         payload = {"reason": reason, "kind": kind}
         if kind != "dependency":
             payload["recurrences"] = recurrences
+            payload.update(_block_context_from_metadata(metadata))
         elif dependency_pending:
             payload.update(
                 {
