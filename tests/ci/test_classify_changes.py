@@ -176,7 +176,15 @@ def _assert_cannot_resolve_empty(value: str, where: str) -> None:
     """
     match = _EXPRESSION.match(str(value).strip())
     assert match, f"{where}: not a single Actions expression: {value!r}"
-    operands = [o.strip() for o in match.group("body").split("||")]
+    body = match.group("body")
+    # A comparison yields a BOOLEAN, so `secrets.PAT != '' || github.token`
+    # satisfies "non-empty" while handing gh the literal string "true".
+    assert not re.search(r"[=!<>]=|[<>]", body), (
+        f"{where}: comparison in a credential expression yields a boolean, "
+        f"not a credential: {value!r}"
+    )
+    # `(github.token)` is valid and used elsewhere in this repo's workflows.
+    operands = [o.strip().strip("()").strip() for o in body.split("||")]
     assert operands[-1] in _ALWAYS_PRESENT, (
         f"{where}: last fallback {operands[-1]!r} can resolve to the empty "
         f"string; expected one of {_ALWAYS_PRESENT}"
@@ -288,6 +296,8 @@ def test_a_truncated_compare_is_treated_as_an_unreadable_diff():
     "${{ secrets.AUTOFIX_BOT_PAT || secrets.SOME_OTHER_PAT }}",  # ends in another optional secret
     "",
     "${{ inputs.github-token }}",
+    # Non-empty but useless: this resolves to the string "true".
+    "${{ secrets.AUTOFIX_BOT_PAT != '' || github.token }}",
 ])
 def test_the_credential_guard_rejects_emptyable_expressions(value):
     """The guard has to fail on the shapes that look right and are not."""
@@ -299,6 +309,8 @@ def test_the_credential_guard_rejects_emptyable_expressions(value):
     "${{ inputs.github-token || github.token }}",
     "${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}",
     "${{ github.token }}",
+    "${{ (github.token) }}",
+    "${{ secrets.AUTOFIX_BOT_PAT || (github.token) }}",
 ])
 def test_the_credential_guard_accepts_a_real_fallback(value):
     _assert_cannot_resolve_empty(value, "fixture")
