@@ -1579,6 +1579,27 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def mutate_job(job_id: str, mutate) -> Optional[Dict[str, Any]]:
+    """Read-modify-write ONE job record inside the store lock.
+
+    ``update_job`` writes values its caller computed BEFORE the lock was taken,
+    so two writers racing on the same field each silently clobber the other.
+    A caller whose new value depends on the CURRENT persisted value — cron's
+    held-delivery queue, where a lost write is a lost or duplicated alert —
+    needs the read and the write in one critical section, which is what this
+    gives it. ``mutate`` receives the live record and edits it in place.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            mutate(job)
+            save_jobs(jobs)
+            return _normalize_job_record(job)
+    return None
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -1712,6 +1733,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
                     # Check if we've hit the repeat limit
                     if times is not None and times > 0 and completed >= times:
+                        # Removing the job also discards anything its final run
+                        # held for re-delivery (BUILD-870) — the job never fires
+                        # again, so nothing would ever flush it. Say so loudly:
+                        # the payload's script has already marked its event
+                        # announced, so this is the one path where an alert
+                        # still dies silently.
+                        held = job.get("pending_delivery") or []
+                        if held:
+                            logger.error(
+                                "Job '%s': removing a finished job that still "
+                                "holds %d undelivered payload(s) — they can no "
+                                "longer be re-delivered (last error: %s)",
+                                job.get("name", job_id), len(held),
+                                held[-1].get("last_error") if isinstance(held[-1], dict) else None,
+                            )
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)

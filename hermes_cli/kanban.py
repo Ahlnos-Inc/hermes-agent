@@ -1543,13 +1543,22 @@ def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
         return refused
     try:
         raw = Path(args.graph_file).read_text(encoding="utf-8")
-        tasks = json.loads(raw)
+        payload = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"kanban gate issue-graph: cannot read --graph-file: {exc}", file=sys.stderr)
         return 2
+    # BUILD-862: the payload may be a bare task list (legacy) or an object
+    # {"tasks": [...], "max_rework_cycles": N} declaring the rework budget.
+    max_rework_cycles = None
+    if isinstance(payload, dict):
+        tasks = payload.get("tasks")
+        max_rework_cycles = payload.get("max_rework_cycles")
+    else:
+        tasks = payload
     if not isinstance(tasks, list) or not tasks:
         print(
-            "kanban gate issue-graph: --graph-file must hold a non-empty JSON list",
+            "kanban gate issue-graph: --graph-file must hold a non-empty JSON "
+            "list, or an object with a non-empty \"tasks\" list",
             file=sys.stderr,
         )
         return 2
@@ -1573,6 +1582,7 @@ def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
             issued = kb.issue_architecture_graph(
                 conn, gate.gate_id, issuer, tasks,
                 idempotency_key=str(args.idempotency_key),
+                max_rework_cycles=max_rework_cycles,
             )
         except (kb.ArchitectureGateError, ValueError, TypeError) as exc:
             print(f"kanban gate issue-graph: {exc}", file=sys.stderr)

@@ -53,7 +53,10 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          github-token: ${{ secrets.AUTOFIX_BOT_PAT }}
+          # Fork: AUTOFIX_BOT_PAT is an upstream-only secret. Without the
+          # fallback this passes the empty string, which OVERRIDES the
+          # action's default and leaves gh with no credential (BUILD-871).
+          github-token: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.

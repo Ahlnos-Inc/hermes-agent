@@ -7,7 +7,11 @@ description: >-
 
 inputs:
   github-token:
-    description: Token for the GitHub API (gh CLI). Pass secrets.AUTOFIX_BOT_PAT from the calling workflow.
+    description: >-
+      Credential for the GitHub API (gh CLI). Optional — omit it, or pass an
+      upstream-only secret with a `|| secrets.GITHUB_TOKEN` fallback. An
+      unguarded reference to a secret this repo does not define resolves to
+      the empty string and disables the compare call entirely.
     required: false
     default: ${{ github.token }}
 
@@ -47,7 +51,13 @@ runs:
       id: classify
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.github-token }}
+        # Fall back to the ambient workflow token when the caller passes an
+        # empty value. A caller writing `github-token: ${{ secrets.SOME_PAT }}`
+        # for a secret that does not exist in this repo passes the empty
+        # STRING, which counts as "provided" and therefore overrides the
+        # `default:` above — so gh ran with no credential at all, the compare
+        # call failed, and every lane failed open (BUILD-871).
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -69,10 +79,26 @@ runs:
           # run — safe, but wasteful and it masks the API failure).
           CHANGED=""
           for i in 1 2 3; do
-            if CHANGED="$(gh api \
+            # One line per FILE, both of its names tab-separated: a rename
+            # reports the NEW path in `filename` and the OLD one in
+            # `previous_filename`, and taking only the former loses the gated
+            # name when a workflow or an eslint config is renamed away from it.
+            # One line per file also makes the row count the FILE count, so the
+            # truncation check below needs no second API call.
+            if RAW="$(gh api \
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[].filename')"; then
+              --jq '.files[] | [.filename, (.previous_filename // "")] | @tsv')"; then
+              FILE_COUNT="$(printf '%s\n' "$RAW" | grep -c . || true)"
+              CHANGED="$(printf '%s\n' "$RAW" | tr '\t' '\n' | grep -v '^$' || true)"
+              # The compare endpoint caps `files` at 300 whatever the
+              # pagination. A list at the cap may be truncated, and a truncated
+              # list can omit the one sensitive path a gate exists to catch —
+              # so treat it as an unreadable diff rather than a partial answer.
+              if [ "${FILE_COUNT:-0}" -ge 300 ]; then
+                echo "::warning::compare returned the 300-file maximum — the list may be truncated, failing open (all lanes run)"
+                CHANGED=""
+              fi
               break
             fi
             if [ "$i" = 3 ]; then

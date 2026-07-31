@@ -203,7 +203,7 @@ jobs:
       - name: Post or update review warning
         if: steps.label-check.outputs.reviewed != 'true' && github.event.pull_request.head.repo.fork != true
         env:
-          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           PR="${{ github.event.pull_request.number }}"
@@ -251,7 +251,7 @@ jobs:
       - name: Update previous warning to passed
         if: steps.label-check.outputs.reviewed == 'true' && github.event.pull_request.head.repo.fork != true
         env:
-          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          GH_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           PR="${{ github.event.pull_request.number }}"

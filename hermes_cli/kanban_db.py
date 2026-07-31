@@ -231,6 +231,12 @@ ARCHITECTURE_GATE_CANONICALIZATION_VERSION = "v1"
 ARCHITECTURE_GATE_MODES = {"off", "shadow", "orchestrator_only", "enforce"}
 ARCHITECTURE_GATE_ENFORCING_MODES = {"orchestrator_only", "enforce"}
 ARCHITECTURE_GATE_REASON_OPEN = "architecture_gate_open"
+# BUILD-862: bounded autonomous rework inside an issued graph. The budget is
+# declared once at issuance (default when the payload omits it) and the re-arm
+# event kind doubles as the durable cycle-accounting floor.
+ARCHITECTURE_REWORK_DEFAULT_BUDGET = 2
+ARCHITECTURE_REWORK_MAX_BUDGET = 10
+ARCHITECTURE_REWORK_REARMED_EVENT = "architecture_rework_rearmed"
 AUTHENTICATED_APPROVAL_SURFACES = frozenset({"cli", "dashboard", "api", "acp", "gateway"})
 READ_ONLY_DISCOVERY_PROFILES = frozenset({"scout", "researcher"})
 DISCOVERY_CAPABILITY_TTL_SECONDS = 300
@@ -1111,7 +1117,7 @@ class ReworkResult:
 
     review_task_id: str
     fix_task_id: Optional[str]
-    fix_action: Literal["created", "adopted", "replayed", "escalated"]
+    fix_action: Literal["created", "adopted", "rearmed", "replayed", "escalated"]
     review_status: str
     request_event_id: int
     escalated: bool = False
@@ -2199,7 +2205,22 @@ CREATE TABLE IF NOT EXISTS architecture_graph_issuances (
     idempotency_key  TEXT NOT NULL,
     task_ids         TEXT NOT NULL,
     issued_by        TEXT NOT NULL,
-    issued_at        INTEGER NOT NULL
+    issued_at        INTEGER NOT NULL,
+    -- BUILD-862: bounded rework contract declared once at issuance and never
+    -- mutated. NULL identifies a legacy issuance: no autonomous re-arm, ever.
+    rework_policy    TEXT
+);
+
+-- BUILD-862: monotonic per-edge rework cycle accounting. Lives beside the
+-- immutable issuance row; only ever incremented, inside the same write_txn
+-- as the re-arm it counts.
+CREATE TABLE IF NOT EXISTS architecture_graph_rework_cycles (
+    gate_id        TEXT NOT NULL,
+    fix_task_id    TEXT NOT NULL,
+    review_task_id TEXT NOT NULL,
+    cycles_used    INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (gate_id, fix_task_id, review_task_id)
 );
 
 -- One immutable, idempotent compilation per workflow. The graph specification
@@ -3988,6 +4009,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ):
             if name not in gate_cols:
                 _add_column_if_missing(conn, "architecture_gates", name, definition)
+
+    # BUILD-862: rework_policy on architecture_graph_issuances. Legacy rows
+    # stay NULL forever, which the re-arm path reads as "no budget declared".
+    issuance_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'architecture_graph_issuances'"
+    ).fetchone()
+    if issuance_table is not None:
+        issuance_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(architecture_graph_issuances)")
+        }
+        if "rework_policy" not in issuance_cols:
+            _add_column_if_missing(
+                conn, "architecture_graph_issuances", "rework_policy", "rework_policy TEXT"
+            )
 
     # BUILD-655: sha256 on task_attachments (computed at upload time). Some
     # focused migration tests intentionally create only a tasks table, so first
@@ -5787,13 +5823,27 @@ def issue_architecture_graph(
     tasks: list[dict[str, Any]],
     *,
     idempotency_key: str,
+    max_rework_cycles: Optional[int] = None,
 ) -> list[str]:
     """Issue the one canonical implementation graph for a human-approved gate.
 
     The runtime-owned context is the authorization boundary. All graph rows are
     inserted in one transaction so a rejected duplicate cannot leave partial
     tasks or dependency edges behind.
+
+    ``max_rework_cycles`` (BUILD-862) bounds the autonomous fix→review re-arm
+    loop for every fix→review edge in this graph. It is part of the issued,
+    immutable contract: declared here or defaulted, never changed afterwards.
     """
+    if max_rework_cycles is None:
+        max_rework_cycles = ARCHITECTURE_REWORK_DEFAULT_BUDGET
+    if type(max_rework_cycles) is not int or not (
+        0 <= max_rework_cycles <= ARCHITECTURE_REWORK_MAX_BUDGET
+    ):
+        raise ValueError(
+            "max_rework_cycles must be an integer in "
+            f"[0, {ARCHITECTURE_REWORK_MAX_BUDGET}]"
+        )
     if _dispatcher_worker_provenance(conn) is not None:
         raise ArchitectureGateError("approval_surface_is_dispatcher_worker")
     if (
@@ -5905,11 +5955,27 @@ def issue_architecture_graph(
                     conn, task_ids[index], "linked",
                     {"parent": parent_id, "child": task_ids[index], "gate_id": gate_id},
                 )
+        rework_policy = json.dumps(
+            {
+                "version": 1,
+                "max_rework_cycles": max_rework_cycles,
+                "workspace_kind": architect.workspace_kind,
+                "workspace_path": architect.workspace_path,
+                "assignees": {
+                    task_ids[index]: normalized[index][1]
+                    for index in range(len(normalized))
+                },
+            },
+            sort_keys=True,
+        )
         conn.execute(
             """INSERT INTO architecture_graph_issuances
-               (gate_id, idempotency_key, task_ids, issued_by, issued_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (gate_id, idempotency_key, json.dumps(task_ids), context.principal, now),
+               (gate_id, idempotency_key, task_ids, issued_by, issued_at, rework_policy)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                gate_id, idempotency_key, json.dumps(task_ids),
+                context.principal, now, rework_policy,
+            ),
         )
         _append_gate_audit(conn, gate, "architecture_graph_issued")
         return task_ids
@@ -7571,7 +7637,7 @@ def _rework_event_payload(
     request_key: str,
     actor: str,
     finding: str,
-    disposition: Literal["created", "adopted", "escalated"],
+    disposition: Literal["created", "adopted", "rearmed", "escalated"],
     summary: Optional[str],
     metadata: Optional[dict],
     human_gate_task_id: Optional[str] = None,
@@ -7893,7 +7959,7 @@ class _DependencyTransitionResult:
 
     requester_task_id: str
     dependency_task_id: Optional[str]
-    dependency_action: Literal["created", "adopted", "replayed", "escalated"]
+    dependency_action: Literal["created", "adopted", "rearmed", "replayed", "escalated"]
     requester_status: str
     request_event_id: int
     escalated: bool = False
@@ -7911,10 +7977,10 @@ def _transition_to_dependency(
     dependency_event_kind: str,
     dependency_id_payload_key: str,
     materialize_dependency: Callable[
-        [sqlite3.Connection], tuple[str, Literal["created", "adopted"]]
+        [sqlite3.Connection], tuple[str, Literal["created", "adopted", "rearmed"]]
     ],
     event_payload: Callable[
-        [sqlite3.Connection, str, Literal["created", "adopted"]], dict[str, Any]
+        [sqlite3.Connection, str, Literal["created", "adopted", "rearmed"]], dict[str, Any]
     ],
     terminal_error: str,
     unknown_error: str,
@@ -7936,7 +8002,7 @@ def _transition_to_dependency(
     ] = None,
     post_request: Optional[
         Callable[
-            [sqlite3.Connection, str, Literal["created", "adopted"], int, Optional[int]],
+            [sqlite3.Connection, str, Literal["created", "adopted", "rearmed"], int, Optional[int]],
             None,
         ]
     ] = None,
@@ -8051,12 +8117,16 @@ def _transition_to_dependency(
                 return escalated
 
         dependency_task_id, disposition = materialize_dependency(conn)
-        _link_tasks_in_txn(
-            conn,
-            dependency_task_id,
-            requester_task_id,
-            mutation_context=mutation_context,
-        )
+        if disposition != "rearmed":
+            # A re-arm (BUILD-862) proved the fix→review edge already exists
+            # in the issued topology; linking again would only re-run the
+            # issued-graph link denial against the graph's own edge.
+            _link_tasks_in_txn(
+                conn,
+                dependency_task_id,
+                requester_task_id,
+                mutation_context=mutation_context,
+            )
 
         run_id = _end_run(
             conn,
@@ -8122,6 +8192,194 @@ def _transition_to_dependency(
         )
 
 
+_FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _rework_cycles_used(
+    conn: sqlite3.Connection,
+    gate_id: str,
+    fix_task_id: str,
+    review_task_id: str,
+) -> int:
+    """Fail-closed effective cycle count for one issued fix→review edge.
+
+    The counter row is authoritative; the append-only re-arm events are a
+    floor so deleting the counter row cannot reset the budget. Any malformed
+    value reads as tampering and denies.
+    """
+    row = conn.execute(
+        "SELECT cycles_used FROM architecture_graph_rework_cycles "
+        "WHERE gate_id = ? AND fix_task_id = ? AND review_task_id = ?",
+        (gate_id, fix_task_id, review_task_id),
+    ).fetchone()
+    counter = 0
+    if row is not None:
+        counter = row["cycles_used"]
+        if type(counter) is not int or counter < 0:
+            raise ArchitectureGateError("architecture_rework_cycle_counter_invalid")
+    events = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ? "
+        "AND json_extract(payload, '$.gate_id') = ? "
+        "AND json_extract(payload, '$.review_task_id') = ?",
+        (fix_task_id, ARCHITECTURE_REWORK_REARMED_EVENT, gate_id, review_task_id),
+    ).fetchone()[0]
+    return max(counter, int(events))
+
+
+def _rearm_issued_fix_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    gate: ArchitectureGate,
+    issued_row: sqlite3.Row,
+    review_task_id: str,
+    fix_task_id: str,
+    request_key: str,
+    actor: str,
+) -> None:
+    """Re-arm one issued fix node for a bounded rework cycle (BUILD-862).
+
+    This is execution of the approved topology, not an exception to it: every
+    precondition proves the request stays inside exactly what issuance
+    declared, and any failure raises a typed, audited denial without touching
+    a row. The caller owns ``write_txn``; the fix flip, the cycle increment,
+    and the audit events commit or roll back together with the reviewer
+    transition in :func:`_transition_to_dependency`.
+    """
+    if gate.state not in ARCHITECTURE_GATE_APPROVED_STATES:
+        raise _gate_denied(gate, "rework", "architecture_graph_issued")
+
+    # Legacy issuance (no declared budget) keeps today's behavior exactly.
+    raw_policy = issued_row["rework_policy"]
+    if raw_policy is None:
+        raise _gate_denied(gate, "rework", "architecture_graph_issued")
+    try:
+        policy = json.loads(raw_policy)
+        if not isinstance(policy, dict):
+            raise TypeError("rework_policy must be an object")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise _gate_denied(gate, "rework", "architecture_rework_policy_invalid")
+    budget = policy.get("max_rework_cycles")
+    if type(budget) is not int or not (0 <= budget <= ARCHITECTURE_REWORK_MAX_BUDGET):
+        raise _gate_denied(gate, "rework", "architecture_rework_policy_invalid")
+
+    # Same-issuance membership: both endpoints must be issued graph nodes.
+    try:
+        issued_ids = set(json.loads(issued_row["task_ids"]))
+    except (TypeError, json.JSONDecodeError):
+        raise _gate_denied(gate, "rework", "architecture_graph_issuance_corrupt")
+    if review_task_id not in issued_ids or fix_task_id not in issued_ids:
+        raise _gate_denied(gate, "rework", "architecture_graph_issued")
+
+    # The fix→review edge must already exist in the issued topology; re-arm
+    # never adds an edge.
+    edge = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (fix_task_id, review_task_id),
+    ).fetchone()
+    if edge is None:
+        raise _gate_denied(gate, "rework", "architecture_rework_edge_missing")
+
+    fix_row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (fix_task_id,)
+    ).fetchone()
+    review_row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (review_task_id,)
+    ).fetchone()
+    if fix_row is None or review_row is None:
+        raise _gate_denied(gate, "rework", "architecture_rework_node_missing")
+    if (
+        fix_row["status"] != "done"
+        or fix_row["current_run_id"] is not None
+        or fix_row["claim_lock"] is not None
+        or fix_row["worker_pid"] is not None
+    ):
+        raise _gate_denied(gate, "rework", "architecture_rework_fix_not_terminal")
+    if (
+        fix_row["policy_quarantined"] or fix_row["policy_invalidated"]
+        or review_row["policy_quarantined"] or review_row["policy_invalidated"]
+    ):
+        raise _gate_denied(gate, "rework", "architecture_rework_node_quarantined")
+
+    assignees = policy.get("assignees")
+    if not isinstance(assignees, dict):
+        raise _gate_denied(gate, "rework", "architecture_rework_policy_invalid")
+    for task_id, row in ((fix_task_id, fix_row), (review_task_id, review_row)):
+        if _canonical_assignee(row["assignee"]) != assignees.get(task_id):
+            raise _gate_denied(gate, "rework", "architecture_rework_role_mismatch")
+        if (
+            row["workspace_kind"] != policy.get("workspace_kind")
+            or row["workspace_path"] != policy.get("workspace_path")
+        ):
+            raise _gate_denied(gate, "rework", "architecture_rework_workspace_changed")
+
+    cycles_used = _rework_cycles_used(conn, gate.gate_id, fix_task_id, review_task_id)
+    if cycles_used >= budget:
+        raise _gate_denied(gate, "rework", "architecture_rework_budget_exhausted")
+
+    # The reviewed SHA comes from the fix's completed handoff (VAAD contract):
+    # the exact commit the reviewer judged. No attested SHA, no re-arm.
+    run_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (fix_task_id,),
+    ).fetchone()
+    reviewed_sha = None
+    if run_row is not None and run_row["metadata"]:
+        try:
+            run_meta = json.loads(run_row["metadata"])
+            delivery = run_meta.get("artifact_delivery")
+            if isinstance(delivery, dict):
+                candidate = str(delivery.get("commit_sha") or "")
+                if _FULL_COMMIT_SHA_RE.fullmatch(candidate):
+                    reviewed_sha = candidate
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reviewed_sha = None
+    if reviewed_sha is None:
+        raise _gate_denied(gate, "rework", "architecture_rework_reviewed_sha_unattested")
+
+    now = int(time.time())
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready', completed_at = NULL, block_kind = NULL "
+        "WHERE id = ? AND status = 'done' AND current_run_id IS NULL "
+        "AND claim_lock IS NULL AND worker_pid IS NULL "
+        "AND policy_quarantined = 0 AND policy_invalidated = 0",
+        (fix_task_id,),
+    )
+    if cur.rowcount != 1:
+        raise _gate_denied(gate, "rework", "architecture_rework_cas_conflict")
+    conn.execute(
+        "INSERT INTO architecture_graph_rework_cycles "
+        "(gate_id, fix_task_id, review_task_id, cycles_used, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(gate_id, fix_task_id, review_task_id) "
+        "DO UPDATE SET cycles_used = MAX(cycles_used + 1, excluded.cycles_used), "
+        "updated_at = excluded.updated_at",
+        (gate.gate_id, fix_task_id, review_task_id, cycles_used + 1, now),
+    )
+    open_blockers = [
+        {"id": row["id"], "severity": row["severity"]}
+        for row in conn.execute(
+            "SELECT id, severity FROM continuation_blockers "
+            "WHERE task_id = ? AND status = 'open' AND severity IN ('P0', 'P1') "
+            "ORDER BY id",
+            (review_task_id,),
+        )
+    ]
+    payload = {
+        "gate_id": gate.gate_id,
+        "cycle": cycles_used + 1,
+        "max_rework_cycles": budget,
+        "review_task_id": review_task_id,
+        "fix_task_id": fix_task_id,
+        "reviewed_sha": reviewed_sha,
+        "open_blockers": open_blockers,
+        "request_key": request_key,
+        "actor": actor,
+    }
+    _append_event(conn, fix_task_id, ARCHITECTURE_REWORK_REARMED_EVENT, payload)
+    _append_gate_audit(conn, gate, ARCHITECTURE_REWORK_REARMED_EVENT, extra=payload)
+
+
 def request_rework(
     conn: sqlite3.Connection,
     review_task_id: str,
@@ -8178,6 +8436,32 @@ def request_rework(
                 raise ValueError("a review task cannot be its own fix")
             if fix_row["policy_quarantined"] or fix_row["policy_invalidated"]:
                 raise ValueError("cannot adopt a quarantined or invalidated fix task")
+            # BUILD-862: inside an issued architecture graph, adopting an
+            # issued fix node is a bounded re-arm of the approved topology,
+            # not a link mutation. Everything else stays denied fail-closed.
+            gate = (
+                get_architecture_gate_for_task(conn_in, review_task_id)
+                or get_architecture_gate_for_task(conn_in, fix_task_id)
+            )
+            if (
+                gate is not None
+                and gate.enforcement_mode in ARCHITECTURE_GATE_ENFORCING_MODES
+            ):
+                issued_row = conn_in.execute(
+                    "SELECT * FROM architecture_graph_issuances WHERE gate_id = ?",
+                    (gate.gate_id,),
+                ).fetchone()
+                if issued_row is not None:
+                    _rearm_issued_fix_in_txn(
+                        conn_in,
+                        gate=gate,
+                        issued_row=issued_row,
+                        review_task_id=review_task_id,
+                        fix_task_id=fix_task_id,
+                        request_key=request_key,
+                        actor=actor,
+                    )
+                    return fix_task_id, "rearmed"
             return fix_task_id, "adopted"
 
         if not fix.title or not str(fix.title).strip():
@@ -8208,7 +8492,7 @@ def request_rework(
     def payload_factory(
         _conn_in: sqlite3.Connection,
         fix_task_id: str,
-        disposition: Literal["created", "adopted"],
+        disposition: Literal["created", "adopted", "rearmed"],
     ) -> dict[str, Any]:
         artifact_binding = _ensure_review_artifact_binding_in_txn(
             _conn_in,
@@ -8436,7 +8720,7 @@ def request_rework(
     def post_request(
         conn_in: sqlite3.Connection,
         fix_task_id: str,
-        disposition: Literal["created", "adopted"],
+        disposition: Literal["created", "adopted", "rearmed"],
         request_event_id: int,
         _review_run_id: Optional[int],
     ) -> None:
@@ -8663,7 +8947,7 @@ def request_publication_handoff(
     def payload_factory(
         conn_in: sqlite3.Connection,
         publication_id: str,
-        disposition: Literal["created", "adopted"],
+        disposition: Literal["created", "adopted", "rearmed"],
     ) -> dict[str, Any]:
         row = conn_in.execute(
             """SELECT publication_expected_sha, publication_remote,
@@ -15966,6 +16250,7 @@ def dispatch_cause_counts(
         if result.skipped_per_profile_capped:
             _bump("concurrency_cap(per_profile)", len(result.skipped_per_profile_capped))
         _bump("claim_race", len(getattr(result, "claim_race", []) or []))
+        _bump("dirty_workspace", len(getattr(result, "dirty_workspace", []) or []))
         _bump("workspace_collision", len(result.workspace_collisions))
         _bump("spawn_exception", len(getattr(result, "spawn_errors", []) or []))
         if result.skipped_locked:
@@ -16016,6 +16301,9 @@ def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> 
     * ``unassigned`` / ``nonspawnable`` — routing issues, not dispatcher bugs
       (the latter is the expected steady-state for control-plane lanes).
     * ``claim_race`` — lost an atomic claim to a concurrent claimant.
+    * ``dirty_workspace`` — a non-worktree workspace is a git repo with
+      uncommitted/untracked changes; dispatch refuses until it is cleaned.
+      The offending paths are in the task's ``dirty_workspace`` events.
     * ``workspace_collision`` — another running task already owns the
       non-scratch workspace.
     * ``spawn_exception`` — workspace resolution or ``spawn_fn`` raised.
