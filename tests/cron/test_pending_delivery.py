@@ -18,7 +18,7 @@ import logging
 import pytest
 
 import cron.scheduler as s
-from cron.jobs import get_job, save_jobs
+from cron.jobs import get_job, load_jobs, save_jobs
 
 
 REPLAY_MARKER = "⏳ Held from"
@@ -340,6 +340,54 @@ def test_queue_cap_drops_the_oldest_loudly(store, caplog):
     assert len(queue) == s._PENDING_DELIVERY_MAX_ENTRIES
     assert queue[0]["content"] == "alert 2"  # the two oldest were dropped
     assert len([r for r in caplog.records if "over its" in r.getMessage()]) == 2
+
+
+def test_a_long_outage_overflow_keeps_the_newest_per_job(store, caplog):
+    """BUILD-877: the 2026-07-30 outage overflowed this cap 6 times and the
+    money alerts past it were dropped. `pending_delivery` lives on each job's
+    OWN record (see mutate_job), so overflow can only ever evict that SAME
+    job's older entries — a second job racing the same outage is a separate
+    record and cannot be touched, no matter how deep the first job's queue
+    goes. Every eviction still names the job and the reason, at WARNING+.
+    """
+    save_jobs(load_jobs() + [{
+        "id": "other",
+        "name": "another money cron",
+        "prompt": "",
+        "script": "y.sh",
+        "no_agent": True,
+        "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+        "schedule_display": "every 5m",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": "2999-01-01T00:00:00",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "-1003907677753"},
+    }])
+
+    overflow_by = 3
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.WARNING):
+        for n in range(s._PENDING_DELIVERY_MAX_ENTRIES + overflow_by):
+            _patch_pipeline(mp, _fail_connect, final=f"capture alert {n}")
+            s.run_one_job(get_job("capture"))
+        _patch_pipeline(mp, _fail_connect, final="other alert")
+        s.run_one_job(get_job("other"))
+
+    capture_queue = get_job("capture")["pending_delivery"]
+    other_queue = get_job("other")["pending_delivery"]
+
+    # The newest capture alert survives the overflow...
+    newest = s._PENDING_DELIVERY_MAX_ENTRIES + overflow_by - 1
+    assert capture_queue[-1]["content"] == f"capture alert {newest}"
+    assert len(capture_queue) == s._PENDING_DELIVERY_MAX_ENTRIES
+    # ...and the other job's own entry was never touched by capture's overflow.
+    assert [e["content"] for e in other_queue] == ["other alert"]
+
+    drops = [r for r in caplog.records if "over its" in r.getMessage()]
+    assert len(drops) == overflow_by
+    assert all(r.levelno >= logging.WARNING for r in drops)
+    assert all("Job 'capture'" in r.getMessage() for r in drops)
 
 
 def test_a_still_down_link_keeps_the_rest_of_the_queue_in_order(store):

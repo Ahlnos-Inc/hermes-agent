@@ -2182,13 +2182,21 @@ def _deliver_result(
 # noise anyway.
 _PENDING_DELIVERY_MAX_AGE_SECONDS = 72 * 3600
 # jobs.json is loaded and rewritten under a lock on every run of every job, so
-# the whole queue must stay small.
-_PENDING_DELIVERY_MAX_BYTES = 64_000
+# this queue — one job's own held outputs, it lives on that job's record, not
+# a store-wide list — must stay small. BUILD-877: the 2026-07-30 Telegram
+# outage overflowed this cap 6 times on a single frequently-firing job and
+# dropped the money alerts past it, so this is sized for a real outage rather
+# than a handful of retries.
+_PENDING_DELIVERY_MAX_BYTES = 512_000
 # An outage spanning several firings holds one payload PER firing — a single
 # slot would let each new alert overwrite the last, losing exactly the money
 # alert this whole mechanism exists to protect.  The queue is bounded by count
-# as well as by total bytes.
-_PENDING_DELIVERY_MAX_ENTRIES = 10
+# as well as by total bytes. BUILD-877: raised from 10 (outage-sized, see
+# above). Overflow always evicts this job's OLDEST entry first (queue is kept
+# sorted oldest-first — see _write_pending_delivery_queue), so the newest
+# alert is the last thing ever dropped; there is no cross-job eviction to
+# guard against because each job's queue is its own record.
+_PENDING_DELIVERY_MAX_ENTRIES = 50
 # Storage-sanity ceiling on one payload.  jobs.json is loaded and rewritten
 # under a lock on every run of every job, so a giant report is dropped loudly
 # rather than parked in it.  This is a SIZE bound, not a safety predicate.
