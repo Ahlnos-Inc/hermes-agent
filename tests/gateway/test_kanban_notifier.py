@@ -14,7 +14,7 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
 
-    async def send(self, chat_id, text, metadata=None):
+    async def send(self, chat_id, text, reply_to=None, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
 
