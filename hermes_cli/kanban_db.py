@@ -15882,6 +15882,7 @@ def dispatch_cause_counts(
         if result.skipped_per_profile_capped:
             _bump("concurrency_cap(per_profile)", len(result.skipped_per_profile_capped))
         _bump("claim_race", len(getattr(result, "claim_race", []) or []))
+        _bump("dirty_workspace", len(getattr(result, "dirty_workspace", []) or []))
         _bump("workspace_collision", len(result.workspace_collisions))
         _bump("spawn_exception", len(getattr(result, "spawn_errors", []) or []))
         if result.skipped_locked:
@@ -15932,6 +15933,9 @@ def summarize_dispatch_causes(results: "Iterable[Optional[DispatchResult]]") -> 
     * ``unassigned`` / ``nonspawnable`` — routing issues, not dispatcher bugs
       (the latter is the expected steady-state for control-plane lanes).
     * ``claim_race`` — lost an atomic claim to a concurrent claimant.
+    * ``dirty_workspace`` — a non-worktree workspace is a git repo with
+      uncommitted/untracked changes; dispatch refuses until it is cleaned.
+      The offending paths are in the task's ``dirty_workspace`` events.
     * ``workspace_collision`` — another running task already owns the
       non-scratch workspace.
     * ``spawn_exception`` — workspace resolution or ``spawn_fn`` raised.
