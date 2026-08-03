@@ -296,3 +296,155 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# BUILD-858 Slice 1: durable initial holds and ordered sticky state
+# ---------------------------------------------------------------------------
+
+
+def test_initial_status_blocked_is_sticky(kanban_home: Path) -> None:
+    """A task created with initial_status='blocked' must have a durable hold:
+    - status='blocked', block_kind='needs_input', block_recurrences=1
+    - one standard 'blocked' event with code='initial_status_blocked'
+    - _has_sticky_block() recognizes it immediately
+    - recompute_ready() never promotes it (even with no parents)
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="human gate", initial_status="blocked",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", "initial_status=blocked must persist"
+        assert task.block_kind == "needs_input", "block_kind must be needs_input"
+        assert task.block_recurrences == 1, "block_recurrences must be 1"
+
+        # Must have a 'blocked' event so _has_sticky_block recognizes it.
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "created" in kinds
+        assert "blocked" in kinds, f"expected blocked event; got {kinds}"
+
+        import json
+        blocked_events = [e for e in events if e["kind"] == "blocked"]
+        payload = json.loads(blocked_events[0]["payload"])
+        assert payload.get("code") == "initial_status_blocked"
+        assert payload.get("kind") == "needs_input"
+        assert payload.get("recurrences") == 1
+
+        # _has_sticky_block must immediately return True.
+        assert kb._has_sticky_block(conn, tid), "initial blocked task must be sticky"
+
+        # recompute_ready must not promote it, even hammered.
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "initial blocked task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_initial_status_blocked_with_done_parent_survives(kanban_home: Path) -> None:
+    """An initial_status='blocked' task must stay blocked even when every parent
+    is done — parent completion does not authorize promotion of an explicit hold."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        gate = kb.create_task(
+            conn, title="human gate", initial_status="blocked", parents=[parent],
+        )
+        kb.complete_task(conn, parent, result="ok")
+
+        # Repeated recompute must leave the gate blocked.
+        for _ in range(3):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0
+            assert kb.get_task(conn, gate).status == "blocked"
+
+
+def test_initial_status_blocked_can_be_completed(kanban_home: Path) -> None:
+    """complete_task accepts blocked status — trusted terminal resolution
+    (BUILD-858 Invariant I1 terminal path)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="human gate", initial_status="blocked",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        # complete_task must accept a blocked source status.
+        ok = kb.complete_task(conn, tid, result="approved")
+        assert ok, "complete_task must succeed on a blocked task"
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_initial_status_blocked_unblock_then_spawns(kanban_home: Path) -> None:
+    """Explicit unblock is the only authorized promotion path (Invariant I1)."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        gate = kb.create_task(
+            conn, title="gate", initial_status="blocked", parents=[parent],
+        )
+        kb.complete_task(conn, parent, result="ok")
+
+        # Unblocking must return True and put the task back to ready.
+        unblocked = kb.unblock_task(conn, gate)
+        assert unblocked, "unblock_task must succeed on initial-blocked task"
+        assert kb.get_task(conn, gate).status == "ready"
+
+        # After unblock, recompute_ready treats it as a normal ready task.
+        assert kb.recompute_ready(conn) == 0  # already ready, no promotion needed
+
+
+def test_initial_status_blocked_creates_no_run(kanban_home: Path) -> None:
+    """Creating a task with initial_status='blocked' must not create a run."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gate", initial_status="blocked",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.current_run_id is None, "initial blocked task must have no run"
+
+
+def test_pre_upgrade_initial_blocked_fallback(kanban_home: Path) -> None:
+    """Pre-upgrade rows: if a blocked task has a 'created' event with
+    status='blocked' but no 'blocked' event, _has_sticky_block must still
+    return True (ordered created-event fallback for legacy/pre-BUILD-858 rows).
+
+    This covers the t_9deb9d53 incident shape: a task was created with
+    initial_status='blocked' before the blocked event was written in the same
+    transaction.  The created event's status field is the fallback authority.
+    """
+    import json as _json
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+
+        # Simulate a pre-upgrade blocked row: status='blocked', created event
+        # with status='blocked', but no 'blocked' event row.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?",
+            (child,),
+        )
+        # Ensure the created event has status='blocked' (pre-upgrade shape).
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'created'",
+            (_json.dumps({"status": "blocked", "assignee": None, "parents": [parent]}), child),
+        )
+        conn.commit()
+
+        # No 'blocked' event exists — only created + promoted may be present.
+        blocked_events = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (child,),
+        ).fetchall()
+        assert blocked_events == [], "pre-upgrade row must have no blocked event"
+
+        # The fallback must recognize the hold.
+        assert kb._has_sticky_block(conn, child), \
+            "created event fallback must recognize initial-blocked pre-upgrade row"
+
+        # recompute_ready must not promote this pre-upgrade row.
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"

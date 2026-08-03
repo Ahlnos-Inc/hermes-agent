@@ -7617,6 +7617,27 @@ def _insert_task_in_txn(
             "goal_max_turns": prepared.goal_max_turns,
         },
     )
+    # BUILD-858 (Slice 1): persist durable hold metadata when the task was
+    # explicitly created as blocked.  This emits one standard ``blocked``
+    # event in the same write transaction so ``_has_sticky_block`` recognizes
+    # the hold without relying on the ``created`` event fallback, and so the
+    # notifier cursor (which starts at 0) can observe it immediately.
+    if task_status == "blocked":
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input', block_recurrences = 1 WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": "initial_status_blocked",
+                "code": "initial_status_blocked",
+                "kind": "needs_input",
+                "recurrences": 1,
+            },
+        )
     if mutation_context is not None and mutation_context.phase == "architecture":
         _open_architecture_gate(conn, task_id, mutation_context)
     return task_id
@@ -11215,6 +11236,52 @@ def _resolve_dependency_materialization_sla_seconds(
         pass
     return DEFAULT_DEPENDENCY_MATERIALIZATION_SLA_SECONDS
 
+
+# ---------------------------------------------------------------------------
+# BUILD-858 helpers: canonical recurrence arithmetic + collision predicate
+# ---------------------------------------------------------------------------
+
+
+def _compute_block_recurrences(
+    prev_kind: Optional[str],
+    prev_recurrences: int,
+    new_kind: Optional[str],
+) -> int:
+    """Compute the new ``block_recurrences`` for a block transition.
+
+    Same-kind re-block increments the counter (supporting block-loop
+    escalation to triage). A different kind or a first block resets to 1.
+    Both ``block_task`` and the dirty-workspace CAS use this helper so
+    their recurrence contracts never diverge.
+    """
+    if prev_kind == new_kind:
+        return prev_recurrences + 1
+    return 1
+
+
+def _find_workspace_collision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace_kind: str,
+    workspace_path: str,
+) -> Optional[str]:
+    """Return the running task ID that holds *workspace_path*, or ``None``.
+
+    Used by the dispatch pre-check and the dirty-block CAS so both share
+    the canonical collision predicate and cannot drift independently.
+    """
+    row = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'running' "
+        "  AND workspace_kind = ? "
+        "  AND workspace_path = ? "
+        "  AND id != ? "
+        "LIMIT 1",
+        (workspace_kind, workspace_path, task_id),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call or by the failure circuit breaker.
@@ -11239,9 +11306,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     auto-promote it.  The operator fence is durable before process
     termination so a surviving worker can never be joined by a replacement.
 
-    Returns ``False`` when there is no such event at all (e.g. direct DB
-    manipulation of old rows), preserving the legacy auto-recover path
-    only for rows with no durable block/failure event.
+    BUILD-858: When no hold/release transition exists (pre-upgrade rows or
+    tasks created with ``initial_status="blocked"`` before this patch),
+    fall back to the ``created`` event's ``status`` field.  A created event
+    with ``status="blocked"`` is an explicit operator/human hold that must
+    survive ``recompute_ready``; any other value preserves the legacy
+    eventless auto-recover path for genuinely transient failures.
+
+    Returns ``False`` when no sticky signal is found, preserving the
+    legacy auto-recover path only for rows with no durable block event.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -11250,10 +11323,24 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in {
-        "blocked", "operator_block_fenced", "gave_up",
-    }
-
+    if row is not None:
+        return row["kind"] in {"blocked", "operator_block_fenced", "gave_up"}
+    # Fallback: no hold/release event exists yet (pre-upgrade row or a row
+    # whose initial_status="blocked" was set before BUILD-858's creation-
+    # transaction blocked event was added).  Check the created event's status
+    # payload as the ordered fallback authority for explicit initial holds.
+    created = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if created and created["payload"]:
+        try:
+            payload = json.loads(created["payload"])
+            return payload.get("status") == "blocked"
+        except Exception:
+            pass
+    return False
 
 def _awaiting_manual_promotion(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is a decomposed entry child that is
@@ -11573,21 +11660,15 @@ def claim_task(
         ).fetchone()
         if ws_row and ws_row["workspace_path"] and ws_row["workspace_kind"] \
            and ws_row["workspace_kind"] != "scratch":
-            collision = conn.execute(
-                "SELECT id FROM tasks "
-                "WHERE status = 'running' "
-                "  AND workspace_kind = ? "
-                "  AND workspace_path = ? "
-                "  AND id != ? "
-                "LIMIT 1",
-                (ws_row["workspace_kind"], ws_row["workspace_path"], task_id),
-            ).fetchone()
-            if collision:
+            collision_id = _find_workspace_collision(
+                conn, task_id, ws_row["workspace_kind"], ws_row["workspace_path"],
+            )
+            if collision_id is not None:
                 _append_event(
                     conn, task_id, "claim_rejected",
                     {
                         "reason": "workspace_collision",
-                        "conflict_with": collision["id"],
+                        "conflict_with": collision_id,
                         "workspace_kind": ws_row["workspace_kind"],
                         "workspace_path": ws_row["workspace_path"],
                     },
@@ -14188,10 +14269,12 @@ def block_task(
                 )
             _blocked_task = get_task(conn, task_id)
         else:
-            # Truly-blocked kinds. Increment the unblock-loop counter when this
-            # is a re-block for the SAME reason after a prior unblock.
-            same_cause = prev_kind == kind
-            recurrences = prev_recurrences + 1 if same_cause else 1
+            # Truly-blocked kinds. Reuse the canonical recurrence arithmetic
+            # shared by the no-run dirty-workspace blocker so the persisted
+            # counter and blocked-event payload cannot diverge.
+            recurrences = _compute_block_recurrences(
+                prev_kind, prev_recurrences, kind,
+            )
 
             if recurrences >= BLOCK_RECURRENCE_LIMIT:
                 target_status = "triage"
@@ -16122,7 +16205,8 @@ class DispatchResult:
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
-    """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    """Task ids auto-blocked by a deterministic dispatcher transition: the
+    spawn-failure circuit breaker or BUILD-858 dirty-workspace preflight."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -16157,10 +16241,10 @@ class DispatchResult:
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
     dirty_workspace: list[str] = field(default_factory=list)
-    """Task ids skipped because their workspace was detected as dirty
-    (uncommitted/untracked changes in a git repo). These tasks stay
-    ``running`` but no worker is spawned — the sentinel can escalate
-    or the human can clean the workspace and retry."""
+    """Task ids transitioned from ``ready`` to a durable ``needs_input``
+    block because their non-worktree Git workspace has uncommitted or
+    untracked changes. No worker run is created; an operator must clean or
+    move the workspace and explicitly unblock the task before retrying."""
     claim_race: list[str] = field(default_factory=list)
     """Task ids where an atomic claim (``claim_task`` / ``claim_review_task``)
     returned ``None`` — another claimant (a concurrent dispatcher, or a
@@ -20244,22 +20328,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# ── Safe workspace diagnostics for crash/timeout forensics ─────────
-_WORKSPACE_DIAG_MAX_BYTES = 4096
-_WORKSPACE_DIAG_MAX_LINES = 50
-_WORKSPACE_DIAG_REDACT_PATTERNS = [
-    re.compile(r"(?:api_?key|token|secret|password|auth)\s*[:=]\s*\S+", re.I),
-    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),
-    re.compile(r"sk-[A-Za-z0-9]{32,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{36,}"),
-]
-
-
 def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
-    """Capture capped, redacted git status for a crashed worker's workspace.
+    """Capture privacy-safe git status for a crashed worker's workspace.
 
     Returns ``None`` if the path does not exist or is not a git repo.
-    Never returns full diffs — only status/diffstat lines.
+    Never returns filenames or full diffs.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
@@ -20284,21 +20357,23 @@ def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
             if first_line.startswith("## "):
                 branch = first_line[3:].split("...")[0].strip()
             return {"git_repo": True, "branch": branch or None, "dirty": False}
-        capped_lines = file_lines[:_WORKSPACE_DIAG_MAX_LINES]
-        capped = "\n".join(capped_lines)
-        if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
-            capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
-        for pat in _WORKSPACE_DIAG_REDACT_PATTERNS:
-            capped = pat.sub("[REDACTED]", capped)
+        status_counts = {}
+        for line in file_lines:
+            status_class = line[:2].strip()
+            status_counts[status_class] = status_counts.get(status_class, 0) + 1
         branch = ""
-        first_line = capped_lines[0] if capped_lines else ""
+        first_line = file_lines[0] if file_lines else ""
         if first_line.startswith("## "):
             branch = first_line[3:].split("...")[0].strip()
         return {
             "git_repo": True,
             "branch": branch or None,
             "dirty": True,
-            "git_status_raw": capped,
+            "status_counts": status_counts,
+            "file_count": len(file_lines),
+            "status_digest": hashlib.sha256(
+                "\n".join(file_lines).encode("utf-8", "replace")
+            ).hexdigest()[:12],
         }
     except Exception:
         return None
@@ -20312,6 +20387,113 @@ def _is_workspace_dirty(workspace_path: str) -> bool:
     """
     diag = _capture_workspace_diag(workspace_path)
     return diag is not None and diag.get("dirty") is True
+
+
+def _block_dirty_ready_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace_diag: Optional[dict],
+) -> Optional[str]:
+    """Atomically transition a dirty ready task to a durable needs_input block.
+
+    Opens an IMMEDIATE serialization boundary and:
+
+    1. Re-reads the task and canonical workspace identity.
+    2. Re-evaluates the canonical workspace-collision predicate against all
+       running tasks sharing the same non-scratch workspace.
+    3. If a collision exists, writes nothing and returns the conflict task ID.
+    4. Performs a CAS requiring ``status='ready'``, ``claim_lock IS NULL``,
+       and ``current_run_id IS NULL``.
+    5. On CAS loss (claim race), writes nothing and returns ``"__claim_race__"``.
+    6. On success, persists ``status='blocked'``, ``block_kind='needs_input'``,
+       canonical recurrence value, clears claim fields, and appends one
+       standard ``blocked`` event with payload code ``"dirty_workspace"``.
+
+    The helper does NOT call ``block_task()`` because that function can
+    synthesize a task run when a summary exists, violating the no-run
+    acceptance criterion (BUILD-858 Invariant I2).  Returns ``None`` on a
+    successful block transition.
+
+    After this function returns ``None``, the caller must invoke the
+    ``kanban_task_blocked`` lifecycle hook best-effort — outside this
+    write transaction so no plugin code executes under a write lock.
+    """
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, claim_lock, current_run_id, "
+            "       workspace_kind, workspace_path, "
+            "       block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return "__claim_race__"
+
+        workspace_kind = task_row["workspace_kind"]
+        workspace_path = task_row["workspace_path"]
+
+        # Re-evaluate canonical collision predicate inside the write lock so a
+        # concurrent claim on a different task sharing the path cannot slip
+        # past between the outer pre-check and this CAS (BUILD-858 §5.2).
+        if workspace_kind and workspace_kind != "scratch" and workspace_path:
+            coll = _find_workspace_collision(
+                conn, task_id, workspace_kind, workspace_path,
+            )
+            if coll is not None:
+                return coll  # collision wins; write nothing
+
+        # CAS: task must still be ready, unclaimed, and have no active run.
+        if (
+            task_row["status"] != "ready"
+            or task_row["claim_lock"] is not None
+            or task_row["current_run_id"] is not None
+        ):
+            return "__claim_race__"
+
+        # Compute recurrence using the shared helper so the block-loop counter
+        # accumulates consistently with block_task's own counter (§4.3).
+        prev_kind = task_row["block_kind"]
+        prev_recurrences = int(task_row["block_recurrences"] or 0)
+        new_recurrences = _compute_block_recurrences(
+            prev_kind, prev_recurrences, "needs_input",
+        )
+
+        # Persist the transition atomically.  No run is created; no retry /
+        # failure counter is incremented; Git files are never touched.
+        rows_changed = conn.execute(
+            "UPDATE tasks "
+            "SET status = 'blocked', block_kind = 'needs_input', "
+            "    block_recurrences = ?, "
+            "    claim_lock = NULL, claim_expires = NULL, "
+            "    worker_pid = NULL, worker_started_at = NULL, "
+            "    worker_pgid = NULL, worker_sid = NULL "
+            "WHERE id = ? "
+            "  AND status = 'ready' "
+            "  AND claim_lock IS NULL "
+            "  AND current_run_id IS NULL",
+            (new_recurrences, task_id),
+        ).rowcount
+        if rows_changed != 1:
+            return "__claim_race__"
+
+        # Append one standard blocked event with the privacy-safe diagnostic.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": (
+                    "dirty_workspace: workspace has uncommitted or untracked changes"
+                ),
+                "code": "dirty_workspace",
+                "kind": "needs_input",
+                "recurrences": new_recurrences,
+                "workspace_diag": workspace_diag or {},
+            },
+        )
+
+    # Return None = success; caller fires the best-effort lifecycle hook.
+    return None
 
 
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
@@ -21942,17 +22124,6 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
-        if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
-            # Increment per-profile counter even in dry_run so the cap
-            # check sees the would-be spawn on subsequent iterations.
-            # Without this, dry_run reports every task as spawnable and
-            # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
-                )
-            continue
         # ── Workspace collision pre-check ────────────────────────
         # Before claiming, check whether another running task already
         # holds the same non-scratch workspace.  The in-transaction
@@ -21966,39 +22137,67 @@ def _dispatch_once_locked(
         ).fetchone()
         if ws_info and ws_info["workspace_path"] and ws_info["workspace_kind"] \
            and ws_info["workspace_kind"] != "scratch":
-            coll = conn.execute(
-                "SELECT id FROM tasks "
-                "WHERE status = 'running' "
-                "  AND workspace_kind = ? "
-                "  AND workspace_path = ? "
-                "  AND id != ? "
-                "LIMIT 1",
-                (ws_info["workspace_kind"], ws_info["workspace_path"], row["id"]),
-            ).fetchone()
-            if coll:
-                result.workspace_collisions.append((row["id"], coll["id"]))
+            # BUILD-858: use the canonical extracted predicate so the dispatch
+            # pre-check and the dirty-block CAS can never drift.
+            coll = _find_workspace_collision(
+                conn, row["id"],
+                ws_info["workspace_kind"], ws_info["workspace_path"],
+            )
+            if coll is not None:
+                result.workspace_collisions.append((row["id"], coll))
                 continue
-        # ── Dirty-workspace pre-flight check ──────────────────────
-        # Approach A: refuse to dispatch when the workspace is a git
-        # repo with uncommitted/untracked changes.  This prevents the
-        # crash-class from occurring (architect workers in dirty
-        # shared workspaces).  Only reads git status — never writes.
+        # ── Dirty-workspace pre-flight check (BUILD-858 Invariant I2) ─────
+        # For profile-dispatchable ready cards in dirty non-worktree shared
+        # Git directories: atomically transition to a durable needs_input block
+        # rather than leaving the card ready and appending a diagnostic-only
+        # event on every tick.  Only reads git status — never writes Git files.
         # Scratch workspaces (no git repo) pass through cleanly.
-        # Worktree tasks use the board's default_workdir (the shared
-        # repo root) as their workspace_path — flagging those as dirty
-        # would block all worktree dispatches.  Skip worktrees.
+        # Worktree tasks use the board's default_workdir (the shared repo root)
+        # as workspace_path — flagging those would block all worktree dispatches.
         if ws_info and ws_info[0] != "worktree":
             _ws_path = (ws_info[1] if ws_info else None) or None
             if _ws_path and _is_workspace_dirty(_ws_path):
                 ws_diag = _capture_workspace_diag(_ws_path)
                 if not dry_run:
-                    with write_txn(conn):
-                        _append_event(
-                            conn, row["id"], "dirty_workspace",
-                            {"workspace_diag": ws_diag or {}},
+                    block_result = _block_dirty_ready_task(
+                        conn, row["id"], ws_diag,
+                    )
+                    if block_result is None:
+                        # Successfully transitioned to blocked/needs_input.
+                        result.dirty_workspace.append(row["id"])
+                        result.auto_blocked.append(row["id"])
+                        # Best-effort lifecycle hook — after commit, outside txn.
+                        _fire_kanban_lifecycle_hook(
+                            "kanban_task_blocked",
+                            row["id"],
+                            board=get_current_board(),
+                            assignee=row["assignee"],
+                            run_id=None,
+                            reason="dirty_workspace",
                         )
-                result.dirty_workspace.append(row["id"])
+                    elif block_result == "__claim_race__":
+                        # Another claimant committed first; not an error.
+                        result.claim_race.append(row["id"])
+                    else:
+                        # Collision found inside the write lock — benign.
+                        result.workspace_collisions.append(
+                            (row["id"], block_result)
+                        )
+                else:
+                    # Dry-run: report without mutating.
+                    result.dirty_workspace.append(row["id"])
                 continue
+        if dry_run:
+            result.spawned.append((row["id"], row_assignee, ""))
+            # Increment per-profile counter even in dry_run so the cap
+            # check sees the would-be spawn on subsequent iterations.
+            # Without this, dry_run reports every task as spawnable and
+            # under-reports the capped subset (#21582).
+            if _per_profile_cap is not None and row_assignee:
+                _per_profile_running[row_assignee] = (
+                    _per_profile_running.get(row_assignee, 0) + 1
+                )
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             # BUILD-263: lost the atomic claim to a concurrent claimant

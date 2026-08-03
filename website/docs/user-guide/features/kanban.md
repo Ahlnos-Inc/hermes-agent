@@ -69,6 +69,37 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Durable human and dirty-workspace holds
+
+A task created with `initial_status=blocked` is an explicit human/operator hold.
+It remains `blocked` across dependency recomputation and dispatcher ticks until
+a trusted operator explicitly runs `hermes kanban unblock <task-id>` (or a
+trusted terminal operation completes it). It is not a recoverable dependency
+wait.
+
+For a profile-assigned `ready` task using a non-`worktree` Git `dir:<path>`,
+the dispatcher reads `git status --short --branch` before claiming it. If the
+workspace has uncommitted or untracked changes, the first ordinary dispatch
+attempt atomically changes the task to `blocked` with
+`block_kind=needs_input` and a standard `blocked` event whose stable
+`code` is `dirty_workspace`. The transition creates no worker run, does not
+consume retry/failure budget, and never changes Git files.
+
+To resolve a `dirty_workspace` hold:
+
+1. Inspect the task (`hermes kanban show <task-id>`) and its bounded,
+   redacted workspace diagnostic.
+2. Clean or move unrelated files yourself; Hermes will **not** reset, stash,
+   delete, or edit user Git files automatically.
+3. Confirm the directory is safe, then run `hermes kanban unblock <task-id>`.
+   A clean task can be dispatched on the next tick. If it is still dirty, the
+   new operator-authorized attempt will block it again.
+
+`worktree` tasks are deliberately excluded from this preflight because their
+pre-materialization path may be the shared repository root. Workspace
+collisions are checked before dirtiness and remain benign: a running task may
+legitimately make a shared directory dirty.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
@@ -973,7 +1004,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
-| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
+| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. A task constructed with `initial_status=blocked` emits this event with `code: initial_status_blocked` and no run. Dirty non-worktree Git workspaces emit it with `code: dirty_workspace` plus a bounded/redacted `workspace_diag`; that transition also creates no run. Other ordinary never-claimed `--reason` blocks synthesize a zero-duration run. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
