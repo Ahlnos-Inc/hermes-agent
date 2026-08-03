@@ -1547,6 +1547,9 @@ def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"kanban gate issue-graph: cannot read --graph-file: {exc}", file=sys.stderr)
         return 2
+    request_digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
     # BUILD-862: the payload may be a bare task list (legacy) or an object
     # {"tasks": [...], "max_rework_cycles": N} declaring the rework budget.
     max_rework_cycles = None
@@ -1562,6 +1565,43 @@ def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    preset_keys = {
+        "model_routing", "task_category", "data_sensitivity", "verifiability", "quota_policy",
+    }
+    if any(isinstance(task, dict) and preset_keys.intersection(task) for task in tasks):
+        try:
+            from tools.kanban_tools import _resolve_model_routing
+        except Exception as exc:
+            print(
+                f"kanban gate issue-graph: cannot resolve execution policy presets: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        resolved_tasks = []
+        try:
+            for raw_task in tasks:
+                if not isinstance(raw_task, dict):
+                    resolved_tasks.append(raw_task)
+                    continue
+                task = dict(raw_task)
+                resolved_model, routing = _resolve_model_routing(
+                    task, task.pop("model_override", None),
+                )
+                for key in preset_keys:
+                    task.pop(key, None)
+                if resolved_model:
+                    task["model_override"] = resolved_model
+                if routing:
+                    task["model_provider_override"] = routing.get("provider")
+                    task["model_reasoning_effort"] = routing.get("reasoning_effort")
+                resolved_tasks.append(task)
+        except Exception as exc:
+            print(
+                f"kanban gate issue-graph: cannot resolve execution policy presets: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        tasks = resolved_tasks
     with kb.connect_closing() as conn:
         gate = _gate_load(conn, args.gate_id)
         if gate is None:
@@ -1583,6 +1623,7 @@ def _cmd_gate_issue_graph(args: argparse.Namespace) -> int:
                 conn, gate.gate_id, issuer, tasks,
                 idempotency_key=str(args.idempotency_key),
                 max_rework_cycles=max_rework_cycles,
+                request_digest=request_digest,
             )
         except (kb.ArchitectureGateError, ValueError, TypeError) as exc:
             print(f"kanban gate issue-graph: {exc}", file=sys.stderr)

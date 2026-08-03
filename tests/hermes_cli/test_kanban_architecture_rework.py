@@ -23,6 +23,10 @@ GOOD_SHA_2 = "b" * 40
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("architect", "coder", "reviewer", "verifier", "releaser", "orchestrator"):
+        profile_dir = home / "profiles" / profile
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -111,11 +115,12 @@ def _issued_loop(conn, *, max_rework_cycles=None, scope: str = "turn-1"):
             {"title": "implement", "assignee": "coder", "parents": []},
             {"title": "review", "assignee": "reviewer", "parents": [0]},
             {"title": "verify", "assignee": "verifier", "parents": [1]},
+            {"title": "report", "assignee": "releaser", "parents": [2], "role": "reporter", "terminal": True},
         ],
         idempotency_key=f"graph-{scope}",
         max_rework_cycles=max_rework_cycles,
     )
-    assert len(issued) == 3
+    assert len(issued) == 4
     return approved, issued[0], issued[1], issued[2]
 
 
@@ -174,7 +179,7 @@ def test_issuance_stores_default_and_explicit_budget(kanban_home):
             (gate.gate_id,),
         ).fetchone()[0])
         assert policy["max_rework_cycles"] == kb.ARCHITECTURE_REWORK_DEFAULT_BUDGET
-        assert set(policy["assignees"].values()) == {"coder", "reviewer", "verifier"}
+        assert set(policy["assignees"].values()) == {"coder", "reviewer", "verifier", "releaser"}
 
         gate_b, *_ = _issued_loop(conn, max_rework_cycles=1, scope="turn-2")
         policy_b = json.loads(conn.execute(

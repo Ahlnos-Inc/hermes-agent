@@ -24,6 +24,10 @@ def kanban_home(tmp_path, monkeypatch):
 
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("coder", "reviewer", "orchestrator"):
+        profile_dir = home / "profiles" / profile
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # A gate action must never be mistaken for a worker action by default.
@@ -207,8 +211,9 @@ def test_unknown_gate_id_exits_non_zero(kanban_home, capsys):
 def _graph_file(tmp_path) -> str:
     path = tmp_path / "graph.json"
     path.write_text(json.dumps([
-        {"title": "ingestion", "assignee": "coder", "parents": []},
-        {"title": "review", "assignee": "reviewer", "parents": [0]},
+        {"title": "ingestion", "assignee": "coder", "parents": [], "role": "coder"},
+        {"title": "review", "assignee": "reviewer", "parents": [0],
+         "role": "reporter", "terminal": True},
     ]), encoding="utf-8")
     return str(path)
 
@@ -228,6 +233,50 @@ def test_issue_graph_is_single_shot(kanban_home, tmp_path, capsys):
     assert _run("issue-graph", gate_id=gate.gate_id, graph_file=graph,
                 idempotency_key="graph-v2") == 1
     assert "architecture_graph_issued" in capsys.readouterr().err
+
+
+def test_issue_graph_resolves_presets_and_retries_from_raw_payload_digest(
+    kanban_home, tmp_path, monkeypatch, capsys,
+):
+    with kb.connect_closing() as conn:
+        gate = _open_awaiting_approval(conn)
+    assert _run("approve", gate_id=gate.gate_id, digest=gate.design_digest) == 0
+    capsys.readouterr()
+
+    graph = tmp_path / "preset-graph.json"
+    graph.write_text(json.dumps([
+        {
+            "title": "implementation", "assignee": "coder", "parents": [], "role": "coder",
+            "model_routing": "implementation", "task_category": "coding",
+        },
+        {
+            "title": "review", "assignee": "reviewer", "parents": [0],
+            "role": "reporter", "terminal": True,
+        },
+    ]), encoding="utf-8")
+    from tools import kanban_tools
+
+    monkeypatch.setattr(
+        kanban_tools, "_resolve_model_routing",
+        lambda *_: ("resolved-model", {"provider": "prov", "reasoning_effort": "high"}),
+    )
+    assert _run("issue-graph", gate_id=gate.gate_id, graph_file=str(graph),
+                idempotency_key="preset-retry") == 0
+    first_output = capsys.readouterr().out
+    issued = first_output.strip().split(": ", 1)[1].split(", ")
+    with kb.connect_closing() as conn:
+        coder = kb.get_task(conn, issued[0])
+    assert (coder.model_override, coder.model_provider_override, coder.model_reasoning_effort) == (
+        "resolved-model", "prov", "high",
+    )
+
+    monkeypatch.setattr(
+        kanban_tools, "_resolve_model_routing",
+        lambda *_: ("different-model", {"provider": "other", "reasoning_effort": "none"}),
+    )
+    assert _run("issue-graph", gate_id=gate.gate_id, graph_file=str(graph),
+                idempotency_key="preset-retry") == 0
+    assert capsys.readouterr().out.strip().endswith(", ".join(issued))
 
 
 def test_issue_graph_rejects_an_unreadable_or_empty_graph_file(kanban_home, tmp_path):
