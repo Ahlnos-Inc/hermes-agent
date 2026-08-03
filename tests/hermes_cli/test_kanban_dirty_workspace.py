@@ -21,7 +21,9 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 import subprocess
 import threading
 from pathlib import Path
@@ -212,10 +214,15 @@ def test_workspace_diag_captured_in_event(kanban_home, all_assignees_spawnable):
         diag = payload["workspace_diag"]
         assert diag.get("git_repo") is True
         assert diag.get("dirty") is True
-        assert "git_status_raw" in diag
-        # Key invariant: workspace_diag must never leak file contents.
-        raw = diag.get("git_status_raw", "")
-        assert "token=abc123secret" not in raw
+        assert "git_status_raw" not in diag
+        assert diag.get("status_counts") == {"??": 1}
+        assert diag.get("file_count") == 1
+        assert diag.get("status_digest") == hashlib.sha256(
+            b"?? secret_file.txt"
+        ).hexdigest()[:12]
+        serialized = json.dumps(diag)
+        assert "secret_file.txt" not in serialized
+        assert "token=abc123secret" not in serialized
 
 
 def test_dirty_workspace_idempotent(kanban_home, all_assignees_spawnable):
@@ -523,21 +530,36 @@ def test_claim_vs_dirty_block_race_serializes(kanban_home, all_assignees_spawnab
         claim_result: list = []
         block_result: list = []
         errors: list = []
+        barrier = threading.Barrier(2)
+        claim_conn = sqlite3.connect(
+            str(kb.kanban_db_path()),
+            isolation_level=None,
+            timeout=10,
+            check_same_thread=False,
+        )
+        block_conn = sqlite3.connect(
+            str(kb.kanban_db_path()),
+            isolation_level=None,
+            timeout=10,
+            check_same_thread=False,
+        )
+        claim_conn.row_factory = sqlite3.Row
+        block_conn.row_factory = sqlite3.Row
+        ws_diag = kb._capture_workspace_diag(str(dirty_ws))
 
         def _run_claim() -> None:
             try:
-                with kb.connect() as c:
-                    result = kb.claim_task(c, t)
-                    claim_result.append(result)
+                barrier.wait(timeout=10)
+                result = kb.claim_task(claim_conn, t)
+                claim_result.append(result)
             except Exception as exc:
                 errors.append(("claim", exc))
 
         def _run_dirty_block() -> None:
             try:
-                ws_diag = kb._capture_workspace_diag(str(dirty_ws))
-                with kb.connect() as c:
-                    result = kb._block_dirty_ready_task(c, t, ws_diag)
-                    block_result.append(result)
+                barrier.wait(timeout=10)
+                result = kb._block_dirty_ready_task(block_conn, t, ws_diag)
+                block_result.append(result)
             except Exception as exc:
                 errors.append(("block", exc))
 
@@ -548,7 +570,19 @@ def test_claim_vs_dirty_block_race_serializes(kanban_home, all_assignees_spawnab
         t1.join(timeout=10)
         t2.join(timeout=10)
 
+        assert not t1.is_alive() and not t2.is_alive(), (
+            f"Round {round_num}: contended workers did not finish"
+        )
         assert not errors, f"Round {round_num}: unexpected errors: {errors}"
+        assert len(claim_result) == 1, (
+            f"Round {round_num}: expected one claim result; got {claim_result}"
+        )
+        assert len(block_result) == 1, (
+            f"Round {round_num}: expected one block result; got {block_result}"
+        )
+
+        claim_conn.close()
+        block_conn.close()
 
         with kb.connect() as conn:
             task = kb.get_task(conn, t)

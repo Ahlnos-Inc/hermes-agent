@@ -20183,22 +20183,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# ── Safe workspace diagnostics for crash/timeout forensics ─────────
-_WORKSPACE_DIAG_MAX_BYTES = 4096
-_WORKSPACE_DIAG_MAX_LINES = 50
-_WORKSPACE_DIAG_REDACT_PATTERNS = [
-    re.compile(r"(?:api_?key|token|secret|password|auth)\s*[:=]\s*\S+", re.I),
-    re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"),
-    re.compile(r"sk-[A-Za-z0-9]{32,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{36,}"),
-]
-
-
 def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
-    """Capture capped, redacted git status for a crashed worker's workspace.
+    """Capture privacy-safe git status for a crashed worker's workspace.
 
     Returns ``None`` if the path does not exist or is not a git repo.
-    Never returns full diffs — only status/diffstat lines.
+    Never returns filenames or full diffs.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
@@ -20223,21 +20212,23 @@ def _capture_workspace_diag(workspace_path: str) -> Optional[dict]:
             if first_line.startswith("## "):
                 branch = first_line[3:].split("...")[0].strip()
             return {"git_repo": True, "branch": branch or None, "dirty": False}
-        capped_lines = file_lines[:_WORKSPACE_DIAG_MAX_LINES]
-        capped = "\n".join(capped_lines)
-        if len(capped) > _WORKSPACE_DIAG_MAX_BYTES:
-            capped = capped[:_WORKSPACE_DIAG_MAX_BYTES] + "\n… [truncated]"
-        for pat in _WORKSPACE_DIAG_REDACT_PATTERNS:
-            capped = pat.sub("[REDACTED]", capped)
+        status_counts = {}
+        for line in file_lines:
+            status_class = line[:2].strip()
+            status_counts[status_class] = status_counts.get(status_class, 0) + 1
         branch = ""
-        first_line = capped_lines[0] if capped_lines else ""
+        first_line = file_lines[0] if file_lines else ""
         if first_line.startswith("## "):
             branch = first_line[3:].split("...")[0].strip()
         return {
             "git_repo": True,
             "branch": branch or None,
             "dirty": True,
-            "git_status_raw": capped,
+            "status_counts": status_counts,
+            "file_count": len(file_lines),
+            "status_digest": hashlib.sha256(
+                "\n".join(file_lines).encode("utf-8", "replace")
+            ).hexdigest()[:12],
         }
     except Exception:
         return None
@@ -20340,7 +20331,7 @@ def _block_dirty_ready_task(
         if rows_changed != 1:
             return "__claim_race__"
 
-        # Append one standard blocked event with the bounded/redacted diagnostic.
+        # Append one standard blocked event with the privacy-safe diagnostic.
         _append_event(
             conn,
             task_id,
