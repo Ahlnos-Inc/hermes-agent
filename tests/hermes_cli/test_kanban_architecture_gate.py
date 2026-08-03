@@ -19,6 +19,13 @@ from agent.kanban_delivery_policy import (
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("architect", "coder", "reviewer", "verifier", "releaser", "orchestrator"):
+        profile_dir = home / "profiles" / profile
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+    skill_dir = home / "profiles" / "coder" / "skills" / "kanban"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: kanban\n---\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -309,6 +316,214 @@ def _awaiting_human_approval(conn, mode: str = "enforce") -> "kb.ArchitectureGat
     return accepted
 
 
+def _graph_issuer(gate: "kb.ArchitectureGate") -> "kb.MutationContext":
+    return kb.MutationContext(
+        board_key="default", principal="orchestrator-session",
+        actor_type="orchestrator_agent", profile="orchestrator",
+        session_id="session-1", request_scope_id="turn-1", gate_id=gate.gate_id,
+        mode="enforce", phase="graph_issuance",
+    )
+
+
+def _execution_graph(*, model_override: str = "gpt-test") -> list[dict]:
+    return [
+        {
+            "title": "implement", "assignee": "coder", "parents": [], "role": "coder",
+            "skills": ["kanban"], "toolsets": ["file"], "max_runtime_seconds": 60,
+            "priority": 3, "model_override": model_override,
+            "model_provider_override": "openai", "model_reasoning_effort": "high",
+        },
+        {
+            "title": "verify", "assignee": "verifier", "parents": [0], "role": "verifier",
+            "publication_repo": "owner/repo",
+        },
+        {
+            "title": "report", "assignee": "releaser", "parents": [1], "role": "reporter",
+            "terminal": True, "publication_repo": "owner/repo",
+        },
+    ]
+
+
+def test_issued_graph_binds_execution_fields_and_contract(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        architect = kb.get_task(conn, approved.architect_task_id)
+        conn.execute(
+            "UPDATE tasks SET publication_repo = ?, workspace_kind = 'worktree', "
+            "workspace_path = '/tmp/repo' WHERE id = ?",
+            ("owner/repo", architect.id),
+        )
+        issued = kb.issue_architecture_graph(
+            conn, approved.gate_id, _graph_issuer(approved), _execution_graph(),
+            idempotency_key="execution-policy-v1",
+        )
+        coder = kb.get_task(conn, issued[0])
+        verifier = kb.get_task(conn, issued[1])
+        contract = json.loads(conn.execute(
+            "SELECT graph_contract FROM architecture_graph_issuances WHERE gate_id = ?",
+            (approved.gate_id,),
+        ).fetchone()[0])
+
+    assert (coder.priority, coder.skills, coder.toolsets) == (3, ["kanban"], ["file"])
+    assert (coder.model_override, coder.model_provider_override, coder.model_reasoning_effort) == (
+        "gpt-test", "openai", "high",
+    )
+    assert coder.max_runtime_seconds == 60
+    assert coder.publication_repo == verifier.publication_repo == "owner/repo"
+    assert verifier.branch_name == f"wt/{issued[0]}"
+    assert contract["version"] == 1 and contract["digest"]
+    assert any(
+        event.payload["model_override"] == "gpt-test"
+        for event in kb.list_events(conn, issued[0]) if event.kind == "created"
+    )
+
+
+@pytest.mark.parametrize(
+    ("graph", "error"),
+    [
+        ([{"title": "only", "assignee": "coder", "parents": [], "role": "coder"}], "exactly one terminal"),
+        ([
+            {"title": "one", "assignee": "coder", "parents": [], "role": "finalizer", "terminal": True},
+            {"title": "two", "assignee": "reviewer", "parents": [], "role": "reporter", "terminal": True},
+        ], "exactly one terminal"),
+        ([{"title": "bad", "assignee": "coder", "parents": [], "role": "coder", "terminal": True}], "terminal role"),
+        ([
+            {"title": "stranded", "assignee": "coder", "parents": [], "role": "coder"},
+            {"title": "end", "assignee": "releaser", "parents": [], "role": "reporter", "terminal": True},
+        ], "must reach the terminal"),
+        ([
+            {"title": "one", "assignee": "coder", "parents": [1], "role": "coder"},
+            {"title": "end", "assignee": "releaser", "parents": [0], "role": "reporter", "terminal": True},
+        ], "contains a cycle"),
+    ],
+)
+def test_issue_graph_rejects_invalid_terminal_contract(kanban_home, graph, error):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(conn, gate.gate_id, _human_context(), gate.design_digest or "")
+        with pytest.raises(ValueError, match=error):
+            kb.issue_architecture_graph(conn, approved.gate_id, _graph_issuer(approved), graph, idempotency_key="invalid-terminal")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (lambda graph: graph[0].update(model_routing="implementation"), "unsupported fields"),
+        (lambda graph: graph[0].update(assignee="missing-profile"), "unknown profile"),
+        (lambda graph: graph[0].update(skills=["disabled-skill"]), "forced skill validation failed"),
+        (lambda graph: graph[0].update(toolsets=["missing-toolset"]), "unknown toolsets"),
+        (lambda graph: graph[0].update(model_reasoning_effort="bad"), "model_reasoning_effort"),
+        (lambda graph: graph[0].update(publication_repo="own er/re po"), "tasks\\[0\\]\\.publication_repo must be owner/repo"),
+        (lambda graph: graph[1].update(publication_repo="other/repo"), "divergent publication_repo"),
+    ],
+)
+@pytest.mark.real_assignee_guard
+def test_issue_graph_rejects_unbound_or_invalid_execution_policy(kanban_home, monkeypatch, mutate, error):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(conn, gate.gate_id, _human_context(), gate.design_digest or "")
+        architect = kb.get_task(conn, approved.architect_task_id)
+        conn.execute("UPDATE tasks SET publication_repo = ? WHERE id = ?", ("owner/repo", architect.id))
+        graph = _execution_graph()
+        mutate(graph)
+        if error == "forced skill validation failed":
+            monkeypatch.setattr(kb, "_forced_skill_validation_error", lambda *_: "forced skill validation failed")
+        with pytest.raises(ValueError, match=error):
+            kb.issue_architecture_graph(conn, approved.gate_id, _graph_issuer(approved), graph, idempotency_key="invalid-policy")
+
+
+def test_issue_graph_retry_uses_request_digest_before_volatile_contract_resolution(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(conn, gate.gate_id, _human_context(), gate.design_digest or "")
+        issuer = _graph_issuer(approved)
+        graph = _execution_graph()
+        issued = kb.issue_architecture_graph(
+            conn, approved.gate_id, issuer, graph,
+            idempotency_key="exact-retry", request_digest="r1",
+        )
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert kb.issue_architecture_graph(
+            conn, approved.gate_id, issuer, _execution_graph(model_override="volatile-drift"),
+            idempotency_key="exact-retry", request_digest="r1",
+        ) == issued
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_graph_identity_conflict"):
+            kb.issue_architecture_graph(
+                conn, approved.gate_id, issuer, graph,
+                idempotency_key="exact-retry", request_digest="r2",
+            )
+        assert kb.issue_architecture_graph(
+            conn, approved.gate_id, issuer, graph, idempotency_key="exact-retry",
+        ) == issued
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+        with pytest.raises(kb.ArchitectureGateError, match="architecture_graph_issued"):
+            kb.issue_architecture_graph(conn, approved.gate_id, issuer, graph, idempotency_key="other-key")
+        conn.execute("UPDATE architecture_graph_issuances SET graph_contract = NULL WHERE gate_id = ?", (approved.gate_id,))
+        assert kb.issue_architecture_graph(conn, approved.gate_id, issuer, _execution_graph(model_override="legacy-change"), idempotency_key="exact-retry") == issued
+
+
+def test_issue_graph_requires_one_task_publication_repo_scope_without_architect_repo(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        divergent = _execution_graph()
+        divergent[0]["publication_repo"] = "owner/one"
+        divergent[1]["publication_repo"] = "owner/two"
+        with pytest.raises(ValueError, match="divergent publication_repo"):
+            kb.issue_architecture_graph(
+                conn, approved.gate_id, _graph_issuer(approved), divergent,
+                idempotency_key="divergent-repos",
+            )
+
+        graph = _execution_graph()
+        for task in graph:
+            task["publication_repo"] = "owner/repo"
+        issued = kb.issue_architecture_graph(
+            conn, approved.gate_id, _graph_issuer(approved), graph,
+            idempotency_key="matching-repos",
+        )
+        assert [kb.get_task(conn, task_id).publication_repo for task_id in issued] == [
+            "owner/repo", "owner/repo", "owner/repo",
+        ]
+
+
+def test_issue_graph_accepts_known_non_profile_assignee_on_non_terminal_task(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        graph = _execution_graph()
+        graph[0]["assignee"] = "nicholas"
+        issued = kb.issue_architecture_graph(
+            conn, approved.gate_id, _graph_issuer(approved), graph,
+            idempotency_key="human-lane",
+        )
+
+        assert kb.get_task(conn, issued[0]).assignee == "nicholas"
+
+
+def test_issue_graph_rejects_boolean_parent_indexes(kanban_home):
+    with kb.connect() as conn:
+        gate = _awaiting_human_approval(conn)
+        approved = kb.approve_architecture_gate(
+            conn, gate.gate_id, _human_context(), gate.design_digest or "",
+        )
+        graph = _execution_graph()
+        graph[1]["parents"] = [False]
+
+        with pytest.raises(ValueError, match=r"tasks\[1\]\.parents is invalid"):
+            kb.issue_architecture_graph(
+                conn, approved.gate_id, _graph_issuer(approved), graph,
+                idempotency_key="boolean-parent",
+            )
+
+
 def test_malformed_architect_handoff_rolls_back_completion(kanban_home):
     with kb.connect() as conn:
         architect = kb.create_task(
@@ -413,7 +628,7 @@ def test_human_approved_gate_issues_one_atomic_five_card_graph(kanban_home):
             {"title": "Strava ingestion", "assignee": "coder", "parents": []},
             {"title": "Google Drive export", "assignee": "reviewer", "parents": [0]},
             {"title": "verification", "assignee": "verifier", "parents": [1]},
-            {"title": "publisher", "assignee": "releaser", "parents": [2]},
+            {"title": "publisher", "assignee": "releaser", "parents": [2], "role": "reporter", "terminal": True},
         ]
 
         issued = kb.issue_architecture_graph(
@@ -462,7 +677,7 @@ def test_worker_kanban_create_cannot_append_to_an_issued_graph(kanban_home, monk
                 mode="enforce",
                 phase="graph_issuance",
             ),
-            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            [{"title": "implementation", "assignee": "releaser", "parents": [], "role": "reporter", "terminal": True}],
             idempotency_key="issued-worker-graph",
         )
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
@@ -492,7 +707,7 @@ def test_auto_decompose_cannot_append_to_an_issued_graph(kanban_home):
                 request_scope_id="turn-1", gate_id=approved.gate_id,
                 profile="orchestrator", mode="enforce", phase="graph_issuance",
             ),
-            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            [{"title": "implementation", "assignee": "releaser", "parents": [], "role": "reporter", "terminal": True}],
             idempotency_key="issued-auto-decompose-graph",
         )
         triage = kb.create_task(conn, title="late decomposition", triage=True)
@@ -971,7 +1186,7 @@ def test_authorized_graph_and_post_approval_descendants_are_not_quarantined(kanb
                 {"title": "implementation", "assignee": "coder", "parents": []},
                 {"title": "Google configuration", "assignee": "coder", "parents": [0]},
                 {"title": "verification", "assignee": "verifier", "parents": [1]},
-                {"title": "finalizer", "assignee": "releaser", "parents": [2]},
+                {"title": "finalizer", "assignee": "releaser", "parents": [2], "role": "finalizer", "terminal": True},
             ],
             idempotency_key="incident-five-card-v1",
         )
@@ -1369,7 +1584,7 @@ def test_a_shadow_gate_allows_a_context_less_link_even_after_graph_issuance(kanb
                 request_scope_id="turn-1", gate_id=approved.gate_id,
                 profile="orchestrator", mode="shadow", phase="graph_issuance",
             ),
-            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            [{"title": "implementation", "assignee": "releaser", "parents": [], "role": "reporter", "terminal": True}],
             idempotency_key="issued-shadow-graph",
         )
         outsider = kb.create_task(conn, title="late addition", assignee="coder")
@@ -1438,7 +1653,7 @@ def test_context_less_link_after_graph_issuance_is_refused_as_issued(kanban_home
                 profile="orchestrator", mode="orchestrator_only",
                 phase="graph_issuance",
             ),
-            [{"title": "implementation", "assignee": "coder", "parents": []}],
+            [{"title": "implementation", "assignee": "releaser", "parents": [], "role": "reporter", "terminal": True}],
             idempotency_key="issued-link-graph",
         )
         outsider = kb.create_task(conn, title="late addition", assignee="coder")

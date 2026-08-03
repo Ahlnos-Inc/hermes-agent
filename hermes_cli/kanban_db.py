@@ -2209,7 +2209,10 @@ CREATE TABLE IF NOT EXISTS architecture_graph_issuances (
     issued_at        INTEGER NOT NULL,
     -- BUILD-862: bounded rework contract declared once at issuance and never
     -- mutated. NULL identifies a legacy issuance: no autonomous re-arm, ever.
-    rework_policy    TEXT
+    rework_policy    TEXT,
+    -- BUILD-864: exact, normalized execution graph accepted at issuance.
+    -- NULL identifies legacy key-only issuances.
+    graph_contract   TEXT
 );
 
 -- BUILD-862: monotonic per-edge rework cycle accounting. Lives beside the
@@ -4025,6 +4028,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "architecture_graph_issuances", "rework_policy", "rework_policy TEXT"
             )
+        if "graph_contract" not in issuance_cols:
+            _add_column_if_missing(
+                conn, "architecture_graph_issuances", "graph_contract", "graph_contract TEXT"
+            )
 
     # BUILD-655: sha256 on task_attachments (computed at upload time). Some
     # focused migration tests intentionally create only a tasks table, so first
@@ -5817,6 +5824,95 @@ def reject_architecture_gate(
         return rejected
 
 
+def _normalize_graph_execution_fields(
+    raw: dict[str, Any],
+    *,
+    index: int,
+    assignee: Optional[str],
+    default_priority: int,
+    error_cls: type[Exception],
+    item_name: str,
+    context: str,
+) -> dict[str, Any]:
+    """Normalize fields shared by workflow compilation and gate issuance."""
+    raw_skills = raw.get("skills")
+    raw_toolsets = raw.get("toolsets")
+    max_runtime_seconds = raw.get("max_runtime_seconds")
+    step_priority = raw.get("priority", default_priority)
+    model_override = str(raw.get("model_override") or "").strip() or None
+    model_provider_override = (
+        str(raw.get("model_provider_override") or "").strip() or None
+    )
+    model_provider_override, model_override = _sanitize_denied_routing_override(
+        model_provider_override, model_override, context=context
+    )
+    model_reasoning_effort = (
+        str(raw.get("model_reasoning_effort") or "").strip().lower() or None
+    )
+    if raw_skills is not None and not isinstance(raw_skills, list):
+        raise error_cls(f"{item_name}[{index}].skills must be a list")
+    skills: list[str] = []
+    for skill in raw_skills or []:
+        name = str(skill or "").strip()
+        if not name:
+            continue
+        if "," in name:
+            raise error_cls(f"{item_name}[{index}].skill names cannot contain commas")
+        if name not in skills:
+            skills.append(name)
+    skill_validation_error = _forced_skill_validation_error(assignee, skills)
+    if skill_validation_error:
+        raise error_cls(skill_validation_error)
+    if raw_toolsets is not None and not isinstance(raw_toolsets, list):
+        raise error_cls(f"{item_name}[{index}].toolsets must be a list")
+    toolsets: Optional[list[str]] = None
+    if raw_toolsets is not None:
+        toolsets = []
+        unknown_toolsets: list[str] = []
+        for raw_toolset in raw_toolsets:
+            name = str(raw_toolset or "").strip().casefold()
+            if not name:
+                continue
+            if name not in KNOWN_TOOLSET_NAMES:
+                unknown_toolsets.append(name)
+            elif name not in toolsets:
+                toolsets.append(name)
+        if unknown_toolsets:
+            raise error_cls(
+                f"{item_name}[{index}] has unknown toolsets: {sorted(unknown_toolsets)}"
+            )
+        if not toolsets:
+            raise error_cls(f"{item_name}[{index}].toolsets must contain at least one toolset")
+    if max_runtime_seconds is not None:
+        try:
+            max_runtime_seconds = int(max_runtime_seconds)
+        except (TypeError, ValueError) as exc:
+            raise error_cls(
+                f"{item_name}[{index}].max_runtime_seconds must be an integer"
+            ) from exc
+        if max_runtime_seconds <= 0:
+            raise error_cls(f"{item_name}[{index}].max_runtime_seconds must be positive")
+    try:
+        step_priority = int(step_priority)
+    except (TypeError, ValueError) as exc:
+        raise error_cls(f"{item_name}[{index}].priority must be an integer") from exc
+    supported_efforts = {"none", *VALID_REASONING_EFFORTS}
+    if model_reasoning_effort is not None and model_reasoning_effort not in supported_efforts:
+        raise error_cls(
+            f"{item_name}[{index}].model_reasoning_effort must be one of "
+            + ", ".join(sorted(supported_efforts))
+        )
+    return {
+        "skills": skills,
+        "toolsets": toolsets,
+        "max_runtime_seconds": max_runtime_seconds,
+        "priority": step_priority,
+        "model_override": model_override,
+        "model_provider_override": model_provider_override,
+        "model_reasoning_effort": model_reasoning_effort,
+    }
+
+
 def issue_architecture_graph(
     conn: sqlite3.Connection,
     gate_id: str,
@@ -5825,6 +5921,7 @@ def issue_architecture_graph(
     *,
     idempotency_key: str,
     max_rework_cycles: Optional[int] = None,
+    request_digest: Optional[str] = None,
 ) -> list[str]:
     """Issue the one canonical implementation graph for a human-approved gate.
 
@@ -5858,31 +5955,67 @@ def issue_architecture_graph(
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("architecture graph tasks must be a non-empty list")
 
-    normalized: list[tuple[str, Optional[str], Optional[str], list[int]]] = []
+    allowed_task_fields = {
+        "title", "assignee", "body", "parents", "role", "terminal", "skills", "toolsets",
+        "max_runtime_seconds", "priority", "model_override", "model_provider_override",
+        "model_reasoning_effort", "publication_repo",
+    }
+    terminal_roles = {"finalizer", "synthesizer", "reporter"}
+    normalized: list[dict[str, Any]] = []
     for index, raw in enumerate(tasks):
         if not isinstance(raw, dict):
             raise ValueError(f"architecture graph tasks[{index}] must be an object")
+        unknown_fields = set(raw) - allowed_task_fields
+        if unknown_fields:
+            raise ValueError(
+                f"architecture graph tasks[{index}] has unsupported fields: {sorted(unknown_fields)}"
+            )
         title = raw.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"architecture graph tasks[{index}].title is required")
         assignee = _canonical_assignee(raw.get("assignee"))
+        if not assignee_is_dispatchable(assignee):
+            raise ValueError(f"architecture graph tasks[{index}].assignee is an unknown profile")
         body = raw.get("body")
         if body is not None and not isinstance(body, str):
             raise ValueError(f"architecture graph tasks[{index}].body must be a string")
         parents = raw.get("parents") or []
         if not isinstance(parents, list) or any(
-            not isinstance(parent, int) or parent < 0 or parent >= len(tasks) or parent == index
+            isinstance(parent, bool) or not isinstance(parent, int)
+            or parent < 0 or parent >= len(tasks) or parent == index
             for parent in parents
         ):
             raise ValueError(f"architecture graph tasks[{index}].parents is invalid")
         if len(set(parents)) != len(parents):
             raise ValueError(f"architecture graph tasks[{index}].parents has duplicates")
-        normalized.append((title.strip(), assignee, body, parents))
+        parents = sorted(parents)
+        role = str(raw.get("role") or "worker").strip().lower()
+        terminal = raw.get("terminal", False)
+        if not role:
+            raise ValueError(f"architecture graph tasks[{index}].role is required")
+        if not isinstance(terminal, bool):
+            raise ValueError(f"architecture graph tasks[{index}].terminal must be boolean")
+        publication_repo = raw.get("publication_repo")
+        if publication_repo is not None:
+            publication_repo = str(publication_repo).strip() or None
+            if publication_repo is not None and not re.fullmatch(
+                r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", publication_repo
+            ):
+                raise ValueError(
+                    f"architecture graph tasks[{index}].publication_repo must be owner/repo"
+                )
+        normalized.append(
+            {
+                "title": title.strip(), "assignee": assignee, "body": body, "parents": parents,
+                "role": role, "terminal": terminal, "publication_repo": publication_repo,
+                "raw": raw,
+            }
+        )
 
     in_degree = [0] * len(normalized)
     descendants: list[list[int]] = [[] for _ in normalized]
-    for index, (_, _, _, parents) in enumerate(normalized):
-        for parent in parents:
+    for index, task in enumerate(normalized):
+        for parent in task["parents"]:
             in_degree[index] += 1
             descendants[parent].append(index)
     ready = [index for index, degree in enumerate(in_degree) if degree == 0]
@@ -5897,6 +6030,23 @@ def issue_architecture_graph(
     if visited != len(normalized):
         raise ValueError("architecture graph contains a cycle")
 
+    terminals = [task for task in normalized if task["terminal"]]
+    if len(terminals) != 1:
+        raise ValueError("architecture graph must declare exactly one terminal task")
+    terminal_index = normalized.index(terminals[0])
+    if terminals[0]["role"] not in terminal_roles:
+        raise ValueError("architecture graph terminal role must be finalizer, synthesizer, or reporter")
+    reaches_terminal = {terminal_index}
+    frontier = [terminal_index]
+    while frontier:
+        current = frontier.pop()
+        for parent in normalized[current]["parents"]:
+            if parent not in reaches_terminal:
+                reaches_terminal.add(parent)
+                frontier.append(parent)
+    if len(reaches_terminal) != len(normalized):
+        raise ValueError("every architecture graph task must reach the terminal")
+
     with write_txn(conn):
         gate = get_architecture_gate(conn, gate_id)
         if (
@@ -5908,43 +6058,113 @@ def issue_architecture_graph(
         if gate.state != "human_approved":
             raise ArchitectureGateError("architecture_graph_requires_human_approval")
 
+        architect = get_task(conn, gate.architect_task_id)
+        if architect is None:
+            raise ArchitectureGateError("architecture_graph_architect_task_missing")
+        architect_repo = str(architect.publication_repo or "").strip() or None
+        task_repos = {
+            task["publication_repo"] for task in normalized if task["publication_repo"] is not None
+        }
+        if architect_repo is None and len(task_repos) > 1:
+            raise ValueError("architecture graph has divergent publication_repo")
+        for index, task in enumerate(normalized):
+            task["publication_repo"] = task["publication_repo"] or architect_repo
+            if architect_repo and task["publication_repo"] != architect_repo:
+                raise ValueError("architecture graph has divergent publication_repo")
+            task.update(
+                _normalize_graph_execution_fields(
+                    task.pop("raw"), index=index, assignee=task["assignee"],
+                    default_priority=0, error_cls=ValueError, item_name="architecture graph tasks",
+                    context="issue_architecture_graph",
+                )
+            )
+        canonical_contract = {
+            "version": 1,
+            "tasks": normalized,
+            "max_rework_cycles": max_rework_cycles,
+        }
+        contract_bytes = json.dumps(
+            canonical_contract, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        graph_contract = {
+            **canonical_contract,
+            "digest": hashlib.sha256(contract_bytes).hexdigest(),
+            "request_digest": request_digest,
+        }
+        graph_contract_json = json.dumps(
+            graph_contract, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+
         existing = conn.execute(
-            "SELECT idempotency_key, task_ids FROM architecture_graph_issuances WHERE gate_id = ?",
+            "SELECT idempotency_key, task_ids, graph_contract FROM architecture_graph_issuances WHERE gate_id = ?",
             (gate_id,),
         ).fetchone()
         if existing is not None:
             if existing["idempotency_key"] == idempotency_key:
+                if existing["graph_contract"] is not None:
+                    try:
+                        stored_contract = json.loads(existing["graph_contract"])
+                        stored_request_digest = stored_contract.get("request_digest")
+                        if stored_request_digest is not None and request_digest is not None:
+                            if stored_request_digest != request_digest:
+                                raise ArchitectureGateError(
+                                    "architecture_graph_identity_conflict", gate=gate
+                                )
+                        elif stored_contract["digest"] != graph_contract["digest"]:
+                            raise ArchitectureGateError(
+                                "architecture_graph_identity_conflict", gate=gate
+                            )
+                    except (TypeError, KeyError, json.JSONDecodeError) as exc:
+                        raise ArchitectureGateError("architecture_graph_issuance_corrupt") from exc
                 try:
                     return list(json.loads(existing["task_ids"]))
                 except (TypeError, json.JSONDecodeError) as exc:
                     raise ArchitectureGateError("architecture_graph_issuance_corrupt") from exc
             raise ArchitectureGateError("architecture_graph_issued")
 
-        architect = get_task(conn, gate.architect_task_id)
-        if architect is None:
-            raise ArchitectureGateError("architecture_graph_architect_task_missing")
         now = int(time.time())
         task_ids = [_new_task_id() for _ in normalized]
-        for index, (title, assignee, body, parents) in enumerate(normalized):
-            task_status = "ready" if not parents else "todo"
+        for index, task in enumerate(normalized):
+            task_status = "ready" if not task["parents"] else "todo"
+            branch_name = None
+            if architect.workspace_kind == "worktree" and task["role"] == "verifier":
+                coder_parents = [
+                    parent for parent in task["parents"] if normalized[parent]["role"] == "coder"
+                ]
+                if len(coder_parents) == 1:
+                    branch_name = f"wt/{task_ids[coder_parents[0]]}"
             conn.execute(
                 """INSERT INTO tasks (
-                    id, title, body, assignee, status, created_by, created_at,
-                    workspace_kind, workspace_path, tenant, session_id, workflow_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    id, title, body, assignee, status, priority, created_by, created_at,
+                    workspace_kind, workspace_path, tenant, session_id, workflow_key, skills,
+                    toolsets, model_override, model_provider_override, model_reasoning_effort,
+                    max_runtime_seconds, publication_repo, branch_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    task_ids[index], title, body, assignee, task_status,
+                    task_ids[index], task["title"], task["body"], task["assignee"], task_status,
+                    task["priority"],
                     "architecture-graph", now, architect.workspace_kind,
                     architect.workspace_path, architect.tenant, architect.session_id,
-                    gate.workflow_key,
+                    gate.workflow_key, json.dumps(task["skills"]) if task["skills"] else None,
+                    json.dumps(task["toolsets"]) if task["toolsets"] is not None else None,
+                    task["model_override"], task["model_provider_override"],
+                    task["model_reasoning_effort"], task["max_runtime_seconds"],
+                    task["publication_repo"], branch_name,
                 ),
             )
             _append_event(
                 conn, task_ids[index], "created",
-                {"by": "architecture-graph", "gate_id": gate_id, "status": task_status},
+                {
+                    "by": "architecture-graph", "gate_id": gate_id, "status": task_status,
+                    "model_override": task["model_override"],
+                    "model_provider_override": task["model_provider_override"],
+                    "model_reasoning_effort": task["model_reasoning_effort"],
+                },
             )
-        for index, (_, _, _, parents) in enumerate(normalized):
-            parent_ids_for_task = [task_ids[parent] for parent in parents]
+        for index, task in enumerate(normalized):
+            parent_ids_for_task = [task_ids[parent] for parent in task["parents"]]
             if not parent_ids_for_task:
                 parent_ids_for_task = [gate.architect_task_id]
             for parent_id in parent_ids_for_task:
@@ -5963,7 +6183,7 @@ def issue_architecture_graph(
                 "workspace_kind": architect.workspace_kind,
                 "workspace_path": architect.workspace_path,
                 "assignees": {
-                    task_ids[index]: normalized[index][1]
+                    task_ids[index]: normalized[index]["assignee"]
                     for index in range(len(normalized))
                 },
             },
@@ -5971,11 +6191,11 @@ def issue_architecture_graph(
         )
         conn.execute(
             """INSERT INTO architecture_graph_issuances
-               (gate_id, idempotency_key, task_ids, issued_by, issued_at, rework_policy)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (gate_id, idempotency_key, task_ids, issued_by, issued_at, rework_policy, graph_contract)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 gate_id, idempotency_key, json.dumps(task_ids),
-                context.principal, now, rework_policy,
+                context.principal, now, rework_policy, graph_contract_json,
             ),
         )
         _append_gate_audit(conn, gate, "architecture_graph_issued")
@@ -6094,20 +6314,6 @@ def compile_workflow_graph(
         terminal = raw.get("terminal", False)
         initial_status = raw.get("initial_status")
         result = raw.get("result")
-        raw_skills = raw.get("skills")
-        raw_toolsets = raw.get("toolsets")
-        max_runtime_seconds = raw.get("max_runtime_seconds")
-        step_priority = raw.get("priority", priority)
-        model_override = str(raw.get("model_override") or "").strip() or None
-        model_provider_override = (
-            str(raw.get("model_provider_override") or "").strip() or None
-        )
-        model_provider_override, model_override = _sanitize_denied_routing_override(
-            model_provider_override, model_override, context="compile_workflow"
-        )
-        model_reasoning_effort = (
-            str(raw.get("model_reasoning_effort") or "").strip().lower() or None
-        )
         if not step_key:
             raise WorkflowGraphError(f"steps[{index}].key is required")
         if step_key in step_keys:
@@ -6135,70 +6341,10 @@ def compile_workflow_graph(
             )
         if result is not None and not isinstance(result, str):
             raise WorkflowGraphError(f"steps[{index}].result must be a string")
-        if raw_skills is not None and not isinstance(raw_skills, list):
-            raise WorkflowGraphError(f"steps[{index}].skills must be a list")
-        skills: list[str] = []
-        for skill in raw_skills or []:
-            name = str(skill or "").strip()
-            if not name:
-                continue
-            if "," in name:
-                raise WorkflowGraphError(
-                    f"steps[{index}].skill names cannot contain commas"
-                )
-            if name not in skills:
-                skills.append(name)
-        skill_validation_error = _forced_skill_validation_error(assignee, skills)
-        if skill_validation_error:
-            raise WorkflowGraphError(skill_validation_error)
-        if raw_toolsets is not None and not isinstance(raw_toolsets, list):
-            raise WorkflowGraphError(f"steps[{index}].toolsets must be a list")
-        toolsets: Optional[list[str]] = None
-        if raw_toolsets is not None:
-            toolsets = []
-            unknown_toolsets: list[str] = []
-            for raw_toolset in raw_toolsets:
-                name = str(raw_toolset or "").strip().casefold()
-                if not name:
-                    continue
-                if name not in KNOWN_TOOLSET_NAMES:
-                    unknown_toolsets.append(name)
-                elif name not in toolsets:
-                    toolsets.append(name)
-            if unknown_toolsets:
-                raise WorkflowGraphError(
-                    f"steps[{index}] has unknown toolsets: {sorted(unknown_toolsets)}"
-                )
-            if not toolsets:
-                raise WorkflowGraphError(
-                    f"steps[{index}].toolsets must contain at least one toolset"
-                )
-        if max_runtime_seconds is not None:
-            try:
-                max_runtime_seconds = int(max_runtime_seconds)
-            except (TypeError, ValueError) as exc:
-                raise WorkflowGraphError(
-                    f"steps[{index}].max_runtime_seconds must be an integer"
-                ) from exc
-            if max_runtime_seconds <= 0:
-                raise WorkflowGraphError(
-                    f"steps[{index}].max_runtime_seconds must be positive"
-                )
-        try:
-            step_priority = int(step_priority)
-        except (TypeError, ValueError) as exc:
-            raise WorkflowGraphError(
-                f"steps[{index}].priority must be an integer"
-            ) from exc
-        supported_efforts = {"none", *VALID_REASONING_EFFORTS}
-        if (
-            model_reasoning_effort is not None
-            and model_reasoning_effort not in supported_efforts
-        ):
-            raise WorkflowGraphError(
-                f"steps[{index}].model_reasoning_effort must be one of "
-                + ", ".join(sorted(supported_efforts))
-            )
+        execution = _normalize_graph_execution_fields(
+            raw, index=index, assignee=assignee, default_priority=priority,
+            error_cls=WorkflowGraphError, item_name="steps", context="compile_workflow",
+        )
         step_keys.add(step_key)
         normalized_steps.append(
             {
@@ -6211,13 +6357,7 @@ def compile_workflow_graph(
                 "terminal": terminal,
                 "initial_status": initial_status,
                 "result": result,
-                "skills": skills,
-                "toolsets": toolsets,
-                "max_runtime_seconds": max_runtime_seconds,
-                "priority": step_priority,
-                "model_override": model_override,
-                "model_provider_override": model_provider_override,
-                "model_reasoning_effort": model_reasoning_effort,
+                **execution,
             }
         )
 
