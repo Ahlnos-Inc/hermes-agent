@@ -7264,6 +7264,32 @@ def test_orphan_sweep_force_reclaims_dirty_worktree_past_force_age(
     assert not dirty.exists()
 
 
+def test_orphan_sweep_never_forces_while_git_admin_dir_is_fresh(
+    kanban_home, tmp_path,
+):
+    """BUILD-927 review: the root dir's mtime is not a liveness clock --
+    edits deep in the tree never touch it, but every git operation moves the
+    worktree's admin dir. A stale root with a fresh admin dir is live work,
+    not abandonment: refuse to force."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    dirty = _orphan_worktree(repo, "t_rootstale1")
+    (dirty / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+    now = int(time.time())
+    old = now - 200
+    os.utime(dirty, (old, old))  # root looks abandoned; admin dir stays fresh
+
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, owned=(set(), set()), min_age_seconds=0,
+        force_age_seconds=100, now=now,
+    )
+
+    assert len(results) == 1
+    assert results[0]["status"] == "deferred"
+    assert results[0]["reason"] == "git_worktree_remove_refused"
+    assert dirty.exists()
+
+
 def test_orphan_sweep_defers_dirty_worktree_younger_than_force_age(
     kanban_home, tmp_path,
 ):
@@ -7324,6 +7350,20 @@ def test_stale_worktree_census_finds_foreign_and_claude_worktrees(tmp_path):
     assert by_path[str(old_claude)]["kind"] == "claude-worktree"
     assert str(young) not in by_path
     assert old_feature.exists() and old_claude.exists() and young.exists()
+
+    # Board-owned worktrees and already-reported orphans are the sweep's
+    # reach, not its blind spot -- exclusions keep them out of the census.
+    old_owned = repo / ".worktrees" / "t_owned"
+    old_owned.mkdir(parents=True)
+    os.utime(old_owned, (old_mtime, old_mtime))
+    census = kb.stale_worktree_census(
+        [repo], min_age_seconds=7 * 86400, now=now,
+        exclude_names={"t_owned"}, exclude_paths={str(old_feature)},
+    )
+    by_path = {entry["path"]: entry for entry in census}
+    assert str(old_owned) not in by_path
+    assert str(old_feature) not in by_path
+    assert str(old_claude) in by_path
 
 
 class TestScratchHeaderDescriptorEviction:

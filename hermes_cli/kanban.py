@@ -4271,9 +4271,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     # Task worktrees whose card was archived or purged have no row left to
     # sweep by, so they need the cross-board negative proof (BUILD-751).
     orphans: list[dict] = []
+    known_ids: set[str] = set()
     known_paths: set[str] = set()
+    boards_read_ok = False
     try:
         known_ids, known_paths = kb._all_board_task_ids_and_paths()
+        boards_read_ok = True
         for repo_root in kb.discover_task_worktree_roots(known_paths):
             orphans.extend(
                 kb.cleanup_orphan_task_worktrees(
@@ -4281,7 +4284,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                 )
             )
     except Exception as exc:  # an incomplete board read is not proof of orphanhood
-        print(f"Orphan worktree sweep skipped: {exc}")
+        print(f"Orphan worktree sweep aborted: {exc} (earlier results kept)")
     removed_worktrees = sum(1 for entry in orphans if entry["status"] == "cleaned")
     kept = len(orphans) - removed_worktrees
     for entry in orphans:
@@ -4290,14 +4293,23 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     # Report-only census of worktree-shaped dirs the sweep above is
     # structurally blind to (non-t_/foreign-convention dirs, .claude/
-    # worktrees, verifier scratch). Runs even if the sweep above aborted --
-    # discover_task_worktree_roots still honors HERMES_GC_WORKTREE_ROOTS
-    # with whatever known_paths it got (BUILD-927).
+    # worktrees, verifier scratch). Requires a complete board read -- with
+    # empty exclusions every live owned worktree would be misreported as
+    # stale (BUILD-927 review).
     census: list[dict] = []
-    try:
-        census = kb.stale_worktree_census(kb.discover_task_worktree_roots(known_paths))
-    except Exception as exc:
-        print(f"Stale worktree census skipped: {exc}")
+    if boards_read_ok:
+        try:
+            census = kb.stale_worktree_census(
+                kb.discover_task_worktree_roots(known_paths),
+                # Owned worktrees and orphans already reported above are the
+                # sweep's reach, not its blind spot -- keep them out.
+                exclude_names=known_ids,
+                exclude_paths=known_paths | {entry["path"] for entry in orphans},
+            )
+        except Exception as exc:
+            print(f"Stale worktree census skipped: {exc}")
+    else:
+        print("Stale worktree census skipped: board read failed")
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -4318,10 +4330,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"kanban gc: state file write failed: {exc}")
 
+    # A forced deletion is the loudest thing this sweep can do -- name it in
+    # the summary (delivered, since removed > 0) instead of hiding it in the
+    # state file. All-zero runs keep the exact prefix the wrapper matches.
+    forced_n = sum(1 for entry in orphans if entry.get("forced"))
+    forced_note = f", {forced_n} forced" if forced_n else ""
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_worktrees} orphan worktree(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed, "
-          f"{kept} kept, {len(census)} stale")
+          f"{kept} kept, {len(census)} stale{forced_note}")
     return 0
 
 
