@@ -4207,6 +4207,40 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _write_gc_state_file(
+    *,
+    removed_ws: int,
+    removed_worktrees: int,
+    removed_events: int,
+    removed_logs: int,
+    orphans: list[dict],
+    census: list[dict],
+) -> None:
+    """Persist the last GC run so an operator can see what got kept/found.
+
+    Written under the *active* profile's home (whatever ``HERMES_HOME``
+    resolves to when GC runs), same mechanism ``active_sessions.py`` and
+    friends already use for `<profile_home>/state/...` files -- never a
+    hardcoded orchestrator path (BUILD-927).
+    """
+    from hermes_constants import get_hermes_home
+    from utils import atomic_json_write
+
+    state_path = get_hermes_home() / "state" / "kanban-gc" / "last-run.json"
+    atomic_json_write(state_path, {
+        "at": int(time.time()),
+        "removed": {
+            "workspaces": removed_ws,
+            "worktrees": removed_worktrees,
+            "events": removed_events,
+            "logs": removed_logs,
+        },
+        "orphans_kept": [entry for entry in orphans if entry["status"] != "cleaned"],
+        "forced": [entry["path"] for entry in orphans if entry.get("forced")],
+        "census": census,
+    })
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
@@ -4237,6 +4271,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     # Task worktrees whose card was archived or purged have no row left to
     # sweep by, so they need the cross-board negative proof (BUILD-751).
     orphans: list[dict] = []
+    known_paths: set[str] = set()
     try:
         known_ids, known_paths = kb._all_board_task_ids_and_paths()
         for repo_root in kb.discover_task_worktree_roots(known_paths):
@@ -4248,9 +4283,21 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     except Exception as exc:  # an incomplete board read is not proof of orphanhood
         print(f"Orphan worktree sweep skipped: {exc}")
     removed_worktrees = sum(1 for entry in orphans if entry["status"] == "cleaned")
+    kept = len(orphans) - removed_worktrees
     for entry in orphans:
         if entry["status"] != "cleaned":
             print(f"Orphan worktree kept: {entry['path']} ({entry['reason']})")
+
+    # Report-only census of worktree-shaped dirs the sweep above is
+    # structurally blind to (non-t_/foreign-convention dirs, .claude/
+    # worktrees, verifier scratch). Runs even if the sweep above aborted --
+    # discover_task_worktree_roots still honors HERMES_GC_WORKTREE_ROOTS
+    # with whatever known_paths it got (BUILD-927).
+    census: list[dict] = []
+    try:
+        census = kb.stale_worktree_census(kb.discover_task_worktree_roots(known_paths))
+    except Exception as exc:
+        print(f"Stale worktree census skipped: {exc}")
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -4261,9 +4308,20 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
+
+    try:
+        _write_gc_state_file(
+            removed_ws=removed_ws, removed_worktrees=removed_worktrees,
+            removed_events=removed_events, removed_logs=removed_logs,
+            orphans=orphans, census=census,
+        )
+    except Exception as exc:
+        print(f"kanban gc: state file write failed: {exc}")
+
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_worktrees} orphan worktree(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed, "
+          f"{kept} kept, {len(census)} stale")
     return 0
 
 
