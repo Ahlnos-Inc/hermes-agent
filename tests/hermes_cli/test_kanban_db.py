@@ -7241,6 +7241,131 @@ def test_orphan_sweep_reads_every_board_before_claiming_orphanhood(
     assert path.exists()
 
 
+def test_orphan_sweep_force_reclaims_dirty_worktree_past_force_age(
+    kanban_home, tmp_path,
+):
+    """BUILD-927: the orphan proof is already complete by the refusal path --
+    a dirty unowned tree that has ALSO sat past the force-age floor is
+    abandonment, not a race, so the sweep escalates to `--force`."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    dirty = _orphan_worktree(repo, "t_dirtyold1")
+    (dirty / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, owned=(set(), set()), min_age_seconds=0,
+        force_age_seconds=100, now=int(time.time()) + 200,
+    )
+
+    assert results == [{
+        "task_id": "t_dirtyold1", "status": "cleaned",
+        "path": str(dirty), "repo_root": str(repo), "forced": True,
+    }]
+    assert not dirty.exists()
+
+
+def test_orphan_sweep_never_forces_while_git_admin_dir_is_fresh(
+    kanban_home, tmp_path,
+):
+    """BUILD-927 review: the root dir's mtime is not a liveness clock --
+    edits deep in the tree never touch it, but every git operation moves the
+    worktree's admin dir. A stale root with a fresh admin dir is live work,
+    not abandonment: refuse to force."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    dirty = _orphan_worktree(repo, "t_rootstale1")
+    (dirty / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+    now = int(time.time())
+    old = now - 200
+    os.utime(dirty, (old, old))  # root looks abandoned; admin dir stays fresh
+
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, owned=(set(), set()), min_age_seconds=0,
+        force_age_seconds=100, now=now,
+    )
+
+    assert len(results) == 1
+    assert results[0]["status"] == "deferred"
+    assert results[0]["reason"] == "git_worktree_remove_refused"
+    assert dirty.exists()
+
+
+def test_orphan_sweep_defers_dirty_worktree_younger_than_force_age(
+    kanban_home, tmp_path,
+):
+    """Same dirty tree, but still short of the force-age floor: kept."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    dirty = _orphan_worktree(repo, "t_dirtynew1")
+    (dirty / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    results = kb.cleanup_orphan_task_worktrees(
+        repo, owned=(set(), set()), min_age_seconds=0,
+        force_age_seconds=100, now=int(time.time()) + 50,
+    )
+
+    assert len(results) == 1
+    entry = results[0]
+    assert entry["task_id"] == "t_dirtynew1"
+    assert entry["status"] == "deferred"
+    assert entry["reason"] == "git_worktree_remove_refused"
+    assert "age_days" in entry
+    assert "forced" not in entry
+    assert dirty.exists()
+
+
+def test_discover_task_worktree_roots_honors_env_roots(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """BUILD-927: HERMES_GC_WORKTREE_ROOTS adds repos no board ever pointed
+    at, e.g. hermes-config's own dev worktrees."""
+    repo = tmp_path / "extra-repo"
+    (repo / ".worktrees").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_GC_WORKTREE_ROOTS", f"{repo}::")
+
+    assert kb.discover_task_worktree_roots([]) == [repo]
+
+
+def test_stale_worktree_census_finds_foreign_and_claude_worktrees(tmp_path):
+    """BUILD-927: report-only census sees what the reap sweep structurally
+    can't -- a foreign-convention dir and Claude's own .claude/worktrees --
+    skips young dirs, and deletes nothing."""
+    repo = tmp_path / "repo"
+    old_feature = repo / ".worktrees" / "wip-refactor"
+    old_feature.mkdir(parents=True)
+    old_claude = repo / ".claude" / "worktrees" / "session-1"
+    old_claude.mkdir(parents=True)
+    young = repo / ".worktrees" / "t_freshtask"
+    young.mkdir(parents=True)
+
+    now = int(time.time())
+    old_mtime = now - 10 * 86400
+    os.utime(old_feature, (old_mtime, old_mtime))
+    os.utime(old_claude, (old_mtime, old_mtime))
+
+    census = kb.stale_worktree_census([repo], min_age_seconds=7 * 86400, now=now)
+
+    by_path = {entry["path"]: entry for entry in census}
+    assert by_path[str(old_feature)]["kind"] == "feature-worktree"
+    assert by_path[str(old_claude)]["kind"] == "claude-worktree"
+    assert str(young) not in by_path
+    assert old_feature.exists() and old_claude.exists() and young.exists()
+
+    # Board-owned worktrees and already-reported orphans are the sweep's
+    # reach, not its blind spot -- exclusions keep them out of the census.
+    old_owned = repo / ".worktrees" / "t_owned"
+    old_owned.mkdir(parents=True)
+    os.utime(old_owned, (old_mtime, old_mtime))
+    census = kb.stale_worktree_census(
+        [repo], min_age_seconds=7 * 86400, now=now,
+        exclude_names={"t_owned"}, exclude_paths={str(old_feature)},
+    )
+    by_path = {entry["path"]: entry for entry in census}
+    assert str(old_owned) not in by_path
+    assert str(old_feature) not in by_path
+    assert str(old_claude) in by_path
+
+
 class TestScratchHeaderDescriptorEviction:
     """BUILD-771: the never-closed header fd cache must not grow per test.
 

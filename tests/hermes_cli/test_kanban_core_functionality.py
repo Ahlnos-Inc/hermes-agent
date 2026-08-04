@@ -1019,6 +1019,28 @@ def test_cli_gc_reports_counts(kanban_home):
     assert "GC complete" in out
 
 
+def test_cli_gc_writes_state_file(kanban_home):
+    """BUILD-927: last-run.json under the active profile's state/ dir, with
+    the summary line extended to include kept/stale counts."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x")
+        kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+    out = run_slash("gc")
+
+    assert "GC complete" in out
+    assert "kept" in out and "stale" in out
+
+    state_path = kanban_home / "state" / "kanban-gc" / "last-run.json"
+    assert state_path.is_file(), "state file must land under HERMES_HOME, not hardcoded"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"at", "removed", "orphans_kept", "forced", "census"}
+    assert set(payload["removed"]) == {"workspaces", "worktrees", "events", "logs"}
+
+
 # ---------------------------------------------------------------------------
 # run_slash parity — every verb returns a sensible, non-crashy string
 # ---------------------------------------------------------------------------

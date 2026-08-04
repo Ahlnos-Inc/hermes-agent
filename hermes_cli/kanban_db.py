@@ -13412,6 +13412,14 @@ def cleanup_terminal_task_worktrees(
 # worktree materialized seconds ago for a card not yet committed to the DB.
 ORPHAN_WORKTREE_MIN_AGE_SECONDS = 6 * 3600
 
+# The orphan proof above is already complete by the time a worktree reaches
+# the refusal path -- every board was read (or the sweep aborted instead of
+# guessing) and it already cleared the age floor. A dirty unowned tree that
+# has *also* sat past this second, much longer floor is not a race with an
+# in-flight worker; it is abandonment, so the sweep escalates to `--force`
+# rather than leaking it forever (BUILD-927).
+ORPHAN_WORKTREE_FORCE_AGE_SECONDS = 14 * 86400
+
 
 def _all_board_task_ids_and_paths() -> tuple[set[str], set[str]]:
     """Every task id and workspace path across EVERY board on disk.
@@ -13439,6 +13447,7 @@ def cleanup_orphan_task_worktrees(
     now: Optional[int] = None,
     clock: Optional[Callable[[], float]] = None,
     min_age_seconds: int = ORPHAN_WORKTREE_MIN_AGE_SECONDS,
+    force_age_seconds: int = ORPHAN_WORKTREE_FORCE_AGE_SECONDS,
     limit: int = 50,
     owned: Optional[tuple[set[str], set[str]]] = None,
 ) -> list[dict[str, Any]]:
@@ -13446,7 +13455,11 @@ def cleanup_orphan_task_worktrees(
 
     Applies the same gates as the owned path: a linked worktree checkout,
     registered with this repo, removed by ``git worktree remove`` WITHOUT
-    ``--force`` so Git itself refuses a dirty tree.
+    ``--force`` so Git itself refuses a dirty tree. One deliberate
+    escalation on top (BUILD-927): a refused-dirty orphan whose root AND
+    git admin dir have both sat past ``force_age_seconds`` is abandonment,
+    not a race -- the negative proof is already complete -- so it is
+    retried once with ``--force``.
     """
     effective_now = _workspace_cleanup_now(now, clock)
     root = Path(repo_root).expanduser()
@@ -13484,10 +13497,11 @@ def cleanup_orphan_task_worktrees(
             reason = "workspace_is_not_linked_worktree"
         elif not _registered_worktree_path(root, path):
             reason = "workspace_not_registered"
+        age_days = round(age / 86400, 1)
         if reason is not None:
             results.append({
                 "task_id": task_id, "status": "deferred",
-                "path": str(path), "reason": reason,
+                "path": str(path), "reason": reason, "age_days": age_days,
             })
             continue
         try:
@@ -13499,6 +13513,7 @@ def cleanup_orphan_task_worktrees(
             results.append({
                 "task_id": task_id, "status": "deferred", "path": str(path),
                 "reason": f"git_worktree_remove_failed:{type(exc).__name__}",
+                "age_days": age_days,
             })
             continue
         if removed.returncode == 0:
@@ -13507,12 +13522,46 @@ def cleanup_orphan_task_worktrees(
                 "task_id": task_id, "status": "cleaned",
                 "path": str(path), "repo_root": str(root),
             })
-        else:
-            results.append({
-                "task_id": task_id, "status": "deferred", "path": str(path),
-                "reason": "git_worktree_remove_refused",
-                "detail": ((removed.stderr or removed.stdout or "").strip()[:400]) or None,
-            })
+            continue
+        detail = ((removed.stderr or removed.stdout or "").strip()[:400]) or None
+        # The root dir's mtime is not a liveness clock -- weeks of edits deep
+        # in the tree never touch it. The worktree's git admin dir DOES move
+        # on every git operation, so escalate only when BOTH have sat past
+        # the force floor (BUILD-927 review).
+        force_ready = age >= force_age_seconds
+        if force_ready:
+            admin_dir = _git_dir(path)
+            try:
+                admin_age = (
+                    effective_now - int(admin_dir.stat().st_mtime)
+                    if admin_dir is not None
+                    else 0
+                )
+            except OSError:
+                admin_age = 0
+            force_ready = admin_age >= force_age_seconds
+        if force_ready:
+            try:
+                forced = subprocess.run(
+                    ["git", "-C", str(root), "worktree", "remove", "--force", str(path)],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+            except OSError:
+                forced = None
+            if forced is not None and forced.returncode == 0:
+                _log.info("kanban: force-reclaimed dirty orphan worktree %s", path)
+                results.append({
+                    "task_id": task_id, "status": "cleaned", "path": str(path),
+                    "repo_root": str(root), "forced": True,
+                })
+                continue
+            if forced is not None:
+                detail = ((forced.stderr or forced.stdout or "").strip()[:400]) or detail
+        results.append({
+            "task_id": task_id, "status": "deferred", "path": str(path),
+            "reason": "git_worktree_remove_refused", "detail": detail,
+            "age_days": age_days,
+        })
     return results
 
 
@@ -13521,7 +13570,9 @@ def discover_task_worktree_roots(known_paths: Iterable[str]) -> list[Path]:
 
     Derived from the workspace paths boards recorded plus each board's
     ``default_workdir`` — a repo no board ever pointed at cannot have received
-    a Hermes-created task worktree.
+    a Hermes-created task worktree. ``HERMES_GC_WORKTREE_ROOTS`` (colon
+    separated) adds repos no board ever knew about, e.g. hermes-config's own
+    dev worktrees (BUILD-927).
     """
     roots: set[Path] = set()
     for raw in known_paths:
@@ -13532,7 +13583,96 @@ def discover_task_worktree_roots(known_paths: Iterable[str]) -> list[Path]:
         workdir = board.get("default_workdir")
         if workdir:
             roots.add(Path(str(workdir)).expanduser())
+    for raw in os.environ.get("HERMES_GC_WORKTREE_ROOTS", "").split(":"):
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).expanduser()
+        except RuntimeError:  # e.g. ~nonexistentuser -- skip, don't kill the sweep
+            continue
+        # A relative root would silently fail the registered-path comparison
+        # (git emits absolute paths) and defer everything forever.
+        if candidate.is_absolute():
+            roots.add(candidate)
     return sorted(root for root in roots if (root / ".worktrees").is_dir())
+
+
+def _census_scan(
+    container: Path, kind: str, *, floor: int, now: int,
+    exclude_names: Optional[set[str]] = None,
+    exclude_paths: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if not container.is_dir():
+        return entries
+    for path in container.iterdir():
+        try:
+            if not path.is_dir():
+                continue
+            age = now - int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if age < floor:
+            continue
+        if (exclude_names and path.name in exclude_names) or (
+            exclude_paths and str(path) in exclude_paths
+        ):
+            continue
+        entry_kind = kind
+        if entry_kind == "task-worktree" and not path.name.startswith("t_"):
+            entry_kind = "feature-worktree"
+        entries.append({
+            "path": str(path), "age_days": round(age / 86400, 1), "kind": entry_kind,
+        })
+    return entries
+
+
+def stale_worktree_census(
+    roots: Iterable[Path | str],
+    min_age_seconds: int = 7 * 86400,
+    now: Optional[int] = None,
+    clock: Optional[Callable[[], float]] = None,
+    exclude_names: Optional[set[str]] = None,
+    exclude_paths: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    """Report every worktree-shaped directory the reap sweep can't reach.
+
+    REPORT-ONLY -- never deletes anything. Surfaces what
+    ``cleanup_orphan_task_worktrees`` is structurally blind to: non-``t_``
+    / foreign-convention dirs under ``.worktrees/``, Claude Code's own
+    ``.claude/worktrees/``, and leaked verifier scratch dirs under
+    ``/private/tmp`` -- so an operator can see the blind spot even though
+    the sweep still won't touch it (BUILD-927).
+
+    ``exclude_names``/``exclude_paths`` drop ``.worktrees/`` entries the
+    sweep DOES reach -- board-owned task ids/paths and orphans it already
+    reported -- so the census stays a pure blind-spot report instead of
+    flagging a live task's 8-day-old workspace as stale.
+    """
+    effective_now = _workspace_cleanup_now(now, clock)
+    floor = max(0, int(min_age_seconds))
+    entries: list[dict[str, Any]] = []
+    for raw_root in roots:
+        root = Path(raw_root).expanduser()
+        entries.extend(_census_scan(
+            root / ".worktrees", "task-worktree", floor=floor, now=effective_now,
+            exclude_names=exclude_names, exclude_paths=exclude_paths,
+        ))
+        entries.extend(_census_scan(root / ".claude" / "worktrees", "claude-worktree", floor=floor, now=effective_now))
+    for path in Path("/private/tmp").glob("hermes-verifier-*"):
+        try:
+            if not path.is_dir():
+                continue
+            age = effective_now - int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if age < floor:
+            continue
+        entries.append({
+            "path": str(path), "age_days": round(age / 86400, 1), "kind": "verifier-scratch",
+        })
+    entries.sort(key=lambda entry: entry["path"])
+    return entries
 
 
 def _merge_completion_prose_artifacts(
