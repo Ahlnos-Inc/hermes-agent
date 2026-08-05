@@ -1368,3 +1368,24 @@ def test_a_second_external_alias_keeps_the_boundary_closed_after_recovery(tmp_pa
     # The journal is append-only: both acts are recorded, in order.
     lines = (quarantine / "actions.jsonl").read_text(encoding="utf-8").splitlines()
     assert [json.loads(line)["alias"] for line in lines] == [str(alias), str(second)]
+
+
+def test_claude_sdk_terminal_fails_closed_for_github_review(monkeypatch, tmp_path):
+    from hermes_cli import worker_credentials as wc
+
+    monkeypatch.setattr(
+        wc,
+        "has_trusted_worker_action",
+        lambda capability, **_kwargs: capability == "github_review",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="does not support github_review"):
+        build_workspace_terminal_args(
+            {"command": "gh pr view"},
+            workspace=workspace,
+            host_home=tmp_path / "host",
+            exact_env={"PATH": "/usr/bin:/bin"},
+            platform_name="Linux",
+        )

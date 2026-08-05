@@ -248,6 +248,111 @@ def test_releaser_terminal_gets_exact_git_and_gh_isolation(
     assert TOKEN not in caplog.text
 
 
+def test_reviewer_terminal_projects_gh_token_without_a_git_write_helper(
+    monkeypatch, tmp_path, caplog
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / wc.MANIFEST_FILENAME).write_text(
+        "version: 1\nprofiles:\n  reviewer:\n    actions: [github_review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-reviewer-terminal")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "846")
+    monkeypatch.setenv(wc.MANIFEST_DIGEST_ENV, wc.load_manifest(hermes_home).digest)
+    monkeypatch.setenv(wc.GITHUB_REVIEW_HANDOFF_ENV, TOKEN)
+    monkeypatch.setenv(wc.GITHUB_REVIEW_SOURCE_KEY, "ambient-review-source")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github")
+    wc.reset_worker_credential_context_for_tests()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        f"test \"$GH_TOKEN\" = {TOKEN}\n"
+        "test -d \"$GH_CONFIG_DIR\"\n"
+        "test ! -e \"$GH_CONFIG_DIR/hosts.yml\"\n"
+        "printf 'review-ok\\n'\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o700)
+
+    try:
+        with caplog.at_level("INFO", logger=wc._log.name):
+            run_env = local._make_run_env(
+                {"PATH": f"{fake_bin}:/usr/bin:/bin"}
+            )
+
+        assert run_env["GH_TOKEN"] == TOKEN
+        assert wc.GITHUB_REVIEW_SOURCE_KEY not in run_env
+        assert wc.GITHUB_REVIEW_HANDOFF_ENV not in run_env
+        assert "GITHUB_TOKEN" not in run_env
+        assert run_env["GIT_CONFIG_COUNT"] == "1"
+        assert run_env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert run_env["GIT_CONFIG_VALUE_0"] == ""
+        assert "GIT_CONFIG_KEY_1" not in run_env
+        assert "GIT_CONFIG_VALUE_1" not in run_env
+        assert wc.GIT_ENV_TOKEN_HELPER not in run_env.values()
+        assert TOKEN not in Path(run_env["GIT_CONFIG_GLOBAL"]).read_text(
+            encoding="utf-8"
+        )
+        assert TOKEN not in caplog.text
+
+        result = subprocess.run(
+            ["gh", "pr", "view"],
+            cwd=tmp_path,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "review-ok\n"
+        assert TOKEN not in result.stdout
+        assert TOKEN not in result.stderr
+    finally:
+        wc.cleanup_worker_terminal_artifacts()
+        wc.reset_worker_credential_context_for_tests()
+
+
+def test_terminal_rejects_registry_derived_github_write_projection_conflict(
+    monkeypatch
+):
+    capability = "synthetic_github_projection"
+    monkeypatch.setitem(
+        wc.CAPABILITIES,
+        capability,
+        wc.CapabilityDefinition(
+            name=capability,
+            source_key="SYNTHETIC_GITHUB_SOURCE",
+            handoff_env=f"{wc.PRIVATE_HANDOFF_PREFIX}SYNTHETIC_GITHUB",
+            projection_env=("GH_TOKEN",),
+        ),
+    )
+    runtime = wc.TrustedWorkerCredentialRuntime(
+        profile="reviewer",
+        task_id="task-conflict",
+        run_id="1",
+        manifest_digest="synthetic-digest",
+        manifest_verified=True,
+        kanban_db_path="",
+        capabilities=("github_write", capability),
+        _values=(("github_write", "write-value"), (capability, "review-value")),
+    )
+    monkeypatch.setattr(wc, "bootstrap_worker_credential_context", lambda: runtime)
+    projected = {"PATH": "/usr/bin:/bin"}
+
+    with pytest.raises(wc.WorkerCredentialError, match=capability):
+        wc.project_worker_terminal_environment(projected)
+
+    assert "GH_TOKEN" not in projected
+    assert wc.GIT_ENV_TOKEN_HELPER not in projected.values()
+
+
 def test_marketing_worker_terminal_never_gets_the_vault_access_token(
     tmp_path, monkeypatch
 ):

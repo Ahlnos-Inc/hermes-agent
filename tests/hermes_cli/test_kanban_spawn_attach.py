@@ -338,9 +338,11 @@ def test_dispatch_rejects_legacy_integer_pid_without_signalling_it(
     assert signalled == []
 
 
-def _write_worker_contract(home: Path, *, actions: str = "[github_write]") -> None:
+def _write_worker_contract(
+    home: Path, *, profile: str = "releaser", actions: str = "[github_write]"
+) -> None:
     (home / "worker-credential-contract.yaml").write_text(
-        "version: 1\nprofiles:\n  releaser:\n    actions: "
+        f"version: 1\nprofiles:\n  {profile}:\n    actions: "
         f"{actions}\n",
         encoding="utf-8",
     )
@@ -423,6 +425,53 @@ def test_default_spawn_preflights_and_handoffs_only_authorized_action(
     assert sentinel not in repr(receipt)
 
 
+def test_default_spawn_hands_github_review_only_to_reviewer(
+    kanban_home, monkeypatch, caplog
+):
+    from agent.secret_sources.base import FetchResult
+    from hermes_cli import worker_credentials as wc
+
+    sentinel = "spawn-review-sentinel"
+    _write_worker_contract(
+        kanban_home, profile="reviewer", actions="[github_review]"
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setenv(wc.GITHUB_REVIEW_SOURCE_KEY, "ambient-review-source")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-token")
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(
+            secrets={wc.GITHUB_REVIEW_SOURCE_KEY: sentinel}
+        ),
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 55_846
+
+    def fake_popen(_cmd, *args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with caplog.at_level("INFO", logger=wc._log.name):
+        receipt = kb._default_spawn(
+            _spawn_test_task(assignee="reviewer"),
+            str(kanban_home / "workspace"),
+        )
+
+    env = captured["env"]
+    assert receipt.pid == 55_846
+    assert env[wc.GITHUB_REVIEW_HANDOFF_ENV] == sentinel
+    assert wc.GITHUB_WRITE_HANDOFF_ENV not in env
+    assert wc.GITHUB_REVIEW_SOURCE_KEY not in env
+    assert "GH_TOKEN" not in env
+    assert wc.BWS_BOOTSTRAP_ENV not in env
+    assert sentinel not in caplog.text
+    assert sentinel not in repr(receipt)
+
+
 def test_default_spawn_does_not_call_popen_when_credential_preflight_fails(
     kanban_home, monkeypatch
 ):
@@ -444,6 +493,38 @@ def test_default_spawn_does_not_call_popen_when_credential_preflight_fails(
 
     with pytest.raises(RuntimeError, match="missing BWS bootstrap"):
         kb._default_spawn(_spawn_test_task(), str(kanban_home / "workspace"))
+
+    assert called == []
+
+
+def test_reviewer_spawn_fails_before_popen_when_review_record_is_missing(
+    kanban_home, monkeypatch
+):
+    from agent.secret_sources.base import FetchResult
+    from hermes_cli import worker_credentials as wc
+
+    _write_worker_contract(
+        kanban_home, profile="reviewer", actions="[github_review]"
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "controller-bootstrap")
+    monkeypatch.setattr(
+        wc,
+        "_fetch_bitwarden_result",
+        lambda **_kwargs: FetchResult(secrets={}),
+    )
+    called = []
+
+    def fake_popen(*_args, **_kwargs):
+        called.append(True)
+        raise AssertionError("Popen must not run after credential preflight failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="secret for github_review is missing"):
+        kb._default_spawn(
+            _spawn_test_task(assignee="reviewer"),
+            str(kanban_home / "workspace"),
+        )
 
     assert called == []
 
